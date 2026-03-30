@@ -1,0 +1,18 @@
+name: mason
+display_name: Mason
+role: build_retriever
+# Uses setup default — swap to Gemini/Codex on high-volume code generation runs
+provider: default
+model_override: ~
+responsibilities:
+  - generate_code
+  - modify_code
+  - implement_multi_file_changes
+allowed_tools:
+  - workspace_write
+  - filesystem_read
+  - mcp:filesystem
+disallowed_tools:
+  - scenario_store
+  - unrestricted_shell
+personality_file: ../personality/labrador.md

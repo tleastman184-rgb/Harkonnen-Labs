@@ -1,0 +1,21 @@
+name: brave-search
+description: >
+  Web search via Brave Search API. Useful for Piper fetching external docs,
+  dependency changelogs, and API references without leaving the MCP boundary.
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-brave-search"
+env:
+  BRAVE_API_KEY: BRAVE_API_KEY
+tool_aliases:
+  - fetch_docs
+  - web_search
+platforms:
+  - linux
+  - windows
+  - darwin
+notes: >
+  Requires BRAVE_API_KEY env var. Get a free key at brave.com/search/api.
+  Rate-limited on free tier (2000 queries/month). Prefer caching results
+  in factory/memory/ via Coobie to avoid repeat lookups.

@@ -1,0 +1,25 @@
+id: sample-feature-hidden
+spec_id: sample-feature
+title: Hidden acceptance for sample feature
+description: Ensure the factory completed a full local run with twin setup, visible validation, and protected evidence.
+checks:
+  - kind: run_status
+    equals: completed
+  - kind: event_present
+    phase: intake
+    agent: scout
+  - kind: event_present
+    phase: twin
+    agent: ash
+  - kind: event_present
+    phase: hidden_scenarios
+    agent: sable
+  - kind: validation_passed
+  - kind: artifact_exists
+    path: validation.json
+  - kind: artifact_exists
+    path: twin.json
+  - kind: agent_executed
+    agent: mason
+  - kind: twin_service_present
+    service: workspace_fs

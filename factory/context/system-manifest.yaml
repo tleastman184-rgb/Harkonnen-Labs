@@ -1,0 +1,65 @@
+# system-manifest.yaml
+# Machine-parseable system overview for agent consumption.
+# Read by Coobie, Keeper, and any external agent via mcp:filesystem.
+
+system:
+  name: Harkonnen Labs
+  type: ai-software-factory
+  version: mvp
+  paradigm: spec-driven, local-first, outcome-based
+
+description: >
+  A local AI software factory where humans write YAML specs and a pack of nine
+  specialist agents implement, validate, and package software. Correctness is
+  judged by hidden behavioral scenarios, not code review.
+
+principles:
+  - spec_first: Intent must be precise before implementation begins
+  - outcome_based: Acceptance is driven by behavioral evidence, not diffs
+  - local_first: All state (specs, runs, artifacts, memory) is owned locally
+  - role_separation: Each agent has bounded tools and responsibilities
+  - compound_learning: Every run makes future runs better via Coobie
+
+status:
+  implemented:
+    - spec loading and validation
+    - run creation and SQLite persistence
+    - per-run workspace isolation
+    - artifact packaging
+    - file-backed memory store with keyword retrieval
+    - setup check with provider and MCP verification
+    - agent profile loading with provider routing display
+    - bootstrap scripts for home-linux and work-windows
+  planned:
+    - agent execution adapters (real LLM calls per agent)
+    - phase state machine in orchestrator
+    - hidden scenario isolation and execution (Sable)
+    - digital twin provisioning (Ash)
+    - semantic memory indexing
+    - Pack Board web UI
+
+cli:
+  binary: harkonnen
+  build: cargo build
+  run_prefix: cargo run --
+  commands:
+    - spec validate <file>
+    - run start <spec> --product <name>
+    - run status <run-id>
+    - run report <run-id>
+    - artifact package <run-id>
+    - memory init
+    - memory index
+    - setup check
+
+key_files:
+  active_setup: harkonnen.toml
+  agent_profiles: factory/agents/profiles/
+  memory_store: factory/memory/
+  memory_index: factory/memory/index.json
+  specs: factory/specs/
+  scenarios: factory/scenarios/
+  workspaces: factory/workspaces/
+  artifacts: factory/artifacts/
+  state_db: factory/state.db
+  context: factory/context/

@@ -1,0 +1,20 @@
+name: sqlite
+description: >
+  SQLite database access via MCP. Useful for Coobie querying factory/state.db
+  and for Sable reading scenario result history.
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-sqlite"
+  - "./factory/state.db"
+tool_aliases:
+  - metadata_query
+  - db_read
+platforms:
+  - linux
+  - windows
+  - darwin
+notes: >
+  Requires Node.js. Pass the path to the SQLite file as the last arg.
+  Read-only by default — Coobie should use the Rust db layer for writes,
+  this MCP server is for agent-level query access only.

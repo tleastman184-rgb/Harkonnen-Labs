@@ -1,0 +1,2 @@
+Amazon builder setup notes for Coobie.
+winccOA MCP may be optional by org.

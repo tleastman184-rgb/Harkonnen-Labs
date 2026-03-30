@@ -1,0 +1,28 @@
+# CI — minimal, Claude only, no interactive services
+#
+# Designed for GitHub Actions / CI runners.
+# Requires only ANTHROPIC_API_KEY secret.
+# No Docker, no Node-based MCP servers (filesystem ops go direct).
+#
+# Usage:
+#   env:
+#     HARKONNEN_SETUP: ci
+#     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+[setup]
+name        = "ci"
+platform    = "linux"
+anythingllm = false
+openclaw    = false
+
+[providers]
+default = "claude"
+
+[providers.claude]
+type        = "anthropic"
+model       = "claude-haiku-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+enabled     = true
+
+# No MCP servers in CI — agents fall back to direct Rust I/O layer.
+# Add servers here if your CI runner has Node.js and you need them.

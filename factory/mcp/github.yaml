@@ -1,0 +1,20 @@
+name: github
+description: >
+  GitHub API access via MCP — search repos, read files, manage issues and PRs.
+  Useful for Piper (fetching docs/dependencies) and Scout (reading upstream specs).
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-github"
+env:
+  GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN
+tool_aliases:
+  - github_read
+  - fetch_docs
+platforms:
+  - linux
+  - windows
+  - darwin
+notes: >
+  Requires GITHUB_TOKEN env var. Set a fine-grained token with read access
+  to repos you need. Write access only if Piper needs to push changes.

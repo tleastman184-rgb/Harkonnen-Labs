@@ -1,0 +1,18 @@
+name: bramble
+display_name: Bramble
+role: test_retriever
+# Uses setup default — test generation benefits from cost-effective models at scale
+provider: default
+model_override: ~
+responsibilities:
+  - generate_tests
+  - run_lint
+  - run_build
+  - run_visible_tests
+allowed_tools:
+  - build_runner
+  - workspace_write
+  - mcp:filesystem
+disallowed_tools:
+  - scenario_store
+personality_file: ../personality/labrador.md

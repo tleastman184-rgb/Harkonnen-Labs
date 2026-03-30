@@ -1,0 +1,57 @@
+# Work Windows — Claude only, no Docker required
+#
+# AnythingLLM and OpenClaw are replaced by:
+#   - @modelcontextprotocol/server-memory  (Coobie's memory/RAG)
+#   - @modelcontextprotocol/server-filesystem (file access)
+#   - Claude Code's native MCP support and higher token budget
+#
+# Prerequisites: Node.js, cargo, ANTHROPIC_API_KEY
+# No Docker needed.
+#
+# Usage (PowerShell):
+#   $env:HARKONNEN_SETUP = "work-windows"
+#   $env:ANTHROPIC_API_KEY = "sk-ant-..."
+#   cargo run -- setup check
+
+[setup]
+name        = "work-windows"
+platform    = "windows"
+anythingllm = false
+openclaw    = false
+
+[providers]
+default = "claude"
+
+[providers.claude]
+type         = "anthropic"
+model        = "claude-sonnet-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "high"
+surface      = "claude-code"
+
+# gemini and codex are not configured — agents with provider = "default"
+# will resolve to claude on this setup.
+
+# No explicit routing table is required here because both pinned and default
+# agents collapse to Claude under the work Windows setup.
+
+[[mcp.servers]]
+name         = "filesystem"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-filesystem", "./products", "./factory/workspaces", "./factory/artifacts"]
+tool_aliases = ["filesystem_read", "workspace_write", "artifact_writer"]
+
+[[mcp.servers]]
+name         = "memory"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-memory"]
+tool_aliases = ["memory_store", "metadata_query"]
+# Replaces AnythingLLM for Coobie's retrieval on this setup.
+# For persistence across sessions set MEMORY_FILE_PATH=./factory/memory/store.json
+
+[[mcp.servers]]
+name         = "sqlite"
+command      = "npx"
+args         = ["-y", "@modelcontextprotocol/server-sqlite", "./factory/state.db"]
+tool_aliases = ["db_read"]

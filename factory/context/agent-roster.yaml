@@ -1,0 +1,205 @@
+# agent-roster.yaml
+# Structured agent definitions for programmatic consumption.
+# All nine agents, their roles, tool permissions, and provider assignments.
+
+agents:
+
+  scout:
+    display_name: Scout
+    role: spec_retriever
+    profile_provider: claude
+    pinned: true
+    responsibilities:
+      - parse_specs
+      - identify_ambiguity
+      - produce_intent_package
+    allowed_tools:
+      - filesystem_read
+      - spec_loader
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+      - destructive_shell
+    personality: labrador
+    notes: >
+      Trust-critical. Pinned to Claude because spec interpretation must be
+      reliable and consistent. The factory's front door.
+
+  mason:
+    display_name: Mason
+    role: build_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - generate_code
+      - modify_code
+      - implement_multi_file_changes
+    allowed_tools:
+      - workspace_write
+      - filesystem_read
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+      - unrestricted_shell
+    personality: labrador
+    notes: >
+      Routes to Codex on home-linux (high-volume code generation).
+      Routes to Claude on work-windows (only provider available).
+
+  piper:
+    display_name: Piper
+    role: tool_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - run_tools
+      - fetch_docs
+      - execute_build_helpers
+    allowed_tools:
+      - build_runner
+      - filesystem_read
+      - container_runner
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+    personality: labrador
+
+  bramble:
+    display_name: Bramble
+    role: test_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - generate_tests
+      - run_lint
+      - run_build
+      - run_visible_tests
+    allowed_tools:
+      - build_runner
+      - workspace_write
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+    personality: labrador
+
+  sable:
+    display_name: Sable
+    role: scenario_retriever
+    profile_provider: claude
+    pinned: true
+    responsibilities:
+      - execute_hidden_scenarios
+      - compare_behavior
+      - produce_evaluation_reports
+    allowed_tools:
+      - scenario_store
+      - twin_runner
+      - report_writer
+      - mcp:filesystem
+    disallowed_tools:
+      - implementation_write
+    personality: labrador
+    notes: >
+      Trust-critical. Pinned to Claude. The hidden scenario system is the true
+      acceptance test — Sable must never see the implementation it is judging
+      before running the scenario. Scenario isolation is enforced by Keeper.
+
+  ash:
+    display_name: Ash
+    role: twin_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - provision_twins
+      - mock_dependencies
+      - prepare_test_environment
+    allowed_tools:
+      - container_runner
+      - filesystem_read
+      - mcp:filesystem
+    disallowed_tools:
+      - production_access
+    personality: labrador
+
+  flint:
+    display_name: Flint
+    role: artifact_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - collect_outputs
+      - package_bundles
+      - summarize_artifacts
+    allowed_tools:
+      - artifact_writer
+      - filesystem_read
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+    personality: labrador
+
+  coobie:
+    display_name: Coobie
+    role: memory_retriever
+    profile_provider: default
+    pinned: false
+    responsibilities:
+      - retrieve_prior_specs
+      - retrieve_patterns
+      - retrieve_failures
+      - store_new_knowledge
+    allowed_tools:
+      - memory_store
+      - filesystem_read
+      - metadata_query
+      - mcp:memory
+      - mcp:filesystem
+    disallowed_tools:
+      - scenario_store
+      - destructive_shell
+    personality: labrador
+    backends:
+      file_index:
+        path: factory/memory/index.json
+        always_available: true
+      mcp_memory:
+        server: "@modelcontextprotocol/server-memory"
+        all_setups: true
+        note: Set MEMORY_FILE_PATH for cross-session persistence
+      anythingllm:
+        home_linux_only: true
+        script: scripts/coobie-seed-anythingllm.sh
+    notes: >
+      Routes to Claude on home-linux (routing.agents override).
+      Routes to Claude on work-windows (only provider available).
+      Three backends, one source of truth: factory/memory/*.md files.
+
+  keeper:
+    display_name: Keeper
+    role: boundary_retriever
+    profile_provider: claude
+    pinned: true
+    responsibilities:
+      - enforce_policy
+      - prevent_unsafe_actions
+      - protect_secrets
+      - maintain_factory_product_boundary
+    allowed_tools:
+      - policy_engine
+      - filesystem_read
+      - secret_scanner
+      - mcp:filesystem
+    disallowed_tools:
+      - destructive_shell
+      - production_access
+      - scenario_store
+    personality: labrador
+    notes: >
+      Trust-critical. Pinned to Claude. Sole holder of policy_engine access.
+      Must be the last agent to approve any action that crosses a boundary.
+
+invariants:
+  - mason_cannot_see_scenarios: Mason disallowed_tools includes scenario_store
+  - sable_cannot_write_code: Sable disallowed_tools includes implementation_write
+  - keeper_owns_policy_engine: Only Keeper has policy_engine in allowed_tools
+  - all_agents_share_personality: personality = labrador for all agents

@@ -1,0 +1,23 @@
+name: filesystem
+description: >
+  Read/write access to local filesystem paths via MCP.
+  Backs filesystem_read, workspace_write, and artifact_writer tool aliases.
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-filesystem"
+  - "./products"
+  - "./factory/workspaces"
+  - "./factory/artifacts"
+tool_aliases:
+  - filesystem_read
+  - workspace_write
+  - artifact_writer
+platforms:
+  - linux
+  - windows
+  - darwin
+notes: >
+  Requires Node.js. Pass additional allowed paths as extra args.
+  On Windows use forward slashes or quote paths with spaces.
+  Replaces direct file I/O for agents that must stay within MCP boundaries.

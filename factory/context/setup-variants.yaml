@@ -1,0 +1,112 @@
+# setup-variants.yaml
+# Side-by-side comparison of all named setup environments.
+# Used by Coobie and agents to understand what capabilities are available
+# in the current environment.
+
+active_setup_env_var: HARKONNEN_SETUP
+default_config_file: harkonnen.toml
+setup_directory: setups/
+
+variants:
+
+  home-linux:
+    file: setups/home-linux.toml
+    platform: linux
+    providers:
+      default: gemini
+      available: [claude, gemini, codex]
+    routing_overrides:
+      coobie: claude
+      mason: codex
+    docker: true
+    anythingllm: true
+    openclaw: true
+    mcp_servers: [filesystem, memory, sqlite, github, brave-search]
+    activation:
+      linux: export HARKONNEN_SETUP=home-linux
+      windows: $env:HARKONNEN_SETUP = "home-linux"
+    notes: >
+      Full stack. Gemini is the default for implementation agents (cost-effective
+      at volume). Codex handles code generation (Mason). Claude handles trust-critical
+      roles and Coobie. AnythingLLM adds semantic RAG over factory/memory/.
+
+  work-windows:
+    file: setups/work-windows.toml
+    platform: windows
+    providers:
+      default: claude
+      available: [claude]
+    routing_overrides: {}
+    docker: false
+    anythingllm: false
+    openclaw: false
+    mcp_servers: [filesystem, memory, sqlite]
+    activation:
+      windows: $env:HARKONNEN_SETUP = "work-windows"
+      linux: export HARKONNEN_SETUP=work-windows
+    prerequisites:
+      - Node.js (for npx MCP servers)
+      - cargo / Rust toolchain
+      - ANTHROPIC_API_KEY
+    bootstrap: scripts/bootstrap-windows.ps1
+    notes: >
+      Claude-only. No Docker required. AnythingLLM replaced by mcp:memory.
+      OpenClaw replaced by Claude Code's native agent capabilities.
+      All nine agents collapse to Claude for this setup — routing table is empty.
+
+  ci:
+    file: setups/ci.toml
+    platform: linux
+    providers:
+      default: claude
+      available: [claude]
+      model: claude-haiku-4-5  # cost-optimized for CI
+    routing_overrides: {}
+    docker: false
+    anythingllm: false
+    openclaw: false
+    mcp_servers: []
+    activation:
+      github_actions: |
+        env:
+          HARKONNEN_SETUP: ci
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    notes: >
+      Minimal. No MCP servers — agents fall back to Rust I/O layer directly.
+      Uses Claude Haiku for cost efficiency on CI runners.
+      Add MCP servers here only if the CI runner has Node.js available.
+
+agent_routing_matrix:
+  description: >
+    Which provider each agent uses per setup, after resolving profile declarations
+    and routing overrides.
+  home-linux:
+    scout:   claude     # pinned in profile
+    mason:   codex      # routing override
+    piper:   gemini     # default
+    bramble: gemini     # default
+    sable:   claude     # pinned in profile
+    ash:     gemini     # default
+    flint:   gemini     # default
+    coobie:  claude     # routing override
+    keeper:  claude     # pinned in profile
+  work-windows:
+    scout:   claude     # pinned (and only provider)
+    mason:   claude     # default = claude (only provider)
+    piper:   claude     # default = claude
+    bramble: claude     # default = claude
+    sable:   claude     # pinned
+    ash:     claude     # default = claude
+    flint:   claude     # default = claude
+    coobie:  claude     # default = claude (no routing table needed)
+    keeper:  claude     # pinned
+  ci:
+    scout:   claude-haiku   # pinned + haiku model
+    mason:   claude-haiku
+    piper:   claude-haiku
+    bramble: claude-haiku
+    sable:   claude-haiku   # pinned + haiku model
+    ash:     claude-haiku
+    flint:   claude-haiku
+    coobie:  claude-haiku
+    keeper:  claude-haiku   # pinned + haiku model

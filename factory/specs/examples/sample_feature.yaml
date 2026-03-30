@@ -1,0 +1,34 @@
+id: sample-feature
+title: Sample Feature
+purpose: Demonstrate the Harkonnen Labs MVP run lifecycle with a small local spec.
+scope:
+  - validate a spec from disk
+  - start a run and persist metadata
+  - package a simple artifact bundle
+constraints:
+  - remain local-first
+  - avoid destructive actions
+inputs:
+  - yaml specification file
+  - target product name
+outputs:
+  - run record in sqlite
+  - workspace directory for the run
+  - artifact summary bundle
+acceptance_criteria:
+  - spec validation succeeds
+  - run creation stores metadata
+  - report output shows the current run state
+forbidden_behaviors:
+  - deleting unrelated files
+  - reaching outside the workspace boundary
+rollback_requirements:
+  - retain prior artifacts unless explicitly cleaned up
+dependencies:
+  - sqlite
+  - tokio
+  - clap
+performance_expectations:
+  - cli commands should complete quickly for local metadata operations
+security_expectations:
+  - constrain file access to the project workspace

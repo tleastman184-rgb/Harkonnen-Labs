@@ -1,0 +1,23 @@
+name: memory
+description: >
+  Persistent key-value memory store via MCP.
+  Backs memory_store and metadata_query tool aliases for Coobie.
+  Replaces AnythingLLM for Claude-only setups (work-windows) and as a
+  lightweight alternative on home-linux when document RAG is not needed.
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-memory"
+tool_aliases:
+  - memory_store
+  - metadata_query
+platforms:
+  - linux
+  - windows
+  - darwin
+notes: >
+  Requires Node.js. State is stored in the MCP server process memory by
+  default — for persistence across restarts configure MEMORY_FILE_PATH
+  env var to point at a JSON file inside factory/memory/.
+  For richer document RAG (large corpora, semantic search) prefer
+  AnythingLLM on setups that have Docker available.

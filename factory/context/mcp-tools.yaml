@@ -1,0 +1,120 @@
+# mcp-tools.yaml
+# Maps abstract tool names (used in agent profiles) to MCP servers.
+# Used by Coobie and agents resolving tool access.
+
+# How to read this file:
+#   - tool_aliases: what agent profiles write in allowed_tools
+#   - server: the MCP server that backs that alias
+#   - available_in: which named setups include this server
+
+servers:
+
+  filesystem:
+    package: "@modelcontextprotocol/server-filesystem"
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "./products"
+      - "./factory/workspaces"
+      - "./factory/artifacts"
+    tool_aliases:
+      - filesystem_read
+      - workspace_write
+      - artifact_writer
+    available_in: [home-linux, work-windows, ci-with-node]
+    platforms: [linux, windows, darwin]
+    requires_env: []
+    notes: >
+      Core server. Needed by almost every agent for read access.
+      Pass additional allowed paths as extra args.
+
+  memory:
+    package: "@modelcontextprotocol/server-memory"
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-memory"
+    tool_aliases:
+      - memory_store
+      - metadata_query
+    available_in: [home-linux, work-windows]
+    platforms: [linux, windows, darwin]
+    requires_env: []
+    optional_env:
+      MEMORY_FILE_PATH: >
+        Path to a JSON file for cross-session persistence.
+        e.g. ./factory/memory/store.json
+    notes: >
+      Replaces AnythingLLM on work-windows and ci setups.
+      Without MEMORY_FILE_PATH, entities reset on server restart.
+      factory/memory/index.json is always the authoritative source of truth.
+
+  sqlite:
+    package: "@modelcontextprotocol/server-sqlite"
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-sqlite"
+      - "./factory/state.db"
+    tool_aliases:
+      - metadata_query
+      - db_read
+    available_in: [home-linux, work-windows]
+    platforms: [linux, windows, darwin]
+    requires_env: []
+    notes: >
+      Read-only agent access to run history, spec metadata, and status.
+      Rust db layer handles all writes; this MCP server is query-only for agents.
+
+  github:
+    package: "@modelcontextprotocol/server-github"
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-github"
+    tool_aliases:
+      - fetch_docs
+      - github_read
+    available_in: [home-linux]
+    platforms: [linux, windows, darwin]
+    requires_env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN
+    notes: >
+      Piper uses this to fetch upstream docs, changelogs, and dependency specs.
+      Fine-grained token: read access to relevant repos is sufficient.
+
+  brave-search:
+    package: "@modelcontextprotocol/server-brave-search"
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-brave-search"
+    tool_aliases:
+      - fetch_docs
+      - web_search
+    available_in: [home-linux]
+    platforms: [linux, windows, darwin]
+    requires_env:
+      BRAVE_API_KEY: BRAVE_API_KEY
+    notes: >
+      External doc and dependency research for Piper.
+      Free tier: 2000 queries/month. Cache results via Coobie to preserve quota.
+
+# Abstract tool names with no MCP server backing (handled by Rust layer)
+rust_layer_tools:
+  - build_runner       # Piper: shell execution for build commands
+  - container_runner   # Ash: Docker/Podman for digital twins
+  - spec_loader        # Scout: Rust spec parser
+  - policy_engine      # Keeper: Rust policy enforcement
+  - secret_scanner     # Keeper: env var and secrets checker
+  - report_writer      # Sable: Rust report generator
+  - twin_runner        # Sable: twin environment runner
+  - scenario_store     # Sable + Keeper: isolated scenario file store
+
+# Adding a new MCP server:
+# 1. Add [[mcp.servers]] entry in the active setup TOML
+# 2. Create factory/mcp/<name>.yaml for documentation
+# 3. Add tool_aliases to this file
+# 4. Reference the alias in the relevant agent profile allowed_tools
+# 5. Run: cargo run -- setup check

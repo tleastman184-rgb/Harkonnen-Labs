@@ -1,0 +1,27 @@
+name: coobie
+display_name: Coobie
+role: memory_retriever
+# Uses setup default — on work-windows this routes to mcp:memory (server-memory);
+# on home-linux it can also use AnythingLLM for richer document RAG
+provider: default
+model_override: ~
+responsibilities:
+  - retrieve_prior_specs
+  - retrieve_patterns
+  - retrieve_failures
+  - manage_short_term_context
+  - maintain_shared_team_board
+  - consolidate_long_term_memory
+  - store_new_knowledge
+allowed_tools:
+  - memory_store
+  - filesystem_read
+  - metadata_query
+  - db_read
+  - mcp:memory
+  - mcp:filesystem
+  - mcp:sqlite
+disallowed_tools:
+  - scenario_store
+  - destructive_shell
+personality_file: ../personality/labrador.md

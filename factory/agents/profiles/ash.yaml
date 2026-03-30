@@ -1,0 +1,17 @@
+name: ash
+display_name: Ash
+role: twin_retriever
+# Uses setup default — environment provisioning is procedural, not reasoning-heavy
+provider: default
+model_override: ~
+responsibilities:
+  - provision_twins
+  - mock_dependencies
+  - prepare_test_environment
+allowed_tools:
+  - container_runner
+  - filesystem_read
+  - mcp:filesystem
+disallowed_tools:
+  - production_access
+personality_file: ../personality/labrador.md

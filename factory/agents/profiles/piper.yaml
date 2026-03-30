@@ -1,0 +1,18 @@
+name: piper
+display_name: Piper
+role: tool_retriever
+# Uses setup default — mostly mechanical tool execution, not judgment-heavy
+provider: default
+model_override: ~
+responsibilities:
+  - run_tools
+  - fetch_docs
+  - execute_build_helpers
+allowed_tools:
+  - build_runner
+  - filesystem_read
+  - container_runner
+  - mcp:filesystem
+disallowed_tools:
+  - scenario_store
+personality_file: ../personality/labrador.md

@@ -1,0 +1,17 @@
+name: flint
+display_name: Flint
+role: artifact_retriever
+# Uses setup default — packaging is mechanical and low-risk
+provider: default
+model_override: ~
+responsibilities:
+  - collect_outputs
+  - package_bundles
+  - summarize_artifacts
+allowed_tools:
+  - artifact_writer
+  - filesystem_read
+  - mcp:filesystem
+disallowed_tools:
+  - scenario_store
+personality_file: ../personality/labrador.md
