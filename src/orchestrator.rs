@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -19,9 +19,10 @@ use crate::{
     llm::{self, LlmRequest},
     memory::MemoryStore,
     models::{
-        AgentExecution, BlackboardState, EpisodeRecord, HiddenScenarioCheckResult,
-        HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, RunEvent,
-        RunRecord, ScenarioResult, Spec, TwinEnvironment, TwinService, ValidationSummary,
+        AgentExecution, BlackboardState, CoobieBriefing, EpisodeRecord,
+        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
+        IntentPackage, LessonRecord, PriorCauseSignal, RunEvent, RunRecord, ScenarioResult,
+        Spec, TwinEnvironment, TwinService, ValidationSummary,
     },
     policy,
     scenarios,
@@ -455,7 +456,7 @@ impl AppContext {
             )
             .await?;
         let implementation_plan = self
-            .mason_implementation_plan(spec_obj, &intent, &memory_hits, &staged_product, target_source)
+            .mason_implementation_plan(spec_obj, &intent, &briefing, &staged_product, target_source)
             .await;
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
@@ -515,7 +516,7 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        let tool_plan = self.piper_tool_plan(spec_obj).await;
+        let tool_plan = self.piper_tool_plan(spec_obj, &briefing).await;
         tokio::fs::write(run_dir.join("tool_plan.md"), &tool_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "tool_plan.md");
         self.write_agent_execution(
@@ -567,7 +568,7 @@ impl AppContext {
             .await?;
         let twin = self.build_twin_environment(run_id, spec_obj);
         self.write_json_file(&run_dir.join("twin.json"), &twin).await?;
-        if let Some(narrative) = self.ash_twin_narrative(spec_obj, &twin).await {
+        if let Some(narrative) = self.ash_twin_narrative(spec_obj, &twin, &briefing).await {
             let _ = tokio::fs::write(run_dir.join("twin_narrative.md"), &narrative).await;
             push_unique(&mut blackboard.artifact_refs, "twin_narrative.md");
         }
@@ -619,7 +620,7 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        let mut validation = self.run_visible_validation(&workspace_root, &staged_product).await?;
+        let mut validation = self.run_visible_validation(&workspace_root, &staged_product, spec_obj).await?;
         if let Some(message) = req.harness_message("validation") {
             validation.passed = false;
             validation.results.push(ScenarioResult {
@@ -686,7 +687,10 @@ impl AppContext {
             push_unique(&mut blackboard.open_blockers, "visible_validation_failed");
         }
         // Bramble LLM interpretation — best-effort, non-blocking
-        if let Some(analysis) = self.bramble_interpret_validation(spec_obj, &validation).await {
+        if let Some(analysis) = self
+            .bramble_interpret_validation(spec_obj, &validation, &briefing)
+            .await
+        {
             let _ = tokio::fs::write(run_dir.join("validation_analysis.md"), &analysis).await;
             push_unique(&mut blackboard.artifact_refs, "validation_analysis.md");
         }
@@ -948,40 +952,250 @@ impl AppContext {
         })
     }
 
-    async fn scout_intake(&self, spec_obj: &Spec, memory_hits: &[String]) -> Result<IntentPackage> {
-        // Try a real LLM call via Scout's configured provider. Fall back to the
-        // rule-based stub when no API key is available or the call fails.
-        if let Some(provider) = llm::build_provider("scout", "claude", &self.paths.setup) {
-            let memory_section = if memory_hits.is_empty()
-                || memory_hits.iter().all(|h| h.contains("No memories found") || h.contains("Memory not initialized"))
-            {
-                "No prior memory matched this spec.".to_string()
-            } else {
-                memory_hits.join("\n\n")
-            };
+    async fn retrieve_coobie_memory_context(&self, query_terms: &[String]) -> Result<Vec<String>> {
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
 
+        for term in query_terms {
+            if term.trim().is_empty() {
+                continue;
+            }
+            for hit in self.memory_store.retrieve_context(term).await? {
+                if hit.contains("No memories found") || hit.contains("Memory not initialized") {
+                    continue;
+                }
+                if seen.insert(hit.clone()) {
+                    hits.push(hit);
+                }
+            }
+        }
+
+        if hits.is_empty() {
+            Ok(vec![format!(
+                "No memories found for Coobie preflight queries: {}",
+                query_terms.join(", ")
+            )])
+        } else {
+            hits.truncate(10);
+            Ok(hits)
+        }
+    }
+
+    async fn find_relevant_lessons(
+        &self,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<Vec<LessonRecord>> {
+        let lessons = self.list_lessons().await?;
+        let mut scored = lessons
+            .into_iter()
+            .map(|lesson| {
+                let haystack = format!(
+                    "{} {} {}",
+                    lesson.pattern.to_lowercase(),
+                    lesson.tags.join(" ").to_lowercase(),
+                    lesson.intervention.clone().unwrap_or_default().to_lowercase(),
+                );
+                let mut score = 0_i32;
+                for term in query_terms {
+                    let needle = term.to_lowercase();
+                    if needle.len() >= 3 && haystack.contains(&needle) {
+                        score += 3;
+                    }
+                }
+                for signal in domain_signals {
+                    if haystack.contains(&signal.to_lowercase()) {
+                        score += 2;
+                    }
+                }
+                if lesson.tags.iter().any(|tag| tag == "causal") {
+                    score += 1;
+                }
+                (score, lesson)
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.created_at.cmp(&left.1.created_at))
+        });
+
+        let mut relevant = scored
+            .iter()
+            .filter(|(score, _)| *score > 0)
+            .map(|(_, lesson)| lesson.clone())
+            .take(5)
+            .collect::<Vec<_>>();
+
+        if relevant.is_empty() {
+            relevant = scored
+                .iter()
+                .filter(|(_, lesson)| lesson.tags.iter().any(|tag| tag == "causal" || tag == "lesson"))
+                .map(|(_, lesson)| lesson.clone())
+                .take(3)
+                .collect::<Vec<_>>();
+        }
+
+        Ok(relevant)
+    }
+
+    async fn summarize_prior_causes(&self, limit: usize) -> Result<Vec<PriorCauseSignal>> {
+        #[derive(Debug)]
+        struct CauseAggregate {
+            description: String,
+            occurrences: i64,
+            scenario_successes: i64,
+            last_seen_run_id: Option<String>,
+            last_seen_at: Option<chrono::DateTime<Utc>>,
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT h.run_id, h.cause_id, h.description, h.created_at, s.scenario_passed
+            FROM causal_hypotheses h
+            LEFT JOIN coobie_episode_scores s ON s.run_id = h.run_id
+            ORDER BY h.created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut aggregates: HashMap<String, CauseAggregate> = HashMap::new();
+        for row in rows {
+            let cause_id = row.get::<String, _>("cause_id");
+            let description = row.get::<String, _>("description");
+            let run_id = row.get::<String, _>("run_id");
+            let created_at = chrono::DateTime::parse_from_rfc3339(
+                row.get::<String, _>("created_at").as_str(),
+            )?
+            .with_timezone(&Utc);
+            let scenario_passed = row.get::<Option<i64>, _>("scenario_passed").unwrap_or(0) != 0;
+
+            let entry = aggregates.entry(cause_id).or_insert_with(|| CauseAggregate {
+                description,
+                occurrences: 0,
+                scenario_successes: 0,
+                last_seen_run_id: Some(run_id.clone()),
+                last_seen_at: Some(created_at),
+            });
+            entry.occurrences += 1;
+            if scenario_passed {
+                entry.scenario_successes += 1;
+            }
+            if entry.last_seen_at.is_none() {
+                entry.last_seen_at = Some(created_at);
+                entry.last_seen_run_id = Some(run_id);
+            }
+        }
+
+        let mut signals = aggregates
+            .into_iter()
+            .map(|(cause_id, aggregate)| PriorCauseSignal {
+                cause_id,
+                description: aggregate.description,
+                occurrences: aggregate.occurrences,
+                scenario_pass_rate: if aggregate.occurrences > 0 {
+                    aggregate.scenario_successes as f32 / aggregate.occurrences as f32
+                } else {
+                    0.0
+                },
+                last_seen_run_id: aggregate.last_seen_run_id,
+                last_seen_at: aggregate.last_seen_at,
+            })
+            .collect::<Vec<_>>();
+
+        signals.sort_by(|left, right| {
+            right
+                .occurrences
+                .cmp(&left.occurrences)
+                .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
+        });
+        signals.truncate(limit);
+        Ok(signals)
+    }
+
+    async fn build_coobie_briefing(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+        memory_hits: &[String],
+    ) -> Result<CoobieBriefing> {
+        let relevant_lessons = self.find_relevant_lessons(query_terms, domain_signals).await?;
+        let prior_causes = self.summarize_prior_causes(5).await?;
+        let prior_report_count = sqlx::query(
+            "SELECT COUNT(DISTINCT run_id) AS cnt FROM causal_hypotheses",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .get::<i64, _>("cnt") as usize;
+        let application_risks = build_application_risks(spec_obj, domain_signals, memory_hits, &prior_causes);
+        let environment_risks = build_environment_risks(spec_obj, domain_signals);
+        let regulatory_considerations = build_regulatory_considerations(spec_obj, domain_signals);
+        let recommended_guardrails = build_recommended_guardrails(domain_signals, memory_hits, &prior_causes);
+        let required_checks = build_required_checks(spec_obj, domain_signals, &regulatory_considerations);
+        let open_questions = build_coobie_open_questions(spec_obj, domain_signals, &regulatory_considerations);
+
+        let mut briefing = CoobieBriefing {
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            query_terms: query_terms.to_vec(),
+            domain_signals: domain_signals.to_vec(),
+            prior_report_count,
+            memory_hits: memory_hits.to_vec(),
+            relevant_lessons,
+            prior_causes,
+            application_risks,
+            environment_risks,
+            regulatory_considerations,
+            recommended_guardrails,
+            required_checks,
+            open_questions,
+            coobie_response: String::new(),
+            generated_at: Utc::now(),
+        };
+        briefing.coobie_response = crate::coobie::render_coobie_briefing_response(&briefing);
+        Ok(briefing)
+    }
+
+    async fn scout_intake(&self, spec_obj: &Spec, briefing: &CoobieBriefing) -> Result<IntentPackage> {
+        if let Some(provider) = llm::build_provider("scout", "claude", &self.paths.setup) {
+            let memory_section = format_memory_context(&briefing.memory_hits);
+            let briefing_json = serde_json::to_string_pretty(briefing).unwrap_or_default();
             let spec_yaml = serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
 
             let req = LlmRequest::simple(
-                "You are Scout, a spec-intake specialist for a software factory. \
-                 Your job is to read a YAML spec and prior memory context, then produce a \
-                 concise implementation intent package as JSON with these fields: \
-                 spec_id (string), summary (one sentence), ambiguity_notes (array of strings — \
-                 things that are unclear or missing), recommended_steps (ordered array of strings). \
-                 Respond with valid JSON only — no markdown, no explanation.",
+                "You are Scout, a spec-intake specialist for a software factory.                  Your job is to read a YAML spec and prior memory context, then produce a                  concise implementation intent package as JSON with these fields:                  spec_id (string), summary (one sentence), ambiguity_notes (array of strings —                  things that are unclear or missing), recommended_steps (ordered array of strings).                  Respond with valid JSON only — no markdown, no explanation.",
                 format!(
-                    "SPEC:\n```yaml\n{spec_yaml}\n```\n\nPRIOR MEMORY:\n{memory_section}\n\n\
-                     Produce the intent package JSON."
+                    "SPEC:
+```yaml
+{spec_yaml}
+```
+
+PRIOR MEMORY:
+{memory_section}
+
+COOBIE BRIEFING:
+```json
+{briefing_json}
+```
+
+COOBIE RESPONSE:
+{response}
+
+                     Produce the intent package JSON and incorporate Coobie guardrails, required checks, and open questions.",
+                    response = briefing.coobie_response,
                 ),
             );
 
             match provider.complete(req).await {
                 Ok(resp) => {
-                    // Parse the JSON response; fall through to stub on failure
                     if let Ok(parsed) = serde_json::from_str::<IntentPackage>(&resp.content.trim()) {
                         return Ok(parsed);
                     }
-                    // Try stripping markdown fences if the model added them
                     let stripped = resp.content
                         .trim()
                         .trim_start_matches("```json")
@@ -999,7 +1213,6 @@ impl AppContext {
             }
         }
 
-        // Rule-based fallback — always works without an API key
         let mut ambiguity_notes = Vec::new();
         if spec_obj.outputs.is_empty() {
             ambiguity_notes.push("Spec does not describe concrete outputs yet".to_string());
@@ -1007,18 +1220,21 @@ impl AppContext {
         if spec_obj.acceptance_criteria.is_empty() {
             ambiguity_notes.push("Spec is missing acceptance criteria".to_string());
         }
-        if memory_hits
+        if briefing
+            .memory_hits
             .iter()
             .any(|hit| hit.contains("No memories found") || hit.contains("Memory not initialized"))
         {
             ambiguity_notes.push("No strong prior memory matched this spec".to_string());
         }
+        ambiguity_notes.extend(briefing.open_questions.iter().cloned());
 
         Ok(IntentPackage {
             spec_id: spec_obj.id.clone(),
             summary: format!("Implement {}", spec_obj.title),
             ambiguity_notes,
             recommended_steps: vec![
+                "Read Coobie's preflight briefing and required guardrails".into(),
                 "Retrieve prior patterns with Coobie".into(),
                 "Stage an isolated product workspace".into(),
                 "Run visible validation before scenario work".into(),
@@ -1033,36 +1249,48 @@ impl AppContext {
         &self,
         spec_obj: &Spec,
         intent: &IntentPackage,
-        memory_hits: &[String],
+        briefing: &CoobieBriefing,
         staged_product: &Path,
         target_source: &TargetSourceMetadata,
     ) -> String {
-        let stub = build_implementation_plan(spec_obj, intent, memory_hits, staged_product, target_source);
+        let stub = build_implementation_plan(spec_obj, intent, briefing, staged_product, target_source);
 
         if let Some(provider) = llm::build_provider("mason", "default", &self.paths.setup) {
-            let memory_section = if memory_hits.is_empty()
-                || memory_hits.iter().all(|h| h.contains("No memories found") || h.contains("Memory not initialized"))
-            {
-                "No prior memory hits.".to_string()
-            } else {
-                memory_hits.join("\n\n")
-            };
-
+            let memory_section = format_memory_context(&briefing.memory_hits);
             let spec_yaml = serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
             let intent_json = serde_json::to_string_pretty(intent).unwrap_or_default();
+            let briefing_json = serde_json::to_string_pretty(briefing).unwrap_or_default();
 
             let req = LlmRequest::simple(
-                "You are Mason, an implementation planning specialist for a software factory. \
-                 You receive a YAML spec, a Scout intent package, and prior memory context. \
-                 Produce a clear, actionable implementation plan in Markdown. \
-                 Structure: ## Target, ## Intent Summary, ## Scope, ## Acceptance Criteria, \
-                 ## Recommended Steps (ordered, numbered), ## Risks, ## Prior Context. \
-                 Be specific. No filler. No preamble.",
+                "You are Mason, an implementation planning specialist for a software factory.                  You receive a YAML spec, a Scout intent package, and prior memory context.                  Produce a clear, actionable implementation plan in Markdown.                  Structure: ## Target, ## Intent Summary, ## Scope, ## Acceptance Criteria,                  ## Recommended Steps (ordered, numbered), ## Risks, ## Prior Context.                  Be specific. No filler. No preamble.",
                 format!(
-                    "SPEC:\n```yaml\n{spec_yaml}\n```\n\nINTENT:\n```json\n{intent_json}\n```\n\n\
-                     TARGET: {} ({})\n\nPRIOR MEMORY:\n{memory_section}\n\n\
-                     Produce the implementation plan markdown.",
-                    target_source.label, target_source.source_path,
+                    "SPEC:
+```yaml
+{spec_yaml}
+```
+
+INTENT:
+```json
+{intent_json}
+```
+
+                     TARGET: {} ({})
+
+PRIOR MEMORY:
+{memory_section}
+
+COOBIE BRIEFING:
+```json
+{briefing_json}
+```
+
+COOBIE RESPONSE:
+{response}
+
+                     Produce the implementation plan markdown and treat Coobie guardrails and required checks as constraints.",
+                    target_source.label,
+                    target_source.source_path,
+                    response = briefing.coobie_response,
                 ),
             );
 
@@ -1076,19 +1304,27 @@ impl AppContext {
     }
 
     /// Piper: build a tool and MCP surface plan, using an LLM when available.
-    async fn piper_tool_plan(&self, spec_obj: &Spec) -> String {
-        let stub = self.build_tool_plan();
+    async fn piper_tool_plan(&self, spec_obj: &Spec, briefing: &CoobieBriefing) -> String {
+        let stub = self.build_tool_plan(briefing);
 
         if let Some(provider) = llm::build_provider("piper", "default", &self.paths.setup) {
             let req = LlmRequest::simple(
-                "You are Piper, a tool and MCP routing specialist for a software factory. \
-                 You receive the current tool surface and a spec summary. \
-                 Produce a brief Markdown report: which tools are available, which are relevant \
-                 to this spec, and any gaps or warnings. No filler.",
+                "You are Piper, a tool and MCP routing specialist for a software factory.                  You receive the current tool surface and a spec summary.                  Produce a brief Markdown report: which tools are available, which are relevant                  to this spec, and any gaps or warnings. No filler.",
                 format!(
-                    "SPEC: {} — {}\n\nTOOL SURFACE:\n{stub}\n\n\
-                     Produce the tool plan analysis.",
-                    spec_obj.id, spec_obj.title,
+                    "SPEC: {} — {}
+DOMAIN SIGNALS: {}
+REGULATORY: {}
+REQUIRED CHECKS: {}
+
+TOOL SURFACE:
+{stub}
+
+                     Produce the tool plan analysis and explicitly call out tools or MCP gaps that block Coobie's required checks.",
+                    spec_obj.id,
+                    spec_obj.title,
+                    if briefing.domain_signals.is_empty() { "none".to_string() } else { briefing.domain_signals.join(", ") },
+                    if briefing.regulatory_considerations.is_empty() { "none".to_string() } else { briefing.regulatory_considerations.join(" | ") },
+                    if briefing.required_checks.is_empty() { "none".to_string() } else { briefing.required_checks.join(" | ") },
                 ),
             );
 
@@ -1105,6 +1341,7 @@ impl AppContext {
         &self,
         workspace_root: &Path,
         staged_product: &Path,
+        spec_obj: &Spec,
     ) -> Result<ValidationSummary> {
         let mut results = Vec::new();
         let run_dir = workspace_root.join("run");
@@ -1294,6 +1531,44 @@ impl AppContext {
             });
         }
 
+        // Run spec-driven test commands (e.g. corpus tests) and write corpus_results.json.
+        if !spec_obj.test_commands.is_empty() {
+            let mut command_results = Vec::new();
+            let mut all_passed = true;
+            for raw_cmd in &spec_obj.test_commands {
+                let parts: Vec<&str> = raw_cmd.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                let (program, args) = (parts[0], &parts[1..]);
+                let outcome = self
+                    .run_command_capture(program, args, staged_product)
+                    .await?;
+                if !outcome.success {
+                    all_passed = false;
+                }
+                output_chunks.push(format_command_output(raw_cmd, &outcome));
+                results.push(ScenarioResult {
+                    scenario_id: format!("test_command_{}", command_results.len() + 1),
+                    passed: outcome.success,
+                    details: command_detail(raw_cmd, &outcome),
+                });
+                command_results.push(serde_json::json!({
+                    "label": raw_cmd,
+                    "exit_code": outcome.code.unwrap_or(-1),
+                    "passed": outcome.success,
+                }));
+            }
+            let corpus_results = serde_json::json!({
+                "commands": command_results,
+                "all_passed": all_passed,
+            });
+            let corpus_results_path = workspace_root.join("run").join("corpus_results.json");
+            if let Ok(json_str) = serde_json::to_string_pretty(&corpus_results) {
+                let _ = tokio::fs::write(&corpus_results_path, json_str).await;
+            }
+        }
+
         if !output_chunks.is_empty() {
             tokio::fs::write(&validation_log_path, output_chunks.join("\n\n"))
                 .await
@@ -1362,6 +1637,7 @@ impl AppContext {
         &self,
         spec_obj: &Spec,
         validation: &ValidationSummary,
+        briefing: &CoobieBriefing,
     ) -> Option<String> {
         let provider = llm::build_provider("bramble", "default", &self.paths.setup)?;
 
@@ -1370,17 +1646,25 @@ impl AppContext {
             .iter()
             .map(|r| format!("- [{}] {}: {}", if r.passed { "PASS" } else { "FAIL" }, r.scenario_id, r.details))
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("
+");
 
         let req = LlmRequest::simple(
-            "You are Bramble, a validation analyst for a software factory. \
-             You receive a spec summary and the results of visible validation checks. \
-             Produce a brief Markdown analysis: what passed, what failed, likely root causes \
-             for any failures, and what a developer should look at first. No filler.",
+            "You are Bramble, a validation analyst for a software factory.              You receive a spec summary and the results of visible validation checks.              Produce a brief Markdown analysis: what passed, what failed, likely root causes              for any failures, and what a developer should look at first. No filler.",
             format!(
-                "SPEC: {} — {}\n\nVALIDATION RESULTS (passed={}):\n{results_text}\n\n\
-                 Produce the validation analysis.",
-                spec_obj.id, spec_obj.title, validation.passed,
+                "SPEC: {} — {}
+COOBIE REQUIRED CHECKS: {}
+COOBIE GUARDRAILS: {}
+
+VALIDATION RESULTS (passed={}):
+{results_text}
+
+                 Produce the validation analysis and note any checks Coobie asked for that are still unproven.",
+                spec_obj.id,
+                spec_obj.title,
+                if briefing.required_checks.is_empty() { "none".to_string() } else { briefing.required_checks.join(" | ") },
+                if briefing.recommended_guardrails.is_empty() { "none".to_string() } else { briefing.recommended_guardrails.join(" | ") },
+                validation.passed,
             ),
         );
 
@@ -1395,26 +1679,37 @@ impl AppContext {
 
     /// Ash: write a narrative describing the provisioned twin environment.
     /// Returns `None` when no LLM is available — caller continues without it.
-    async fn ash_twin_narrative(&self, spec_obj: &Spec, twin: &TwinEnvironment) -> Option<String> {
+    async fn ash_twin_narrative(
+        &self,
+        spec_obj: &Spec,
+        twin: &TwinEnvironment,
+        briefing: &CoobieBriefing,
+    ) -> Option<String> {
         let provider = llm::build_provider("ash", "default", &self.paths.setup)?;
 
         let services = twin.services.iter()
             .map(|s| format!("- {} [{}] status={} — {}", s.name, s.kind, s.status, s.details))
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("
+");
 
         let req = LlmRequest::simple(
-            "You are Ash, a digital twin specialist for a software factory. \
-             You have just provisioned a local twin environment for a run. \
-             Produce a brief Markdown narrative: what was provisioned, what each service \
-             provides to this run, and any gaps or warnings relevant to the spec. \
-             Two to four short paragraphs. No filler.",
+            "You are Ash, a digital twin specialist for a software factory.              You have just provisioned a local twin environment for a run.              Produce a brief Markdown narrative: what was provisioned, what each service              provides to this run, and any gaps or warnings relevant to the spec.              Two to four short paragraphs. No filler.",
             format!(
-                "SPEC: {} — {}\nDEPENDENCIES: {}\n\nTWIN SERVICES:\n{services}\n\n\
-                 Write the twin environment narrative.",
+                "SPEC: {} — {}
+DEPENDENCIES: {}
+COOBIE ENVIRONMENT RISKS: {}
+COOBIE REQUIRED CHECKS: {}
+
+TWIN SERVICES:
+{services}
+
+                 Write the twin environment narrative and identify any simulation gaps against Coobie's environment risks.",
                 spec_obj.id,
                 spec_obj.title,
                 if spec_obj.dependencies.is_empty() { "none".to_string() } else { spec_obj.dependencies.join(", ") },
+                if briefing.environment_risks.is_empty() { "none".to_string() } else { briefing.environment_risks.join(" | ") },
+                if briefing.required_checks.is_empty() { "none".to_string() } else { briefing.required_checks.join(" | ") },
             ),
         );
 
@@ -1427,7 +1722,7 @@ impl AppContext {
         }
     }
 
-    fn build_tool_plan(&self) -> String {
+    fn build_tool_plan(&self, briefing: &CoobieBriefing) -> String {
         let mut lines = vec![
             "Tool Plan".to_string(),
             "=========".to_string(),
@@ -1449,6 +1744,34 @@ impl AppContext {
                 ));
             }
         }
+
+        lines.push(String::new());
+        lines.push("Coobie Requirements".to_string());
+        lines.push("-------------------".to_string());
+        lines.push(format!(
+            "- Domain signals: {}",
+            if briefing.domain_signals.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.domain_signals.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "- Regulatory considerations: {}",
+            if briefing.regulatory_considerations.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.regulatory_considerations.join(" | ")
+            }
+        ));
+        lines.push(format!(
+            "- Required checks: {}",
+            if briefing.required_checks.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.required_checks.join(" | ")
+            }
+        ));
 
         lines.push(String::new());
         lines.push("Host Commands".to_string());
@@ -2229,7 +2552,7 @@ impl AppContext {
 fn build_implementation_plan(
     spec_obj: &Spec,
     intent: &IntentPackage,
-    memory_hits: &[String],
+    briefing: &CoobieBriefing,
     staged_product: &Path,
     target_source: &TargetSourceMetadata,
 ) -> String {

@@ -17,6 +17,8 @@ pub struct Spec {
     pub dependencies: Vec<String>,
     pub performance_expectations: Vec<String>,
     pub security_expectations: Vec<String>,
+    #[serde(default)]
+    pub test_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,36 @@ pub struct LessonRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorCauseSignal {
+    pub cause_id: String,
+    pub description: String,
+    pub occurrences: i64,
+    pub scenario_pass_rate: f32,
+    pub last_seen_run_id: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoobieBriefing {
+    pub spec_id: String,
+    pub product: String,
+    pub query_terms: Vec<String>,
+    pub domain_signals: Vec<String>,
+    pub prior_report_count: usize,
+    pub memory_hits: Vec<String>,
+    pub relevant_lessons: Vec<LessonRecord>,
+    pub prior_causes: Vec<PriorCauseSignal>,
+    pub application_risks: Vec<String>,
+    pub environment_risks: Vec<String>,
+    pub regulatory_considerations: Vec<String>,
+    pub recommended_guardrails: Vec<String>,
+    pub required_checks: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub coobie_response: String,
+    pub generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlackboardState {
     pub run_id: String,
@@ -99,22 +131,53 @@ impl BlackboardState {
             }
             "scout" => {
                 view.agent_claims.retain(|agent, _| agent == "scout");
-                view.artifact_refs
-                    .retain(|artifact| artifact == "intent.json" || artifact == "memory_context.md");
+                view.artifact_refs.retain(|artifact| {
+                    matches!(
+                        artifact.as_str(),
+                        "intent.json"
+                            | "memory_context.md"
+                            | "coobie_briefing.json"
+                            | "coobie_preflight_response.md"
+                    )
+                });
             }
             "mason" => {
                 view.agent_claims.retain(|agent, _| agent == "mason");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
-                        "intent.json" | "memory_context.md" | "implementation_plan.md" | "validation.json"
+                        "intent.json"
+                            | "memory_context.md"
+                            | "coobie_briefing.json"
+                            | "coobie_preflight_response.md"
+                            | "implementation_plan.md"
+                            | "validation.json"
                     )
                 });
             }
             "bramble" => {
                 view.agent_claims.retain(|agent, _| agent == "bramble");
-                view.artifact_refs
-                    .retain(|artifact| artifact == "validation.json" || artifact == "twin.json");
+                view.artifact_refs.retain(|artifact| {
+                    matches!(
+                        artifact.as_str(),
+                        "validation.json"
+                            | "twin.json"
+                            | "coobie_briefing.json"
+                            | "coobie_preflight_response.md"
+                    )
+                });
+            }
+            "ash" => {
+                view.agent_claims.retain(|agent, _| agent == "ash");
+                view.artifact_refs.retain(|artifact| {
+                    matches!(
+                        artifact.as_str(),
+                        "twin.json"
+                            | "twin_narrative.md"
+                            | "coobie_briefing.json"
+                            | "coobie_preflight_response.md"
+                    )
+                });
             }
             "flint" => {
                 view.agent_claims.retain(|agent, _| agent == "flint");

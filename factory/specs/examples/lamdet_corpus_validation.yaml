@@ -1,0 +1,52 @@
+id: lamdet-corpus-validation
+title: LamDet Corpus Validation
+purpose: >
+  Validate that the ceres-pipeline LamDet algorithm correctly classifies
+  thermal frame profiles from the example corpus dataset. Confirms frame
+  classification coverage, peak detection rate, and common bond (line-d)
+  detection rate meet defined thresholds without requiring live hardware.
+scope:
+  - run ceres-pipeline corpus test against the example CSV dataset
+  - capture per-metric pass/fail results
+  - package test output as a factory artifact bundle
+  - record a causal summary via Coobie for regression tracking
+constraints:
+  - no live hardware required — corpus replay only
+  - do not modify the example CSV dataset
+  - test must run inside the ceres-station workspace boundary
+  - treat classification thresholds as fixed acceptance criteria, not tuning targets
+inputs:
+  - csv corpus at: products/ceres-station/examples/csv_files-20260223T192449Z-1-001/csv_files/
+  - ceres-pipeline crate at: products/ceres-station/ceres-station/crates/ceres-pipeline/
+test_commands:
+  - cargo test -p ceres-pipeline --test lamdet_example_corpus -- --nocapture
+outputs:
+  - test stdout/stderr captured to workspace
+  - corpus_results.json with frame counts and metric ratios
+  - validation.json with pass/fail verdict per check
+  - causal_summary.md from Coobie
+acceptance_criteria:
+  - total frames evaluated > 38000
+  - TAB-classified frames > 30000
+  - SHIM-classified frames > 3000
+  - UNKNOWN-classified frames == 0
+  - peak detection coverage > 95%
+  - common bond (line-d) detection coverage > 50%
+  - cargo test exits 0
+forbidden_behaviors:
+  - modifying source files in ceres-pipeline or ceres-core
+  - adjusting classification thresholds to make tests pass
+  - running hardware capture paths (no Optris camera required)
+  - reaching outside products/ceres-station/ workspace boundary
+rollback_requirements:
+  - no source changes are made, so no rollback needed
+  - workspace artifacts can be discarded cleanly
+dependencies:
+  - rust toolchain (cargo)
+  - ceres-station workspace builds cleanly
+  - example CSV corpus present at expected path
+performance_expectations:
+  - full corpus test should complete in under 60 seconds on home-linux
+security_expectations:
+  - no credentials or hardware serial numbers in output artifacts
+  - corpus data does not leave the local workspace

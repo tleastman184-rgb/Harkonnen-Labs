@@ -1,19 +1,19 @@
 {
   "mcpServers": {
     "memory": {
-      "command": "/usr/bin/npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"]
+      "command": "flatpak-spawn",
+      "args": ["--host", "npx", "-y", "@modelcontextprotocol/server-memory"]
     },
     "filesystem": {
-      "command": "/usr/bin/npx",
+      "command": "flatpak-spawn",
       "args": [
-        "-y", "@modelcontextprotocol/server-filesystem",
+        "--host", "npx", "-y", "@modelcontextprotocol/server-filesystem",
         "./products", "./factory/workspaces", "./factory/artifacts", "./factory/memory"
       ]
     },
     "sqlite": {
-      "command": "/usr/bin/npx",
-      "args": ["-y", "@modelcontextprotocol/server-sqlite", "./factory/state.db"]
+      "command": "flatpak-spawn",
+      "args": ["--host", "npx", "-y", "@modelcontextprotocol/server-sqlite", "./factory/state.db"]
     }
   }
 }

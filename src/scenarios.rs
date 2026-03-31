@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use std::path::Path;
 
 use crate::models::{
@@ -27,6 +28,14 @@ pub enum HiddenScenarioCheck {
     ValidationPassed,
     AgentExecuted { agent: String },
     TwinServicePresent { service: String },
+    /// Check the exit_code field in corpus_results.json for the named command.
+    TestExitCode { equals: i32, label: String },
+    /// Check that a numeric field in a JSON artifact is >= value.
+    MetricGte { artifact: String, field: String, value: f64 },
+    /// Check that a field in a JSON artifact equals value (JSON comparison).
+    MetricEq { artifact: String, field: String, value: JsonValue },
+    /// Check that any .md artifact in the run dir contains all required tag strings.
+    MemoryEntryExists { tags: Vec<String> },
 }
 
 pub fn load_hidden_scenarios(root: &Path, spec_id: &str) -> Result<Vec<HiddenScenarioFile>> {
@@ -188,5 +197,102 @@ fn evaluate_check(
                 },
             }
         }
+        HiddenScenarioCheck::TestExitCode { equals, label } => {
+            let kind = format!("test_exit_code({label}) == {equals}");
+            let results_path = run_dir.join("corpus_results.json");
+            let json = match read_json_artifact(&results_path) {
+                Ok(v) => v,
+                Err(msg) => return HiddenScenarioCheckResult { kind, passed: false, details: msg },
+            };
+            let commands = json.get("commands").and_then(|c| c.as_array());
+            let entry = commands.and_then(|cmds| {
+                cmds.iter().find(|cmd| {
+                    cmd.get("label")
+                        .and_then(|l| l.as_str())
+                        .map(|l| l.contains(label.as_str()))
+                        .unwrap_or(false)
+                })
+            });
+            let exit_code = entry
+                .and_then(|e| e.get("exit_code"))
+                .and_then(|c| c.as_i64())
+                .unwrap_or(-1) as i32;
+            HiddenScenarioCheckResult {
+                kind,
+                passed: exit_code == *equals,
+                details: format!("actual exit_code: {exit_code}"),
+            }
+        }
+        HiddenScenarioCheck::MetricGte { artifact, field, value } => {
+            let kind = format!("metric_gte({artifact}.{field} >= {value})");
+            let json = match read_json_artifact(&run_dir.join(artifact)) {
+                Ok(v) => v,
+                Err(msg) => return HiddenScenarioCheckResult { kind, passed: false, details: msg },
+            };
+            match json.get(field).and_then(|v| v.as_f64()) {
+                Some(n) => HiddenScenarioCheckResult {
+                    kind,
+                    passed: n >= *value,
+                    details: format!("actual: {n}, required >= {value}"),
+                },
+                None => HiddenScenarioCheckResult {
+                    kind,
+                    passed: false,
+                    details: format!("field '{field}' not found or not numeric in {artifact}"),
+                },
+            }
+        }
+        HiddenScenarioCheck::MetricEq { artifact, field, value } => {
+            let kind = format!("metric_eq({artifact}.{field} == {value})");
+            let json = match read_json_artifact(&run_dir.join(artifact)) {
+                Ok(v) => v,
+                Err(msg) => return HiddenScenarioCheckResult { kind, passed: false, details: msg },
+            };
+            match json.get(field) {
+                Some(actual) => HiddenScenarioCheckResult {
+                    kind,
+                    passed: actual == value,
+                    details: format!("actual: {actual}, expected: {value}"),
+                },
+                None => HiddenScenarioCheckResult {
+                    kind,
+                    passed: false,
+                    details: format!("field '{field}' not found in {artifact}"),
+                },
+            }
+        }
+        HiddenScenarioCheck::MemoryEntryExists { tags } => {
+            let kind = format!("memory_entry_exists(tags: [{}])", tags.join(", "));
+            let found = std::fs::read_dir(run_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
+                        .any(|e| {
+                            let content = std::fs::read_to_string(e.path()).unwrap_or_default();
+                            tags.iter().all(|tag| content.contains(tag.as_str()))
+                        })
+                })
+                .unwrap_or(false);
+            HiddenScenarioCheckResult {
+                kind,
+                passed: found,
+                details: if found {
+                    "found matching memory entry in run artifacts".to_string()
+                } else {
+                    format!("no .md artifact contains all tags: [{}]", tags.join(", "))
+                },
+            }
+        }
     }
+}
+
+fn read_json_artifact(path: &Path) -> std::result::Result<JsonValue, String> {
+    if !path.exists() {
+        return Err(format!("{} not found", path.display()));
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))
 }

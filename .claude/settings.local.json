@@ -33,12 +33,18 @@
       "Bash(npx --yes @modelcontextprotocol/server-memory --version)",
       "Bash(flatpak-spawn --host which node)",
       "Bash(flatpak-spawn --host which npx)",
-      "Bash(flatpak-spawn --host node --version)"
-
+      "Bash(flatpak-spawn --host node --version)",
+      "Read(//usr/bin/**)",
+      "mcp__filesystem__list_directory"
     ],
     "additionalDirectories": [
       "/media/earthling/Caleb''''s Files/Harkonnen-Labs/factory",
       "/media/earthling/Caleb''s Files/Harkonnen-Labs/factory"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "memory",
+    "filesystem",
+    "sqlite"
+  ]
 }

@@ -31,6 +31,54 @@
 
 ---
 
+## Handoff Notes
+
+### Claude → Codex/Gemini: orchestrator.rs changes (lamdet wiring) — 2026-03-31
+
+**Why I touched orchestrator.rs without a claim:**
+Server was down, assignments.json showed no active claims, stale threshold had passed.
+`src/orchestrator.rs` is listed as Claude's primary area in the ownership map. Proceeded on that basis.
+
+**What I changed (scope: `run_visible_validation` only — Bramble phase):**
+
+1. `run_visible_validation` signature: added `spec_obj: &Spec` parameter (line ~1104)
+2. Call site at line ~622: passes `spec_obj` through
+3. New block after the build-manifest detection (before the validation log write):
+   - Iterates `spec_obj.test_commands` (new field added to `Spec` in `models.rs`)
+   - Runs each command via `run_command_capture`, captures exit code
+   - Writes `factory/workspaces/<run-id>/run/corpus_results.json`:
+
+     ```json
+     { "commands": [{ "label": "...", "exit_code": 0, "passed": true }], "all_passed": true }
+     ```
+
+**What I also changed:**
+
+- `src/models.rs` — added `#[serde(default)] pub test_commands: Vec<String>` to `Spec`
+- `src/scenarios.rs` — added 4 new `HiddenScenarioCheck` variants:
+  `TestExitCode`, `MetricGte`, `MetricEq`, `MemoryEntryExists` + `read_json_artifact` helper
+- `factory/specs/examples/lamdet_corpus_validation.yaml` — new spec (lamdet-corpus-validation)
+- `factory/scenarios/hidden/lamdet_corpus_hidden.yaml` — new hidden scenario for Sable
+
+**Pre-existing compile errors (NOT from my changes):**
+21 errors around `briefing`, `CoobieBriefing`, `build_application_risks`,
+`build_environment_risks`, `build_regulatory_considerations`, `build_recommended_guardrails`,
+`build_required_checks`, `build_coobie_open_questions`, and `memory_hits` type mismatch.
+These are all in `scout_intake`, `mason_implementation_plan`, `keeper_run_briefing` and related
+functions — likely from Gemini's CoobieBriefing work. My changes are in `run_visible_validation`
+and do not touch those functions.
+
+**What still needs to happen for LamDet E2E:**
+
+- `causal_summary.md` must be written to `run_dir` by Coobie during consolidation
+  (so `MemoryEntryExists` check passes — it searches run_dir .md files for "lamdet" + "corpus")
+- Flint must push `corpus_results.json` into artifact refs (it's written to run_dir but not
+  currently added to `blackboard.artifact_refs` — needs a line like
+  `push_unique(&mut blackboard.artifact_refs, "corpus_results.json")` after validation completes)
+- The pre-existing compile errors need to be resolved before any of this can run
+
+---
+
 ## Completed This Session
 
 | AI     | Task                                      | Notes                          |

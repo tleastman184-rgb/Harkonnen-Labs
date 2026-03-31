@@ -1,0 +1,62 @@
+id: lamdet-corpus-hidden
+spec_id: lamdet-corpus-validation
+title: Hidden acceptance for LamDet corpus validation
+description: >
+  Sable verifies that the factory run against the LamDet example corpus
+  produced correct classification metrics, a clean test exit, and the
+  expected artifact bundle. Checks are derived from the known-good thresholds
+  in lamdet_example_corpus.rs — Sable must not adjust thresholds to pass.
+checks:
+  - kind: run_status
+    equals: completed
+
+  # All relevant agents must have executed
+  - kind: event_present
+    phase: intake
+    agent: scout
+  - kind: event_present
+    phase: memory
+    agent: coobie
+  - kind: event_present
+    phase: validation
+    agent: bramble
+  - kind: event_present
+    phase: hidden_scenarios
+    agent: sable
+  - kind: event_present
+    phase: artifacts
+    agent: flint
+
+  # Bramble must have run the corpus test and it must have passed
+  - kind: validation_passed
+
+  # Corpus test exit code — label substring matches the command in corpus_results.json
+  - kind: test_exit_code
+    equals: 0
+    label: lamdet_example_corpus
+
+  # All spec-driven test commands must have passed
+  - kind: metric_eq
+    artifact: corpus_results.json
+    field: all_passed
+    value: true
+
+  # Required artifact bundle
+  - kind: artifact_exists
+    path: validation.json
+  - kind: artifact_exists
+    path: corpus_results.json
+  - kind: artifact_exists
+    path: causal_summary.md
+
+  # Twin services must be present (workspace_fs confirms workspace isolation held)
+  - kind: twin_service_present
+    service: workspace_fs
+  - kind: twin_service_present
+    service: state_db
+
+  # Coobie must have recorded a causal summary referencing the lamdet corpus run
+  - kind: memory_entry_exists
+    tags:
+      - lamdet
+      - corpus

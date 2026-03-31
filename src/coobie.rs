@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::{
-    CausalHypothesis, CounterfactualEstimate, CounterfactualOutcome, FactoryEpisode,
-    InterventionPlan,
+    CausalHypothesis, CoobieBriefing, CounterfactualEstimate, CounterfactualOutcome,
+    FactoryEpisode, InterventionPlan,
 };
 
 // ── Public reasoning trait ────────────────────────────────────────────────────
@@ -446,6 +446,182 @@ fn build_deep_causality_analysis(scores: &EpisodeScores) -> DeepCausalityAnalysi
         active_signals,
         inactive_signals,
     }
+}
+
+fn render_bullet_lines(items: &[String], empty_line: &str) -> String {
+    if items.is_empty() {
+        format!("- {}", empty_line)
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("
+")
+    }
+}
+
+pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
+    let cause_lines = if briefing.prior_causes.is_empty() {
+        "- No prior causal reports matched strongly enough to summarize yet.".to_string()
+    } else {
+        briefing
+            .prior_causes
+            .iter()
+            .map(|cause| {
+                format!(
+                    "- {}: {} occurrence(s), {:.0}% scenario pass rate in prior runs",
+                    cause.cause_id,
+                    cause.occurrences,
+                    cause.scenario_pass_rate * 100.0,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("
+")
+    };
+
+    format!(
+        "# Coobie Preflight Response
+
+I reviewed prior memory and causal history for `{}` targeting `{}`.
+
+## Domain Signals
+{}
+
+## Application Risks
+{}
+
+## Environment Risks
+{}
+
+## Regulatory Considerations
+{}
+
+## Prior Causes Worth Respecting
+{}
+
+## Guardrails I Want The Pack To Follow
+{}
+
+## Required Checks
+{}
+
+## Open Questions
+{}
+",
+        briefing.spec_id,
+        briefing.product,
+        render_bullet_lines(&briefing.domain_signals, "No domain signals were detected yet."),
+        render_bullet_lines(&briefing.application_risks, "No application risks were highlighted yet."),
+        render_bullet_lines(&briefing.environment_risks, "No environment risks were highlighted yet."),
+        render_bullet_lines(
+            &briefing.regulatory_considerations,
+            "No explicit regulatory considerations were recorded yet.",
+        ),
+        cause_lines,
+        render_bullet_lines(
+            &briefing.recommended_guardrails,
+            "No extra guardrails were generated yet.",
+        ),
+        render_bullet_lines(&briefing.required_checks, "No required checks were generated yet."),
+        render_bullet_lines(&briefing.open_questions, "No open questions were raised."),
+    )
+}
+
+pub fn render_coobie_report_response(report: &CausalReport) -> String {
+    let primary = report
+        .primary_cause
+        .clone()
+        .unwrap_or_else(|| "No dominant cause was identified.".to_string());
+    let contributing = if report.contributing_causes.is_empty() {
+        "- No secondary causes were elevated.".to_string()
+    } else {
+        report
+            .contributing_causes
+            .iter()
+            .map(|cause| format!("- {}", cause))
+            .collect::<Vec<_>>()
+            .join("
+")
+    };
+    let interventions = if report.recommended_interventions.is_empty() {
+        "- No concrete interventions were recommended.".to_string()
+    } else {
+        report
+            .recommended_interventions
+            .iter()
+            .map(|plan| format!("- [{}] {} -> {}", plan.target, plan.action, plan.expected_impact))
+            .collect::<Vec<_>>()
+            .join("
+")
+    };
+    let deep_signals = report
+        .deep_causality
+        .as_ref()
+        .map(|deep| {
+            if deep.active_signals.is_empty() {
+                "- No DeepCausality signals activated for this run.".to_string()
+            } else {
+                deep.active_signals
+                    .iter()
+                    .take(5)
+                    .map(|signal| {
+                        format!(
+                            "- {} activated at {:.0}% strength (obs {:.2} vs threshold {:.2})",
+                            signal.cause_id,
+                            signal.activation_strength * 100.0,
+                            signal.observation,
+                            signal.threshold,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("
+")
+            }
+        })
+        .unwrap_or_else(|| "- DeepCausality analysis was not available.".to_string());
+    let counterfactual = report
+        .counterfactual_prediction
+        .as_ref()
+        .map(|prediction| {
+            format!(
+                "{} (confidence gain {:.0}%)",
+                prediction.prediction,
+                prediction.confidence_gain * 100.0,
+            )
+        })
+        .unwrap_or_else(|| "No counterfactual prediction was available.".to_string());
+
+    format!(
+        "# Coobie Run Response
+
+I completed a causal review for run `{}`.
+
+## Primary Cause
+- {}
+- Confidence: {:.0}%
+
+## Contributing Causes
+{}
+
+## Recommended Interventions
+{}
+
+## Deep Signals
+{}
+
+## Counterfactual
+- {}
+",
+        report.run_id,
+        primary,
+        report.primary_confidence * 100.0,
+        contributing,
+        interventions,
+        deep_signals,
+        counterfactual,
+    )
 }
 
 // ── SQLite-backed engine ──────────────────────────────────────────────────────
