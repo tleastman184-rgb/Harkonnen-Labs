@@ -251,6 +251,24 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
             scores.test_coverage_score,
             scores.memory_retrieval_score,
         ));
+        if let Some(deep) = &causal.deep_causality {
+            report.push_str(&format!(
+                "DeepCausality: effect={:.2} active_signals={}/{} ({:.0}%)\n",
+                deep.effect_score,
+                deep.active_signal_count,
+                deep.active_signal_count + deep.inactive_signals.len(),
+                deep.active_signal_percent,
+            ));
+            for signal in deep.active_signals.iter().take(3) {
+                report.push_str(&format!(
+                    "  - {} obs={:.2} threshold={:.2} strength={:.0}%\n",
+                    signal.cause_id,
+                    signal.observation,
+                    signal.threshold,
+                    signal.activation_strength * 100.0,
+                ));
+            }
+        }
         if causal.recommended_interventions.is_empty() {
             report.push_str("Interventions: none recommended\n");
         } else {

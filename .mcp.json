@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "/usr/bin/npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "filesystem": {
+      "command": "/usr/bin/npx",
+      "args": [
+        "-y", "@modelcontextprotocol/server-filesystem",
+        "./products", "./factory/workspaces", "./factory/artifacts", "./factory/memory"
+      ]
+    },
+    "sqlite": {
+      "command": "/usr/bin/npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite", "./factory/state.db"]
+    }
+  }
+}

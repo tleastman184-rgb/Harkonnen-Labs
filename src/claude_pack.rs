@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     agents::{self, AgentProfile},
     config::Paths,
-    setup::{slugify_machine_name, McpServerConfig},
+    setup::{slugify_machine_name, McpServerConfig, SystemDiscovery},
 };
 
 const LAB_PACK_START: &str = "<!-- HARKONNEN LAB PACK START -->";
@@ -46,7 +46,10 @@ struct PackManifest {
     generated_at: String,
     source_repo: String,
     active_setup: String,
+    machine_scope: String,
     project: PackProject,
+    project_scan: ProjectScan,
+    engine_routing: EngineRoutingSnapshot,
     agents: Vec<String>,
     mcp_servers: Vec<String>,
 }
@@ -59,6 +62,60 @@ struct PackProject {
     domain: String,
     summary: String,
     target_root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct ProjectScan {
+    detected_roots: Vec<String>,
+    read_first_files: Vec<String>,
+    launch_commands: Vec<String>,
+    validation_commands: Vec<String>,
+    stack_signals: Vec<String>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EngineRoutingSnapshot {
+    machine_scope: String,
+    setup_name: String,
+    platform: String,
+    default_provider: String,
+    coordinator: EngineCoordinator,
+    openclaw_enabled: bool,
+    openclaw_available: bool,
+    providers: Vec<EngineProviderSnapshot>,
+    assignments: Vec<AgentEngineAssignment>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EngineCoordinator {
+    provider: String,
+    surface: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct EngineProviderSnapshot {
+    name: String,
+    provider_type: String,
+    model: String,
+    surface: String,
+    enabled: bool,
+    usage_rights: Option<String>,
+    api_key_env: String,
+    credential_state: String,
+    operational_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct AgentEngineAssignment {
+    agent: String,
+    role: String,
+    provider: String,
+    model: String,
+    surface: String,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +140,7 @@ pub fn export_claude_pack(paths: &Paths, req: ClaudePackRequest) -> Result<Claud
 
     let write_settings = req.write_settings;
     let profile = build_project_profile(&target_root, req);
+    let scan = scan_target_project(&target_root)?;
     let pack_root = target_root.join(".harkonnen");
     let claude_dir = target_root.join(".claude");
     let agents_dir = claude_dir.join("agents");
@@ -97,15 +155,34 @@ pub fn export_claude_pack(paths: &Paths, req: ClaudePackRequest) -> Result<Claud
     let profiles = agents::load_profiles(&paths.factory.join("agents").join("profiles"))?;
     let mut agent_names: Vec<_> = profiles.keys().cloned().collect();
     agent_names.sort();
+    let engine_routing = build_engine_routing_snapshot(paths, &profiles, &agent_names);
+    let machine_scope = engine_routing.machine_scope.clone();
+    let machine_dir = pack_root.join("machines").join(&machine_scope);
 
     write_text_file(&pack_root.join("README.md"), &build_pack_readme(&profile, paths))?;
     write_text_file(
         &pack_root.join("project-context.md"),
-        &build_project_context(&profile, paths),
+        &build_project_context(&profile, paths, &scan),
+    )?;
+    write_text_file(
+        &pack_root.join("project-scan.md"),
+        &build_project_scan_doc(&profile, &scan),
     )?;
     write_text_file(
         &pack_root.join("launch-guide.md"),
-        &build_launch_guide(&profile),
+        &build_launch_guide(&profile, paths, &scan),
+    )?;
+    write_text_file(
+        &context_dir.join("engine-routing.md"),
+        &build_engine_routing_doc(&engine_routing),
+    )?;
+    write_text_file(
+        &machine_dir.join("engine-routing.yaml"),
+        &serde_yaml::to_string(&engine_routing)?,
+    )?;
+    write_text_file_if_missing(
+        &machine_dir.join("engine-state.yaml"),
+        &build_engine_state_template(&engine_routing),
     )?;
     write_text_file(
         &pack_root.join("spec-template.yaml"),
@@ -131,6 +208,7 @@ pub fn export_claude_pack(paths: &Paths, req: ClaudePackRequest) -> Result<Claud
         generated_at: Utc::now().to_rfc3339(),
         source_repo: paths.root.display().to_string(),
         active_setup: paths.setup.setup.name.clone(),
+        machine_scope: machine_scope.clone(),
         project: PackProject {
             name: profile.name.clone(),
             slug: profile.slug.clone(),
@@ -139,6 +217,8 @@ pub fn export_claude_pack(paths: &Paths, req: ClaudePackRequest) -> Result<Claud
             summary: profile.summary.clone(),
             target_root: target_root.display().to_string(),
         },
+        project_scan: scan.clone(),
+        engine_routing: engine_routing.clone(),
         agents: agent_names.clone(),
         mcp_servers: build_mcp_server_names(paths, profile.include_winccoa),
     };
@@ -180,7 +260,7 @@ pub fn export_claude_pack(paths: &Paths, req: ClaudePackRequest) -> Result<Claud
     };
 
     let claude_md_path = target_root.join("CLAUDE.md");
-    merge_claude_md_block(&claude_md_path, &build_root_claude_block(&profile))?;
+    merge_claude_md_block(&claude_md_path, &build_root_claude_block(&profile, paths))?;
 
     Ok(ClaudePackSummary {
         project_name: profile.name,
@@ -222,10 +302,10 @@ fn build_project_profile(target_root: &Path, req: ClaudePackRequest) -> ProjectP
     let summary = req.summary.unwrap_or_else(|| {
         if include_winccoa {
             format!(
-                "{name} is a Siemens WinCC OA product prepared for a Claude-only Harkonnen Labrador pack."
+                "{name} is a Siemens WinCC OA product prepared for a machine-aware Harkonnen Labrador pack."
             )
         } else {
-            format!("{name} is prepared for a Claude-only Harkonnen Labrador pack.")
+            format!("{name} is prepared for a machine-aware Harkonnen Labrador pack.")
         }
     });
     let slug = req
@@ -258,15 +338,85 @@ fn build_project_profile(target_root: &Path, req: ClaudePackRequest) -> ProjectP
 }
 
 fn build_pack_readme(profile: &ProjectProfile, paths: &Paths) -> String {
+    let machine_scope = current_machine_scope(paths);
+    let engine_rel = machine_routing_rel(&machine_scope);
+    let state_rel = machine_state_rel(&machine_scope);
+
     format!(
-        "# Harkonnen Labrador Pack\n\nThis directory was generated by `harkonnen setup claude-pack` for `{}`.\n\nIt gives a separate project a Claude-first Labrador operating pack:\n\n- project-level Claude subagents in `.claude/agents/`\n- local project context in `.harkonnen/`\n- Coobie seed memory copied from Harkonnen Labs\n- MCP settings suitable for Claude Code on a work-laptop setup\n\nActive setup snapshot: `{}`\nProject type: `{}`\nDomain: `{}`\n\nStart with `.harkonnen/launch-guide.md` and `.harkonnen/project-context.md`.\n",
-        profile.name, paths.setup.setup.name, profile.project_type, profile.domain
+        r#"# Harkonnen Labrador Pack
+
+This directory was generated by `harkonnen setup claude-pack` for `{}`.
+
+It gives a separate project a coordinator-agnostic Labrador operating pack:
+
+- project-level Claude subagents in `.claude/agents/`
+- coordinator-agnostic routing and machine state in `.harkonnen/`
+- Coobie seed memory copied from Harkonnen Labs
+- MCP settings suitable for Claude Code when Claude is the active coordinator
+
+Active setup snapshot: `{}`
+Machine scope: `{}`
+Project type: `{}`
+Domain: `{}`
+
+Start with `.harkonnen/context/engine-routing.md`, `{}`, and `{}`.
+"#,
+        profile.name,
+        paths.setup.setup.name,
+        machine_scope,
+        profile.project_type,
+        profile.domain,
+        engine_rel,
+        state_rel,
     )
 }
 
-fn build_project_context(profile: &ProjectProfile, paths: &Paths) -> String {
+fn build_project_context(profile: &ProjectProfile, paths: &Paths, scan: &ProjectScan) -> String {
+    let machine_scope = current_machine_scope(paths);
+    let engine_rel = machine_routing_rel(&machine_scope);
+    let state_rel = machine_state_rel(&machine_scope);
+    let discovery = SystemDiscovery::discover();
+    let default_provider = paths.setup.providers.default.clone();
+    let default_surface = paths
+        .setup
+        .resolve_provider(&default_provider)
+        .and_then(|config| config.surface.clone())
+        .unwrap_or_else(|| "unassigned".to_string());
     let mut out = format!(
-        "# Project Context\n\nProject: {}\nSlug: {}\nType: {}\nDomain: {}\n\nSummary:\n{}\n\nWhy this pack exists:\n- This repo is being operated through a Claude-only Labrador pack.\n- Role discipline matters even though every Labrador ultimately runs on Claude Code.\n- The goal is spec-first, observable, boundary-aware delivery rather than ad hoc prompting.\n\nOperating model:\n- Scout shapes requests into Harkonnen-style specs.\n- Mason implements approved scope.\n- Piper handles tools, docs, helper scripts, and MCP-assisted investigation.\n- Bramble validates visible behavior.\n- Sable performs acceptance review without writing implementation.\n- Ash designs twins, simulations, and dependency stubs.\n- Flint packages evidence and rollout notes.\n- Coobie retrieves reusable patterns and stores lessons.\n- Keeper enforces safety, scope, and boundary discipline.\n\nCurrent Harkonnen setup snapshot:\n- setup: {}\n- platform: {}\n- claude surface: {}\n",
+        r#"# Project Context
+
+Project: {}
+Slug: {}
+Type: {}
+Domain: {}
+
+Summary:
+{}
+
+Why this pack exists:
+- This repo is being operated through a project-level Harkonnen Labrador pack.
+- Role discipline matters even when the coordinator changes between Claude, Codex, Gemini, OpenClaw, or another runner.
+- The goal is spec-first, observable, boundary-aware delivery rather than ad hoc prompting.
+
+Operating model:
+- Scout shapes requests into Harkonnen-style specs.
+- Mason implements approved scope.
+- Piper handles tools, docs, helper scripts, and MCP-assisted investigation.
+- Bramble validates visible behavior.
+- Sable performs acceptance review without writing implementation.
+- Ash designs twins, simulations, and dependency stubs.
+- Flint packages evidence and rollout notes.
+- Coobie retrieves reusable patterns and stores lessons.
+- Keeper enforces safety, scope, and boundary discipline.
+
+Current Harkonnen setup snapshot:
+- setup: {}
+- platform: {}
+- default provider: {} via {}
+- openclaw enabled in setup: {}
+- openclaw detected on this machine: {}
+- machine scope: {}
+"#,
         profile.name,
         profile.slug,
         profile.project_type,
@@ -274,44 +424,234 @@ fn build_project_context(profile: &ProjectProfile, paths: &Paths) -> String {
         profile.summary,
         paths.setup.setup.name,
         paths.setup.setup.platform,
-        paths
-            .setup
-            .providers
-            .claude
-            .as_ref()
-            .and_then(|config| config.surface.clone())
-            .unwrap_or_else(|| "claude-code".to_string()),
+        default_provider,
+        default_surface,
+        paths.setup.setup.openclaw.unwrap_or(false),
+        discovery.openclaw,
+        machine_scope,
     );
 
     if !profile.constraints.is_empty() {
-        out.push_str("\nConstraints:\n");
+        out.push_str(
+            r#"
+Constraints:
+"#,
+        );
         for item in &profile.constraints {
-            out.push_str(&format!("- {item}\n"));
+            out.push_str(&format!("- {item}
+"));
         }
     }
 
     if profile.include_winccoa {
         out.push_str(
-            "\nWinCC OA guidance:\n - Treat CTRL scripts, panels, datapoints, managers, alerting, and runtime actions as operationally sensitive.\n - Prefer read-first investigation, offline exports, simulators, and staged rollout instructions.\n - Any action that could affect a live plant, station, or operator workflow requires explicit human approval.\n - Be precise about panel paths, datapoint schemas, manager boundaries, and deployment assumptions.\n",
+            r#"
+WinCC OA guidance:
+ - Treat CTRL scripts, panels, datapoints, managers, alerting, and runtime actions as operationally sensitive.
+ - Prefer read-first investigation, offline exports, simulators, and staged rollout instructions.
+ - Any action that could affect a live plant, station, or operator workflow requires explicit human approval.
+ - Be precise about panel paths, datapoint schemas, manager boundaries, and deployment assumptions.
+"#,
         );
     }
 
-    out.push_str(
-        "\nFiles to read first:\n - `.harkonnen/project-context.md`\n - `.harkonnen/spec-template.yaml`\n - `.harkonnen/context/system-manifest.yaml`\n - `.harkonnen/context/agent-roster.yaml`\n - `.harkonnen/memory/index.json`\n",
-    );
+    out.push_str(&format!(
+        r#"
+Coordinator-agnostic routing files:
+ - `.harkonnen/context/engine-routing.md`
+ - `{}`
+ - `{}`
+
+Files to read first:
+ - `.harkonnen/project-context.md`
+ - `.harkonnen/context/engine-routing.md`
+ - `{}`
+ - `{}`
+ - `.harkonnen/project-scan.md`
+ - `.harkonnen/spec-template.yaml`
+ - `.harkonnen/context/system-manifest.yaml`
+ - `.harkonnen/context/agent-roster.yaml`
+ - `.harkonnen/memory/index.json`
+"#,
+        engine_rel,
+        state_rel,
+        engine_rel,
+        state_rel,
+    ));
+
+    if !scan.stack_signals.is_empty() {
+        out.push_str(
+            r#"
+Detected stack signals:
+"#,
+        );
+        for item in &scan.stack_signals {
+            out.push_str(&format!("- {item}
+"));
+        }
+    }
+
+    if !scan.detected_roots.is_empty() {
+        out.push_str(
+            r#"
+Detected project roots:
+"#,
+        );
+        for item in &scan.detected_roots {
+            out.push_str(&format!("- {item}
+"));
+        }
+    }
+
+    if !scan.read_first_files.is_empty() {
+        out.push_str(
+            r#"
+Local project files to read early:
+"#,
+        );
+        for item in scan.read_first_files.iter().take(8) {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
 
     out
 }
 
-fn build_launch_guide(profile: &ProjectProfile) -> String {
+fn build_project_scan_doc(profile: &ProjectProfile, scan: &ProjectScan) -> String {
     let mut out = format!(
-        "# Launch Guide\n\nThis project has a Harkonnen Labrador pack for `{}`.\n\n1. Restart Claude Code after the generated `.claude/settings.local.json` is written.\n2. Run `/agents` and confirm the Labrador subagents are visible.\n3. Ask Scout to turn your requested work into a Harkonnen-style spec using `.harkonnen/spec-template.yaml`.\n4. Ask Mason to implement only after the scope is clear.\n5. Use Bramble for visible validation and Sable for acceptance review.\n6. Use Keeper before any risky operational, deployment, or boundary-crossing step.\n\nSuggested opener:\n`Use Scout to draft a Harkonnen spec for the next {} change, then use Coobie to retrieve similar patterns from .harkonnen/memory.`\n",
-        profile.name, profile.name
+        "# Project Scan
+
+This file captures auto-detected local signals for `{}` so the Labrador pack can stay project-level and reusable across machines.
+",
+        profile.name,
     );
+
+    if scan.detected_roots.is_empty() {
+        out.push_str("
+No nested project roots were detected beyond the target root.
+");
+    } else {
+        out.push_str("
+Detected roots:
+");
+        for item in &scan.detected_roots {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    if !scan.stack_signals.is_empty() {
+        out.push_str("
+Detected stack signals:
+");
+        for item in &scan.stack_signals {
+            out.push_str(&format!("- {item}
+"));
+        }
+    }
+
+    if !scan.read_first_files.is_empty() {
+        out.push_str("
+Read-first local files:
+");
+        for item in &scan.read_first_files {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    if !scan.launch_commands.is_empty() {
+        out.push_str("
+Launch commands:
+");
+        for item in &scan.launch_commands {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    if !scan.validation_commands.is_empty() {
+        out.push_str("
+Validation commands:
+");
+        for item in &scan.validation_commands {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    out
+}
+
+fn build_launch_guide(profile: &ProjectProfile, paths: &Paths, scan: &ProjectScan) -> String {
+    let machine_scope = current_machine_scope(paths);
+    let engine_rel = machine_routing_rel(&machine_scope);
+    let state_rel = machine_state_rel(&machine_scope);
+    let mut out = format!(
+        r#"# Launch Guide
+
+This project has a Harkonnen Labrador pack for `{}`.
+
+1. Any coordinator should read `.harkonnen/context/engine-routing.md`, `{}`, and `{}` first.
+2. If Claude Code is coordinating, restart it after the generated `.claude/settings.local.json` is written.
+3. Route work according to the current machine-scoped engine plan before asking a Labrador to act.
+4. Ask Scout to turn your requested work into a Harkonnen-style spec using `.harkonnen/spec-template.yaml`.
+5. Ask Mason to implement only after the scope is clear.
+6. Use Bramble for visible validation and Sable for acceptance review.
+7. Use Keeper before any risky operational, deployment, or boundary-crossing step.
+
+Suggested opener:
+`Use Scout to draft a Harkonnen spec for the next {} change, then confirm the active coordinator and agent routes from .harkonnen/context/engine-routing.md before implementation starts.`
+"#,
+        profile.name,
+        engine_rel,
+        state_rel,
+        profile.name,
+    );
+
+    if !scan.read_first_files.is_empty() {
+        out.push_str(
+            r#"
+Project read-first files:
+"#,
+        );
+        for item in scan.read_first_files.iter().take(6) {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    if !scan.launch_commands.is_empty() {
+        out.push_str(
+            r#"
+Local launch commands:
+"#,
+        );
+        for item in &scan.launch_commands {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
+
+    if !scan.validation_commands.is_empty() {
+        out.push_str(
+            r#"
+Local validation commands:
+"#,
+        );
+        for item in &scan.validation_commands {
+            out.push_str(&format!("- `{item}`
+"));
+        }
+    }
 
     if profile.include_winccoa {
         out.push_str(
-            "\nSuggested WinCC OA opener:\n`Use Scout to draft a WinCC OA-safe Harkonnen spec for the SPO task, then have Ash outline the twin/simulation approach and Keeper identify any live-system risks.`\n",
+            r#"
+Suggested WinCC OA opener:
+`Use Scout to draft a WinCC OA-safe Harkonnen spec for the SPO task, then have Ash outline the twin/simulation approach and Keeper identify any live-system risks.`
+"#,
         );
     }
 
@@ -374,14 +714,74 @@ fn build_agent_markdown(
     let description = agent_description(agent_name, &project.name);
     let role_rules = agent_role_rules(agent_name, project.include_winccoa);
     let handoff = agent_handoff_rules(agent_name);
+    let machine_scope = current_machine_scope(paths);
+    let engine_rel = machine_routing_rel(&machine_scope);
+    let state_rel = machine_state_rel(&machine_scope);
     let winccoa_note = if project.include_winccoa {
-        "\nWinCC OA note:\n- Treat runtime, managers, datapoints, panels, alarms, and live integrations as safety-sensitive.\n- Prefer read-first investigation and simulation before proposing operational steps.\n"
+        "
+WinCC OA note:
+- Treat runtime, managers, datapoints, panels, alarms, and live integrations as safety-sensitive.
+- Prefer read-first investigation and simulation before proposing operational steps.
+"
     } else {
         ""
     };
 
     format!(
-        "---\nname: {agent_name}\ndescription: {description}\n---\n\nYou are {display_name}, the Harkonnen Labrador `{agent_name}` for `{project_name}`.\n\nYou are part of a Claude Code subagent pack. Even though every Labrador runs on Claude on this machine, role discipline still matters. Stay inside your specialty, return useful progress, and hand off cleanly when another Labrador should take over.\n\nShared Labrador personality:\n- loyal to the mission\n- persistent and calm under repetition\n- honest when uncertain\n- non-destructive and boundary-aware\n- clear in summaries and next steps\n\nNon-negotiable rules:\n- return something useful every time\n- do not fail silently\n- do not bluff\n- do not take destructive actions without approval\n- protect the workspace, artifacts, and secrets\n\nRead these first when they matter:\n- `.harkonnen/project-context.md`\n- `.harkonnen/context/system-manifest.yaml`\n- `.harkonnen/context/agent-roster.yaml`\n- `.harkonnen/spec-template.yaml`\n- `.harkonnen/memory/index.json`\n- `.harkonnen/launch-guide.md`\n\nRole:\n- display name: {display_name}\n- factory role: {role}\n- preferred provider in source factory: {provider}\n- current project pack: Claude Code project subagent\n\nResponsibilities:\n{responsibilities}Role-specific operating rules:\n{role_rules}Handoff rules:\n{handoff}Project constraints:\n{constraints}Project summary:\n{summary}\n{winccoa_note}\nWhen you finish, leave the main thread with:\n- what you learned or changed\n- any blockers or risks\n- which Labrador should go next, if any\n",
+        r#"---
+name: {agent_name}
+description: {description}
+---
+
+You are {display_name}, the Harkonnen Labrador `{agent_name}` for `{project_name}`.
+
+You are part of a project-level Harkonnen Labrador pack. The coordinator may change between Claude Code, Codex, Gemini, OpenClaw, or another runner depending on this machine and this project's current state. Stay inside your specialty, return useful progress, and hand off cleanly when another Labrador should take over.
+
+Shared Labrador personality:
+- loyal to the mission
+- persistent and calm under repetition
+- honest when uncertain
+- non-destructive and boundary-aware
+- clear in summaries and next steps
+
+Non-negotiable rules:
+- return something useful every time
+- do not fail silently
+- do not bluff
+- do not take destructive actions without approval
+- protect the workspace, artifacts, and secrets
+- respect the effective engine routing for this machine before assuming who should act
+
+Read these first when they matter:
+- `.harkonnen/project-context.md`
+- `.harkonnen/context/engine-routing.md`
+- `{engine_rel}`
+- `{state_rel}`
+- `.harkonnen/project-scan.md`
+- `.harkonnen/context/system-manifest.yaml`
+- `.harkonnen/context/agent-roster.yaml`
+- `.harkonnen/spec-template.yaml`
+- `.harkonnen/memory/index.json`
+- `.harkonnen/launch-guide.md`
+
+Role:
+- display name: {display_name}
+- factory role: {role}
+- preferred provider in source factory: {provider}
+- current project pack: machine-aware project pack with coordinator-agnostic `.harkonnen` routing
+
+Responsibilities:
+{responsibilities}Role-specific operating rules:
+{role_rules}Handoff rules:
+{handoff}Project constraints:
+{constraints}Project summary:
+{summary}
+{winccoa_note}
+When you finish, leave the main thread with:
+- what you learned or changed
+- any blockers or risks
+- which Labrador should go next, if any
+"#,
         agent_name = agent_name,
         description = description,
         display_name = profile.display_name,
@@ -396,6 +796,8 @@ fn build_agent_markdown(
         constraints = bullet_lines(&project.constraints),
         summary = project.summary,
         winccoa_note = winccoa_note,
+        engine_rel = engine_rel,
+        state_rel = state_rel,
     )
 }
 
@@ -532,15 +934,50 @@ fn bullet_lines(items: &[String]) -> String {
     out
 }
 
-fn build_root_claude_block(profile: &ProjectProfile) -> String {
+fn build_root_claude_block(profile: &ProjectProfile, paths: &Paths) -> String {
+    let machine_scope = current_machine_scope(paths);
+    let engine_rel = machine_routing_rel(&machine_scope);
+    let state_rel = machine_state_rel(&machine_scope);
     let winccoa_note = if profile.include_winccoa {
-        "\n- Treat WinCC OA runtime access, datapoints, panels, alarms, and manager operations as safety-sensitive."
+        "
+- Treat WinCC OA runtime access, datapoints, panels, alarms, and manager operations as safety-sensitive."
     } else {
         ""
     };
 
     format!(
-        "{LAB_PACK_START}\n## Harkonnen Labrador Pack\n\nThis repo includes project-level Claude subagents under `.claude/agents/`.\n\nUse the Labradors proactively:\n- Scout first for spec shaping and ambiguity review\n- Mason for implementation\n- Piper for tools, docs, and helpers\n- Bramble for visible validation\n- Sable for acceptance review without writing code\n- Ash for twin/simulation design\n- Flint for evidence packaging\n- Coobie for memory retrieval and lesson capture\n- Keeper for safety and boundary review\n\nPrimary context files:\n- `.harkonnen/project-context.md`\n- `.harkonnen/launch-guide.md`\n- `.harkonnen/spec-template.yaml`\n- `.harkonnen/context/system-manifest.yaml`\n{winccoa_note}\n{LAB_PACK_END}\n"
+        r#"{LAB_PACK_START}
+## Harkonnen Labrador Pack
+
+This repo includes project-level Claude subagents under `.claude/agents/`.
+
+Core coordination data lives under `.harkonnen` so the project can also be coordinated by Codex, Gemini, OpenClaw, or another runner on machines that support them.
+
+Use the Labradors proactively:
+- Scout first for spec shaping and ambiguity review
+- Mason for implementation
+- Piper for tools, docs, and helpers
+- Bramble for visible validation
+- Sable for acceptance review without writing code
+- Ash for twin/simulation design
+- Flint for evidence packaging
+- Coobie for memory retrieval and lesson capture
+- Keeper for safety and boundary review
+
+Primary context files:
+- `.harkonnen/project-context.md`
+- `.harkonnen/context/engine-routing.md`
+- `{engine_rel}`
+- `{state_rel}`
+- `.harkonnen/project-scan.md`
+- `.harkonnen/launch-guide.md`
+- `.harkonnen/spec-template.yaml`
+- `.harkonnen/context/system-manifest.yaml`
+{winccoa_note}
+{LAB_PACK_END}
+"#,
+        engine_rel = engine_rel,
+        state_rel = state_rel,
     )
 }
 
@@ -626,6 +1063,476 @@ fn server_to_settings_json(server: &McpServerConfig) -> Value {
         object.insert("env".to_string(), Value::Object(env_object));
     }
     Value::Object(object)
+}
+
+fn current_machine_scope(paths: &Paths) -> String {
+    machine_scope_id(paths, &SystemDiscovery::discover())
+}
+
+fn machine_scope_id(paths: &Paths, discovery: &SystemDiscovery) -> String {
+    let raw = paths
+        .setup
+        .machine
+        .as_ref()
+        .map(|machine| machine.name.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| discovery.hostname.clone())
+        .or_else(|| discovery.username.clone())
+        .unwrap_or_else(|| format!("{}-{}", paths.setup.setup.name, discovery.platform));
+    let slug = slugify_machine_name(&raw);
+    if slug.is_empty() {
+        "current-machine".to_string()
+    } else {
+        slug
+    }
+}
+
+fn machine_routing_rel(machine_scope: &str) -> String {
+    format!(".harkonnen/machines/{machine_scope}/engine-routing.yaml")
+}
+
+fn machine_state_rel(machine_scope: &str) -> String {
+    format!(".harkonnen/machines/{machine_scope}/engine-state.yaml")
+}
+
+fn build_engine_routing_snapshot(
+    paths: &Paths,
+    profiles: &std::collections::HashMap<String, AgentProfile>,
+    agent_names: &[String],
+) -> EngineRoutingSnapshot {
+    let discovery = SystemDiscovery::discover();
+    let machine_scope = machine_scope_id(paths, &discovery);
+    let default_provider = paths.setup.providers.default.clone();
+    let coordinator_surface = paths
+        .setup
+        .resolve_provider(&default_provider)
+        .and_then(|config| config.surface.clone())
+        .unwrap_or_else(|| "unassigned".to_string());
+
+    let mut providers = Vec::new();
+    for (name, config) in [
+        ("claude", paths.setup.providers.claude.as_ref()),
+        ("gemini", paths.setup.providers.gemini.as_ref()),
+        ("codex", paths.setup.providers.codex.as_ref()),
+    ] {
+        if let Some(config) = config {
+            providers.push(EngineProviderSnapshot {
+                name: name.to_string(),
+                provider_type: config.provider_type.clone(),
+                model: config.model.clone(),
+                surface: config
+                    .surface
+                    .clone()
+                    .unwrap_or_else(|| "unassigned".to_string()),
+                enabled: config.enabled,
+                usage_rights: config.usage_rights.clone(),
+                api_key_env: config.api_key_env.clone(),
+                credential_state: if std::env::var(&config.api_key_env).is_ok() {
+                    "env_present".to_string()
+                } else {
+                    "env_missing_or_external".to_string()
+                },
+                operational_state: if config.enabled {
+                    "ready".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+            });
+        }
+    }
+    providers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut assignments = Vec::new();
+    for agent_name in agent_names {
+        if let Some(profile) = profiles.get(agent_name) {
+            let provider_name = paths
+                .setup
+                .resolve_agent_provider_name(&profile.name, &profile.provider);
+            let resolved = paths
+                .setup
+                .resolve_agent_provider(&profile.name, &profile.provider);
+            let source = if paths
+                .setup
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.agents.get(&profile.name))
+                .is_some()
+            {
+                "setup routing override".to_string()
+            } else if profile.provider == "default" {
+                "setup default provider".to_string()
+            } else {
+                "agent profile provider preference".to_string()
+            };
+            assignments.push(AgentEngineAssignment {
+                agent: profile.name.clone(),
+                role: profile.role.clone(),
+                provider: provider_name,
+                model: resolved
+                    .map(|config| config.model.clone())
+                    .unwrap_or_else(|| "unresolved".to_string()),
+                surface: resolved
+                    .and_then(|config| config.surface.clone())
+                    .unwrap_or_else(|| "unassigned".to_string()),
+                source,
+            });
+        }
+    }
+
+    let mut notes = vec![
+        "Assignments are project-scoped and machine-scoped.".to_string(),
+        "Treat the generated engine-routing.yaml as the base plan for this machine.".to_string(),
+        "Treat engine-state.yaml as the live override layer when quotas, coordinator choice, or local tooling availability change.".to_string(),
+    ];
+    if paths.setup.setup.openclaw.unwrap_or(false) {
+        notes.push(
+            "OpenClaw is enabled in the setup and may orchestrate cross-engine handoffs when installed on this machine.".to_string(),
+        );
+    }
+
+    EngineRoutingSnapshot {
+        machine_scope,
+        setup_name: paths.setup.setup.name.clone(),
+        platform: paths.setup.setup.platform.clone(),
+        default_provider: default_provider.clone(),
+        coordinator: EngineCoordinator {
+            provider: default_provider,
+            surface: coordinator_surface,
+            source: "setup providers.default".to_string(),
+        },
+        openclaw_enabled: paths.setup.setup.openclaw.unwrap_or(false),
+        openclaw_available: discovery.openclaw,
+        providers,
+        assignments,
+        notes,
+    }
+}
+
+fn build_engine_routing_doc(routing: &EngineRoutingSnapshot) -> String {
+    let engine_rel = machine_routing_rel(&routing.machine_scope);
+    let state_rel = machine_state_rel(&routing.machine_scope);
+    let mut out = format!(
+        r#"# Engine Routing
+
+This guidance is coordinator-agnostic. Any engine that coordinates the Labradors for this project should read the base routing snapshot at `{}` and then apply live overrides from `{}`.
+
+Current machine scope:
+- `{}`
+- setup: `{}`
+- platform: `{}`
+- default coordinator: `{}` via `{}`
+- openclaw enabled in setup: `{}`
+- openclaw detected on this machine: `{}`
+
+Routing rules:
+- assignments are per project and per machine
+- the coordinator can be Claude, Codex, Gemini, OpenClaw, or another local or remote runner
+- when quotas or tooling change, update `{}` instead of rewriting agent prompts
+- if `routing_overrides` exists in `{}`, treat it as higher priority than the base snapshot
+"#,
+        engine_rel,
+        state_rel,
+        routing.machine_scope,
+        routing.setup_name,
+        routing.platform,
+        routing.coordinator.provider,
+        routing.coordinator.surface,
+        routing.openclaw_enabled,
+        routing.openclaw_available,
+        state_rel,
+        state_rel,
+    );
+
+    if !routing.providers.is_empty() {
+        out.push_str(
+            r#"
+Configured providers:
+"#,
+        );
+        for provider in &routing.providers {
+            out.push_str(&format!(
+                "- `{}` -> model `{}`, surface `{}`, enabled={}, credential_state={}, operational_state={}
+",
+                provider.name,
+                provider.model,
+                provider.surface,
+                provider.enabled,
+                provider.credential_state,
+                provider.operational_state,
+            ));
+        }
+    }
+
+    if !routing.assignments.is_empty() {
+        out.push_str(
+            r#"
+Base agent assignments:
+"#,
+        );
+        for assignment in &routing.assignments {
+            out.push_str(&format!(
+                "- `{}` -> `{}` via `{}` ({})
+",
+                assignment.agent,
+                assignment.provider,
+                assignment.surface,
+                assignment.source,
+            ));
+        }
+    }
+
+    if !routing.notes.is_empty() {
+        out.push_str(
+            r#"
+Notes:
+"#,
+        );
+        for note in &routing.notes {
+            out.push_str(&format!("- {note}
+"));
+        }
+    }
+
+    out
+}
+
+fn build_engine_state_template(routing: &EngineRoutingSnapshot) -> String {
+    let mut out = format!(
+        "# Live machine-scoped overrides for this project.
+# Coordinators of any engine should merge this file over engine-routing.yaml.
+# Edit this file when quotas, coordinator choice, or local tool availability change.
+
+machine_scope: {}
+updated_at: {}
+coordinator_override: null
+provider_state:
+",
+        routing.machine_scope,
+        Utc::now().to_rfc3339(),
+    );
+
+    for provider in &routing.providers {
+        out.push_str(&format!(
+            "  {}:
+    operational_state: {}
+    notes: []
+",
+            provider.name,
+            provider.operational_state,
+        ));
+    }
+
+    out.push_str(
+        "routing_overrides: {}
+notes:
+  - Update operational_state when quotas or availability change.
+  - Valid operational_state values include ready, quota_exhausted, rate_limited, offline, disabled, and review.
+  - Use routing_overrides to temporarily reassign agents on this machine for this project.
+",
+    );
+
+    out
+}
+
+fn scan_target_project(target_root: &Path) -> Result<ProjectScan> {
+    let mut roots = vec![String::from(".")];
+    let mut stack_signals = Vec::new();
+    let mut read_first_files = Vec::new();
+    let mut launch_commands = Vec::new();
+    let mut validation_commands = Vec::new();
+
+    for rel in discover_paths(target_root, 3, &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "docker-compose.yml",
+        "compose.yml",
+    ])? {
+        if let Some(parent) = Path::new(&rel).parent() {
+            let parent_str = normalize_rel(parent);
+            match Path::new(&rel).file_name().and_then(|value| value.to_str()) {
+                Some("Cargo.toml") => {
+                    if has_ancestor_manifest(target_root, &parent_str, "Cargo.toml") {
+                        continue;
+                    }
+                    push_unique_string(&mut roots, parent_str.clone());
+                    push_unique_string(&mut stack_signals, format!("Rust workspace or crate at `{parent_str}`"));
+                    push_unique_string(&mut validation_commands, scoped_command(&parent_str, "cargo test -q"));
+                }
+                Some("package.json") => {
+                    if has_ancestor_manifest(target_root, &parent_str, "package.json") {
+                        continue;
+                    }
+                    push_unique_string(&mut roots, parent_str.clone());
+                    push_unique_string(&mut stack_signals, format!("Node/Svelte/Vite package at `{parent_str}`"));
+                    push_unique_string(&mut validation_commands, scoped_command(&parent_str, "npm run build"));
+                }
+                Some("pyproject.toml") => {
+                    if has_ancestor_manifest(target_root, &parent_str, "pyproject.toml") {
+                        continue;
+                    }
+                    push_unique_string(&mut roots, parent_str.clone());
+                    push_unique_string(&mut stack_signals, format!("Python project at `{parent_str}`"));
+                }
+                Some("go.mod") => {
+                    if has_ancestor_manifest(target_root, &parent_str, "go.mod") {
+                        continue;
+                    }
+                    push_unique_string(&mut roots, parent_str.clone());
+                    push_unique_string(&mut stack_signals, format!("Go module at `{parent_str}`"));
+                }
+                Some("docker-compose.yml") | Some("compose.yml") => {
+                    if has_ancestor_manifest(target_root, &parent_str, "docker-compose.yml")
+                        || has_ancestor_manifest(target_root, &parent_str, "compose.yml")
+                    {
+                        continue;
+                    }
+                    push_unique_string(&mut roots, parent_str.clone());
+                    push_unique_string(&mut stack_signals, format!("Docker Compose runtime at `{parent_str}`"));
+                    push_unique_string(&mut launch_commands, scoped_command(&parent_str, "docker compose up"));
+                }
+                _ => {}
+            }
+        }
+    }
+    let candidate_docs = [
+        "README.md",
+        "codex.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "docs/architecture.md",
+        "docs/workflow-blueprint.md",
+        "docs/requirements-alignment.md",
+        "docs/E2E-Lamdet-Test.md",
+        "functional-spec/README.md",
+    ];
+
+    let roots_snapshot = roots.clone();
+    for root in &roots_snapshot {
+        for candidate in candidate_docs {
+            let rel = join_rel(root, candidate);
+            if target_root.join(&rel).exists() {
+                push_unique_string(&mut read_first_files, rel);
+            }
+        }
+
+        let launch_script = join_rel(root, "scripts/launch.sh");
+        if target_root.join(&launch_script).exists() {
+            push_unique_string(&mut launch_commands, scoped_command(root, "./scripts/launch.sh up"));
+        }
+    }
+
+    roots.sort();
+    stack_signals.sort();
+    read_first_files.sort();
+    launch_commands.sort();
+    validation_commands.sort();
+
+    Ok(ProjectScan {
+        detected_roots: roots,
+        read_first_files,
+        launch_commands,
+        validation_commands,
+        stack_signals,
+    })
+}
+
+fn discover_paths(target_root: &Path, max_depth: usize, file_names: &[&str]) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    scan_dir(target_root, target_root, 0, max_depth, file_names, &mut found)?;
+    found.sort();
+    Ok(found)
+}
+
+fn scan_dir(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    file_names: &[&str],
+    found: &mut Vec<String>,
+) -> Result<()> {
+    if depth > max_depth {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if path.is_dir() {
+            if matches!(
+                name.as_ref(),
+                ".git" | "node_modules" | "target" | ".harkonnen" | ".claude" | ".svelte-kit" | "dist"
+            ) {
+                continue;
+            }
+            scan_dir(root, &path, depth + 1, max_depth, file_names, found)?;
+            continue;
+        }
+
+        if file_names.iter().any(|candidate| *candidate == name.as_ref()) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            push_unique_string(found, rel);
+        }
+    }
+
+    Ok(())
+}
+
+fn scoped_command(root: &str, command: &str) -> String {
+    if root == "." {
+        command.to_string()
+    } else {
+        format!("(cd {root} && {command})")
+    }
+}
+
+fn join_rel(root: &str, child: &str) -> String {
+    if root == "." {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
+}
+
+fn normalize_rel(path: &Path) -> String {
+    let rel = path.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        ".".to_string()
+    } else {
+        rel
+    }
+}
+
+fn has_ancestor_manifest(target_root: &Path, rel_dir: &str, manifest_name: &str) -> bool {
+    if rel_dir == "." {
+        return false;
+    }
+
+    let mut current = Path::new(rel_dir).parent();
+    while let Some(parent) = current {
+        let rel = normalize_rel(parent);
+        if target_root.join(&rel).join(manifest_name).exists() {
+            return true;
+        }
+        current = parent.parent();
+    }
+
+    false
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|existing| existing == &value) {
+        items.push(value);
+    }
 }
 
 fn merge_json_object_at_path(path: &Path, key: &str, new_value: Value) -> Result<()> {
@@ -729,6 +1636,13 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_text_file_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    write_text_file(path, content)
+}
+
 fn copy_if_exists(from: &Path, to: &Path) -> Result<()> {
     if !from.exists() {
         return Ok(());
@@ -751,6 +1665,24 @@ mod tests {
         assert!(next.contains("NEW BLOCK"));
         assert!(next.contains("Tail"));
         assert!(!next.contains("old"));
+    }
+
+    #[test]
+    fn engine_state_template_mentions_override_controls() {
+        let snapshot = EngineRoutingSnapshot {
+            machine_scope: "test-machine".to_string(),
+            providers: vec![EngineProviderSnapshot {
+                name: "claude".to_string(),
+                operational_state: "ready".to_string(),
+                ..EngineProviderSnapshot::default()
+            }],
+            ..EngineRoutingSnapshot::default()
+        };
+
+        let rendered = build_engine_state_template(&snapshot);
+        assert!(rendered.contains("test-machine"));
+        assert!(rendered.contains("routing_overrides"));
+        assert!(rendered.contains("quota_exhausted"));
     }
 
     #[test]

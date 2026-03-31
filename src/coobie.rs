@@ -9,11 +9,11 @@
 //!     interventions were applied
 //!   - Emits a structured CausalReport for failed/degraded runs
 //!
-//! Phase 2 (pending Cargo.toml — Codex owns that):
-//!   Add `deep_causality` crate for PropagatingEffect/PropagatingProcess chains,
-//!   Context hypergraph, Causaloid composition, and Effect Ethos policy layer.
-//!   The trait surface and scoring dimensions here are already shaped to map
-//!   cleanly onto DeepCausality's model.
+//! Phase 2 (partially wired):
+//!   Coobie now uses `deep_causality` observations, inferences, and causaloids
+//!   to activate causal signals alongside the existing heuristic rule engine.
+//!   The next layer is richer contextual hypergraphs and policy-oriented
+//!   propagation on top of the current signal model.
 //!
 //! Initial causal domain: "why do runs pass internal validation but fail
 //! hidden scenarios?" — the most common and useful failure pattern.
@@ -21,8 +21,14 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use deep_causality::prelude::{
+    BaseCausaloid, Causable, CausalityError, Causaloid, Inferable, Inference, Observable,
+    Observation,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::{
@@ -67,7 +73,31 @@ pub struct CausalReport {
     pub recommended_interventions: Vec<InterventionPlan>,
     pub counterfactual_prediction: Option<CounterfactualOutcome>,
     pub episode_scores: EpisodeScores,
+    #[serde(default)]
+    pub deep_causality: Option<DeepCausalityAnalysis>,
     pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepCausalitySignal {
+    pub cause_id: String,
+    pub question: String,
+    pub observation: f64,
+    pub threshold: f64,
+    pub effect: f64,
+    pub target: f64,
+    pub activated: bool,
+    pub activation_strength: f32,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepCausalityAnalysis {
+    pub effect_score: f64,
+    pub active_signal_count: usize,
+    pub active_signal_percent: f64,
+    pub active_signals: Vec<DeepCausalitySignal>,
+    pub inactive_signals: Vec<DeepCausalitySignal>,
 }
 
 // ── Episode scoring ───────────────────────────────────────────────────────────
@@ -194,6 +224,229 @@ const CAUSAL_RULES: &[CausalRule] = &[
         },
     },
 ];
+
+
+struct DeepSignalSpec {
+    cause_id: &'static str,
+    question: &'static str,
+    description: &'static str,
+    threshold: f64,
+    observe: fn(&EpisodeScores) -> f64,
+    verify: fn(f64) -> Result<bool, CausalityError>,
+}
+
+const DEEP_SIGNAL_SPECS: &[DeepSignalSpec] = &[
+    DeepSignalSpec {
+        cause_id: "SPEC_AMBIGUITY",
+        question: "Is spec ambiguity the most plausible driver of this run's outcome?",
+        description: "Deep Causality signal for spec ambiguity.",
+        threshold: 0.45,
+        observe: spec_ambiguity_observation,
+        verify: spec_ambiguity_causality,
+    },
+    DeepSignalSpec {
+        cause_id: "TWIN_GAP",
+        question: "Did the twin environment under-represent production behavior?",
+        description: "Deep Causality signal for twin fidelity gaps.",
+        threshold: 0.40,
+        observe: twin_gap_observation,
+        verify: twin_gap_causality,
+    },
+    DeepSignalSpec {
+        cause_id: "TEST_BLIND_SPOT",
+        question: "Did visible validation overfit the happy path?",
+        description: "Deep Causality signal for visible-test blind spots.",
+        threshold: 0.75,
+        observe: test_blind_spot_observation,
+        verify: test_blind_spot_causality,
+    },
+    DeepSignalSpec {
+        cause_id: "NO_PRIOR_MEMORY",
+        question: "Did the run proceed without enough prior memory context?",
+        description: "Deep Causality signal for missing prior memory.",
+        threshold: 0.90,
+        observe: no_prior_memory_observation,
+        verify: no_prior_memory_causality,
+    },
+    DeepSignalSpec {
+        cause_id: "BROAD_SCOPE",
+        question: "Was the implementation scope broad enough to raise hidden risk?",
+        description: "Deep Causality signal for overly broad scope.",
+        threshold: 0.75,
+        observe: broad_scope_observation,
+        verify: broad_scope_causality,
+    },
+];
+
+fn threshold_causality(obs: f64, threshold: f64) -> Result<bool, CausalityError> {
+    if obs.is_nan() {
+        return Err(CausalityError("Observation is NULL/NAN".into()));
+    }
+    Ok(obs >= threshold)
+}
+
+fn spec_ambiguity_causality(obs: f64) -> Result<bool, CausalityError> {
+    threshold_causality(obs, 0.45)
+}
+
+fn twin_gap_causality(obs: f64) -> Result<bool, CausalityError> {
+    threshold_causality(obs, 0.40)
+}
+
+fn test_blind_spot_causality(obs: f64) -> Result<bool, CausalityError> {
+    threshold_causality(obs, 0.75)
+}
+
+fn no_prior_memory_causality(obs: f64) -> Result<bool, CausalityError> {
+    threshold_causality(obs, 0.90)
+}
+
+fn broad_scope_causality(obs: f64) -> Result<bool, CausalityError> {
+    threshold_causality(obs, 0.75)
+}
+
+fn spec_ambiguity_observation(scores: &EpisodeScores) -> f64 {
+    (1.0 - scores.spec_clarity_score as f64).clamp(0.0, 1.0)
+}
+
+fn twin_gap_observation(scores: &EpisodeScores) -> f64 {
+    (1.0 - scores.twin_fidelity_score as f64).clamp(0.0, 1.0)
+}
+
+fn test_blind_spot_observation(scores: &EpisodeScores) -> f64 {
+    if scores.validation_passed && !scores.scenario_passed {
+        (scores.test_coverage_score as f64).clamp(0.0, 1.0)
+    } else if !scores.scenario_passed {
+        ((scores.test_coverage_score as f64) * 0.85).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn no_prior_memory_observation(scores: &EpisodeScores) -> f64 {
+    (1.0 - scores.memory_retrieval_score as f64).clamp(0.0, 1.0)
+}
+
+fn broad_scope_observation(scores: &EpisodeScores) -> f64 {
+    (scores.change_scope_score as f64).clamp(0.0, 1.0)
+}
+
+fn run_effect_score(scores: &EpisodeScores) -> f64 {
+    match (scores.validation_passed, scores.scenario_passed) {
+        (true, false) => 1.0,
+        (false, false) => 0.9,
+        (false, true) => 0.45,
+        (true, true) => 0.1,
+    }
+}
+
+fn deep_signal_id(cause_id: &str) -> u64 {
+    cause_id
+        .bytes()
+        .fold(17_u64, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as u64 + 1))
+}
+
+fn deep_confidence(signal: &DeepCausalitySignal) -> f32 {
+    if signal.activated && signal.effect >= 0.45 {
+        (0.35 + signal.activation_strength * 0.45 + (signal.effect as f32 * 0.10)).min(0.90)
+    } else {
+        0.0
+    }
+}
+
+fn sort_signals(signals: &mut [DeepCausalitySignal]) {
+    signals.sort_by(|left, right| {
+        right
+            .activation_strength
+            .partial_cmp(&left.activation_strength)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .observation
+                    .partial_cmp(&left.observation)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+}
+
+fn build_deep_signal(spec: &DeepSignalSpec, scores: &EpisodeScores) -> DeepCausalitySignal {
+    let effect_score = run_effect_score(scores);
+    let cause_id = deep_signal_id(spec.cause_id);
+    let observation_value = (spec.observe)(scores);
+    let observation = Observation::new(cause_id, observation_value, effect_score);
+    let inference = Inference::new(
+        cause_id,
+        spec.question.to_string(),
+        observation.observation(),
+        spec.threshold,
+        observation.observed_effect(),
+        1.0,
+    );
+    let causaloid: BaseCausaloid<'static> = Causaloid::new(cause_id, spec.verify, spec.description);
+    let activated = causaloid
+        .verify_single_cause(&inference.observation())
+        .unwrap_or(false);
+    let activation_strength = if activated {
+        ((inference.observation() - inference.threshold())
+            / (inference.target() - inference.threshold()).max(0.0001))
+            .clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    let explanation = causaloid.explain().unwrap_or_else(|_| {
+        format!(
+            "Causaloid {} remained inactive at observation {:.2} against threshold {:.2}",
+            spec.cause_id,
+            inference.observation(),
+            inference.threshold()
+        )
+    });
+
+    DeepCausalitySignal {
+        cause_id: spec.cause_id.to_string(),
+        question: inference.question(),
+        observation: inference.observation(),
+        threshold: inference.threshold(),
+        effect: inference.effect(),
+        target: inference.target(),
+        activated,
+        activation_strength,
+        explanation,
+    }
+}
+
+fn build_deep_causality_analysis(scores: &EpisodeScores) -> DeepCausalityAnalysis {
+    let mut active_signals = Vec::new();
+    let mut inactive_signals = Vec::new();
+
+    for spec in DEEP_SIGNAL_SPECS {
+        let signal = build_deep_signal(spec, scores);
+        if signal.activated {
+            active_signals.push(signal);
+        } else {
+            inactive_signals.push(signal);
+        }
+    }
+
+    sort_signals(&mut active_signals);
+    sort_signals(&mut inactive_signals);
+
+    let active_signal_count = active_signals.len();
+    let total_signals = active_signal_count + inactive_signals.len();
+    let active_signal_percent = if total_signals == 0 {
+        0.0
+    } else {
+        (active_signal_count as f64 / total_signals as f64) * 100.0
+    };
+
+    DeepCausalityAnalysis {
+        effect_score: run_effect_score(scores),
+        active_signal_count,
+        active_signal_percent,
+        active_signals,
+        inactive_signals,
+    }
+}
 
 // ── SQLite-backed engine ──────────────────────────────────────────────────────
 
@@ -478,36 +731,64 @@ impl CoobieReasoner for SqliteCoobie {
     }
 
     async fn diagnose(&self, run_id: &str) -> Result<Vec<CausalHypothesis>> {
-        // Load scores — try DB first, fall through gracefully if not found
         let scores = match self.load_scores(run_id).await? {
             Some(s) => s,
             None => return Ok(Vec::new()),
         };
 
+        let deep_analysis = build_deep_causality_analysis(&scores);
+        let deep_signals: HashMap<&str, &DeepCausalitySignal> = deep_analysis
+            .active_signals
+            .iter()
+            .chain(deep_analysis.inactive_signals.iter())
+            .map(|signal| (signal.cause_id.as_str(), signal))
+            .collect();
+
         let mut hypotheses: Vec<CausalHypothesis> = Vec::new();
 
         for rule in CAUSAL_RULES {
-            let Some(base_confidence) = (rule.evaluate)(&scores) else {
+            let heuristic_confidence = (rule.evaluate)(&scores).unwrap_or(0.0);
+            let deep_signal = deep_signals.get(rule.id).copied();
+            let deep_confidence_score = deep_signal.map(deep_confidence).unwrap_or(0.0);
+            let base_confidence = heuristic_confidence.max(deep_confidence_score);
+            if base_confidence <= 0.0 {
                 continue;
-            };
+            }
 
-            // Boost confidence with historical support
-            let supporting = self.find_supporting_runs(rule.id, 10).await
-                .unwrap_or_default();
+            let supporting = self.find_supporting_runs(rule.id, 10).await.unwrap_or_default();
             let support_boost = (supporting.len() as f32 * 0.03).min(0.15);
             let final_confidence = (base_confidence + support_boost).min(0.95);
+            let description = if heuristic_confidence <= 0.0 {
+                if let Some(signal) = deep_signal {
+                    format!(
+                        "{} DeepCausality activated {} at {:.0}% strength from observation {:.2} against threshold {:.2}.",
+                        rule.description,
+                        signal.cause_id,
+                        signal.activation_strength * 100.0,
+                        signal.observation,
+                        signal.threshold,
+                    )
+                } else {
+                    rule.description.to_string()
+                }
+            } else {
+                rule.description.to_string()
+            };
 
             hypotheses.push(CausalHypothesis {
                 cause_id: rule.id.to_string(),
-                description: rule.description.to_string(),
+                description,
                 confidence: final_confidence,
                 supporting_runs: supporting,
-                counterfactuals: Vec::new(), // populated in emit_report
+                counterfactuals: Vec::new(),
             });
         }
 
-        // Sort by confidence descending
-        hypotheses.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        hypotheses.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(Ordering::Equal)
+        });
 
         Ok(hypotheses)
     }
@@ -552,7 +833,6 @@ impl CoobieReasoner for SqliteCoobie {
         let mut hypotheses = self.diagnose(run_id).await?;
         let interventions = self.recommend_interventions(run_id).await?;
 
-        // Enrich each hypothesis with counterfactual estimates
         for h in &mut hypotheses {
             if let Some(rule) = CAUSAL_RULES.iter().find(|r| r.id == h.cause_id) {
                 let plan = InterventionPlan {
@@ -570,7 +850,8 @@ impl CoobieReasoner for SqliteCoobie {
         let primary_cause = primary.map(|h| h.description.clone());
         let primary_confidence = primary.map(|h| h.confidence).unwrap_or(0.0);
 
-        let contributing: Vec<String> = hypotheses.iter()
+        let contributing: Vec<String> = hypotheses
+            .iter()
             .skip(1)
             .take(3)
             .map(|h| h.description.clone())
@@ -582,17 +863,17 @@ impl CoobieReasoner for SqliteCoobie {
             None => None,
         };
 
-        let scores = self.load_scores(run_id).await?
-            .unwrap_or_else(|| EpisodeScores {
-                run_id: run_id.to_string(),
-                spec_clarity_score: 0.0,
-                change_scope_score: 0.0,
-                twin_fidelity_score: 0.0,
-                test_coverage_score: 0.0,
-                memory_retrieval_score: 0.0,
-                scenario_passed: false,
-                validation_passed: false,
-            });
+        let scores = self.load_scores(run_id).await?.unwrap_or_else(|| EpisodeScores {
+            run_id: run_id.to_string(),
+            spec_clarity_score: 0.0,
+            change_scope_score: 0.0,
+            twin_fidelity_score: 0.0,
+            test_coverage_score: 0.0,
+            memory_retrieval_score: 0.0,
+            scenario_passed: false,
+            validation_passed: false,
+        });
+        let deep_causality = build_deep_causality_analysis(&scores);
 
         Ok(CausalReport {
             run_id: run_id.to_string(),
@@ -602,24 +883,67 @@ impl CoobieReasoner for SqliteCoobie {
             recommended_interventions: interventions,
             counterfactual_prediction: counterfactual,
             episode_scores: scores,
+            deep_causality: Some(deep_causality),
             generated_at: Utc::now().to_rfc3339(),
         })
     }
 }
 
+
 // ── Phase 2 stub ──────────────────────────────────────────────────────────────
 //
-// When Codex adds `deep_causality` to Cargo.toml, wire it here:
-//
-// use deep_causality::prelude::*;
-//
-// pub struct DeepCausalityCoobie {
-//     context: BaseContext<...>,
-//     graph: CausalGraph<...>,
-// }
-//
-// impl DeepCausalityCoobie {
-//     fn build_context(ep: &FactoryEpisode) -> BaseContext<...> { ... }
-//     fn map_to_causaloids(scores: &EpisodeScores) -> Vec<Causaloid<...>> { ... }
-//     fn run_propagating_effect(graph: &CausalGraph<...>, intervention: ...) -> ... { ... }
-// }
+// The next layer for Coobie is a contextual Deep Causality model: attach these
+// signals to a real context hypergraph so WinCC OA and product-specific domain
+// facts can influence causal reasoning without replacing the current heuristics.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_causality_activates_failure_signals() {
+        let scores = EpisodeScores {
+            run_id: "run-failure".to_string(),
+            spec_clarity_score: 0.20,
+            change_scope_score: 0.30,
+            twin_fidelity_score: 0.80,
+            test_coverage_score: 0.95,
+            memory_retrieval_score: 0.0,
+            scenario_passed: false,
+            validation_passed: true,
+        };
+
+        let analysis = build_deep_causality_analysis(&scores);
+        let active: Vec<&str> = analysis
+            .active_signals
+            .iter()
+            .map(|signal| signal.cause_id.as_str())
+            .collect();
+
+        assert_eq!(analysis.effect_score, 1.0);
+        assert!(active.contains(&"SPEC_AMBIGUITY"));
+        assert!(active.contains(&"TEST_BLIND_SPOT"));
+        assert!(active.contains(&"NO_PRIOR_MEMORY"));
+        assert!(!active.contains(&"BROAD_SCOPE"));
+    }
+
+    #[test]
+    fn deep_causality_stays_quiet_for_healthy_runs() {
+        let scores = EpisodeScores {
+            run_id: "run-healthy".to_string(),
+            spec_clarity_score: 0.90,
+            change_scope_score: 0.20,
+            twin_fidelity_score: 0.95,
+            test_coverage_score: 0.80,
+            memory_retrieval_score: 1.0,
+            scenario_passed: true,
+            validation_passed: true,
+        };
+
+        let analysis = build_deep_causality_analysis(&scores);
+
+        assert_eq!(analysis.effect_score, 0.1);
+        assert_eq!(analysis.active_signal_count, 0);
+        assert!(analysis.active_signals.is_empty());
+    }
+}
