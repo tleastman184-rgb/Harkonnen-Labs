@@ -39,9 +39,17 @@ Agents do the implementation work.
 ## Quick start
 
 ```bash
+cargo run -- setup check
 cargo run -- spec validate factory/specs/examples/sample_feature.yaml
 cargo run -- run start factory/specs/examples/sample_feature.yaml --product sample-app
 cargo run -- run start factory/specs/examples/sample_feature.yaml --product-path ../some-other-repo
 cargo run -- run status <run-id>
 cargo run -- run report <run-id>
+cargo run -- serve --port 3000
+```
+
+To stamp a Claude-only Labrador pack into another repo, use:
+
+```bash
+cargo run -- setup claude-pack --target-path ../SPO --project-name SPO --project-type winccoa --winccoa
 ```

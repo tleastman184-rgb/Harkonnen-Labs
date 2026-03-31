@@ -403,21 +403,31 @@ do
     printf '    [+] %s\n' "$item"
 done
 
-printf '\n  Not yet wired (next build layer):\n'
-for item in \
-    "Real LLM calls per agent   — profiles exist, execution adapters pending" \
-    "Hidden scenarios (Sable)   — isolation layer planned" \
-    "Digital twins (Ash)        — provisioning planned" \
-    "Pack Board web UI          — axum server stubbed, not yet built"
+printf '
+  Working now, beyond the factory spine:
+'
+for item in     "Provider-aware LLM routing  — Scout, Mason, Piper, Bramble, and Ash can call configured providers with fallback paths"     "Hidden scenarios            — protected scenario files are evaluated through the Rust run pipeline"     "Digital twin manifests      — Ash provisions a safe local twin manifest with dependency stubs and optional narrative"     "Coordination API            — Keeper file claims, heartbeats, and conflict policy are available through harkonnen serve"     "Pack Board UI               — React/Vite UI and API-backed run detail views exist in the repo"     "Claude pack export          — setup claude-pack can stamp another repo with Labradors, context, and MCP wiring"
+do
+    printf '    [+] %s\n' "$item"
+done
+
+printf '
+  Still optional or still evolving:
+'
+for item in     "Direct Claude cowork spawning from the Rust orchestrator is not wired yet — the Claude pack exporter is the handoff path today"     "Richer black-box hidden scenarios beyond artifact/event checks can still be expanded"     "WinCC OA MCP integration depends on the target machine and project environment"     "Coobie semantic memory and DeepCausality phase 2 remain future upgrades"
 do
     printf '    [ ] %s\n' "$item"
 done
 
-printf '\n  Next steps:\n'
+printf '
+  Next steps:
+'
 printf '    1. Restart Claude Code — it will pick up the new MCP servers\n'
 printf '    2. Tell Coobie: "load your memory from factory/memory/index.json"\n'
 printf '    3. harkonnen spec validate factory/specs/examples/sample_feature.yaml\n'
-printf '    4. harkonnen run start factory/specs/examples/sample_feature.yaml --product sample-app\n'
+printf '    4. harkonnen setup claude-pack --target-path <path-to-SPO> --project-name SPO --project-type winccoa --domain "Siemens WinCC OA / industrial automation" --summary "SPO is a WinCC OA based Siemens product operated through a Claude-only Labrador pack." --winccoa\n'
+printf '    5. Open the SPO repo in Claude Code, run /agents, and start with Scout\n'
+
 printf '\n  Binary:  %s\n' "$BIN"
 printf '  Setup:   %s\n' "$HARKONNEN_SETUP"
 printf '  Memory:  %s/factory/memory/\n\n' "$REPO_ROOT"

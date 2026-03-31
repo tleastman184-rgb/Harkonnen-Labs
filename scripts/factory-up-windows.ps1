@@ -16,7 +16,7 @@
 #   7.  Run: harkonnen memory init  (seed Coobie, build index)
 #   8.  Run: harkonnen setup check  (verify providers + MCP)
 #   9.  Write .claude/settings.local.json  MCP block
-#   10. Print what is and is not yet implemented
+#   10. Print current factory status and next steps, including Claude pack export
 
 param(
     [switch]$Release   # pass -Release to build with optimizations
@@ -323,20 +323,32 @@ Write-Host "  What is working now:" -ForegroundColor White
 ) | ForEach-Object { Write-Host "    [+] $_" -ForegroundColor Green }
 
 Write-Host ""
-Write-Host "  What is not yet wired (next build layer):" -ForegroundColor White
+Write-Host ""
+Write-Host "  Working now, beyond the factory spine:" -ForegroundColor White
 @(
-    "Real LLM calls per agent   — agents have profiles but no execution adapters yet",
-    "Hidden scenarios (Sable)   — scenario isolation layer is planned",
-    "Digital twins (Ash)        — twin provisioning is planned",
-    "Pack Board web UI          — axum server is stubbed, not yet built"
+    "Provider-aware LLM routing  — Scout, Mason, Piper, Bramble, and Ash can call configured providers with fallback paths",
+    "Hidden scenarios            — protected scenario files are evaluated through the Rust run pipeline",
+    "Digital twin manifests      — Ash provisions a safe local twin manifest with dependency stubs and optional narrative",
+    "Coordination API            — Keeper file claims, heartbeats, and conflict policy are available through harkonnen serve",
+    "Pack Board UI               — React/Vite UI and API-backed run detail views exist in the repo",
+    "Claude pack export          — setup claude-pack can stamp another repo with Labradors, context, and MCP wiring"
+) | ForEach-Object { Write-Host "    [+] $_" -ForegroundColor Green }
+
+Write-Host ""
+Write-Host "  Still optional or still evolving:" -ForegroundColor White
+@(
+    "Direct Claude cowork spawning from the Rust orchestrator is not wired yet — the Claude pack exporter is the handoff path today",
+    "Richer black-box hidden scenarios beyond artifact/event checks can still be expanded",
+    "WinCC OA MCP integration depends on the target machine and project environment",
+    "Coobie semantic memory and DeepCausality phase 2 remain future upgrades"
 ) | ForEach-Object { Write-Host "    [ ] $_" -ForegroundColor DarkGray }
 
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor White
 Write-Host "    1. Restart Claude Code — it will pick up the new MCP servers"
-Write-Host "    2. Tell Coobie: 'load your memory from factory/memory/index.json'"
-Write-Host "    3. Validate a spec:  harkonnen spec validate factory\specs\examples\sample_feature.yaml"
-Write-Host "    4. Start a run:      harkonnen run start factory\specs\examples\sample_feature.yaml --product sample-app"
+Write-Host "    2. Validate the factory: harkonnen spec validate factory\specs\examples\sample_feature.yaml"
+Write-Host '    3. Export a Labrador pack into SPO: harkonnen setup claude-pack --target-path <path-to-SPO> --project-name SPO --project-type winccoa --domain "Siemens WinCC OA / industrial automation" --summary "SPO is a WinCC OA based Siemens product operated through a Claude-only Labrador pack." --winccoa'
+Write-Host "    4. Open the SPO repo in Claude Code, run /agents, and start with Scout"
 Write-Host ""
 Write-Host "  Binary:  $BinPath"
 Write-Host "  Setup:   $env:HARKONNEN_SETUP"

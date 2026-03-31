@@ -13,7 +13,7 @@ variants:
     file: setups/home-linux.toml
     platform: linux
     providers:
-      default: gemini
+      default: claude
       available: [claude, gemini, codex]
     routing_overrides:
       coobie: claude
@@ -26,9 +26,10 @@ variants:
       linux: export HARKONNEN_SETUP=home-linux
       windows: $env:HARKONNEN_SETUP = "home-linux"
     notes: >
-      Full stack. Gemini is the default for implementation agents (cost-effective
-      at volume). Codex handles code generation (Mason). Claude handles trust-critical
-      roles and Coobie. AnythingLLM adds semantic RAG over factory/memory/.
+      Full stack. Claude is currently the default while Gemini quota is constrained
+      on this machine. Codex handles code generation (Mason). Claude handles the
+      trust-critical roles and currently covers the remaining default-routed agents.
+      AnythingLLM adds semantic RAG over factory/memory/.
 
   work-windows:
     file: setups/work-windows.toml
@@ -83,11 +84,11 @@ agent_routing_matrix:
   home-linux:
     scout:   claude     # pinned in profile
     mason:   codex      # routing override
-    piper:   gemini     # default
-    bramble: gemini     # default
+    piper:   claude     # current default
+    bramble: claude     # current default
     sable:   claude     # pinned in profile
-    ash:     gemini     # default
-    flint:   gemini     # default
+    ash:     claude     # current default
+    flint:   claude     # current default
     coobie:  claude     # routing override
     keeper:  claude     # pinned in profile
   work-windows:

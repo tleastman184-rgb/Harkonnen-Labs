@@ -303,7 +303,7 @@ Responsibilities:
 - produce clear pass/fail evidence
 - preserve hidden truth while still exposing useful diagnostics
 
-Current repo status: planned.
+Current repo status: implemented via protected scenario files and run-state evaluation, with room for richer black-box behavioral scenarios.
 
 ### 6. Digital Twin Environment
 
@@ -319,7 +319,7 @@ What it should include:
 - queue or event simulators when relevant
 - stable endpoints for integration evaluation
 
-Current repo status: planned.
+Current repo status: partial. The current system builds safe twin manifests, dependency stubs, and optional twin narratives, but not full external-system provisioning.
 
 ### 7. Internal Validation Layer
 
@@ -411,6 +411,12 @@ Current commands:
 - `run report`
 - `artifact package`
 - `memory index`
+- `memory search`
+- `memory import`
+- `setup check`
+- `setup init`
+- `setup claude-pack`
+- `serve`
 
 Current repo mapping:
 
@@ -430,7 +436,7 @@ The UI should shift trust from handwritten diff review to:
 - scenario results
 - artifact summaries
 
-Current repo status: planned.
+Current repo status: implemented as a React/Vite Pack Board with API-backed run detail views, with further workflow triggers still open for expansion.
 
 ## UI Concept: The Pack Board
 

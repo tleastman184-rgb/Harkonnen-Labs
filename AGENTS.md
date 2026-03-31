@@ -310,18 +310,24 @@ security_expectations: [auth, secrets, isolation]
 
 ### Implemented
 - Spec loading and validation (Scout layer)
-- Run creation, status, and persistence in SQLite
+- Run creation, status, reporting, and persistence in SQLite
 - Per-run workspace isolation
 - Artifact packaging
-- File-backed memory store with keyword retrieval (Coobie)
-- `setup check` command with provider and MCP server verification
+- File-backed memory store with keyword retrieval and import support (Coobie)
+- `setup check`, `setup init`, and `setup claude-pack`
 - Agent profile loading and provider routing display
+- Provider-aware LLM routing for Claude, Gemini, and OpenAI/Codex
+- Scout, Mason, Piper, Bramble, and Ash LLM calls with rule-based or procedural fallback
+- Hidden scenario evaluation through protected scenario files (Sable)
+- Digital twin manifests with dependency stubs and optional narrative (Ash)
+- Coobie causal reasoning phase 1 with causal report output
+- Keeper coordination API with claims, heartbeats, conflict detection, and release flow
+- Pack Board web UI and API-backed run detail views
 - Bootstrap scripts for home-linux and work-windows
 
 ### Planned (next build layer)
-- Agent execution adapters (real LLM calls per agent, per provider)
-- Phase state machine in the orchestrator
-- Hidden scenario isolation and execution (Sable)
-- Digital twin provisioning (Ash)
+- Direct Claude cowork spawning from the Rust orchestrator
+- Richer black-box hidden scenarios beyond event/artifact evaluation
+- Richer digital twins for external-system simulation
 - Richer memory indexing (semantic, not just keyword)
-- Pack Board web UI
+- DeepCausality phase 2 integration
