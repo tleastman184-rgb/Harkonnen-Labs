@@ -11,7 +11,7 @@ anythingllm = true
 openclaw    = true
 
 [providers]
-default = "gemini"
+default = "claude"
 
 [providers.claude]
 type         = "anthropic"
@@ -20,6 +20,9 @@ api_key_env  = "ANTHROPIC_API_KEY"
 enabled      = true
 usage_rights = "standard"
 surface      = "claude-code"
+
+# Gemini remains configured for later reuse, but default routing is temporarily moved off it while the local quota window is exhausted.
+# Gemini quota is constrained on this machine until the reset window passes.
 
 [providers.gemini]
 type         = "google"
@@ -40,7 +43,7 @@ surface      = "vscode"
 [routing.agents]
 coobie = "claude"
 mason  = "codex"
-# bramble, piper, ash, and flint inherit providers.default = "gemini"
+# bramble, piper, ash, and flint inherit providers.default = "claude" while Gemini quota is constrained on this machine
 
 [[mcp.servers]]
 name         = "filesystem"

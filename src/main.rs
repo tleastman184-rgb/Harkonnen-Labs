@@ -1,8 +1,10 @@
 mod api;
 mod agents;
+mod coobie;
 mod cli;
 mod config;
 mod db;
+mod llm;
 mod memory;
 mod models;
 mod orchestrator;

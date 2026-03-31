@@ -45,3 +45,11 @@ Bootstrap:
     # edit .env: set ANTHROPIC_API_KEY and HARKONNEN_SETUP=work-windows
     cargo run -- memory init
     cargo run -- setup check
+    cargo run -- serve --port 3057
+
+## Multi-AI Coordination
+
+When working in a shared environment (e.g. Gemini + Codex + Claude):
+1. **Autorun the API**: `cargo run -- serve --port 3057`
+2. **Claim Files**: Post active tasks to `POST /api/coordination/claim`.
+3. **Respect Ownership**: Never modify files claimed by another node in `assignments.json`.

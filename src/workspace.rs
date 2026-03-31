@@ -8,15 +8,6 @@ pub async fn create_run_workspace(base: &Path, run_id: &str) -> Result<PathBuf> 
     Ok(path)
 }
 
-pub async fn stage_product_workspace(
-    products_root: &Path,
-    workspace_root: &Path,
-    product_name: &str,
-) -> Result<PathBuf> {
-    let source = products_root.join(product_name);
-    stage_target_workspace(&source, workspace_root).await
-}
-
 pub async fn stage_target_workspace(source: &Path, workspace_root: &Path) -> Result<PathBuf> {
     if !source.exists() {
         bail!("target source not found: {}", source.display());

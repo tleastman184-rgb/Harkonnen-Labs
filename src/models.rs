@@ -54,16 +54,6 @@ pub struct EpisodeRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CausalLink {
-    pub link_id: String,
-    pub from_event: i64,
-    pub to_event: i64,
-    pub link_type: String,
-    pub confidence: f64,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LessonRecord {
     pub lesson_id: String,
     pub source_episode: Option<String>,
@@ -212,4 +202,47 @@ pub struct HiddenScenarioEvaluation {
 pub struct HiddenScenarioSummary {
     pub passed: bool,
     pub results: Vec<HiddenScenarioEvaluation>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryEpisode {
+    pub run_id: String,
+    pub product: String,
+    pub spec_id: String,
+    pub features: Vec<String>,
+    pub agent_events: Vec<RunEvent>,
+    pub tool_events: Vec<String>, // Placeholder for tool-specific events
+    pub twin_env: Option<TwinEnvironment>,
+    pub validation: Option<ValidationSummary>,
+    pub scenarios: Option<HiddenScenarioSummary>,
+    pub decision: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterfactualEstimate {
+    pub intervention: String,
+    pub predicted_outcome: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalHypothesis {
+    pub cause_id: String,
+    pub description: String,
+    pub confidence: f32,
+    pub supporting_runs: Vec<String>,
+    pub counterfactuals: Vec<CounterfactualEstimate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterventionPlan {
+    pub target: String,
+    pub action: String,
+    pub expected_impact: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterfactualOutcome {
+    pub prediction: String,
+    pub confidence_gain: f32,
 }

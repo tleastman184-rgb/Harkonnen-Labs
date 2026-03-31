@@ -141,6 +141,97 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // ── Coobie causal reasoning tables ────────────────────────────────────────
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS coobie_episode_scores (
+            run_id                  TEXT PRIMARY KEY,
+            spec_clarity_score      REAL NOT NULL DEFAULT 0.5,
+            change_scope_score      REAL NOT NULL DEFAULT 0.5,
+            twin_fidelity_score     REAL NOT NULL DEFAULT 0.5,
+            test_coverage_score     REAL NOT NULL DEFAULT 0.0,
+            memory_retrieval_score  REAL NOT NULL DEFAULT 0.0,
+            scenario_passed         INTEGER NOT NULL DEFAULT 0,
+            validation_passed       INTEGER NOT NULL DEFAULT 0,
+            human_accepted          INTEGER,
+            scored_at               TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS causal_hypotheses (
+            hypothesis_id   TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            cause_id        TEXT NOT NULL,
+            description     TEXT NOT NULL,
+            confidence      REAL NOT NULL DEFAULT 0.5,
+            supporting_runs TEXT NOT NULL DEFAULT '[]',
+            counterfactuals TEXT NOT NULL DEFAULT '[]',
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS interventions (
+            intervention_id TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            target          TEXT NOT NULL,
+            action          TEXT NOT NULL,
+            expected_impact TEXT NOT NULL,
+            applied         INTEGER NOT NULL DEFAULT 0,
+            actual_outcome  TEXT,
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS heuristics (
+            heuristic_id    TEXT PRIMARY KEY,
+            cause_pattern   TEXT NOT NULL,
+            effect_pattern  TEXT NOT NULL,
+            intervention    TEXT NOT NULL,
+            hit_count       INTEGER NOT NULL DEFAULT 0,
+            success_count   INTEGER NOT NULL DEFAULT 0,
+            strength        REAL NOT NULL DEFAULT 1.0,
+            accepted        INTEGER NOT NULL DEFAULT 1,
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_causal_hypotheses_run_id
+        ON causal_hypotheses (run_id)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_coobie_scores_scenario
+        ON coobie_episode_scores (scenario_passed, validation_passed)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 

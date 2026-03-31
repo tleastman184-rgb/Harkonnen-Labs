@@ -9,8 +9,12 @@ responsibilities:
   - prevent_unsafe_actions
   - protect_secrets
   - maintain_factory_product_boundary
+  - coordinate_file_claims
+  - record_policy_conflicts
+  - review_stale_claims
 allowed_tools:
   - policy_engine
+  - coordination_store
   - filesystem_read
   - secret_scanner
   - mcp:filesystem

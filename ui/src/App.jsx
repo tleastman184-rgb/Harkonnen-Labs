@@ -98,6 +98,8 @@ function App() {
   const [runState, setRunState] = useState(null);
   const [selectedRole, setSelectedRole] = useState('mason');
   const [roleBoard, setRoleBoard] = useState(null);
+  const [coordination, setCoordination] = useState(null);
+  const [policyEvents, setPolicyEvents] = useState([]);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -194,6 +196,35 @@ function App() {
     };
   }, [activeRunId, selectedRole]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCoordination = async () => {
+      try {
+        const [assignments, events] = await Promise.all([
+          fetchJson(`${API_BASE}/coordination/assignments`),
+          fetchJson(`${API_BASE}/coordination/policy-events`),
+        ]);
+        if (!cancelled) {
+          setCoordination(assignments);
+          setPolicyEvents(Array.isArray(events) ? events : []);
+        }
+      } catch (fetchError) {
+        if (!cancelled) {
+          setCoordination(null);
+          setPolicyEvents([]);
+        }
+      }
+    };
+
+    loadCoordination();
+    const interval = setInterval(loadCoordination, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
   const run = runState?.run || null;
   const events = runState?.events || [];
   const blackboard = runState?.blackboard || null;
@@ -206,8 +237,11 @@ function App() {
   const memoryAgent = agents.find((agent) => agent.group === 'memory');
   const recentEvents = [...events].slice(-14).reverse();
   const activeThreads = agents.filter((agent) => agent.status === 'running');
-  const claims = Object.entries(blackboard?.agent_claims || {});
   const roleClaims = Object.entries(roleBoard?.agent_claims || {});
+  const coordinationClaims = Object.entries(coordination?.active || {});
+  const staleClaims = coordinationClaims.filter(([, claim]) => claim.status === 'stale');
+  const healthyClaims = coordinationClaims.filter(([, claim]) => claim.status !== 'stale');
+  const recentPolicyEvents = [...policyEvents].slice(-6).reverse();
 
   return (
     <div className="pack-board-shell">
@@ -363,24 +397,58 @@ function App() {
             </div>
           </Panel>
 
-          <Panel title="Action Board" compact>
-            <div className="list-block compact-list">
-              {claims.length === 0 ? (
-                <div className="empty-state">No active claims.</div>
-              ) : (
-                claims.map(([agent, claim]) => (
-                  <div key={agent} className="list-item">
-                    <div className="list-item-title">{agent}</div>
-                    <div className="list-item-subtle">{claim}</div>
-                  </div>
-                ))
-              )}
+          <Panel title="Keeper Policy Board" compact>
+            <div className="info-stack">
+              <div className="info-row"><span>Managed by</span><strong>{coordination?.managed_by || 'keeper'}</strong></div>
+              <div className="info-row"><span>Policy mode</span><strong>{coordination?.policy_mode || 'exclusive_file_claims'}</strong></div>
+              <div className="info-row"><span>Heartbeat timeout</span><strong>{coordination?.stale_after_seconds || 600}s</strong></div>
+              <div className="info-row"><span>Healthy claims</span><strong>{healthyClaims.length}</strong></div>
+              <div className="info-row"><span>Stale claims</span><strong>{staleClaims.length}</strong></div>
+              <div className="info-row"><span>Policy events</span><strong>{policyEvents.length}</strong></div>
             </div>
-            <div className="role-lens top-gap">
+
+            <div className="list-block">
               <div className="list-item">
                 <div className="list-item-title">{selectedRole} role view</div>
                 <div className="list-item-subtle">{roleBoard?.active_goal || 'No role-scoped board loaded.'}</div>
               </div>
+            </div>
+
+            <div className="list-block compact-list top-gap">
+              {coordinationClaims.length === 0 ? (
+                <div className="empty-state">No live Keeper claims.</div>
+              ) : (
+                coordinationClaims.map(([agent, claim]) => (
+                  <div key={agent} className={`list-item claim-item ${claim.status === 'stale' ? 'stale-claim' : ''}`}>
+                    <div className="list-item-title">{agent}</div>
+                    <div className="list-item-subtle">{claim.task}</div>
+                    <div className="list-item-subtle">status: {claim.status || 'active'}</div>
+                    <div className="list-item-subtle">last heartbeat: {claim.last_heartbeat_at ? new Date(claim.last_heartbeat_at).toLocaleString() : 'none recorded'}</div>
+                    <div className="list-item-subtle mono top-gap-small">
+                      {(claim.files || []).join(', ') || 'no files declared'}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="list-block compact-list top-gap">
+              {recentPolicyEvents.length === 0 ? (
+                <div className="empty-state">No Keeper policy events yet.</div>
+              ) : (
+                recentPolicyEvents.map((event) => (
+                  <div key={event.event_id} className={`list-item policy-event ${event.status}`}>
+                    <div className="list-item-title">{event.event_type.replaceAll('_', ' ')}</div>
+                    <div className="list-item-subtle">{event.message}</div>
+                    <div className="list-item-subtle mono top-gap-small">
+                      {new Date(event.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="role-lens top-gap">
               <div className="list-block compact-list">
                 {roleClaims.length === 0 ? (
                   <div className="empty-state">No claims visible to this role.</div>
@@ -572,6 +640,10 @@ function App() {
           margin-top: 0.9rem;
         }
 
+        .top-gap-small {
+          margin-top: 0.35rem;
+        }
+
         .role-lens-header {
           display: flex;
           justify-content: space-between;
@@ -666,6 +738,27 @@ function App() {
           color: var(--text-secondary);
           font-size: 0.76rem;
           line-height: 1.45;
+        }
+
+        .policy-event.blocked,
+        .policy-event.stale {
+          border-color: rgba(199, 104, 76, 0.45);
+          background: rgba(120, 39, 30, 0.18);
+        }
+
+        .policy-event.granted,
+        .policy-event.released,
+        .policy-event.revived {
+          border-color: rgba(143, 174, 124, 0.32);
+        }
+
+        .claim-item.stale-claim {
+          border-color: rgba(199, 104, 76, 0.45);
+          background: rgba(120, 39, 30, 0.14);
+        }
+
+        .mono {
+          font-family: var(--font-mono);
         }
 
         .timeline-list {

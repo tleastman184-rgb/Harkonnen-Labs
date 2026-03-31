@@ -34,6 +34,9 @@ performance_expectations:
   - string       # timing or throughput targets
 security_expectations:
   - string       # auth, secrets, isolation requirements
+# Optional: causal_metadata (used by Coobie to tune counterfactuals)
+# causal_metadata:
+#   - string
 ```
 
 ## Complete Example

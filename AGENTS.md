@@ -68,6 +68,41 @@ cargo run -- memory index                      # Rebuild index.json from md file
 cargo run -- setup check                       # Verify active setup (providers + MCP)
 ```
 
+## Coordination
+
+While the API server is running, the live coordination source is:
+
+```sh
+GET /api/coordination/assignments
+POST /api/coordination/claim
+POST /api/coordination/heartbeat
+POST /api/coordination/release
+```
+
+Claim example:
+
+```json
+{ "agent": "claude", "task": "wire mason phase", "files": ["src/orchestrator.rs"] }
+```
+
+Release example:
+
+```json
+{ "agent": "claude" }
+```
+
+Keeper is the policy owner of file-claim coordination. While the API server is running, claim conflicts, stale claims, heartbeats, and releases should be treated as Keeper-managed policy events.
+
+Agents holding files should send a heartbeat about once per minute with:
+
+```json
+{ "agent": "claude" }
+```
+
+Keeper marks claims stale after 600 seconds without a heartbeat and may reap stale conflicting claims when another agent needs the same files.
+
+If the API server is not running yet, use repo-root `assignments.md` as the coordination document and paste only the relevant claim section into each AI's context.
+
 ---
 
 ## Agent Roster
@@ -85,7 +120,7 @@ Agent profiles live in `factory/agents/profiles/<name>.yaml`.
 | Ash     | Twin retriever      | default          | Provision digital twins, mock dependencies |
 | Flint   | Artifact retriever  | default          | Collect outputs, package artifact bundles |
 | Coobie  | Memory retriever    | default          | Retrieve prior specs/patterns, store knowledge |
-| Keeper  | Boundary retriever  | claude (pinned)  | Enforce policy, prevent unsafe actions, protect secrets |
+| Keeper  | Boundary retriever  | claude (pinned)  | Enforce policy, guard boundaries, and manage file-claim coordination |
 
 **Pinned to Claude**: Scout, Sable, Keeper — these are trust-critical roles.
 **Routable**: Mason, Piper, Bramble, Ash, Flint, Coobie — provider set per setup.
@@ -95,6 +130,7 @@ Agent profiles live in `factory/agents/profiles/<name>.yaml`.
 - Mason **cannot** access `scenario_store` — prevents test gaming
 - Sable **cannot** write implementation code
 - Only Keeper has `policy_engine` access
+- Keeper owns file-claim coordination and conflict policy through the coordination API
 - All agents share the labrador personality: loyal, honest, persistent, never bluffs
 
 ---

@@ -18,8 +18,15 @@ Implementation agents use the setup's default provider and can be swapped.
 | Sable   | Scenario retriever  | claude    | scenario_store, twin_runner, report_writer   |
 | Ash     | Twin retriever      | default   | container_runner, filesystem_read            |
 | Flint   | Artifact retriever  | default   | artifact_writer, filesystem_read             |
-| Coobie  | Memory retriever    | default   | memory_store, metadata_query, mcp:memory     |
-| Keeper  | Boundary retriever  | claude    | policy_engine, filesystem_read, secret_scanner |
+| Coobie  | Causal Reasoner     | default   | deep_causality, memory_store, counterfactuals |
+| Keeper  | Coordination Auth   | claude    | policy_engine, assignments_auth, secrets     |
+
+## Orchestration Tier
+
+Harkonnen Labs operates with a three-node AI orchestration protocol:
+- **Gemini**: Lead UI & Memory Architect (Specializing in Blackboard & Causal Engine).
+- **Codex**: Core Engine & Infrastructure (Specializing in Rust, Cargo, and Build systems).
+- **Claude**: Logic & Agent Orchestration (Specializing in LLM routing and Phase logic).
 
 ## Key Invariants
 

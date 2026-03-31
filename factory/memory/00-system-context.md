@@ -26,6 +26,7 @@ perform the implementation work inside a constrained, observable factory.
 - factory/workspaces/   Per-run isolated workspaces
 - factory/artifacts/    Output bundles after each run
 - factory/memory/       Coobie's memory store (this directory)
+- factory/coordination/ Multi-agent synchronization (assignments.json)
 - factory/logs/         Run logs
 - products/             Target product codebases
 - src/                  Rust source for the factory CLI
@@ -41,9 +42,12 @@ perform the implementation work inside a constrained, observable factory.
     cargo run -- memory init
     cargo run -- memory index
     cargo run -- setup check
+    cargo run -- serve --port 3057 (Live API & Coordination Dashboard)
 
-## Current Status (MVP)
+## Current Status (Integrated Build)
 
-Spec loading, run creation, workspace isolation, artifact packaging, and memory
-indexing are implemented. Agent execution adapters, hidden scenario evaluation,
-and digital twin provisioning are planned for the next build layer.
+The factory is now a fully observable "Command Center":
+- **Blackboard State**: Live tracking of goals, blockers, and agent claims.
+- **Episodic Memory**: Every run is normalized into searchable factory episodes.
+- **Causal Reasoning**: Coobie (Phase 1) is now reasoning about run failures via DeepCausality context.
+- **Multi-Agent Coordination**: Authority is maintained via the `/api/coordination` layer to ensure conflict-free file ownership between Gemini, Codex, and Claude.

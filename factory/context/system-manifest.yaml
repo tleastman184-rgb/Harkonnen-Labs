@@ -30,13 +30,23 @@ status:
     - setup check with provider and MCP verification
     - agent profile loading with provider routing display
     - bootstrap scripts for home-linux and work-windows
-  planned:
-    - agent execution adapters (real LLM calls per agent)
-    - phase state machine in orchestrator
-    - hidden scenario isolation and execution (Sable)
+    - LLM provider abstraction (Anthropic, Gemini, OpenAI)
+    - per-agent LLM routing via setup TOML
+    - Scout, Mason, Piper, Bramble LLM calls with rule-based fallback
+    - full run lifecycle phase state machine (orchestrator)
+    - hidden scenario evaluation (Sable)
     - digital twin provisioning (Ash)
-    - semantic memory indexing
-    - Pack Board web UI
+    - Coobie causal reasoning engine (Phase 1, SQLite-backed)
+    - causal report per run (causal_report.json + API endpoint)
+    - Keeper coordination API with file-claim conflict detection and heartbeats
+    - Pack Board web UI (React/Vite) with agent grid, timeline, policy board
+    - RunDetailDrawer with causal, timeline, agents, lessons tabs
+    - CausalReportPanel and ValidationPanel components
+  planned:
+    - DeepCausality integration (Phase 2 causal engine)
+    - Ash LLM call for twin environment narrative
+    - Semantic memory indexing via AnythingLLM or MCP memory
+    - Pack Board: run-start trigger from UI
 
 cli:
   binary: harkonnen

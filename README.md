@@ -41,6 +41,7 @@ Agents do the implementation work.
 ```bash
 cargo run -- spec validate factory/specs/examples/sample_feature.yaml
 cargo run -- run start factory/specs/examples/sample_feature.yaml --product sample-app
+cargo run -- run start factory/specs/examples/sample_feature.yaml --product-path ../some-other-repo
 cargo run -- run status <run-id>
 cargo run -- run report <run-id>
 ```

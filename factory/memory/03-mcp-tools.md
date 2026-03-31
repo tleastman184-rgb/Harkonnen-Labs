@@ -36,12 +36,17 @@ Purpose: Repo search, file reads, issue/PR access for Piper and Scout
 Requires: GITHUB_TOKEN env var
 Platform: all
 
-### brave-search
-Package: @modelcontextprotocol/server-brave-search
-Tool aliases: fetch_docs, web_search
-Purpose: External doc lookup and dependency research for Piper
-Requires: BRAVE_API_KEY env var (free tier: 2000 queries/month)
+### multi-ai-coordination
+Package: internal (axum /api/coordination)
+Tool aliases: assignments_claim, assignments_release
+Purpose: Authorization and file-locking across Gemini, Codex, and Claude.
 Platform: all
+
+### deep-causality
+Package: @harkonnen-labs/server-deep-causality (internal)
+Tool aliases: causality_reason, counterfactual_simulate, context_builder
+Purpose: Causal reasoning and intervention discovery for Coobie.
+Platform: linux
 
 ## Adding a New MCP Server
 

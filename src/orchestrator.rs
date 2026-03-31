@@ -13,8 +13,10 @@ use uuid::Uuid;
 
 use crate::{
     agents::{self, AgentProfile},
+    coobie::CoobieReasoner,
     config::Paths,
     db,
+    llm::{self, LlmRequest},
     memory::MemoryStore,
     models::{
         AgentExecution, BlackboardState, EpisodeRecord, HiddenScenarioCheckResult,
@@ -33,6 +35,7 @@ pub struct AppContext {
     pub pool: SqlitePool,
     pub memory_store: MemoryStore,
     pub blackboard: Arc<RwLock<BlackboardState>>,
+    pub coobie: crate::coobie::SqliteCoobie,
 }
 
 #[derive(Debug, Clone)]
@@ -103,11 +106,13 @@ impl AppContext {
 
         let pool = db::init_db(&paths).await?;
         let memory_store = MemoryStore::new(paths.memory.clone());
+        let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
         Ok(Self {
             paths,
             pool,
             memory_store,
             blackboard: Arc::new(RwLock::new(BlackboardState::default())),
+            coobie,
         })
     }
 
@@ -432,10 +437,10 @@ impl AppContext {
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
         let implementation_episode = self
-            .start_episode(run_id, "implementation", &format!("Plan work for {}", req.product))
+            .start_episode(run_id, "implementation", &format!("Plan work for {}", target_source.label))
             .await?;
         blackboard.current_phase = "implementation".to_string();
-        blackboard.active_goal = format!("Prepare implementation plan for {}", req.product);
+        blackboard.active_goal = format!("Prepare implementation plan for {}", target_source.label);
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
         self.update_run_status(run_id, "implementation").await?;
         let implementation_start = self
@@ -449,16 +454,17 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        let implementation_plan =
-            build_implementation_plan(spec_obj, &intent, &memory_hits, &staged_product);
+        let implementation_plan = self
+            .mason_implementation_plan(spec_obj, &intent, &memory_hits, &staged_product, target_source)
+            .await;
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
         self.write_agent_execution(
             &profiles,
             "mason",
             &format!(
-                "Prepare an implementation plan for product '{}' using the staged workspace.",
-                req.product
+                "Prepare an implementation plan for target '{}' using the staged workspace.",
+                target_source.label
             ),
             "Prepared a local implementation plan for the staged product copy.",
             &implementation_plan,
@@ -509,7 +515,7 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        let tool_plan = self.build_tool_plan();
+        let tool_plan = self.piper_tool_plan(spec_obj).await;
         tokio::fs::write(run_dir.join("tool_plan.md"), &tool_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "tool_plan.md");
         self.write_agent_execution(
@@ -561,6 +567,10 @@ impl AppContext {
             .await?;
         let twin = self.build_twin_environment(run_id, spec_obj);
         self.write_json_file(&run_dir.join("twin.json"), &twin).await?;
+        if let Some(narrative) = self.ash_twin_narrative(spec_obj, &twin).await {
+            let _ = tokio::fs::write(run_dir.join("twin_narrative.md"), &narrative).await;
+            push_unique(&mut blackboard.artifact_refs, "twin_narrative.md");
+        }
         push_unique(&mut blackboard.artifact_refs, "twin.json");
         self.write_agent_execution(
             &profiles,
@@ -674,6 +684,11 @@ impl AppContext {
             remove_blocker(&mut blackboard, "visible_validation_failed");
         } else {
             push_unique(&mut blackboard.open_blockers, "visible_validation_failed");
+        }
+        // Bramble LLM interpretation — best-effort, non-blocking
+        if let Some(analysis) = self.bramble_interpret_validation(spec_obj, &validation).await {
+            let _ = tokio::fs::write(run_dir.join("validation_analysis.md"), &analysis).await;
+            push_unique(&mut blackboard.artifact_refs, "validation_analysis.md");
         }
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
@@ -803,7 +818,7 @@ impl AppContext {
                 vec![
                     "run".to_string(),
                     spec_obj.id.clone(),
-                    req.product.clone(),
+                    target_source.label.clone(),
                     if validation.passed && hidden_scenarios.passed {
                         "completed".to_string()
                     } else {
@@ -814,7 +829,7 @@ impl AppContext {
                 &format!(
                     "Spec: {}\nProduct: {}\nVisible validation passed: {}\nHidden scenarios passed: {}\nRecommended steps: {}\n\nTop memory hits:\n{}",
                     spec_obj.id,
-                    req.product,
+                    target_source.label,
                     validation.passed,
                     hidden_scenarios.passed,
                     intent.recommended_steps.join(", "),
@@ -898,6 +913,34 @@ impl AppContext {
         push_unique(&mut blackboard.resolved_items, "artifacts");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
+        // ── Coobie: full causal ingest + report ───────────────────────────────
+        let all_events = self.list_run_events(run_id).await.unwrap_or_default();
+        let factory_episode = crate::models::FactoryEpisode {
+            run_id: run_id.to_string(),
+            product: target_source.label.clone(),
+            spec_id: spec_obj.id.clone(),
+            features: spec_obj.acceptance_criteria.clone(),
+            agent_events: all_events,
+            tool_events: vec![],
+            twin_env: Some(twin.clone()),
+            validation: Some(validation.clone()),
+            scenarios: Some(hidden_scenarios.clone()),
+            decision: None,
+            created_at: Utc::now(),
+        };
+        if let Err(err) = self.coobie.ingest_episode(&factory_episode).await {
+            tracing::warn!("Coobie ingest failed: {err}");
+        } else {
+            match self.coobie.emit_report(run_id).await {
+                Ok(report) => {
+                    let _ = self
+                        .write_json_file(&run_dir.join("causal_report.json"), &report)
+                        .await;
+                }
+                Err(err) => tracing::warn!("Coobie emit_report failed: {err}"),
+            }
+        }
+
         Ok(ExecutionOutput {
             validation,
             hidden_scenarios,
@@ -906,6 +949,57 @@ impl AppContext {
     }
 
     async fn scout_intake(&self, spec_obj: &Spec, memory_hits: &[String]) -> Result<IntentPackage> {
+        // Try a real LLM call via Scout's configured provider. Fall back to the
+        // rule-based stub when no API key is available or the call fails.
+        if let Some(provider) = llm::build_provider("scout", "claude", &self.paths.setup) {
+            let memory_section = if memory_hits.is_empty()
+                || memory_hits.iter().all(|h| h.contains("No memories found") || h.contains("Memory not initialized"))
+            {
+                "No prior memory matched this spec.".to_string()
+            } else {
+                memory_hits.join("\n\n")
+            };
+
+            let spec_yaml = serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
+
+            let req = LlmRequest::simple(
+                "You are Scout, a spec-intake specialist for a software factory. \
+                 Your job is to read a YAML spec and prior memory context, then produce a \
+                 concise implementation intent package as JSON with these fields: \
+                 spec_id (string), summary (one sentence), ambiguity_notes (array of strings — \
+                 things that are unclear or missing), recommended_steps (ordered array of strings). \
+                 Respond with valid JSON only — no markdown, no explanation.",
+                format!(
+                    "SPEC:\n```yaml\n{spec_yaml}\n```\n\nPRIOR MEMORY:\n{memory_section}\n\n\
+                     Produce the intent package JSON."
+                ),
+            );
+
+            match provider.complete(req).await {
+                Ok(resp) => {
+                    // Parse the JSON response; fall through to stub on failure
+                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(&resp.content.trim()) {
+                        return Ok(parsed);
+                    }
+                    // Try stripping markdown fences if the model added them
+                    let stripped = resp.content
+                        .trim()
+                        .trim_start_matches("```json")
+                        .trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim();
+                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(stripped) {
+                        return Ok(parsed);
+                    }
+                    tracing::warn!("Scout LLM response was not valid IntentPackage JSON — falling back to stub");
+                }
+                Err(e) => {
+                    tracing::warn!("Scout LLM call failed ({}), using stub", e);
+                }
+            }
+        }
+
+        // Rule-based fallback — always works without an API key
         let mut ambiguity_notes = Vec::new();
         if spec_obj.outputs.is_empty() {
             ambiguity_notes.push("Spec does not describe concrete outputs yet".to_string());
@@ -934,6 +1028,79 @@ impl AppContext {
         })
     }
 
+    /// Mason: build an implementation plan, using an LLM when available.
+    async fn mason_implementation_plan(
+        &self,
+        spec_obj: &Spec,
+        intent: &IntentPackage,
+        memory_hits: &[String],
+        staged_product: &Path,
+        target_source: &TargetSourceMetadata,
+    ) -> String {
+        let stub = build_implementation_plan(spec_obj, intent, memory_hits, staged_product, target_source);
+
+        if let Some(provider) = llm::build_provider("mason", "default", &self.paths.setup) {
+            let memory_section = if memory_hits.is_empty()
+                || memory_hits.iter().all(|h| h.contains("No memories found") || h.contains("Memory not initialized"))
+            {
+                "No prior memory hits.".to_string()
+            } else {
+                memory_hits.join("\n\n")
+            };
+
+            let spec_yaml = serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
+            let intent_json = serde_json::to_string_pretty(intent).unwrap_or_default();
+
+            let req = LlmRequest::simple(
+                "You are Mason, an implementation planning specialist for a software factory. \
+                 You receive a YAML spec, a Scout intent package, and prior memory context. \
+                 Produce a clear, actionable implementation plan in Markdown. \
+                 Structure: ## Target, ## Intent Summary, ## Scope, ## Acceptance Criteria, \
+                 ## Recommended Steps (ordered, numbered), ## Risks, ## Prior Context. \
+                 Be specific. No filler. No preamble.",
+                format!(
+                    "SPEC:\n```yaml\n{spec_yaml}\n```\n\nINTENT:\n```json\n{intent_json}\n```\n\n\
+                     TARGET: {} ({})\n\nPRIOR MEMORY:\n{memory_section}\n\n\
+                     Produce the implementation plan markdown.",
+                    target_source.label, target_source.source_path,
+                ),
+            );
+
+            match provider.complete(req).await {
+                Ok(resp) => return resp.content,
+                Err(e) => tracing::warn!("Mason LLM call failed ({}), using stub", e),
+            }
+        }
+
+        stub
+    }
+
+    /// Piper: build a tool and MCP surface plan, using an LLM when available.
+    async fn piper_tool_plan(&self, spec_obj: &Spec) -> String {
+        let stub = self.build_tool_plan();
+
+        if let Some(provider) = llm::build_provider("piper", "default", &self.paths.setup) {
+            let req = LlmRequest::simple(
+                "You are Piper, a tool and MCP routing specialist for a software factory. \
+                 You receive the current tool surface and a spec summary. \
+                 Produce a brief Markdown report: which tools are available, which are relevant \
+                 to this spec, and any gaps or warnings. No filler.",
+                format!(
+                    "SPEC: {} — {}\n\nTOOL SURFACE:\n{stub}\n\n\
+                     Produce the tool plan analysis.",
+                    spec_obj.id, spec_obj.title,
+                ),
+            );
+
+            match provider.complete(req).await {
+                Ok(resp) => return resp.content,
+                Err(e) => tracing::warn!("Piper LLM call failed ({}), using stub", e),
+            }
+        }
+
+        stub
+    }
+
     async fn run_visible_validation(
         &self,
         workspace_root: &Path,
@@ -956,6 +1123,11 @@ impl AppContext {
         let mut output_chunks = Vec::new();
 
         let cargo_manifest = staged_product.join("Cargo.toml");
+        let package_json = staged_product.join("package.json");
+        let pyproject_toml = staged_product.join("pyproject.toml");
+        let requirements_txt = staged_product.join("requirements.txt");
+        let go_mod = staged_product.join("go.mod");
+
         if cargo_manifest.exists() {
             let outcome = self
                 .run_command_capture("cargo", &["check", "--quiet"], staged_product)
@@ -966,45 +1138,160 @@ impl AppContext {
                 passed: outcome.success,
                 details: command_detail("cargo check --quiet", &outcome),
             });
-        } else {
-            let package_json = staged_product.join("package.json");
-            if package_json.exists() {
-                let scripts = detect_package_scripts(&package_json)?;
-                if scripts.contains(&"build".to_string()) {
-                    let outcome = self
-                        .run_command_capture("npm", &["run", "build"], staged_product)
-                        .await?;
-                    output_chunks.push(format_command_output("npm run build", &outcome));
-                    results.push(ScenarioResult {
-                        scenario_id: "npm_build".to_string(),
-                        passed: outcome.success,
-                        details: command_detail("npm run build", &outcome),
+        } else if package_json.exists() {
+            if let Some((program, args, label)) = detect_node_bootstrap(staged_product) {
+                let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
+                let outcome = self
+                    .run_command_capture(program.as_str(), &arg_refs, staged_product)
+                    .await?;
+                output_chunks.push(format_command_output(&label, &outcome));
+                results.push(ScenarioResult {
+                    scenario_id: "node_bootstrap".to_string(),
+                    passed: outcome.success,
+                    details: command_detail(&label, &outcome),
+                });
+                if !outcome.success {
+                    if !output_chunks.is_empty() {
+                        tokio::fs::write(&validation_log_path, output_chunks.join("\n\n"))
+                            .await
+                            .with_context(|| format!("writing validation log {}", validation_log_path.display()))?;
+                    }
+                    return Ok(ValidationSummary {
+                        passed: false,
+                        results,
                     });
-                } else if scripts.contains(&"test".to_string()) {
+                }
+            }
+
+            let scripts = detect_package_scripts(&package_json)?;
+            let build_command = if command_available("npm") {
+                Some(("npm", vec!["run", "build"], "npm run build", "npm_build"))
+            } else if staged_product.join("pnpm-lock.yaml").exists() && command_available("pnpm") {
+                Some(("pnpm", vec!["build"], "pnpm build", "pnpm_build"))
+            } else if staged_product.join("yarn.lock").exists() && command_available("yarn") {
+                Some(("yarn", vec!["build"], "yarn build", "yarn_build"))
+            } else {
+                None
+            };
+            let test_command = if command_available("npm") {
+                Some(("npm", vec!["run", "test"], "npm run test", "npm_test"))
+            } else if staged_product.join("pnpm-lock.yaml").exists() && command_available("pnpm") {
+                Some(("pnpm", vec!["test"], "pnpm test", "pnpm_test"))
+            } else if staged_product.join("yarn.lock").exists() && command_available("yarn") {
+                Some(("yarn", vec!["test"], "yarn test", "yarn_test"))
+            } else {
+                None
+            };
+
+            if scripts.contains(&"build".to_string()) {
+                if let Some((program, args, label, scenario_id)) = build_command {
                     let outcome = self
-                        .run_command_capture("npm", &["run", "test"], staged_product)
+                        .run_command_capture(program, &args, staged_product)
                         .await?;
-                    output_chunks.push(format_command_output("npm run test", &outcome));
+                    output_chunks.push(format_command_output(label, &outcome));
                     results.push(ScenarioResult {
-                        scenario_id: "npm_test".to_string(),
+                        scenario_id: scenario_id.to_string(),
                         passed: outcome.success,
-                        details: command_detail("npm run test", &outcome),
+                        details: command_detail(label, &outcome),
                     });
                 } else {
                     results.push(ScenarioResult {
-                        scenario_id: "build_manifest".to_string(),
-                        passed: true,
-                        details: "package.json found but no build/test script is defined".to_string(),
+                        scenario_id: "node_runtime".to_string(),
+                        passed: false,
+                        details: "package.json found but no supported Node package manager is available".to_string(),
+                    });
+                }
+            } else if scripts.contains(&"test".to_string()) {
+                if let Some((program, args, label, scenario_id)) = test_command {
+                    let outcome = self
+                        .run_command_capture(program, &args, staged_product)
+                        .await?;
+                    output_chunks.push(format_command_output(label, &outcome));
+                    results.push(ScenarioResult {
+                        scenario_id: scenario_id.to_string(),
+                        passed: outcome.success,
+                        details: command_detail(label, &outcome),
+                    });
+                } else {
+                    results.push(ScenarioResult {
+                        scenario_id: "node_runtime".to_string(),
+                        passed: false,
+                        details: "package.json found but no supported Node package manager is available".to_string(),
                     });
                 }
             } else {
                 results.push(ScenarioResult {
                     scenario_id: "build_manifest".to_string(),
                     passed: true,
-                    details: "No Cargo.toml or package.json found; visible validation skipped"
+                    details: "package.json found but no build/test script is defined".to_string(),
+                });
+            }
+        } else if go_mod.exists() {
+            if command_available("go") {
+                let outcome = self
+                    .run_command_capture("go", &["test", "./..."], staged_product)
+                    .await?;
+                output_chunks.push(format_command_output("go test ./...", &outcome));
+                results.push(ScenarioResult {
+                    scenario_id: "go_test".to_string(),
+                    passed: outcome.success,
+                    details: command_detail("go test ./...", &outcome),
+                });
+            } else {
+                results.push(ScenarioResult {
+                    scenario_id: "go_test".to_string(),
+                    passed: false,
+                    details: "go.mod found but the go toolchain is not available".to_string(),
+                });
+            }
+        } else if pyproject_toml.exists() || requirements_txt.exists() {
+            if let Some(python_command) = detect_python_command() {
+                let run_pytest = staged_product.join("tests").exists()
+                    || pyproject_mentions_pytest(&pyproject_toml)?;
+                if run_pytest {
+                    let outcome = if command_available("pytest") {
+                        self.run_command_capture("pytest", &["-q"], staged_product).await?
+                    } else {
+                        self.run_command_capture(python_command, &["-m", "pytest", "-q"], staged_product)
+                            .await?
+                    };
+                    let command_label = if command_available("pytest") {
+                        "pytest -q"
+                    } else {
+                        "python -m pytest -q"
+                    };
+                    output_chunks.push(format_command_output(command_label, &outcome));
+                    results.push(ScenarioResult {
+                        scenario_id: "python_tests".to_string(),
+                        passed: outcome.success,
+                        details: command_detail(command_label, &outcome),
+                    });
+                } else {
+                    let outcome = self
+                        .run_command_capture(python_command, &["-m", "compileall", "."], staged_product)
+                        .await?;
+                    output_chunks.push(format_command_output("python -m compileall .", &outcome));
+                    results.push(ScenarioResult {
+                        scenario_id: "python_compile".to_string(),
+                        passed: outcome.success,
+                        details: command_detail("python -m compileall .", &outcome),
+                    });
+                }
+            } else {
+                results.push(ScenarioResult {
+                    scenario_id: "python_runtime".to_string(),
+                    passed: false,
+                    details: "Python project detected but neither python3 nor python is available"
                         .to_string(),
                 });
             }
+        } else {
+            results.push(ScenarioResult {
+                scenario_id: "build_manifest".to_string(),
+                passed: true,
+                details: "No Cargo.toml, package.json, go.mod, or Python project manifest found; visible validation skipped"
+                    .to_string(),
+            });
         }
 
         if !output_chunks.is_empty() {
@@ -1067,6 +1354,77 @@ impl AppContext {
         self.write_json_file(&run_dir.join("agent_executions.json"), agent_executions)
             .await?;
         Ok(())
+    }
+
+    /// Bramble: interpret validation output with an LLM when available.
+    /// Returns `None` if no LLM is configured (caller uses command output alone).
+    async fn bramble_interpret_validation(
+        &self,
+        spec_obj: &Spec,
+        validation: &ValidationSummary,
+    ) -> Option<String> {
+        let provider = llm::build_provider("bramble", "default", &self.paths.setup)?;
+
+        let results_text = validation
+            .results
+            .iter()
+            .map(|r| format!("- [{}] {}: {}", if r.passed { "PASS" } else { "FAIL" }, r.scenario_id, r.details))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let req = LlmRequest::simple(
+            "You are Bramble, a validation analyst for a software factory. \
+             You receive a spec summary and the results of visible validation checks. \
+             Produce a brief Markdown analysis: what passed, what failed, likely root causes \
+             for any failures, and what a developer should look at first. No filler.",
+            format!(
+                "SPEC: {} — {}\n\nVALIDATION RESULTS (passed={}):\n{results_text}\n\n\
+                 Produce the validation analysis.",
+                spec_obj.id, spec_obj.title, validation.passed,
+            ),
+        );
+
+        match provider.complete(req).await {
+            Ok(resp) => Some(resp.content),
+            Err(e) => {
+                tracing::warn!("Bramble LLM call failed ({}), skipping analysis", e);
+                None
+            }
+        }
+    }
+
+    /// Ash: write a narrative describing the provisioned twin environment.
+    /// Returns `None` when no LLM is available — caller continues without it.
+    async fn ash_twin_narrative(&self, spec_obj: &Spec, twin: &TwinEnvironment) -> Option<String> {
+        let provider = llm::build_provider("ash", "default", &self.paths.setup)?;
+
+        let services = twin.services.iter()
+            .map(|s| format!("- {} [{}] status={} — {}", s.name, s.kind, s.status, s.details))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let req = LlmRequest::simple(
+            "You are Ash, a digital twin specialist for a software factory. \
+             You have just provisioned a local twin environment for a run. \
+             Produce a brief Markdown narrative: what was provisioned, what each service \
+             provides to this run, and any gaps or warnings relevant to the spec. \
+             Two to four short paragraphs. No filler.",
+            format!(
+                "SPEC: {} — {}\nDEPENDENCIES: {}\n\nTWIN SERVICES:\n{services}\n\n\
+                 Write the twin environment narrative.",
+                spec_obj.id,
+                spec_obj.title,
+                if spec_obj.dependencies.is_empty() { "none".to_string() } else { spec_obj.dependencies.join(", ") },
+            ),
+        );
+
+        match provider.complete(req).await {
+            Ok(resp) => Some(resp.content),
+            Err(e) => {
+                tracing::warn!("Ash LLM call failed ({}), skipping narrative", e);
+                None
+            }
+        }
     }
 
     fn build_tool_plan(&self) -> String {
@@ -1182,6 +1540,92 @@ impl AppContext {
             services,
             created_at: Utc::now(),
         }
+    }
+
+    async fn resolve_target_source(&self, req: &RunRequest) -> Result<TargetSourceMetadata> {
+        let (source_kind, source_path, label) = if let Some(product) = &req.product {
+            (
+                "catalog".to_string(),
+                self.paths.products.join(product),
+                product.clone(),
+            )
+        } else if let Some(product_path) = &req.product_path {
+            let candidate = PathBuf::from(product_path);
+            let resolved = if candidate.is_absolute() {
+                candidate
+            } else {
+                self.paths.root.join(candidate)
+            };
+            let label = resolved
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| resolved.display().to_string());
+            ("path".to_string(), resolved, label)
+        } else {
+            bail!("provide either a catalog product or a target path");
+        };
+
+        if !source_path.exists() {
+            bail!("target source not found: {}", source_path.display());
+        }
+        if !source_path.is_dir() {
+            bail!("target source is not a directory: {}", source_path.display());
+        }
+
+        let canonical = source_path.canonicalize()?;
+        let git = self.capture_git_metadata(&canonical).await?;
+        Ok(TargetSourceMetadata {
+            label,
+            source_kind,
+            source_path: canonical.display().to_string(),
+            git,
+        })
+    }
+
+    async fn capture_git_metadata(&self, source: &Path) -> Result<Option<TargetGitMetadata>> {
+        if !command_available("git") {
+            return Ok(None);
+        }
+
+        let branch = self
+            .run_command_capture("git", &["rev-parse", "--abbrev-ref", "HEAD"], source)
+            .await
+            .ok()
+            .filter(|outcome| outcome.success)
+            .map(|outcome| outcome.stdout.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if branch.is_none() {
+            return Ok(None);
+        }
+
+        let commit = self
+            .run_command_capture("git", &["rev-parse", "HEAD"], source)
+            .await
+            .ok()
+            .filter(|outcome| outcome.success)
+            .map(|outcome| outcome.stdout.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let remote_origin = self
+            .run_command_capture("git", &["config", "--get", "remote.origin.url"], source)
+            .await
+            .ok()
+            .filter(|outcome| outcome.success)
+            .map(|outcome| outcome.stdout.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let clean = self
+            .run_command_capture("git", &["status", "--porcelain"], source)
+            .await
+            .ok()
+            .filter(|outcome| outcome.success)
+            .map(|outcome| outcome.stdout.trim().is_empty());
+
+        Ok(Some(TargetGitMetadata {
+            branch,
+            commit,
+            remote_origin,
+            clean,
+        }))
     }
 
     async fn insert_run(
@@ -1404,10 +1848,6 @@ impl AppContext {
             .await?;
         self.write_json_file(&run_dir.join("lessons.json"), &lessons).await?;
         Ok(())
-    }
-
-    pub async fn blackboard_view(&self, role: &str) -> BlackboardState {
-        self.blackboard.read().await.role_view(role)
     }
 
     fn run_log_path(&self, run_id: &str) -> PathBuf {
@@ -1669,6 +2109,22 @@ impl AppContext {
                 )
                 .await?;
             new_lessons.push(lesson);
+
+            // Ingest into Coobie causal engine (partial — full ingest happens post-execution)
+            let intake_episode = crate::models::FactoryEpisode {
+                run_id: run_id.to_string(),
+                product: String::new(),
+                spec_id: String::new(),
+                features: vec![],
+                agent_events: events.clone(),
+                tool_events: vec![],
+                twin_env: None,
+                validation: None,
+                scenarios: None,
+                decision: None,
+                created_at: Utc::now(),
+            };
+            let _ = self.coobie.ingest_episode(&intake_episode).await;
         }
 
         Ok(new_lessons)
@@ -1775,19 +2231,51 @@ fn build_implementation_plan(
     intent: &IntentPackage,
     memory_hits: &[String],
     staged_product: &Path,
+    target_source: &TargetSourceMetadata,
 ) -> String {
     let memory_summary = if memory_hits.is_empty() {
         "No prior memory hits found.".to_string()
     } else {
         memory_hits.join("\n\n")
     };
+    let scope = if spec_obj.scope.is_empty() {
+        "- Scope not specified in the spec yet.".to_string()
+    } else {
+        format!("- {}", spec_obj.scope.join("\n- "))
+    };
+    let acceptance = if spec_obj.acceptance_criteria.is_empty() {
+        "- Acceptance criteria not specified yet.".to_string()
+    } else {
+        format!("- {}", spec_obj.acceptance_criteria.join("\n- "))
+    };
+    let recommended_steps = if intent.recommended_steps.is_empty() {
+        "- No recommended steps were generated.".to_string()
+    } else {
+        format!("- {}", intent.recommended_steps.join("\n- "))
+    };
+    let git_summary = match &target_source.git {
+        Some(git) => format!(
+            "branch={} commit={} remote={} clean={}",
+            git.branch.as_deref().unwrap_or("unknown"),
+            git.commit.as_deref().unwrap_or("unknown"),
+            git.remote_origin.as_deref().unwrap_or("unknown"),
+            git.clean
+                .map(|value| if value { "true" } else { "false" })
+                .unwrap_or("unknown")
+        ),
+        None => "not a git repository or git metadata unavailable".to_string(),
+    };
     format!(
-        "# Mason Implementation Plan\n\nProduct workspace: {}\n\n## Intent\n{}\n\n## Scope\n{}\n\n## Acceptance Criteria\n{}\n\n## Recommended Steps\n{}\n\n## Prior Context\n{}\n",
+        "# Mason Implementation Plan\n\n## Target\n- Label: {}\n- Source kind: {}\n- Source path: {}\n- Staged workspace: {}\n- Git: {}\n\n## Intent\n{}\n\n## Scope\n{}\n\n## Acceptance Criteria\n{}\n\n## Recommended Steps\n{}\n\n## Prior Context\n{}\n",
+        target_source.label,
+        target_source.source_kind,
+        target_source.source_path,
         staged_product.display(),
+        git_summary,
         intent.summary,
-        spec_obj.scope.join("\n- "),
-        spec_obj.acceptance_criteria.join("\n- "),
-        intent.recommended_steps.join("\n- "),
+        scope,
+        acceptance,
+        recommended_steps,
         memory_summary
     )
 }
@@ -1798,6 +2286,83 @@ fn format_memory_context(memory_hits: &[String]) -> String {
     } else {
         memory_hits.join("\n\n---\n\n")
     }
+}
+
+fn detect_python_command() -> Option<&'static str> {
+    if command_available("python3") {
+        Some("python3")
+    } else if command_available("python") {
+        Some("python")
+    } else {
+        None
+    }
+}
+
+fn pyproject_mentions_pytest(pyproject: &Path) -> Result<bool> {
+    if !pyproject.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(pyproject)
+        .with_context(|| format!("reading {}", pyproject.display()))?;
+    Ok(content.contains("pytest") || content.contains("[tool.pytest"))
+}
+
+fn detect_node_bootstrap(staged_product: &Path) -> Option<(String, Vec<String>, String)> {
+    if staged_product.join("node_modules").exists() {
+        return None;
+    }
+
+    if staged_product.join("pnpm-lock.yaml").exists() {
+        if command_available("pnpm") {
+            return Some((
+                "pnpm".to_string(),
+                vec!["install".to_string(), "--frozen-lockfile".to_string()],
+                "pnpm install --frozen-lockfile".to_string(),
+            ));
+        }
+        if command_available("npm") {
+            return Some((
+                "npm".to_string(),
+                vec!["install".to_string(), "--no-fund".to_string(), "--no-audit".to_string()],
+                "npm install --no-fund --no-audit".to_string(),
+            ));
+        }
+    }
+
+    if staged_product.join("yarn.lock").exists() {
+        if command_available("yarn") {
+            return Some((
+                "yarn".to_string(),
+                vec!["install".to_string(), "--frozen-lockfile".to_string()],
+                "yarn install --frozen-lockfile".to_string(),
+            ));
+        }
+        if command_available("npm") {
+            return Some((
+                "npm".to_string(),
+                vec!["install".to_string(), "--no-fund".to_string(), "--no-audit".to_string()],
+                "npm install --no-fund --no-audit".to_string(),
+            ));
+        }
+    }
+
+    if staged_product.join("package-lock.json").exists() && command_available("npm") {
+        return Some((
+            "npm".to_string(),
+            vec!["ci".to_string(), "--no-fund".to_string(), "--no-audit".to_string()],
+            "npm ci --no-fund --no-audit".to_string(),
+        ));
+    }
+
+    if command_available("npm") {
+        return Some((
+            "npm".to_string(),
+            vec!["install".to_string(), "--no-fund".to_string(), "--no-audit".to_string()],
+            "npm install --no-fund --no-audit".to_string(),
+        ));
+    }
+
+    None
 }
 
 fn detect_package_scripts(package_json: &Path) -> Result<Vec<String>> {

@@ -1,0 +1,7 @@
+{
+  "managed_by": "keeper",
+  "policy_mode": "exclusive_file_claims",
+  "stale_after_seconds": 600,
+  "active": {},
+  "updated_at": "2026-03-31T16:24:08.231230306+00:00"
+}

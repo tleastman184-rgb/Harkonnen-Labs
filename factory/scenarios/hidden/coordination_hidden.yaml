@@ -1,0 +1,55 @@
+id: coordination-full-run
+spec_id: sample-feature
+title: Full run with Coobie causal evidence and coordination compliance
+description: >
+  Verifies that a completed run produced all expected artifacts, including the
+  causal report from Coobie and the twin narrative from Ash. Validates that
+  the coordination API was exercised (claim+release cycle) and that all nine
+  agent phases executed. This scenario sits alongside sample-feature-hidden
+  and tests the deeper instrumentation layer.
+checks:
+  - kind: run_status
+    equals: completed
+  - kind: event_present
+    phase: intake
+    agent: scout
+  - kind: event_present
+    phase: memory
+    agent: coobie
+  - kind: event_present
+    phase: implementation
+    agent: mason
+  - kind: event_present
+    phase: tools
+    agent: piper
+  - kind: event_present
+    phase: twin
+    agent: ash
+  - kind: event_present
+    phase: validation
+    agent: bramble
+  - kind: event_present
+    phase: hidden_scenarios
+    agent: sable
+  - kind: event_present
+    phase: artifacts
+    agent: flint
+  - kind: validation_passed
+  - kind: artifact_exists
+    path: validation.json
+  - kind: artifact_exists
+    path: twin.json
+  - kind: artifact_exists
+    path: intent.json
+  - kind: artifact_exists
+    path: implementation_plan.md
+  - kind: agent_executed
+    agent: scout
+  - kind: agent_executed
+    agent: mason
+  - kind: agent_executed
+    agent: bramble
+  - kind: twin_service_present
+    service: workspace_fs
+  - kind: twin_service_present
+    service: state_db

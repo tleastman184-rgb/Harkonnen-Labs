@@ -10,7 +10,22 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebSearch",
       "WebFetch(domain:liquidos-ai.github.io)",
-      "WebFetch(domain:dev.to)"
+      "WebFetch(domain:dev.to)",
+      "Bash(for agent:*)",
+      "Bash(do echo:*)",
+      "Bash(du -sh /home/earthling/*)",
+      "Bash(cargo clean:*)",
+      "Bash(wait)",
+      "Bash(curl -s http://localhost:3000/api/coordination/assignments)",
+      "Bash(cargo check:*)",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/claim -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\",\"\"task\"\":\"\"Wire LLM calls into mason, piper, bramble agents\"\",\"\"files\"\":[\"\"src/orchestrator.rs\"\",\"\"src/agents.rs\"\"]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/release -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\"}')",
+      "Bash(curl -s http://127.0.0.1:3057/api/coordination/assignments)",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/claim -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\",\"\"task\"\":\"\"Ash LLM wiring, causal report in reporting.rs, new UI components\"\",\"\"files\"\":[\"\"src/orchestrator.rs\"\",\"\"src/reporting.rs\"\",\"\"ui/src/components/CausalReportPanel.jsx\"\",\"\"ui/src/components/ValidationPanel.jsx\"\",\"\"ui/src/components/RunDetailDrawer.jsx\"\"]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/claim -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\",\"\"task\"\":\"\"Causal report in reporting.rs, new UI components \\(CausalReportPanel, ValidationPanel, RunDetailDrawer\\)\"\",\"\"files\"\":[\"\"src/reporting.rs\"\",\"\"ui/src/components/CausalReportPanel.jsx\"\",\"\"ui/src/components/ValidationPanel.jsx\"\",\"\"ui/src/components/RunDetailDrawer.jsx\"\"]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/claim -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\",\"\"task\"\":\"\"Add OpenAI client to llm.rs; add missing factory context docs\"\",\"\"files\"\":[\"\"src/llm.rs\"\",\"\"factory/context/agents.yaml\"\",\"\"factory/context/system.yaml\"\"]}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://127.0.0.1:3057/api/coordination/claim -H \"Content-Type: application/json\" -d '{\"\"agent\"\":\"\"claude\"\",\"\"task\"\":\"\"Ash LLM narrative; run start trigger in UI; spec for coordination scenarios\"\",\"\"files\"\":[\"\"src/orchestrator.rs\"\",\"\"ui/src/components/RunStartForm.jsx\"\",\"\"factory/scenarios/hidden/coordination_hidden.yaml\"\"]}')"
     ],
     "additionalDirectories": [
       "/media/earthling/Caleb''''s Files/Harkonnen-Labs/factory",

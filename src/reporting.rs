@@ -1,14 +1,31 @@
 use anyhow::Result;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use std::path::Path;
 
 use crate::{
+    coobie::CausalReport,
     models::{
         AgentExecution, BlackboardState, HiddenScenarioSummary, LessonRecord, TwinEnvironment,
         ValidationSummary,
     },
     orchestrator::AppContext,
 };
+
+#[derive(Debug, Deserialize)]
+struct TargetGitMetadataReport {
+    branch: Option<String>,
+    commit: Option<String>,
+    remote_origin: Option<String>,
+    clean: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TargetSourceMetadataReport {
+    label: String,
+    source_kind: String,
+    source_path: String,
+    git: Option<TargetGitMetadataReport>,
+}
 
 pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
     let run = app.get_run(run_id).await?;
@@ -18,7 +35,10 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
 
     let events = app.list_run_events(run_id).await?;
     let run_dir = app.paths.workspaces.join(run_id).join("run");
-    let validation: Option<ValidationSummary> = read_optional_json(&run_dir.join("validation.json")).await?;
+    let target_source: Option<TargetSourceMetadataReport> =
+        read_optional_json(&run_dir.join("target_source.json")).await?;
+    let validation: Option<ValidationSummary> =
+        read_optional_json(&run_dir.join("validation.json")).await?;
     let twin: Option<TwinEnvironment> = read_optional_json(&run_dir.join("twin.json")).await?;
     let hidden: Option<HiddenScenarioSummary> =
         read_optional_json(&run_dir.join("hidden_scenarios.json")).await?;
@@ -28,6 +48,8 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
         read_optional_json(&run_dir.join("lessons.json")).await?;
     let agent_executions: Option<Vec<AgentExecution>> =
         read_optional_json(&run_dir.join("agent_executions.json")).await?;
+    let causal_report: Option<CausalReport> =
+        read_optional_json(&run_dir.join("causal_report.json")).await?;
 
     let mut report = format!(
         "Run Report\n==========\nRun ID: {}\nSpec ID: {}\nProduct: {}\nStatus: {}\nCreated: {}\nUpdated: {}\nWorkspace: {}\nArtifacts: {}\n",
@@ -40,6 +62,29 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
         app.paths.workspaces.join(run_id).display(),
         app.paths.artifacts.join(run_id).display(),
     );
+
+    report.push_str("\nTarget Source\n-------------\n");
+    if let Some(target_source) = target_source {
+        report.push_str(&format!("Label: {}\n", target_source.label));
+        report.push_str(&format!("Kind: {}\n", target_source.source_kind));
+        report.push_str(&format!("Path: {}\n", target_source.source_path));
+        if let Some(git) = target_source.git {
+            report.push_str(&format!(
+                "Git: branch={} commit={} clean={}\n",
+                git.branch.unwrap_or_else(|| "unknown".to_string()),
+                git.commit.unwrap_or_else(|| "unknown".to_string()),
+                git.clean
+                    .map(|value| if value { "true" } else { "false" }.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+            report.push_str(&format!(
+                "Remote: {}\n",
+                git.remote_origin.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+    } else {
+        report.push_str("No target source metadata written yet.\n");
+    }
 
     report.push_str("\nTimeline\n--------\n");
     if events.is_empty() {
@@ -177,6 +222,54 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
         }
     } else {
         report.push_str("No lessons were promoted for this run.\n");
+    }
+
+    report.push_str("\nCoobie Causal Analysis\n----------------------\n");
+    if let Some(causal) = causal_report {
+        report.push_str(&format!("Generated: {}\n", causal.generated_at));
+        if let Some(cause) = &causal.primary_cause {
+            report.push_str(&format!(
+                "Primary cause: {} (confidence {:.0}%)\n",
+                cause,
+                causal.primary_confidence * 100.0
+            ));
+        } else {
+            report.push_str("Primary cause: none identified\n");
+        }
+        if !causal.contributing_causes.is_empty() {
+            report.push_str(&format!(
+                "Contributing: {}\n",
+                causal.contributing_causes.join(", ")
+            ));
+        }
+        let scores = &causal.episode_scores;
+        report.push_str(&format!(
+            "Scores: spec_clarity={:.2} change_scope={:.2} twin_fidelity={:.2} test_coverage={:.2} memory_retrieval={:.2}\n",
+            scores.spec_clarity_score,
+            scores.change_scope_score,
+            scores.twin_fidelity_score,
+            scores.test_coverage_score,
+            scores.memory_retrieval_score,
+        ));
+        if causal.recommended_interventions.is_empty() {
+            report.push_str("Interventions: none recommended\n");
+        } else {
+            for intervention in &causal.recommended_interventions {
+                report.push_str(&format!(
+                    "- [{}] {} -> {}\n",
+                    intervention.target, intervention.action, intervention.expected_impact
+                ));
+            }
+        }
+        if let Some(cf) = &causal.counterfactual_prediction {
+            report.push_str(&format!(
+                "Counterfactual: {} (confidence gain {:.0}%)\n",
+                cf.prediction,
+                cf.confidence_gain * 100.0
+            ));
+        }
+    } else {
+        report.push_str("No causal analysis generated for this run.\n");
     }
 
     Ok(report)
