@@ -11,11 +11,11 @@
 
 ---
 
-| AI     | Task                                      | Owns (files/areas)            | Started     |
-|--------|-------------------------------------------|-------------------------------|-------------|
-| Codex  | cargo check / artifact-lock contention    | src/, Cargo.toml, Cargo.lock  | session-001 |
-| Gemini | Coobie Causal Engine Design / Imp | ui/src/, src/orchestrator.rs (Coobie) | session-001 |
-| Claude | —                                         | —                             | —           |
+| AI     | Task                                      | Owns (files/areas)            | Started     | Note |
+|--------|-------------------------------------------|-------------------------------|-------------|------|
+| Codex  | Fix pre-existing compile errors (briefing/CoobieBriefing/memory_hits/build_* fns) + Gemini handoff tasks | src/, Cargo.toml, Cargo.lock, ui/src/ | session-001 | Gemini at limit — taking all Gemini work |
+| Claude | capacity.rs + CLI wiring + lamdet corpus scenario | src/capacity.rs, src/scenarios.rs, src/models.rs, factory/specs/, factory/scenarios/ | session-002 | Near limit — pinned agents only |
+| Gemini | —                                         | —                             | —           | At daily quota limit |
 
 ---
 

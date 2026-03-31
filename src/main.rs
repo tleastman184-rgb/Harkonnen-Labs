@@ -1,5 +1,6 @@
 mod api;
 mod agents;
+mod capacity;
 mod claude_pack;
 mod coobie;
 mod cli;
@@ -9,6 +10,7 @@ mod llm;
 mod memory;
 mod models;
 mod orchestrator;
+mod pidgin;
 mod policy;
 mod reporting;
 mod scenarios;
@@ -52,6 +54,10 @@ async fn main() -> Result<()> {
         Commands::Serve(args) => {
             let app = AppContext::bootstrap().await?;
             cli::handle_serve(args, app).await?
+        }
+        Commands::Capacity { command } => {
+            let paths = config::Paths::discover()?;
+            cli::handle_capacity(command, &paths).await?
         }
     }
 

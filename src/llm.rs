@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::capacity::CapacityState;
 use crate::setup::SetupConfig;
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -63,30 +64,68 @@ pub fn build_provider(
     agent_provider: &str,
     setup: &SetupConfig,
 ) -> Option<Box<dyn LlmProvider>> {
-    let provider_cfg = setup.resolve_agent_provider(agent_name, agent_provider)?;
-    if !provider_cfg.enabled {
-        return None;
-    }
-    let api_key = std::env::var(&provider_cfg.api_key_env).ok()?;
+    build_provider_with_capacity(agent_name, agent_provider, setup, None)
+}
 
-    match provider_cfg.provider_type.as_str() {
-        "anthropic" | "claude" => Some(Box::new(AnthropicClient {
-            api_key,
-            model: provider_cfg.model.clone(),
-            http: build_http_client(),
-        })),
-        "gemini" | "google" => Some(Box::new(GeminiClient {
-            api_key,
-            model: provider_cfg.model.clone(),
-            http: build_http_client(),
-        })),
-        "openai" | "codex" => Some(Box::new(OpenAiClient {
-            api_key,
-            model: provider_cfg.model.clone(),
-            http: build_http_client(),
-        })),
-        _ => None,
+/// Capacity-aware provider builder. If the resolved provider is unavailable, falls back
+/// to the next available provider in the capacity state. Returns `None` only if no
+/// available provider with a valid API key can be found.
+pub fn build_provider_with_capacity(
+    agent_name: &str,
+    agent_provider: &str,
+    setup: &SetupConfig,
+    capacity: Option<&CapacityState>,
+) -> Option<Box<dyn LlmProvider>> {
+    let resolved_name = setup.resolve_agent_provider_name(agent_name, agent_provider);
+
+    // Build ordered list of providers to try: preferred first, then fallbacks.
+    let candidates: Vec<String> = if let Some(cap) = capacity {
+        if cap.is_available(&resolved_name) {
+            vec![resolved_name.clone()]
+        } else {
+            // Preferred is unavailable — try fallback chain, skip unavailable entries.
+            let mut chain = cap.fallback_chain.clone();
+            if !chain.contains(&resolved_name) {
+                chain.insert(0, resolved_name.clone());
+            }
+            chain
+                .into_iter()
+                .filter(|name| name != &resolved_name && cap.is_available(name))
+                .collect()
+        }
+    } else {
+        vec![resolved_name.clone()]
+    };
+
+    for candidate in &candidates {
+        let provider_cfg = setup.resolve_provider(candidate)?;
+        if !provider_cfg.enabled {
+            continue;
+        }
+        let Ok(api_key) = std::env::var(&provider_cfg.api_key_env) else {
+            continue;
+        };
+        let client: Box<dyn LlmProvider> = match provider_cfg.provider_type.as_str() {
+            "anthropic" | "claude" => Box::new(AnthropicClient {
+                api_key,
+                model: provider_cfg.model.clone(),
+                http: build_http_client(),
+            }),
+            "gemini" | "google" => Box::new(GeminiClient {
+                api_key,
+                model: provider_cfg.model.clone(),
+                http: build_http_client(),
+            }),
+            "openai" | "codex" => Box::new(OpenAiClient {
+                api_key,
+                model: provider_cfg.model.clone(),
+                http: build_http_client(),
+            }),
+            _ => continue,
+        };
+        return Some(client);
     }
+    None
 }
 
 fn build_http_client() -> reqwest::Client {

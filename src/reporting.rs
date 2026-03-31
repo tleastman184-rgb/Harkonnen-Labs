@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::{
     coobie::CausalReport,
     models::{
-        AgentExecution, BlackboardState, HiddenScenarioSummary, LessonRecord, TwinEnvironment,
+        AgentExecution, BlackboardState, CoobieBriefing, HiddenScenarioSummary, LessonRecord, TwinEnvironment,
         ValidationSummary,
     },
     orchestrator::AppContext,
@@ -48,8 +48,12 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
         read_optional_json(&run_dir.join("lessons.json")).await?;
     let agent_executions: Option<Vec<AgentExecution>> =
         read_optional_json(&run_dir.join("agent_executions.json")).await?;
+    let coobie_briefing: Option<CoobieBriefing> =
+        read_optional_json(&run_dir.join("coobie_briefing.json")).await?;
     let causal_report: Option<CausalReport> =
         read_optional_json(&run_dir.join("causal_report.json")).await?;
+    let coobie_preflight_response = read_optional_text(&run_dir.join("coobie_preflight_response.md")).await?;
+    let coobie_report_response = read_optional_text(&run_dir.join("coobie_report_response.md")).await?;
 
     let mut report = format!(
         "Run Report\n==========\nRun ID: {}\nSpec ID: {}\nProduct: {}\nStatus: {}\nCreated: {}\nUpdated: {}\nWorkspace: {}\nArtifacts: {}\n",
@@ -224,6 +228,54 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
         report.push_str("No lessons were promoted for this run.\n");
     }
 
+    report.push_str("\nCoobie Preflight\n-----------------\n");
+    if let Some(briefing) = coobie_briefing {
+        report.push_str(&format!("Generated: {}\n", briefing.generated_at));
+        report.push_str(&format!(
+            "Domain signals: {}\n",
+            if briefing.domain_signals.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.domain_signals.join(", ")
+            }
+        ));
+        report.push_str(&format!(
+            "Required checks: {}\n",
+            if briefing.required_checks.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.required_checks.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Regulatory considerations: {}\n",
+            if briefing.regulatory_considerations.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.regulatory_considerations.join(" | ")
+            }
+        ));
+    } else {
+        report.push_str("No Coobie preflight briefing written yet.\n");
+    }
+
+    report.push_str("\nCoobie Responses\n-----------------\n");
+    if let Some(response) = coobie_preflight_response {
+        report.push_str("Preflight response:\n");
+        report.push_str(&response);
+        report.push('\n');
+    } else {
+        report.push_str("No Coobie preflight response written yet.\n");
+    }
+    if let Some(response) = coobie_report_response {
+        report.push_str("\nReport response:\n");
+        report.push_str(&response);
+        report.push('\n');
+    } else {
+        report.push_str("Report response: not yet generated.\n");
+    }
+
+
     report.push_str("\nCoobie Causal Analysis\n----------------------\n");
     if let Some(causal) = causal_report {
         report.push_str(&format!("Generated: {}\n", causal.generated_at));
@@ -299,4 +351,11 @@ async fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     }
     let raw = tokio::fs::read_to_string(path).await?;
     Ok(Some(serde_json::from_str::<T>(&raw)?))
+}
+
+async fn read_optional_text(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(tokio::fs::read_to_string(path).await?))
 }

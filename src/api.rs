@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::{
     coobie::CausalReport,
-    models::{AgentExecution, BlackboardState, LessonRecord, RunEvent, RunRecord},
+    models::{AgentExecution, BlackboardState, CoobieBriefing, LessonRecord, RunEvent, RunRecord},
     orchestrator::AppContext,
 };
 
@@ -26,6 +26,10 @@ struct RunStateResponse {
     blackboard: Option<BlackboardState>,
     lessons: Vec<LessonRecord>,
     agent_executions: Vec<AgentExecution>,
+    coobie_briefing: Option<CoobieBriefing>,
+    causal_report: Option<CausalReport>,
+    coobie_preflight_response: Option<String>,
+    coobie_report_response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +114,8 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/blackboard/:role", get(get_run_blackboard_for_role))
         .route("/api/runs/:id/lessons", get(get_run_lessons))
         .route("/api/runs/:id/state", get(get_run_state))
+        .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
+        .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/causal-report", get(get_causal_report))
         .route("/api/coordination/assignments", get(get_assignments))
         .route("/api/coordination/policy-events", get(get_coordination_policy_events))
@@ -213,6 +219,49 @@ async fn get_run_state(Path(id): Path<String>, State(app): State<AppContext>) ->
     }
 }
 
+async fn get_coobie_briefing(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let briefing_path = app.paths.workspaces.join(&id).join("run").join("coobie_briefing.json");
+            match read_optional_json::<CoobieBriefing>(&briefing_path).await {
+                Ok(Some(briefing)) => (StatusCode::OK, Json(briefing)).into_response(),
+                Ok(None) => (StatusCode::NOT_FOUND, "Coobie briefing not yet generated").into_response(),
+                Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_coobie_response(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let run_dir = app.paths.workspaces.join(&id).join("run");
+            let response = match read_optional_text(&run_dir.join("coobie_report_response.md")).await {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => match read_optional_text(&run_dir.join("coobie_preflight_response.md")).await {
+                    Ok(text) => text,
+                    Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+                },
+                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            };
+            match response {
+                Some(text) => (StatusCode::OK, text).into_response(),
+                None => (StatusCode::NOT_FOUND, "Coobie response not yet generated").into_response(),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn get_causal_report(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -245,6 +294,10 @@ async fn build_run_state(app: &AppContext, id: &str) -> anyhow::Result<Option<Ru
     let agent_executions = read_optional_json::<Vec<AgentExecution>>(&run_dir.join("agent_executions.json"))
         .await?
         .unwrap_or_default();
+    let coobie_briefing = read_optional_json::<CoobieBriefing>(&run_dir.join("coobie_briefing.json")).await?;
+    let causal_report = read_optional_json::<CausalReport>(&run_dir.join("causal_report.json")).await?;
+    let coobie_preflight_response = read_optional_text(&run_dir.join("coobie_preflight_response.md")).await?;
+    let coobie_report_response = read_optional_text(&run_dir.join("coobie_report_response.md")).await?;
 
     Ok(Some(RunStateResponse {
         run,
@@ -252,6 +305,10 @@ async fn build_run_state(app: &AppContext, id: &str) -> anyhow::Result<Option<Ru
         blackboard,
         lessons,
         agent_executions,
+        coobie_briefing,
+        causal_report,
+        coobie_preflight_response,
+        coobie_report_response,
     }))
 }
 
@@ -261,6 +318,13 @@ async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Resul
     }
     let raw = tokio::fs::read_to_string(path).await?;
     Ok(Some(serde_json::from_str::<T>(&raw)?))
+}
+
+async fn read_optional_text(path: &FsPath) -> anyhow::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(tokio::fs::read_to_string(path).await?))
 }
 
 fn default_assignment_status() -> String {

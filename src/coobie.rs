@@ -481,8 +481,12 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
 ")
     };
 
+    let pidgin = crate::pidgin::coobie_briefing_pidgin(briefing);
+
     format!(
         "# Coobie Preflight Response
+
+{}
 
 I reviewed prior memory and causal history for `{}` targeting `{}`.
 
@@ -510,6 +514,7 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 ## Open Questions
 {}
 ",
+        pidgin,
         briefing.spec_id,
         briefing.product,
         render_bullet_lines(&briefing.domain_signals, "No domain signals were detected yet."),
@@ -593,8 +598,12 @@ pub fn render_coobie_report_response(report: &CausalReport) -> String {
         })
         .unwrap_or_else(|| "No counterfactual prediction was available.".to_string());
 
+    let pidgin = crate::pidgin::coobie_report_pidgin(report);
+
     format!(
         "# Coobie Run Response
+
+{}
 
 I completed a causal review for run `{}`.
 
@@ -614,6 +623,7 @@ I completed a causal review for run `{}`.
 ## Counterfactual
 - {}
 ",
+        pidgin,
         report.run_id,
         primary,
         report.primary_confidence * 100.0,

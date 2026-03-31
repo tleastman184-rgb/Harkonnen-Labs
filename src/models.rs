@@ -43,6 +43,8 @@ pub struct RunEvent {
     pub created_at: DateTime<Utc>,
 }
 
+pub type FactoryEvent = RunEvent;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeRecord {
     pub episode_id: String,
@@ -202,6 +204,8 @@ pub struct AgentExecution {
     pub usage_rights: Option<String>,
     pub mode: String,
     pub prompt: String,
+    #[serde(default)]
+    pub pidgin_summary: String,
     pub summary: String,
     pub output: String,
     pub allowed_tools: Vec<String>,

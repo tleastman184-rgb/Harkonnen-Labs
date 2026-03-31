@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::{models::AgentExecution, setup::SetupConfig};
+use crate::{models::AgentExecution, pidgin, setup::SetupConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentProfile {
@@ -67,6 +67,9 @@ pub fn build_execution(
         None => "unresolved".to_string(),
     };
 
+    let pidgin_summary = pidgin::pidgin_for_agent_result(&profile.name, summary, output);
+    let summary = pidgin::prepend_pidgin(&pidgin_summary, summary);
+
     AgentExecution {
         agent_name: profile.name.clone(),
         display_name: profile.display_name.clone(),
@@ -77,7 +80,8 @@ pub fn build_execution(
         usage_rights,
         mode,
         prompt: prompt.to_string(),
-        summary: summary.to_string(),
+        pidgin_summary,
+        summary,
         output: output.to_string(),
         allowed_tools: profile.allowed_tools.clone(),
         created_at: Utc::now(),

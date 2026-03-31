@@ -24,6 +24,7 @@ use crate::{
         IntentPackage, LessonRecord, PriorCauseSignal, RunEvent, RunRecord, ScenarioResult,
         Spec, TwinEnvironment, TwinService, ValidationSummary,
     },
+    pidgin,
     policy,
     scenarios,
     setup::command_available,
@@ -266,13 +267,99 @@ impl AppContext {
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
         let mut agent_executions = Vec::new();
+        let query_terms = build_coobie_query_terms(spec_obj, target_source);
+        let domain_signals = infer_domain_signals(spec_obj, target_source, &query_terms);
+
+        let memory_episode = self
+            .start_episode(run_id, "memory", &format!("Coobie preflight for {}", spec_obj.id))
+            .await?;
+        blackboard.current_phase = "memory".to_string();
+        blackboard.active_goal = format!("Coobie preflight for {}", spec_obj.title);
+        claim_agent(&mut blackboard, "coobie", "retrieve prior context and emit causal briefing");
+        self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+        self.update_run_status(run_id, "memory").await?;
+        let memory_start = self
+            .record_event(
+                run_id,
+                Some(&memory_episode),
+                "memory",
+                "coobie",
+                "running",
+                "Retrieving prior context and preparing Coobie briefing",
+                log_path,
+            )
+            .await?;
+        let memory_hits = self.retrieve_coobie_memory_context(&query_terms).await?;
+        let briefing = self
+            .build_coobie_briefing(
+                spec_obj,
+                target_source,
+                &query_terms,
+                &domain_signals,
+                &memory_hits,
+            )
+            .await?;
+        tokio::fs::write(
+            run_dir.join("memory_context.md"),
+            format_memory_context(&memory_hits),
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("coobie_briefing.json"), &briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("coobie_preflight_response.md"),
+            &briefing.coobie_response,
+        )
+        .await?;
+        push_unique(&mut blackboard.artifact_refs, "memory_context.md");
+        push_unique(&mut blackboard.artifact_refs, "coobie_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "coobie_preflight_response.md");
+        self.write_agent_execution(
+            &profiles,
+            "coobie",
+            &format!(
+                "Retrieve prior context, infer domain risks, and produce a preflight causal briefing for spec '{}'.",
+                spec_obj.title
+            ),
+            &format!(
+                "Prepared Coobie preflight with {} memory hit(s), {} guardrail(s), and {} required check(s).",
+                briefing.memory_hits.len(),
+                briefing.recommended_guardrails.len(),
+                briefing.required_checks.len()
+            ),
+            &briefing.coobie_response,
+            &run_dir,
+            &mut agent_executions,
+        )
+        .await?;
+        let memory_end = self
+            .record_event(
+                run_id,
+                Some(&memory_episode),
+                "memory",
+                "coobie",
+                "complete",
+                &format!(
+                    "Prepared Coobie briefing with {} memory hit(s) and {} required check(s)",
+                    briefing.memory_hits.len(),
+                    briefing.required_checks.len()
+                ),
+                log_path,
+            )
+            .await?;
+        self.finish_episode(&memory_episode, "success", Some(1.0)).await?;
+        self.link_events(memory_start.event_id, memory_end.event_id, "contributed_to", 1.0)
+            .await?;
+        release_agent(&mut blackboard, "coobie");
+        push_unique(&mut blackboard.resolved_items, "memory");
+        self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
         let intake_episode = self
             .start_episode(run_id, "intake", &format!("Interpret spec {}", spec_obj.id))
             .await?;
         blackboard.current_phase = "intake".to_string();
         blackboard.active_goal = format!("Interpret spec {}", spec_obj.title);
-        claim_agent(&mut blackboard, "scout", "interpret spec and normalize intent");
+        claim_agent(&mut blackboard, "scout", "interpret spec and normalize intent with Coobie context");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
         self.update_run_status(run_id, "intake").await?;
         let intake_start = self
@@ -282,19 +369,21 @@ impl AppContext {
                 "intake",
                 "scout",
                 "running",
-                &format!("Loading spec '{}'", spec_obj.title),
+                &format!("Loading spec '{}' with Coobie briefing", spec_obj.title),
                 log_path,
             )
             .await?;
-        let memory_hits = self.memory_store.retrieve_context(&spec_obj.title).await?;
-        let intent = self.scout_intake(spec_obj, &memory_hits).await?;
+        let intent = self.scout_intake(spec_obj, &briefing).await?;
         self.write_json_file(&run_dir.join("intent.json"), &intent).await?;
         push_unique(&mut blackboard.artifact_refs, "intent.json");
         self.write_agent_execution(
             &profiles,
             "scout",
-            &format!("Interpret spec {} and prepare a normalized intent package.", spec_obj.id),
-            "Parsed the spec and produced an implementation intent package.",
+            &format!(
+                "Interpret spec {} and prepare a normalized intent package from Coobie's preflight.",
+                spec_obj.id
+            ),
+            "Parsed the spec and produced an implementation intent package anchored to Coobie's briefing.",
             &serde_json::to_string_pretty(&intent)?,
             &run_dir,
             &mut agent_executions,
@@ -319,59 +408,6 @@ impl AppContext {
             .await?;
         release_agent(&mut blackboard, "scout");
         push_unique(&mut blackboard.resolved_items, "intake");
-        self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
-
-        let memory_episode = self
-            .start_episode(run_id, "memory", &format!("Retrieve memory for {}", spec_obj.id))
-            .await?;
-        blackboard.current_phase = "memory".to_string();
-        blackboard.active_goal = format!("Retrieve memory for {}", spec_obj.title);
-        claim_agent(&mut blackboard, "coobie", "retrieve prior context");
-        self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
-        self.update_run_status(run_id, "memory").await?;
-        let memory_start = self
-            .record_event(
-                run_id,
-                Some(&memory_episode),
-                "memory",
-                "coobie",
-                "running",
-                "Retrieving prior factory context",
-                log_path,
-            )
-            .await?;
-        tokio::fs::write(
-            run_dir.join("memory_context.md"),
-            format_memory_context(&memory_hits),
-        )
-        .await?;
-        push_unique(&mut blackboard.artifact_refs, "memory_context.md");
-        self.write_agent_execution(
-            &profiles,
-            "coobie",
-            &format!("Retrieve prior context for spec '{}'", spec_obj.title),
-            &format!("Collected {} memory hit(s).", memory_hits.len()),
-            &format_memory_context(&memory_hits),
-            &run_dir,
-            &mut agent_executions,
-        )
-        .await?;
-        let memory_end = self
-            .record_event(
-                run_id,
-                Some(&memory_episode),
-                "memory",
-                "coobie",
-                "complete",
-                &format!("Captured {} memory hit(s)", memory_hits.len()),
-                log_path,
-            )
-            .await?;
-        self.finish_episode(&memory_episode, "success", Some(1.0)).await?;
-        self.link_events(memory_start.event_id, memory_end.event_id, "contributed_to", 0.9)
-            .await?;
-        release_agent(&mut blackboard, "coobie");
-        push_unique(&mut blackboard.resolved_items, "memory");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
         let workspace_episode = self
@@ -632,6 +668,9 @@ impl AppContext {
         self.write_json_file(&run_dir.join("validation.json"), &validation)
             .await?;
         push_unique(&mut blackboard.artifact_refs, "validation.json");
+        if workspace_root.join("run").join("corpus_results.json").exists() {
+            push_unique(&mut blackboard.artifact_refs, "corpus_results.json");
+        }
         self.write_agent_execution(
             &profiles,
             "bramble",
@@ -937,9 +976,24 @@ impl AppContext {
         } else {
             match self.coobie.emit_report(run_id).await {
                 Ok(report) => {
+                    let report_response = crate::coobie::render_coobie_report_response(&report);
                     let _ = self
                         .write_json_file(&run_dir.join("causal_report.json"), &report)
                         .await;
+                    let _ = tokio::fs::write(
+                        run_dir.join("coobie_report_response.md"),
+                        &report_response,
+                    )
+                    .await;
+                    let _ = tokio::fs::write(
+                        run_dir.join("causal_summary.md"),
+                        &report_response,
+                    )
+                    .await;
+                    push_unique(&mut blackboard.artifact_refs, "causal_report.json");
+                    push_unique(&mut blackboard.artifact_refs, "coobie_report_response.md");
+                    push_unique(&mut blackboard.artifact_refs, "causal_summary.md");
+                    let _ = self.sync_blackboard(&blackboard, Some(&run_dir)).await;
                 }
                 Err(err) => tracing::warn!("Coobie emit_report failed: {err}"),
             }
@@ -2067,6 +2121,18 @@ TWIN SERVICES:
         log_path: &Path,
     ) -> Result<RunEvent> {
         let created_at = Utc::now();
+        let event_preview = RunEvent {
+            event_id: 0,
+            run_id: run_id.to_string(),
+            episode_id: episode_id.map(|value| value.to_string()),
+            phase: phase.to_string(),
+            agent: agent.to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            created_at,
+        };
+        let pidgin_summary = pidgin::pidgin_summary(&event_preview);
+        let message = pidgin::prepend_pidgin(&pidgin_summary, message);
         let result = sqlx::query(
             r#"
             INSERT INTO run_events (run_id, phase, episode_id, agent, status, message, created_at)
@@ -2078,7 +2144,7 @@ TWIN SERVICES:
         .bind(episode_id)
         .bind(agent)
         .bind(status)
-        .bind(message)
+        .bind(&message)
         .bind(created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -2556,26 +2622,41 @@ fn build_implementation_plan(
     staged_product: &Path,
     target_source: &TargetSourceMetadata,
 ) -> String {
-    let memory_summary = if memory_hits.is_empty() {
-        "No prior memory hits found.".to_string()
-    } else {
-        memory_hits.join("\n\n")
-    };
-    let scope = if spec_obj.scope.is_empty() {
-        "- Scope not specified in the spec yet.".to_string()
-    } else {
-        format!("- {}", spec_obj.scope.join("\n- "))
-    };
-    let acceptance = if spec_obj.acceptance_criteria.is_empty() {
-        "- Acceptance criteria not specified yet.".to_string()
-    } else {
-        format!("- {}", spec_obj.acceptance_criteria.join("\n- "))
-    };
-    let recommended_steps = if intent.recommended_steps.is_empty() {
-        "- No recommended steps were generated.".to_string()
-    } else {
-        format!("- {}", intent.recommended_steps.join("\n- "))
-    };
+    let memory_summary = format_memory_context(&briefing.memory_hits);
+    let scope = render_list(&spec_obj.scope, "Scope not specified in the spec yet.");
+    let acceptance = render_list(
+        &spec_obj.acceptance_criteria,
+        "Acceptance criteria not specified yet.",
+    );
+    let recommended_steps = render_list(
+        &intent.recommended_steps,
+        "No recommended steps were generated.",
+    );
+    let domain_signals = render_list(&briefing.domain_signals, "No domain signals inferred yet.");
+    let application_risks = render_list(
+        &briefing.application_risks,
+        "No application-level risks inferred yet.",
+    );
+    let environment_risks = render_list(
+        &briefing.environment_risks,
+        "No environment-level risks inferred yet.",
+    );
+    let regulatory = render_list(
+        &briefing.regulatory_considerations,
+        "No regulatory considerations inferred yet.",
+    );
+    let guardrails = render_list(
+        &briefing.recommended_guardrails,
+        "No additional Coobie guardrails yet.",
+    );
+    let required_checks = render_list(
+        &briefing.required_checks,
+        "No additional Coobie required checks yet.",
+    );
+    let open_questions = render_list(
+        &briefing.open_questions,
+        "No open questions captured by Coobie.",
+    );
     let git_summary = match &target_source.git {
         Some(git) => format!(
             "branch={} commit={} remote={} clean={}",
@@ -2589,7 +2670,54 @@ fn build_implementation_plan(
         None => "not a git repository or git metadata unavailable".to_string(),
     };
     format!(
-        "# Mason Implementation Plan\n\n## Target\n- Label: {}\n- Source kind: {}\n- Source path: {}\n- Staged workspace: {}\n- Git: {}\n\n## Intent\n{}\n\n## Scope\n{}\n\n## Acceptance Criteria\n{}\n\n## Recommended Steps\n{}\n\n## Prior Context\n{}\n",
+        "# Mason Implementation Plan
+
+## Target
+- Label: {}
+- Source kind: {}
+- Source path: {}
+- Staged workspace: {}
+- Git: {}
+
+## Intent
+{}
+
+## Scope
+{}
+
+## Acceptance Criteria
+{}
+
+## Recommended Steps
+{}
+
+## Coobie Domain Signals
+{}
+
+## Application Risks
+{}
+
+## Environment Risks
+{}
+
+## Regulatory Considerations
+{}
+
+## Guardrails
+{}
+
+## Required Checks
+{}
+
+## Open Questions
+{}
+
+## Prior Context
+{}
+
+## Coobie Response
+{}
+",
         target_source.label,
         target_source.source_kind,
         target_source.source_path,
@@ -2599,8 +2727,338 @@ fn build_implementation_plan(
         scope,
         acceptance,
         recommended_steps,
-        memory_summary
+        domain_signals,
+        application_risks,
+        environment_risks,
+        regulatory,
+        guardrails,
+        required_checks,
+        open_questions,
+        memory_summary,
+        briefing.coobie_response,
     )
+}
+
+fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadata) -> Vec<String> {
+    let mut terms = vec![
+        spec_obj.id.clone(),
+        spec_obj.title.clone(),
+        spec_obj.purpose.clone(),
+        target_source.label.clone(),
+        target_source.source_kind.clone(),
+    ];
+
+    for value in spec_obj
+        .scope
+        .iter()
+        .chain(spec_obj.constraints.iter())
+        .chain(spec_obj.inputs.iter())
+        .chain(spec_obj.outputs.iter())
+        .chain(spec_obj.acceptance_criteria.iter())
+        .chain(spec_obj.dependencies.iter())
+        .chain(spec_obj.performance_expectations.iter())
+        .chain(spec_obj.security_expectations.iter())
+    {
+        terms.push(value.clone());
+    }
+
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for term in terms {
+        let normalized = term.trim();
+        if normalized.len() < 3 {
+            continue;
+        }
+        let key = normalized.to_lowercase();
+        if seen.insert(key) {
+            unique.push(normalized.to_string());
+        }
+    }
+    unique
+}
+
+fn infer_domain_signals(
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    query_terms: &[String],
+) -> Vec<String> {
+    let mut signals = Vec::new();
+    let corpus = format!(
+        "{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}
+{}",
+        spec_obj.id,
+        spec_obj.title,
+        spec_obj.purpose,
+        target_source.label,
+        target_source.source_kind,
+        spec_obj.scope.join("
+"),
+        spec_obj.constraints.join("
+"),
+        spec_obj.inputs.join("
+"),
+        spec_obj.outputs.join("
+"),
+        spec_obj.acceptance_criteria.join("
+"),
+        spec_obj.dependencies.join("
+"),
+        spec_obj.performance_expectations.join("
+"),
+        spec_obj.security_expectations.join("
+"),
+        query_terms.join("
+"),
+    )
+    .to_lowercase();
+
+    let signal_map = [
+        (["sensor", "telemetry", "sampling", "daq"].as_slice(), "high_speed_sensing"),
+        (["plc", "opc ua", "modbus", "ethernet/ip", "fieldbus"].as_slice(), "plc_control"),
+        (["histori", "time series", "pi system"].as_slice(), "historian_integration"),
+        (["scada", "hmi", "alarm", "operator"].as_slice(), "scada_operations"),
+        (["simulator", "digital twin", "emulator", "hardware in the loop"].as_slice(), "simulation"),
+        (["analytics", "model", "inference", "prediction"].as_slice(), "analytics"),
+        (["latency", "throughput", "real-time", "jitter", "cycle time"].as_slice(), "timing_sensitive"),
+        (["fail-safe", "interlock", "shutdown", "degraded mode", "safety"].as_slice(), "safety_critical"),
+        (["gmp", "gxp", "21 cfr part 11", "audit trail", "validation"].as_slice(), "regulated_environment"),
+        (["batch", "recipe", "traceability", "electronic record"].as_slice(), "manufacturing_execution"),
+    ];
+
+    for (needles, signal) in signal_map {
+        if needles.iter().any(|needle| corpus.contains(needle)) {
+            signals.push(signal.to_string());
+        }
+    }
+
+    if signals.is_empty() {
+        signals.push("general_software_factory".to_string());
+    }
+
+    signals
+}
+
+fn build_application_risks(
+    spec_obj: &Spec,
+    domain_signals: &[String],
+    memory_hits: &[String],
+    prior_causes: &[PriorCauseSignal],
+) -> Vec<String> {
+    let mut risks = Vec::new();
+
+    if domain_signals.iter().any(|signal| signal == "timing_sensitive") {
+        risks.push("Throughput, latency, or jitter budgets may be violated without explicit buffering and backpressure handling.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "analytics") {
+        risks.push("Analytics outputs may look plausible while operating on stale, replayed, or low-quality plant data.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "manufacturing_execution") {
+        risks.push("Batch, recipe, and traceability state can drift if workflow transitions are not modeled as explicit state machines.".to_string());
+    }
+    if spec_obj.security_expectations.is_empty() {
+        risks.push("Security expectations are underspecified, which leaves device trust, credential handling, and operator access ambiguous.".to_string());
+    }
+    if memory_hits.iter().any(|hit| hit.contains("No memories found")) {
+        risks.push("Coobie found little directly reusable prior context, so assumptions need stronger explicit checks and telemetry.".to_string());
+    }
+    for cause in prior_causes.iter().take(2) {
+        risks.push(format!(
+            "Historical cause signal '{}' has appeared {} time(s); plan mitigations instead of rediscovering it during validation.",
+            cause.description,
+            cause.occurrences
+        ));
+    }
+
+    risks.dedup();
+    risks
+}
+
+fn build_environment_risks(spec_obj: &Spec, domain_signals: &[String]) -> Vec<String> {
+    let mut risks = Vec::new();
+    let dependency_text = spec_obj.dependencies.join(" ").to_lowercase();
+
+    if domain_signals.iter().any(|signal| signal == "high_speed_sensing") {
+        risks.push("High-rate sensor ingest can drop samples or reorder packets unless the twin exercises burst conditions and queue saturation.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "plc_control") {
+        risks.push("PLC handshakes, state transitions, and command acknowledgement timing can diverge from nominal flows on the shop floor.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "historian_integration") {
+        risks.push("Historian lag, replay, and tag-quality changes can create false confidence if only happy-path reads are simulated.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "scada_operations") {
+        risks.push("Alarm acknowledgement, operator overrides, and stale HMI tag quality need environment-level checks, not just unit tests.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "simulation") {
+        risks.push("Simulator fidelity gaps can hide timing or protocol defects unless the twin declares what is simulated versus merely stubbed.".to_string());
+    }
+    if dependency_text.contains("docker") || dependency_text.contains("container") {
+        risks.push("Containerized support services may start cleanly while still masking floor-network timing and service-discovery behavior.".to_string());
+    }
+
+    risks.dedup();
+    risks
+}
+
+fn build_regulatory_considerations(spec_obj: &Spec, domain_signals: &[String]) -> Vec<String> {
+    let mut items = Vec::new();
+    let corpus = format!(
+        "{}
+{}
+{}
+{}
+{}",
+        spec_obj.constraints.join("
+"),
+        spec_obj.acceptance_criteria.join("
+"),
+        spec_obj.security_expectations.join("
+"),
+        spec_obj.outputs.join("
+"),
+        spec_obj.purpose,
+    )
+    .to_lowercase();
+
+    if domain_signals.iter().any(|signal| signal == "regulated_environment")
+        || contains_any(&corpus, &["gmp", "gxp", "21 cfr part 11", "audit trail"])
+    {
+        items.push("Treat the run as potentially regulated: preserve audit trails, user attribution, and evidence needed for validation packages.".to_string());
+    }
+    if contains_any(&corpus, &["electronic signature", "sign-off", "approval"]) {
+        items.push("Approval and sign-off flows need tamper-evident records and clear separation between draft, review, and release states.".to_string());
+    }
+    if contains_any(&corpus, &["traceability", "batch", "lot", "genealogy"]) {
+        items.push("Traceability requirements imply immutable linkage between source events, derived analytics, and operator-visible decisions.".to_string());
+    }
+
+    items.dedup();
+    items
+}
+
+fn build_recommended_guardrails(
+    domain_signals: &[String],
+    memory_hits: &[String],
+    prior_causes: &[PriorCauseSignal],
+) -> Vec<String> {
+    let mut guardrails = vec![
+        "Require every planning agent to consume Coobie's briefing before finalizing its output.".to_string(),
+        "Prefer explicit state machines and quality-coded data flows over implicit happy-path assumptions.".to_string(),
+        "Capture evidence artifacts for each critical validation claim instead of relying on narrative confidence.".to_string(),
+    ];
+
+    if domain_signals.iter().any(|signal| signal == "timing_sensitive") {
+        guardrails.push("Model latency budgets, queue limits, retry windows, and timeout behavior as first-class constraints.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "plc_control") {
+        guardrails.push("Do not assume PLC writes succeeded until acknowledgement, state echo, and timeout handling are explicitly checked.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "regulated_environment") {
+        guardrails.push("Preserve auditability: configuration changes, operator actions, and derived records should all produce reviewable evidence.".to_string());
+    }
+    if memory_hits.iter().any(|hit| hit.contains("No memories found")) {
+        guardrails.push("When prior memory is weak, convert assumptions into explicit open questions and required checks before implementation proceeds.".to_string());
+    }
+    if let Some(cause) = prior_causes.first() {
+        guardrails.push(format!(
+            "Account for recurring cause '{}' early instead of waiting for validation to rediscover it.",
+            cause.description
+        ));
+    }
+
+    guardrails.dedup();
+    guardrails
+}
+
+fn build_required_checks(
+    spec_obj: &Spec,
+    domain_signals: &[String],
+    regulatory_considerations: &[String],
+) -> Vec<String> {
+    let mut checks = vec![
+        "Visible validation must prove the main project still builds or executes in the staged workspace.".to_string(),
+        "The twin narrative must state which external systems are simulated, stubbed, or still missing.".to_string(),
+    ];
+
+    if domain_signals.iter().any(|signal| signal == "high_speed_sensing") {
+        checks.push("Exercise burst input conditions and verify sample loss, ordering, and backpressure behavior.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "plc_control") {
+        checks.push("Verify PLC command/acknowledgement, heartbeat loss, and safe timeout behavior.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "historian_integration") {
+        checks.push("Test historian lag, stale-tag quality, and replay behavior before trusting analytics outputs.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "scada_operations") {
+        checks.push("Validate alarm semantics, acknowledgement flow, and operator-visible degraded modes.".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "simulation") {
+        checks.push("Compare simulator assumptions against at least one declared real-world timing or protocol constraint.".to_string());
+    }
+    if !regulatory_considerations.is_empty() {
+        checks.push("Emit evidence artifacts that support audit trails, traceability, and validation review.".to_string());
+    }
+    if spec_obj.rollback_requirements.is_empty() {
+        checks.push("Clarify rollback and degraded-mode expectations before relying on destructive or stateful flows.".to_string());
+    }
+
+    checks.dedup();
+    checks
+}
+
+fn build_coobie_open_questions(
+    spec_obj: &Spec,
+    domain_signals: &[String],
+    regulatory_considerations: &[String],
+) -> Vec<String> {
+    let mut questions = Vec::new();
+
+    if domain_signals.iter().any(|signal| signal == "plc_control") {
+        questions.push("Which PLC protocols, command acknowledgement semantics, and timeout budgets are expected on the floor?".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "high_speed_sensing") {
+        questions.push("What sampling rates, burst sizes, and loss tolerances define acceptable behavior for incoming sensor data?".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "historian_integration") {
+        questions.push("What historian freshness, replay, and tag-quality guarantees must the application respect?".to_string());
+    }
+    if domain_signals.iter().any(|signal| signal == "simulation") {
+        questions.push("Which simulator behaviors are trusted representations of the plant, and which are convenience stubs only?".to_string());
+    }
+    if !regulatory_considerations.is_empty() {
+        questions.push("Which regulatory evidence expectations, such as GMP validation artifacts or audit trails, must this run preserve?".to_string());
+    }
+    if spec_obj.performance_expectations.is_empty() {
+        questions.push("What performance envelope should the system honor under realistic plant load?".to_string());
+    }
+
+    questions.dedup();
+    questions
+}
+
+fn render_list(items: &[String], empty_message: &str) -> String {
+    if items.is_empty() {
+        format!("- {}", empty_message)
+    } else {
+        format!("- {}", items.join("
+- "))
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(&needle.to_lowercase()))
 }
 
 fn format_memory_context(memory_hits: &[String]) -> String {

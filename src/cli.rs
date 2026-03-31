@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::capacity::CapacityState;
 use crate::config::Paths;
 use crate::claude_pack::{export_claude_pack, ClaudePackRequest};
 use crate::orchestrator::{AppContext, FailureHarness, RunRequest};
@@ -47,6 +48,20 @@ pub enum Commands {
         command: SetupCommands,
     },
     Serve(ServeArgs),
+    Capacity {
+        #[command(subcommand)]
+        command: CapacityCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CapacityCommands {
+    /// Show current provider capacity state.
+    Show,
+    /// Set a provider's capacity status.
+    Set(CapacitySetArgs),
+    /// Reassign all claims from unavailable providers to the best available alternative.
+    Reassign,
 }
 
 #[derive(Subcommand, Debug)]
@@ -188,6 +203,17 @@ pub struct SetupClaudePackArgs {
 pub struct ServeArgs {
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
+}
+
+#[derive(Args, Debug)]
+pub struct CapacitySetArgs {
+    /// Provider name: claude, codex, or gemini.
+    pub provider: String,
+    /// Status: ok, near_limit, or at_limit.
+    pub status: String,
+    /// Optional human-readable note explaining the change.
+    #[arg(long)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1347,6 +1373,123 @@ fn activation_hint(platform: &str, root: &Path, path: &Path) -> String {
     } else {
         format!("export HARKONNEN_SETUP={relative}")
     }
+}
+
+pub async fn handle_capacity(command: CapacityCommands, paths: &Paths) -> Result<()> {
+    match command {
+        CapacityCommands::Show => {
+            let state = CapacityState::load(&paths.root)?;
+            println!("Provider Capacity (updated {})\n", state.updated_at);
+            let mut providers: Vec<_> = state.providers.iter().collect();
+            providers.sort_by_key(|(_, cap)| cap.priority);
+            for (name, cap) in &providers {
+                let avail = if cap.available { "✓" } else { "✗" };
+                let note = cap.note.as_deref().unwrap_or("");
+                println!(
+                    "  [{avail}] {name:<8} {:<12} priority={} {}",
+                    cap.status, cap.priority, note
+                );
+            }
+            println!("\nFallback chain: {}", state.fallback_chain.join(" → "));
+        }
+
+        CapacityCommands::Set(args) => {
+            let valid_statuses = ["ok", "near_limit", "at_limit"];
+            if !valid_statuses.contains(&args.status.as_str()) {
+                anyhow::bail!(
+                    "invalid status '{}' — use: ok, near_limit, at_limit",
+                    args.status
+                );
+            }
+            let mut state = CapacityState::load(&paths.root)?;
+            let availability_changed = state.set(&args.provider, &args.status, args.note.clone(), "human");
+            state.save(&paths.root)?;
+            println!("capacity: {} → {}", args.provider, args.status);
+            if availability_changed {
+                println!(
+                    "  availability changed — run `harkonnen capacity reassign` to update assignments"
+                );
+            }
+        }
+
+        CapacityCommands::Reassign => {
+            let state = CapacityState::load(&paths.root)?;
+            let assignments_path = paths.factory.join("coordination").join("assignments.json");
+
+            if !assignments_path.exists() {
+                println!("No assignments.json found — nothing to reassign.");
+                return Ok(());
+            }
+
+            let raw = std::fs::read_to_string(&assignments_path)?;
+            let mut assignments: serde_json::Value = serde_json::from_str(&raw)?;
+            let active = assignments
+                .get_mut("active")
+                .and_then(|a| a.as_object_mut());
+
+            let Some(active) = active else {
+                println!("No active claims in assignments.json.");
+                return Ok(());
+            };
+
+            let mut reassigned: Vec<(String, String, String)> = Vec::new();
+
+            for (agent, claim) in active.iter_mut() {
+                // Extract owned strings before any mutable borrow.
+                let provider = claim
+                    .get("provider")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(agent.as_str())
+                    .to_string();
+                let task = claim
+                    .get("task")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("(unknown task)")
+                    .to_string();
+
+                if !state.is_available(&provider) {
+                    if let Some(fallback) = state.best_available(&[provider.as_str()]) {
+                        let _ = task;
+                        if let Some(obj) = claim.as_object_mut() {
+                            obj.insert(
+                                "provider".to_string(),
+                                serde_json::Value::String(fallback.clone()),
+                            );
+                            obj.insert(
+                                "reassigned_from".to_string(),
+                                serde_json::Value::String(provider.to_string()),
+                            );
+                            obj.insert(
+                                "reassigned_reason".to_string(),
+                                serde_json::Value::String(format!(
+                                    "{provider} is {}",
+                                    state
+                                        .providers
+                                        .get(&provider)
+                                        .map(|c| c.status.as_str())
+                                        .unwrap_or("unavailable")
+                                )),
+                            );
+                        }
+                        reassigned.push((agent.clone(), provider.clone(), fallback));
+                    }
+                }
+            }
+
+            if reassigned.is_empty() {
+                println!("All active claims are on available providers — nothing to reassign.");
+            } else {
+                assignments["updated_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+                std::fs::write(&assignments_path, serde_json::to_string_pretty(&assignments)?)?;
+                println!("Reassigned {} claim(s):", reassigned.len());
+                for (agent, from, to) in &reassigned {
+                    println!("  {agent}: {from} → {to}");
+                }
+                println!("\nUpdate assignments.md manually to reflect the handoff context.");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_template_preview(template: &str) {

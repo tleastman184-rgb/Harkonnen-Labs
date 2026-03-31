@@ -825,7 +825,7 @@ fn agent_description(agent_name: &str, project_name: &str) -> String {
             "Harkonnen artifact and evidence specialist for {project_name}. Use for packaging outputs, change summaries, rollout evidence, and handoff bundles."
         ),
         "coobie" => format!(
-            "Harkonnen memory specialist for {project_name}. Use proactively to retrieve prior patterns, summarize lessons, and keep reusable knowledge organized."
+            "Harkonnen memory and causal reasoning specialist for {project_name}. Use proactively before planning, implementation, validation, and twin design so the pack can reuse prior lessons instead of rediscovering them."
         ),
         "keeper" => format!(
             "Harkonnen safety and policy specialist for {project_name}. MUST BE USED for risky actions, boundary review, live-system risk review, and coordination conflicts."
@@ -838,11 +838,13 @@ fn agent_role_rules(agent_name: &str, include_winccoa: bool) -> String {
     match agent_name {
         "scout" => bullet_lines(&[
             "shape requests into Harkonnen-style specs before implementation begins".to_string(),
+            "consume Coobie's latest briefing before finalizing scope, ambiguity notes, or recommended steps".to_string(),
             "surface ambiguity, missing constraints, and acceptance gaps".to_string(),
             "do not implement code or operational changes".to_string(),
         ]),
         "mason" => bullet_lines(&[
             "implement the requested change with minimal, intentional edits".to_string(),
+            "treat Coobie's guardrails and required checks as constraints, not optional commentary".to_string(),
             "preserve established project patterns unless the spec calls for change".to_string(),
             "stop and call Keeper if the task starts to cross safety or boundary lines".to_string(),
         ]),
@@ -860,6 +862,7 @@ fn agent_role_rules(agent_name: &str, include_winccoa: bool) -> String {
         }
         "bramble" => bullet_lines(&[
             "focus on visible validation, reproducible checks, and actionable failure analysis".to_string(),
+            "prove or disprove Coobie's required checks with evidence instead of generic pass/fail language".to_string(),
             "do not silently waive failing checks".to_string(),
         ]),
         "sable" => bullet_lines(&[
@@ -870,6 +873,7 @@ fn agent_role_rules(agent_name: &str, include_winccoa: bool) -> String {
         "ash" => {
             let mut rules = vec![
                 "design safe local twins, stubs, and dependency simulations".to_string(),
+                "use Coobie's environment risks to decide what the twin must simulate versus what can remain a stub".to_string(),
                 "be explicit about what is simulated versus real".to_string(),
             ];
             if include_winccoa {
@@ -884,7 +888,9 @@ fn agent_role_rules(agent_name: &str, include_winccoa: bool) -> String {
             "favor concise release notes, rollback notes, and artifact checklists".to_string(),
         ]),
         "coobie" => bullet_lines(&[
-            "retrieve prior patterns from `.harkonnen/memory/index.json` and related notes before answering".to_string(),
+            "retrieve prior patterns from `.harkonnen/memory/index.json` and related notes before the pack plans or acts".to_string(),
+            "emit a preflight briefing with domain signals, guardrails, required checks, and open questions".to_string(),
+            "emit report-based responses after runs so the pack can react to Coobie's causal findings directly".to_string(),
             "store durable lessons under `.harkonnen/memory/notes/` when they are worth reusing".to_string(),
             "call out when the memory corpus is thin or missing domain examples".to_string(),
         ]),
@@ -954,14 +960,14 @@ This repo includes project-level Claude subagents under `.claude/agents/`.
 Core coordination data lives under `.harkonnen` so the project can also be coordinated by Codex, Gemini, OpenClaw, or another runner on machines that support them.
 
 Use the Labradors proactively:
-- Scout first for spec shaping and ambiguity review
-- Mason for implementation
+- Coobie first to retrieve prior lessons, emit a preflight briefing, and surface required checks
+- Scout after Coobie's briefing for spec shaping and ambiguity review
+- Mason for implementation constrained by Coobie's guardrails
 - Piper for tools, docs, and helpers
-- Bramble for visible validation
+- Bramble for visible validation against Coobie's required checks
 - Sable for acceptance review without writing code
-- Ash for twin/simulation design
+- Ash for twin/simulation design driven by Coobie's environment risks
 - Flint for evidence packaging
-- Coobie for memory retrieval and lesson capture
 - Keeper for safety and boundary review
 
 Primary context files:
