@@ -20,7 +20,7 @@ patterns:
       - Ash may read declared product runtime APIs, but coordination and run truth still come from the Harkonnen backend.
       - Sable judges generated evidence artifacts against hidden scenario rules without rewriting the scenario to fit the output.
       - Flint packages the oracle inputs, comparison artifacts, Coobie summaries, and scenario verdict into the run bundle.
-  bounded_worker_forge:
+  trail_pack_forge:
     description: >
       Harkonnen delegates visible exploration, planning, and execution to a
       bounded inner worker harness while retaining memory truth, hidden
@@ -35,11 +35,11 @@ patterns:
       - dataset
       - evidence_artifact
     factory_expectations:
-      - Scout and Coobie prepare a bounded task envelope with explicit allowed paths, denied paths, visible success conditions, and required return artifacts.
+      - Scout and Coobie prepare a retriever task packet with explicit allowed paths, denied paths, visible success conditions, and required return artifacts.
       - The worker harness may explore, plan, execute, and run visible verification, but it cannot access hidden scenarios, Keeper policy internals, or Coobie's core causal memory directly.
       - Coobie critiques the plan before execution and can require plan revisions when known dead ends, stale memories, or causal hazards are ignored.
       - Worker-session continuity remains a harness concern; Harkonnen DB state, blackboard truth, and acceptance state remain external and authoritative.
-      - Bramble, Ash, Sable, Keeper, and Flint still perform independent factory-owned evaluation after the harness returns artifacts.
+      - The forge returns normalized execution evidence such as retriever_execution_report, retriever_forge_hooks, and command logs before Bramble, Ash, Sable, Keeper, and Flint perform independent factory-owned evaluation.
 component_roles:
   code_under_test:
     meaning: Product-owned code or configuration that Harkonnen may change during the run.
@@ -61,7 +61,7 @@ examples:
       - LamDet Python is the external oracle.
       - The CSV corpus is the preserved dataset bundle.
   - spec: conceptual
-    pattern: bounded_worker_forge
+    pattern: trail_pack_forge
     notes:
-      - An OpenAgent-style planner/executor swarm is treated as the inner worker harness.
+      - A retriever-themed planner/executor forge is treated as the inner worker harness.
       - Harkonnen remains the outer factory governor and acceptance authority.

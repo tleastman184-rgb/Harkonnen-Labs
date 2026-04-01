@@ -16,7 +16,7 @@ use tracing::info;
 use crate::{
     coobie::CausalReport,
     models::{AgentExecution, BlackboardState, CoobieBriefing, LessonRecord, RunEvent, RunRecord},
-    orchestrator::AppContext,
+    orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
     tesseract,
 };
@@ -123,7 +123,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/causal-report", get(get_causal_report))
         .route("/api/capacity", get(get_capacity))
         .route("/api/tesseract/scene", get(get_tesseract_scene))
+        .route("/api/runs/start", post(start_run))
         .route("/api/runs/:id/artifacts/:name", get(get_run_artifact))
+        .route("/api/runs/:id/memory-note", post(add_memory_note))
+        .route("/api/scout/draft", post(scout_draft))
         .route("/api/coordination/assignments", get(get_assignments))
         .route("/api/coordination/policy-events", get(get_coordination_policy_events))
         .route("/api/coordination/claim", post(claim_task))
@@ -844,6 +847,233 @@ async fn release_task(
         Ok(()) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+// ── Scout draft ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ScoutDraftRequest {
+    intent: String,
+    product: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScoutDraftResponse {
+    spec_yaml: String,
+    spec_path: String,
+    spec_id: String,
+}
+
+/// Generate a spec YAML from natural-language intent.
+/// Writes a draft to factory/specs/drafts/<id>.yaml so /api/runs/start can use it directly.
+async fn scout_draft(
+    State(app): State<AppContext>,
+    Json(req): Json<ScoutDraftRequest>,
+) -> impl IntoResponse {
+    let intent   = req.intent.trim().to_string();
+    let product  = req.product.trim().to_string();
+
+    if intent.is_empty() || product.is_empty() {
+        return (StatusCode::BAD_REQUEST, "intent and product are required").into_response();
+    }
+
+    let spec_id = format!("{}-draft-{}", slugify(&product), &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Build a structured spec from the intent text.
+    // Lines starting with verbs become acceptance_criteria; everything else is purpose.
+    let lines: Vec<&str> = intent.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let purpose = lines.first().copied().unwrap_or(&intent);
+
+    let criteria: Vec<String> = lines.iter()
+        .skip(1)
+        .map(|l| format!("  - {l}"))
+        .collect();
+
+    let criteria_block = if criteria.is_empty() {
+        "  - run completes without errors".to_string()
+    } else {
+        criteria.join("\n")
+    };
+
+    let spec_yaml = format!(
+r#"id: {spec_id}
+title: {title}
+purpose: >
+  {purpose}
+scope:
+  - {product}
+constraints:
+  - remain within the {product} workspace boundary
+  - do not modify files outside the target product
+inputs:
+  - product directory: products/{product}/
+outputs:
+  - implementation artifacts in the run workspace
+  - validation.json with pass/fail verdict
+acceptance_criteria:
+{criteria_block}
+forbidden_behaviors:
+  - deleting unrelated files
+  - reaching outside the workspace boundary
+rollback_requirements:
+  - retain prior artifacts unless explicitly cleaned up
+dependencies: []
+performance_expectations:
+  - commands should complete in a reasonable time
+security_expectations:
+  - secrets must not appear in logs or artifact bundles
+"#,
+        spec_id = spec_id,
+        title   = title_case(&product),
+        purpose = purpose,
+        product = product,
+        criteria_block = criteria_block,
+    );
+
+    // Save to factory/specs/drafts/
+    let drafts_dir = app.paths.factory.join("specs").join("drafts");
+    if let Err(e) = tokio::fs::create_dir_all(&drafts_dir).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    let spec_filename = format!("{spec_id}.yaml");
+    let spec_path_abs = drafts_dir.join(&spec_filename);
+    let spec_path_rel = format!("factory/specs/drafts/{spec_filename}");
+
+    if let Err(e) = tokio::fs::write(&spec_path_abs, spec_yaml.as_bytes()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    (StatusCode::OK, Json(ScoutDraftResponse {
+        spec_yaml,
+        spec_path: spec_path_rel,
+        spec_id,
+    })).into_response()
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn title_case(s: &str) -> String {
+    s.split(['-', '_', ' '])
+        .filter(|p| !p.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None    => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ── Start run ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct StartRunRequest {
+    spec: String,   // path (relative to repo root) or spec_id for a draft
+    product: String,
+}
+
+async fn start_run(
+    State(app): State<AppContext>,
+    Json(req): Json<StartRunRequest>,
+) -> impl IntoResponse {
+    if req.spec.is_empty() || req.product.is_empty() {
+        return (StatusCode::BAD_REQUEST, "spec and product are required").into_response();
+    }
+
+    // Resolve the spec path: accept absolute, relative-to-root, or relative-to-factory/specs
+    let spec_path = resolve_spec_path(&app, &req.spec);
+
+    let run_req = RunRequest {
+        spec_path,
+        product: Some(req.product),
+        product_path: None,
+        failure_harness: None,
+    };
+
+    match app.start_run(run_req).await {
+        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
+        Err(e)  => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn resolve_spec_path(app: &AppContext, spec: &str) -> String {
+    // If it looks like a path, use it directly
+    if spec.ends_with(".yaml") || spec.ends_with(".yml") || spec.contains('/') {
+        return spec.to_string();
+    }
+    // Otherwise treat it as a spec id: look in drafts first, then examples
+    let drafts = app.paths.factory.join("specs").join("drafts").join(format!("{spec}.yaml"));
+    if drafts.exists() {
+        return drafts.to_string_lossy().into_owned();
+    }
+    let examples = app.paths.factory.join("specs").join("examples").join(format!("{spec}.yaml"));
+    if examples.exists() {
+        return examples.to_string_lossy().into_owned();
+    }
+    spec.to_string()
+}
+
+// ── Memory note ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct MemoryNoteRequest {
+    note: String,
+    tags: Vec<String>,
+}
+
+async fn add_memory_note(
+    Path(run_id): Path<String>,
+    State(app): State<AppContext>,
+    Json(req): Json<MemoryNoteRequest>,
+) -> impl IntoResponse {
+    if req.note.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "note is required").into_response();
+    }
+
+    // Write note as a markdown file in factory/memory/ so Coobie picks it up on next retrieval
+    let note_id = format!("run-note-{}-{}", &run_id[..8], &uuid::Uuid::new_v4().to_string()[..6]);
+    let summary = req.note.lines().next().unwrap_or("Human run note").to_string();
+
+    let mut all_tags = req.tags.clone();
+    all_tags.push("human-note".to_string());
+    all_tags.push(format!("run:{}", &run_id[..8]));
+
+    let tags_yaml = all_tags.iter().map(|t| format!("  - {t}")).collect::<Vec<_>>().join("\n");
+
+    let content = format!(
+        "---\nid: {note_id}\ntags:\n{tags_yaml}\nsummary: {summary}\n---\n\n{note}\n",
+        note_id = note_id,
+        tags_yaml = tags_yaml,
+        summary = summary,
+        note = req.note.trim(),
+    );
+
+    let note_path = app.paths.factory.join("memory").join(format!("{note_id}.md"));
+
+    if let Err(e) = tokio::fs::create_dir_all(note_path.parent().unwrap()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    if let Err(e) = tokio::fs::write(&note_path, content.as_bytes()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // Rebuild the memory index so the note is immediately searchable
+    let _ = app.memory_store.reindex().await;
+
+    (StatusCode::OK, Json(serde_json::json!({ "id": note_id, "path": note_path }))).into_response()
 }
 
 async fn get_tesseract_scene(State(app): State<AppContext>) -> impl IntoResponse {

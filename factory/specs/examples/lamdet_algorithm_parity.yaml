@@ -27,6 +27,8 @@ outputs:
   - products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
   - coobie_briefing.json showing the project components and scenario blueprint Harkonnen used
   - causal_summary.md from Coobie describing parity failures or confirmation
+  - retriever_dispatch.json plus trail-state.json showing bounded dispatch and continuity state
+  - retriever_execution_report.json plus per-command logs showing bounded forge execution evidence
 project_components:
   - name: ceres_station_pipeline
     role: code_under_test
@@ -90,6 +92,30 @@ scenario_blueprint:
     - coobie_briefing.json
     - coobie_preflight_response.md
     - causal_summary.md
+worker_harness:
+  adapter: retriever_forge_adapter
+  profile: trail_pack_forge
+  allowed_components:
+    - ceres_station_pipeline
+    - lamdet_python_oracle
+    - lamdet_csv_corpus
+    - lamdet_parity_report
+  denied_paths:
+    - factory/scenarios/hidden
+    - factory/memory
+    - products/ceres-station/ceres-station/.harkonnen/project-memory
+  visible_success_conditions:
+    - visible build and parity commands complete in the staged workspace
+    - worker returns changed files, rationale summary, and visible validation evidence
+    - worker does not mutate hidden-scenario inputs or Harkonnen memory stores
+  return_artifacts:
+    - changed_files
+    - execution_log
+    - visible_validation_report
+    - rationale_summary
+    - parity_report
+  max_iterations: 6
+  continuity_file: trail-state.json
 test_commands:
   - python3 products/ceres-station/ceres-station/scripts/lamdet_parity.py --output-dir products/ceres-station/ceres-station/tmp/lamdet-parity
 acceptance_criteria:

@@ -38,6 +38,26 @@ pub struct ScenarioBlueprint {
     pub required_artifacts: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerHarnessConfig {
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub profile: String,
+    #[serde(default)]
+    pub allowed_components: Vec<String>,
+    #[serde(default)]
+    pub denied_paths: Vec<String>,
+    #[serde(default)]
+    pub visible_success_conditions: Vec<String>,
+    #[serde(default)]
+    pub return_artifacts: Vec<String>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub continuity_file: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
     pub id: String,
@@ -57,6 +77,8 @@ pub struct Spec {
     pub project_components: Vec<ProjectComponent>,
     #[serde(default)]
     pub scenario_blueprint: Option<ScenarioBlueprint>,
+    #[serde(default)]
+    pub worker_harness: Option<WorkerHarnessConfig>,
     #[serde(default)]
     pub test_commands: Vec<String>,
 }
@@ -171,6 +193,8 @@ pub struct CoobieBriefing {
     pub strategy_register_citations: Vec<CoobieEvidenceCitation>,
     #[serde(default)]
     pub mitigation_history_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub forge_evidence_citations: Vec<CoobieEvidenceCitation>,
     pub relevant_lessons: Vec<LessonRecord>,
     pub prior_causes: Vec<PriorCauseSignal>,
     pub project_components: Vec<ProjectComponent>,

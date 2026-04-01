@@ -22,7 +22,7 @@ use crate::{
         AgentExecution, BlackboardState, CoobieBriefing, CoobieEvidenceCitation, EpisodeRecord,
         HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
         IntentPackage, LessonRecord, PriorCauseSignal, ProjectResumeRisk, RunEvent, RunRecord, ScenarioResult,
-        Spec, TwinEnvironment, TwinService, ValidationSummary,
+        Spec, TwinEnvironment, TwinService, ValidationSummary, WorkerHarnessConfig,
     },
     pidgin,
     policy,
@@ -207,6 +207,151 @@ struct StaleMemoryMitigationStatusArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct StaleMemoryMitigationHistory {
     records: Vec<StaleMemoryMitigationStatusArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerTaskEnvelope {
+    job_id: String,
+    spec_id: String,
+    product: String,
+    adapter: String,
+    profile: String,
+    target_source: String,
+    staged_workspace: String,
+    allowed_paths: Vec<String>,
+    denied_paths: Vec<String>,
+    visible_success_conditions: Vec<String>,
+    return_artifacts: Vec<String>,
+    max_iterations: u32,
+    continuity_file: Option<String>,
+    query_terms: Vec<String>,
+    guardrails: Vec<String>,
+    required_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanReviewStage {
+    stage: String,
+    owner: String,
+    summary: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanReviewChainArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    generated_at: String,
+    stages: Vec<PlanReviewStage>,
+    final_execution_plan: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverDispatchArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    adapter: String,
+    profile: String,
+    generated_at: String,
+    task_packet_artifact: String,
+    review_chain_artifact: String,
+    continuity_artifact: String,
+    dispatch_summary: String,
+    constraints_applied: Vec<String>,
+    next_actions: Vec<String>,
+    visible_success_conditions: Vec<String>,
+    return_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrailStateArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    adapter: String,
+    profile: String,
+    updated_at: String,
+    continuity_file: String,
+    active_constraints: Vec<String>,
+    next_actions: Vec<String>,
+    visible_success_conditions: Vec<String>,
+    return_artifacts: Vec<String>,
+    last_execution_outcome: Option<String>,
+    last_execution_summary: Option<String>,
+    last_execution_artifact: Option<String>,
+    #[serde(default)]
+    executed_commands: Vec<String>,
+    #[serde(default)]
+    returned_artifacts_snapshot: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverPlannedCommand {
+    label: String,
+    raw_command: String,
+    source: String,
+    rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverCommandExecution {
+    label: String,
+    raw_command: String,
+    source: String,
+    rationale: String,
+    passed: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    log_artifact: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverExecutionArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    adapter: String,
+    profile: String,
+    generated_at: String,
+    task_packet_artifact: String,
+    review_chain_artifact: String,
+    dispatch_artifact: String,
+    continuity_artifact: String,
+    hook_artifact: String,
+    passed: bool,
+    summary: String,
+    executed_commands: Vec<RetrieverCommandExecution>,
+    returned_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverHookRecord {
+    stage: String,
+    decision: String,
+    tool: String,
+    command_label: String,
+    raw_command: String,
+    source: String,
+    rationale: String,
+    reasons: Vec<String>,
+    passed: Option<bool>,
+    exit_code: Option<i32>,
+    log_artifact: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverHookArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    adapter: String,
+    profile: String,
+    generated_at: String,
+    records: Vec<RetrieverHookRecord>,
 }
 
 impl AppContext {
@@ -640,6 +785,27 @@ impl AppContext {
             &mut agent_executions,
         )
         .await?;
+        if let Some(worker_harness) = &spec_obj.worker_harness {
+            let envelope = build_worker_task_envelope(
+                run_id,
+                spec_obj,
+                target_source,
+                worker_harness,
+                &briefing,
+                &workspace_root,
+                &run_dir,
+                &staged_product,
+            );
+            self.write_json_file(&run_dir.join("retriever_task_packet.json"), &envelope)
+                .await?;
+            tokio::fs::write(
+                run_dir.join("retriever_task_packet.md"),
+                render_worker_task_envelope_markdown(&envelope),
+            )
+            .await?;
+            push_unique(&mut blackboard.artifact_refs, "retriever_task_packet.json");
+            push_unique(&mut blackboard.artifact_refs, "retriever_task_packet.md");
+        }
         let workspace_end = self
             .record_event(
                 run_id,
@@ -687,6 +853,59 @@ impl AppContext {
             .await;
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
+        if let Some(worker_harness) = &spec_obj.worker_harness {
+            let plan_review_chain = build_plan_review_chain(
+                run_id,
+                spec_obj,
+                target_source,
+                &intent,
+                &briefing,
+                &implementation_plan,
+            );
+            self.write_json_file(&run_dir.join("trail_review_chain.json"), &plan_review_chain)
+                .await?;
+            tokio::fs::write(
+                run_dir.join("trail_review_chain.md"),
+                render_plan_review_chain_markdown(&plan_review_chain),
+            )
+            .await?;
+            push_unique(&mut blackboard.artifact_refs, "trail_review_chain.json");
+            push_unique(&mut blackboard.artifact_refs, "trail_review_chain.md");
+            let (dispatch, trail_state) = self
+                .write_retriever_dispatch_artifacts(
+                    run_id,
+                    spec_obj,
+                    target_source,
+                    worker_harness,
+                    &run_dir,
+                )
+                .await?;
+            push_unique(&mut blackboard.artifact_refs, "retriever_dispatch.json");
+            push_unique(&mut blackboard.artifact_refs, "retriever_dispatch.md");
+            push_unique(&mut blackboard.artifact_refs, &dispatch.continuity_artifact);
+            self.write_agent_execution(
+                &profiles,
+                "mason",
+                &format!(
+                    "Prepare the retriever-forge dispatch contract for target '{}' using the staged workspace.",
+                    target_source.label
+                ),
+                "Prepared the bounded retriever dispatch packet, trail review chain, and continuity state.",
+                &format!(
+                    "dispatch_summary={}
+continuity_file={}
+constraints={}
+next_actions={}",
+                    dispatch.dispatch_summary,
+                    trail_state.continuity_file,
+                    dispatch.constraints_applied.join(" | "),
+                    dispatch.next_actions.join(" | ")
+                ),
+                &run_dir,
+                &mut agent_executions,
+            )
+            .await?;
+        }
         self.write_agent_execution(
             &profiles,
             "mason",
@@ -773,6 +992,81 @@ impl AppContext {
         release_agent(&mut blackboard, "piper");
         push_unique(&mut blackboard.resolved_items, "tools");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+
+        if let Some(worker_harness) = &spec_obj.worker_harness {
+            let forge_episode = self
+                .start_episode(run_id, "retriever_forge", "Run bounded retriever forge execution")
+                .await?;
+            blackboard.current_phase = "retriever_forge".to_string();
+            blackboard.active_goal = "Execute the bounded retriever forge packet".to_string();
+            claim_agent(&mut blackboard, "mason", "run retriever forge packet");
+            self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+            self.update_run_status(run_id, "retriever_forge").await?;
+            let forge_start = self
+                .record_event(
+                    run_id,
+                    Some(&forge_episode),
+                    "retriever_forge",
+                    "mason",
+                    "running",
+                    "Executing bounded retriever forge commands",
+                    log_path,
+                )
+                .await?;
+            let forge_report = self
+                .execute_retriever_forge(run_id, spec_obj, target_source, worker_harness, &run_dir, &staged_product)
+                .await?;
+            push_unique(&mut blackboard.artifact_refs, "retriever_execution_report.json");
+            push_unique(&mut blackboard.artifact_refs, "retriever_execution_report.md");
+            for artifact in &forge_report.returned_artifacts {
+                push_unique(&mut blackboard.artifact_refs, artifact);
+            }
+            self.write_agent_execution(
+                &profiles,
+                "mason",
+                &format!(
+                    "Execute the retriever-forge packet for target '{}' inside the staged workspace.",
+                    target_source.label
+                ),
+                &forge_report.summary,
+                &serde_json::to_string_pretty(&forge_report)?,
+                &run_dir,
+                &mut agent_executions,
+            )
+            .await?;
+            let forge_end = self
+                .record_event(
+                    run_id,
+                    Some(&forge_episode),
+                    "retriever_forge",
+                    "mason",
+                    if forge_report.passed { "complete" } else { "warning" },
+                    &forge_report.summary,
+                    log_path,
+                )
+                .await?;
+            self.finish_episode(
+                &forge_episode,
+                if forge_report.passed { "success" } else { "failure" },
+                Some(if forge_report.passed { 1.0 } else { 0.5 }),
+            )
+            .await?;
+            self.link_events(
+                forge_start.event_id,
+                forge_end.event_id,
+                "contributed_to",
+                if forge_report.passed { 1.0 } else { 0.5 },
+            )
+            .await?;
+            release_agent(&mut blackboard, "mason");
+            if forge_report.passed {
+                push_unique(&mut blackboard.resolved_items, "retriever_forge");
+                remove_blocker(&mut blackboard, "retriever_forge_failed");
+            } else {
+                push_unique(&mut blackboard.open_blockers, "retriever_forge_failed");
+            }
+            self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+        }
 
         let twin_episode = self
             .start_episode(run_id, "twin", "Provision local twin environment")
@@ -1783,7 +2077,12 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         target_source: &TargetSourceMetadata,
         query_terms: &[String],
         domain_signals: &[String],
-    ) -> Result<(Vec<CoobieEvidenceCitation>, Vec<CoobieEvidenceCitation>, Vec<CoobieEvidenceCitation>)> {
+    ) -> Result<(
+        Vec<CoobieEvidenceCitation>,
+        Vec<CoobieEvidenceCitation>,
+        Vec<CoobieEvidenceCitation>,
+        Vec<CoobieEvidenceCitation>,
+    )> {
         let resume_packet = self.load_project_resume_packet(target_source).await?;
         let exploration = self
             .collect_relevant_exploration_citations(spec_obj, target_source, query_terms, domain_signals)
@@ -1800,7 +2099,15 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 &resume_packet.stale_memory,
             )
             .await?;
-        Ok((exploration, strategy, mitigation))
+        let forge = self
+            .collect_relevant_retriever_forge_citations(
+                spec_obj,
+                target_source,
+                query_terms,
+                domain_signals,
+            )
+            .await?;
+        Ok((exploration, strategy, mitigation, forge))
     }
 
     async fn collect_relevant_exploration_citations(
@@ -1987,6 +2294,104 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         Ok(scored.into_iter().map(|(_, _, citation)| citation).take(4).collect())
     }
 
+    async fn collect_relevant_retriever_forge_citations(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<Vec<CoobieEvidenceCitation>> {
+        let runs = self.list_runs(40).await?;
+        let mut scored = Vec::<(i32, chrono::DateTime<Utc>, CoobieEvidenceCitation)>::new();
+
+        for run in runs {
+            if run.product != target_source.label {
+                continue;
+            }
+            let run_dir = self.run_dir(&run.run_id);
+            let report_path = run_dir.join("retriever_execution_report.json");
+            if !report_path.exists() {
+                continue;
+            }
+            let report_raw = match tokio::fs::read_to_string(&report_path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<RetrieverExecutionArtifact>(&report_raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let hook_path = run_dir.join("retriever_forge_hooks.json");
+            let hooks = if hook_path.exists() {
+                tokio::fs::read_to_string(&hook_path)
+                    .await
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<RetrieverHookArtifact>(&raw).ok())
+            } else {
+                None
+            };
+            let denied = hooks
+                .as_ref()
+                .map(|artifact| artifact.records.iter().filter(|record| record.decision == "deny").count())
+                .unwrap_or(0);
+            let failed = report.executed_commands.iter().filter(|command| !command.passed).count();
+            let haystack = format!(
+                "{} {} {} {} {} {} {} {} {}",
+                run.spec_id,
+                run.product,
+                report.adapter,
+                report.profile,
+                report.summary,
+                report.returned_artifacts.join(" "),
+                report.executed_commands.iter().map(|command| format!("{} {} {} {}", command.label, command.raw_command, command.source, command.rationale)).collect::<Vec<_>>().join(" "),
+                hooks.as_ref().map(|artifact| artifact.records.iter().map(|record| format!("{} {} {} {}", record.stage, record.decision, record.raw_command, record.reasons.join(" "))).collect::<Vec<_>>().join(" ")).unwrap_or_default(),
+                if report.passed { "passed" } else { "failed" },
+            );
+            let mut score = score_briefing_evidence(&haystack, &spec_obj.id, &target_source.label, query_terms, domain_signals);
+            if run.spec_id == spec_obj.id {
+                score += 8;
+            }
+            if denied > 0 {
+                score += 12;
+            }
+            if failed > 0 {
+                score += 8;
+            }
+            if score <= 0 {
+                continue;
+            }
+            scored.push((
+                score,
+                run.created_at,
+                CoobieEvidenceCitation {
+                    citation_id: format!("forge:{}", run.run_id),
+                    source_type: "retriever_forge".to_string(),
+                    run_id: run.run_id.clone(),
+                    episode_id: None,
+                    phase: "retriever_forge".to_string(),
+                    agent: "mason".to_string(),
+                    summary: format!(
+                        "retriever forge {} with {} command(s), {} denied, {} failed",
+                        if report.passed { "passed" } else { "returned issues" },
+                        report.executed_commands.len(),
+                        denied,
+                        failed
+                    ),
+                    evidence: format!(
+                        "summary={}; hook_artifact={}; returned_artifacts={}; commands={}",
+                        report.summary,
+                        report.hook_artifact,
+                        report.returned_artifacts.join(" | "),
+                        report.executed_commands.iter().map(|command| format!("{}:{}", command.label, if command.passed { "pass" } else { "fail" })).collect::<Vec<_>>().join(" | ")
+                    ),
+                },
+            ));
+        }
+
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        Ok(scored.into_iter().map(|(_, _, citation)| citation).take(4).collect())
+    }
+
     async fn collect_relevant_strategy_register_citations(
         &self,
         spec_obj: &Spec,
@@ -2060,7 +2465,12 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
     ) -> Result<CoobieBriefing> {
         let relevant_lessons = self.find_relevant_lessons(query_terms, domain_signals).await?;
         let prior_causes = self.summarize_prior_causes(5).await?;
-        let (exploration_citations, strategy_register_citations, mitigation_history_citations) = self
+        let (
+            exploration_citations,
+            strategy_register_citations,
+            mitigation_history_citations,
+            forge_evidence_citations,
+        ) = self
             .collect_briefing_evidence_citations(spec_obj, target_source, query_terms, domain_signals)
             .await?;
         let resume_packet = self.load_project_resume_packet(target_source).await?;
@@ -2100,6 +2510,12 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             &mut recommended_guardrails,
             &mut open_questions,
         );
+        apply_forge_evidence_context(
+            &forge_evidence_citations,
+            &mut recommended_guardrails,
+            &mut required_checks,
+            &mut open_questions,
+        );
 
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
@@ -2116,6 +2532,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             exploration_citations,
             strategy_register_citations,
             mitigation_history_citations,
+            forge_evidence_citations,
             relevant_lessons,
             prior_causes,
             project_components: spec_obj.project_components.clone(),
@@ -2310,6 +2727,328 @@ TOOL SURFACE:
         stub
     }
 
+
+    async fn execute_retriever_forge(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        worker_harness: &WorkerHarnessConfig,
+        run_dir: &Path,
+        staged_product: &Path,
+    ) -> Result<RetrieverExecutionArtifact> {
+        let packet_raw = tokio::fs::read_to_string(run_dir.join("retriever_task_packet.json")).await?;
+        let review_raw = tokio::fs::read_to_string(run_dir.join("trail_review_chain.json")).await?;
+        let dispatch_raw = tokio::fs::read_to_string(run_dir.join("retriever_dispatch.json")).await?;
+        let packet = serde_json::from_str::<WorkerTaskEnvelope>(&packet_raw)?;
+        let _review = serde_json::from_str::<PlanReviewChainArtifact>(&review_raw)?;
+        let dispatch = serde_json::from_str::<RetrieverDispatchArtifact>(&dispatch_raw)?;
+        let continuity_file = worker_harness
+            .continuity_file
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "trail-state.json".to_string());
+        let hook_artifact_name = "retriever_forge_hooks.json".to_string();
+        let command_plan = build_retriever_command_plan(spec_obj, staged_product)?;
+        let logs_dir = run_dir.join("retriever-forge");
+        tokio::fs::create_dir_all(&logs_dir).await?;
+
+        let mut executed_commands = Vec::new();
+        let mut hook_records = Vec::new();
+        let mut returned_artifacts = vec![
+            "retriever_execution_report.json".to_string(),
+            "retriever_execution_report.md".to_string(),
+            hook_artifact_name.clone(),
+            "retriever_forge_hooks.md".to_string(),
+        ];
+        let mut all_passed = true;
+        for (idx, planned) in command_plan.iter().enumerate() {
+            let (decision, reasons) = evaluate_retriever_hook(&packet, planned);
+            hook_records.push(RetrieverHookRecord {
+                stage: "pre_tool_use".to_string(),
+                decision: decision.clone(),
+                tool: "shell_command".to_string(),
+                command_label: planned.label.clone(),
+                raw_command: planned.raw_command.clone(),
+                source: planned.source.clone(),
+                rationale: planned.rationale.clone(),
+                reasons: reasons.clone(),
+                passed: None,
+                exit_code: None,
+                log_artifact: None,
+                created_at: Utc::now().to_rfc3339(),
+            });
+
+            let log_artifact = format!("retriever-forge/command-{:02}.log", idx + 1);
+            if decision == "deny" {
+                all_passed = false;
+                let denied_message = if reasons.is_empty() {
+                    "Keeper denied this retriever-forge command before execution.".to_string()
+                } else {
+                    format!("Keeper denied this retriever-forge command: {}", reasons.join(" | "))
+                };
+                let log_body = format!(
+                    "# {}
+
+- Decision: deny
+- Source: {}
+- Rationale: {}
+- Command: {}
+- Reasons: {}
+",
+                    planned.label,
+                    planned.source,
+                    planned.rationale,
+                    planned.raw_command,
+                    if reasons.is_empty() { "none".to_string() } else { reasons.join(" | ") },
+                );
+                tokio::fs::write(run_dir.join(&log_artifact), log_body).await?;
+                returned_artifacts.push(log_artifact.clone());
+                executed_commands.push(RetrieverCommandExecution {
+                    label: planned.label.clone(),
+                    raw_command: planned.raw_command.clone(),
+                    source: planned.source.clone(),
+                    rationale: planned.rationale.clone(),
+                    passed: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: denied_message.clone(),
+                    log_artifact: log_artifact.clone(),
+                });
+                hook_records.push(RetrieverHookRecord {
+                    stage: "post_tool_use".to_string(),
+                    decision,
+                    tool: "shell_command".to_string(),
+                    command_label: planned.label.clone(),
+                    raw_command: planned.raw_command.clone(),
+                    source: planned.source.clone(),
+                    rationale: planned.rationale.clone(),
+                    reasons,
+                    passed: Some(false),
+                    exit_code: None,
+                    log_artifact: Some(log_artifact),
+                    created_at: Utc::now().to_rfc3339(),
+                });
+                continue;
+            }
+
+            let outcome = self
+                .run_shell_command_capture(&planned.raw_command, staged_product)
+                .await?;
+            let log_body = format!(
+                "# {}
+
+- Source: {}
+- Rationale: {}
+- Command: {}
+- Exit code: {}
+- Passed: {}
+
+## stdout
+{}
+
+## stderr
+{}
+",
+                planned.label,
+                planned.source,
+                planned.rationale,
+                planned.raw_command,
+                outcome
+                    .code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                if outcome.success { "true" } else { "false" },
+                if outcome.stdout.is_empty() { "<empty>" } else { &outcome.stdout },
+                if outcome.stderr.is_empty() { "<empty>" } else { &outcome.stderr },
+            );
+            tokio::fs::write(run_dir.join(&log_artifact), log_body).await?;
+            if !outcome.success {
+                all_passed = false;
+            }
+            returned_artifacts.push(log_artifact.clone());
+            executed_commands.push(RetrieverCommandExecution {
+                label: planned.label.clone(),
+                raw_command: planned.raw_command.clone(),
+                source: planned.source.clone(),
+                rationale: planned.rationale.clone(),
+                passed: outcome.success,
+                exit_code: outcome.code,
+                stdout: outcome.stdout.clone(),
+                stderr: outcome.stderr.clone(),
+                log_artifact: log_artifact.clone(),
+            });
+            hook_records.push(RetrieverHookRecord {
+                stage: "post_tool_use".to_string(),
+                decision: if outcome.success { "allow" } else { "allow_with_failure" }.to_string(),
+                tool: "shell_command".to_string(),
+                command_label: planned.label.clone(),
+                raw_command: planned.raw_command.clone(),
+                source: planned.source.clone(),
+                rationale: planned.rationale.clone(),
+                reasons: if outcome.success {
+                    vec!["Command completed inside the bounded staged workspace.".to_string()]
+                } else {
+                    vec!["Command was allowed but returned a failing exit code.".to_string()]
+                },
+                passed: Some(outcome.success),
+                exit_code: outcome.code,
+                log_artifact: Some(log_artifact),
+                created_at: Utc::now().to_rfc3339(),
+            });
+        }
+
+        if executed_commands.is_empty() {
+            all_passed = false;
+        }
+
+        let hook_artifact = RetrieverHookArtifact {
+            run_id: run_id.to_string(),
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            adapter: packet.adapter.clone(),
+            profile: packet.profile.clone(),
+            generated_at: Utc::now().to_rfc3339(),
+            records: hook_records,
+        };
+        self.write_json_file(&run_dir.join(&hook_artifact_name), &hook_artifact)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("retriever_forge_hooks.md"),
+            render_retriever_hooks_markdown(&hook_artifact),
+        )
+        .await?;
+
+        let summary = if executed_commands.is_empty() {
+            format!(
+                "Retriever forge found no runnable command plan for '{}' and returned no visible execution evidence.",
+                target_source.label
+            )
+        } else if all_passed {
+            format!(
+                "Retriever forge completed {} command(s) for '{}' and returned normalized visible execution evidence with hook records.",
+                executed_commands.len(),
+                target_source.label
+            )
+        } else {
+            format!(
+                "Retriever forge hit visible execution failures for '{}' ({} command(s), {} failed or denied).",
+                target_source.label,
+                executed_commands.len(),
+                executed_commands.iter().filter(|command| !command.passed).count()
+            )
+        };
+
+        let artifact = RetrieverExecutionArtifact {
+            run_id: run_id.to_string(),
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            adapter: packet.adapter.clone(),
+            profile: packet.profile.clone(),
+            generated_at: Utc::now().to_rfc3339(),
+            task_packet_artifact: "retriever_task_packet.json".to_string(),
+            review_chain_artifact: "trail_review_chain.json".to_string(),
+            dispatch_artifact: "retriever_dispatch.json".to_string(),
+            continuity_artifact: continuity_file.clone(),
+            hook_artifact: hook_artifact_name.clone(),
+            passed: all_passed,
+            summary: summary.clone(),
+            executed_commands,
+            returned_artifacts: returned_artifacts.clone(),
+        };
+        self.write_json_file(&run_dir.join("retriever_execution_report.json"), &artifact)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("retriever_execution_report.md"),
+            render_retriever_execution_markdown(&artifact),
+        )
+        .await?;
+
+        let trail_path = run_dir.join(&continuity_file);
+        let mut trail_state = if trail_path.exists() {
+            let raw = tokio::fs::read_to_string(&trail_path).await?;
+            serde_json::from_str::<TrailStateArtifact>(&raw).unwrap_or(TrailStateArtifact {
+                run_id: run_id.to_string(),
+                spec_id: spec_obj.id.clone(),
+                product: target_source.label.clone(),
+                adapter: packet.adapter.clone(),
+                profile: packet.profile.clone(),
+                updated_at: Utc::now().to_rfc3339(),
+                continuity_file: continuity_file.clone(),
+                active_constraints: dispatch.constraints_applied.clone(),
+                next_actions: dispatch.next_actions.clone(),
+                visible_success_conditions: packet.visible_success_conditions.clone(),
+                return_artifacts: packet.return_artifacts.clone(),
+                last_execution_outcome: None,
+                last_execution_summary: None,
+                last_execution_artifact: None,
+                executed_commands: Vec::new(),
+                returned_artifacts_snapshot: Vec::new(),
+            })
+        } else {
+            TrailStateArtifact {
+                run_id: run_id.to_string(),
+                spec_id: spec_obj.id.clone(),
+                product: target_source.label.clone(),
+                adapter: packet.adapter.clone(),
+                profile: packet.profile.clone(),
+                updated_at: Utc::now().to_rfc3339(),
+                continuity_file: continuity_file.clone(),
+                active_constraints: dispatch.constraints_applied.clone(),
+                next_actions: dispatch.next_actions.clone(),
+                visible_success_conditions: packet.visible_success_conditions.clone(),
+                return_artifacts: packet.return_artifacts.clone(),
+                last_execution_outcome: None,
+                last_execution_summary: None,
+                last_execution_artifact: None,
+                executed_commands: Vec::new(),
+                returned_artifacts_snapshot: Vec::new(),
+            }
+        };
+        trail_state.updated_at = Utc::now().to_rfc3339();
+        trail_state.last_execution_outcome = Some(if artifact.passed { "success" } else { "failure" }.to_string());
+        trail_state.last_execution_summary = Some(summary);
+        trail_state.last_execution_artifact = Some("retriever_execution_report.json".to_string());
+        trail_state.executed_commands = artifact
+            .executed_commands
+            .iter()
+            .map(|command| command.label.clone())
+            .collect();
+        trail_state.returned_artifacts_snapshot = artifact.returned_artifacts.clone();
+        self.write_json_file(&trail_path, &trail_state).await?;
+
+        Ok(artifact)
+    }
+
+    async fn run_shell_command_capture(&self, raw_command: &str, cwd: &Path) -> Result<CommandOutcome> {
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(raw_command);
+            command
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.arg("-lc").arg(raw_command);
+            command
+        };
+
+        let output = command
+            .current_dir(cwd)
+            .output()
+            .await
+            .with_context(|| format!("running '{}' in {}", raw_command, cwd.display()))?;
+
+        Ok(CommandOutcome {
+            success: output.status.success(),
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
     async fn run_visible_validation(
         &self,
         workspace_root: &Path,
@@ -2328,6 +3067,23 @@ TOOL SURFACE:
                 run_dir.display()
             ),
         });
+        let retriever_report_path = run_dir.join("retriever_execution_report.json");
+        if retriever_report_path.exists() {
+            if let Ok(raw) = tokio::fs::read_to_string(&retriever_report_path).await {
+                if let Ok(report) = serde_json::from_str::<RetrieverExecutionArtifact>(&raw) {
+                    results.push(ScenarioResult {
+                        scenario_id: "retriever_forge_execution".to_string(),
+                        passed: report.passed,
+                        details: format!(
+                            "{} ({} command(s), artifact={})",
+                            report.summary,
+                            report.executed_commands.len(),
+                            retriever_report_path.display()
+                        ),
+                    });
+                }
+            }
+        }
 
         let validation_log_path = run_dir.join("validation_output.log");
         let mut output_chunks = Vec::new();
@@ -3721,6 +4477,91 @@ TWIN SERVICES:
         )
         .await?;
         Ok(())
+    }
+
+    async fn write_retriever_dispatch_artifacts(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        worker_harness: &WorkerHarnessConfig,
+        run_dir: &Path,
+    ) -> Result<(RetrieverDispatchArtifact, TrailStateArtifact)> {
+        let packet_raw = tokio::fs::read_to_string(run_dir.join("retriever_task_packet.json")).await?;
+        let review_raw = tokio::fs::read_to_string(run_dir.join("trail_review_chain.json")).await?;
+        let packet = serde_json::from_str::<WorkerTaskEnvelope>(&packet_raw)?;
+        let review = serde_json::from_str::<PlanReviewChainArtifact>(&review_raw)?;
+
+        let continuity_file = worker_harness
+            .continuity_file
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "trail-state.json".to_string());
+        let active_constraints = packet
+            .denied_paths
+            .iter()
+            .take(4)
+            .cloned()
+            .chain(packet.required_checks.iter().take(6).cloned())
+            .collect::<Vec<_>>();
+        let next_actions = if review.final_execution_plan.is_empty() {
+            vec!["No final execution plan steps were recorded yet.".to_string()]
+        } else {
+            review.final_execution_plan.iter().take(8).cloned().collect::<Vec<_>>()
+        };
+
+        let dispatch = RetrieverDispatchArtifact {
+            run_id: run_id.to_string(),
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            adapter: packet.adapter.clone(),
+            profile: packet.profile.clone(),
+            generated_at: Utc::now().to_rfc3339(),
+            task_packet_artifact: "retriever_task_packet.json".to_string(),
+            review_chain_artifact: "trail_review_chain.json".to_string(),
+            continuity_artifact: continuity_file.clone(),
+            dispatch_summary: format!(
+                "Dispatch retriever forge '{}' for '{}' with {} allowed path(s) and {} visible success condition(s).",
+                packet.profile,
+                target_source.label,
+                packet.allowed_paths.len(),
+                packet.visible_success_conditions.len()
+            ),
+            constraints_applied: active_constraints.clone(),
+            next_actions: next_actions.clone(),
+            visible_success_conditions: packet.visible_success_conditions.clone(),
+            return_artifacts: packet.return_artifacts.clone(),
+        };
+        let trail_state = TrailStateArtifact {
+            run_id: run_id.to_string(),
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            adapter: packet.adapter.clone(),
+            profile: packet.profile.clone(),
+            updated_at: Utc::now().to_rfc3339(),
+            continuity_file: continuity_file.clone(),
+            active_constraints,
+            next_actions,
+            visible_success_conditions: packet.visible_success_conditions.clone(),
+            return_artifacts: packet.return_artifacts.clone(),
+            last_execution_outcome: None,
+            last_execution_summary: None,
+            last_execution_artifact: None,
+            executed_commands: Vec::new(),
+            returned_artifacts_snapshot: Vec::new(),
+        };
+
+        self.write_json_file(&run_dir.join("retriever_dispatch.json"), &dispatch)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("retriever_dispatch.md"),
+            render_retriever_dispatch_markdown(&dispatch),
+        )
+        .await?;
+        self.write_json_file(&run_dir.join(&continuity_file), &trail_state)
+            .await?;
+
+        Ok((dispatch, trail_state))
     }
 
     async fn write_json_file<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
@@ -5174,6 +6015,44 @@ fn apply_mitigation_history_context(
     open_questions.dedup();
 }
 
+fn apply_forge_evidence_context(
+    citations: &[CoobieEvidenceCitation],
+    recommended_guardrails: &mut Vec<String>,
+    required_checks: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    if citations.is_empty() {
+        return;
+    }
+
+    for citation in citations.iter().take(3) {
+        if citation.summary.contains("denied") || citation.evidence.contains(":fail") {
+            recommended_guardrails.push(format!(
+                "Respect prior retriever-forge evidence from {} before rerunning the same bounded command path.",
+                citation.run_id
+            ));
+            required_checks.push(format!(
+                "Explain what changed since retriever-forge evidence {} before claiming the same command path will now pass.",
+                citation.citation_id
+            ));
+            open_questions.push(format!(
+                "Which prior forge denial or command failure from {} is still relevant to this run?",
+                citation.run_id
+            ));
+        }
+        if citation.summary.contains("passed") {
+            recommended_guardrails.push(format!(
+                "Reuse the successful retriever-forge evidence path recorded in {} instead of inventing a new bounded execution route without cause.",
+                citation.run_id
+            ));
+        }
+    }
+
+    recommended_guardrails.dedup();
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
 fn build_coobie_open_questions(
     spec_obj: &Spec,
     domain_signals: &[String],
@@ -5235,6 +6114,649 @@ fn render_target_git_summary(git: Option<&TargetGitMetadata>) -> String {
         ),
         None => "git metadata unavailable".to_string(),
     }
+}
+
+fn build_worker_task_envelope(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    worker_harness: &WorkerHarnessConfig,
+    briefing: &CoobieBriefing,
+    workspace_root: &Path,
+    run_dir: &Path,
+    staged_product: &Path,
+) -> WorkerTaskEnvelope {
+    let mut allowed_paths = vec![staged_product.display().to_string()];
+    allowed_paths.push(run_dir.join("spec.yaml").display().to_string());
+    allowed_paths.push(run_dir.join("intent.json").display().to_string());
+    allowed_paths.push(run_dir.join("coobie_briefing.json").display().to_string());
+    allowed_paths.push(run_dir.join("coobie_preflight_response.md").display().to_string());
+
+    for component in &spec_obj.project_components {
+        if worker_harness.allowed_components.is_empty()
+            || worker_harness
+                .allowed_components
+                .iter()
+                .any(|name| name == &component.name || name == &component.role)
+        {
+            let component_path = component.path.trim();
+            if !component_path.is_empty() {
+                push_unique(&mut allowed_paths, component_path);
+            }
+        }
+    }
+
+    let mut denied_paths = vec![
+        workspace_root.join("factory/scenarios/hidden").display().to_string(),
+        workspace_root.join("factory/memory").display().to_string(),
+        Path::new(&target_source.source_path)
+            .join(".harkonnen/project-memory")
+            .display()
+            .to_string(),
+    ];
+    for path in &worker_harness.denied_paths {
+        push_unique(&mut denied_paths, path);
+    }
+
+    let visible_success_conditions = if worker_harness.visible_success_conditions.is_empty() {
+        spec_obj.acceptance_criteria.clone()
+    } else {
+        worker_harness.visible_success_conditions.clone()
+    };
+    let return_artifacts = if worker_harness.return_artifacts.is_empty() {
+        vec![
+            "changed_files".to_string(),
+            "execution_log".to_string(),
+            "visible_validation_report".to_string(),
+            "rationale_summary".to_string(),
+        ]
+    } else {
+        worker_harness.return_artifacts.clone()
+    };
+
+    WorkerTaskEnvelope {
+        job_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        adapter: fallback_worker_value(&worker_harness.adapter, "manual"),
+        profile: fallback_worker_value(&worker_harness.profile, "trail_pack_forge"),
+        target_source: target_source.source_path.clone(),
+        staged_workspace: staged_product.display().to_string(),
+        allowed_paths,
+        denied_paths,
+        visible_success_conditions,
+        return_artifacts,
+        max_iterations: worker_harness.max_iterations.unwrap_or(6),
+        continuity_file: worker_harness.continuity_file.clone(),
+        query_terms: briefing.query_terms.clone(),
+        guardrails: briefing.recommended_guardrails.clone(),
+        required_checks: briefing.required_checks.clone(),
+    }
+}
+
+fn build_plan_review_chain(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    intent: &IntentPackage,
+    briefing: &CoobieBriefing,
+    implementation_plan: &str,
+) -> PlanReviewChainArtifact {
+    let mut stages = Vec::new();
+    stages.push(PlanReviewStage {
+        stage: "draft_plan".to_string(),
+        owner: "scout".to_string(),
+        summary: intent.summary.clone(),
+        evidence: intent.recommended_steps.clone(),
+    });
+    stages.push(PlanReviewStage {
+        stage: "gap_review".to_string(),
+        owner: "scout".to_string(),
+        summary: if intent.ambiguity_notes.is_empty() {
+            "No obvious spec ambiguity was recorded in Scout intake.".to_string()
+        } else {
+            format!(
+                "Scout identified {} ambiguity note(s) that should constrain execution.",
+                intent.ambiguity_notes.len()
+            )
+        },
+        evidence: if intent.ambiguity_notes.is_empty() {
+            vec!["No ambiguity notes recorded.".to_string()]
+        } else {
+            intent.ambiguity_notes.clone()
+        },
+    });
+    stages.push(PlanReviewStage {
+        stage: "ruthless_review".to_string(),
+        owner: "coobie".to_string(),
+        summary: format!(
+            "Coobie highlighted {} application/environment risk(s) and {} stale-memory risk(s) before execution.",
+            briefing.application_risks.len() + briefing.environment_risks.len(),
+            briefing.resume_packet_risks.len()
+        ),
+        evidence: briefing
+            .application_risks
+            .iter()
+            .chain(briefing.environment_risks.iter())
+            .chain(briefing.resume_packet_risks.iter().map(|risk| &risk.summary))
+            .take(8)
+            .cloned()
+            .collect(),
+    });
+    stages.push(PlanReviewStage {
+        stage: "coobie_critique".to_string(),
+        owner: "coobie".to_string(),
+        summary: format!(
+            "Coobie required {} guardrail(s), {} check(s), and {} open question(s) before '{}' proceeds.",
+            briefing.recommended_guardrails.len(),
+            briefing.required_checks.len(),
+            briefing.open_questions.len(),
+            target_source.label
+        ),
+        evidence: briefing
+            .recommended_guardrails
+            .iter()
+            .chain(briefing.required_checks.iter())
+            .chain(briefing.open_questions.iter())
+            .take(10)
+            .cloned()
+            .collect(),
+    });
+    stages.push(PlanReviewStage {
+        stage: "final_execution_plan".to_string(),
+        owner: "mason".to_string(),
+        summary: format!(
+            "Bounded execution plan for spec '{}' against '{}'.",
+            spec_obj.id, target_source.label
+        ),
+        evidence: implementation_plan
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(12)
+            .map(ToString::to_string)
+            .collect(),
+    });
+
+    let final_execution_plan = implementation_plan
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && (line.starts_with("- ")
+                    || line.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    PlanReviewChainArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        generated_at: Utc::now().to_rfc3339(),
+        stages,
+        final_execution_plan,
+    }
+}
+
+fn render_worker_task_envelope_markdown(envelope: &WorkerTaskEnvelope) -> String {
+    format!(
+        "# Retriever Task Packet
+
+- Job: {}
+- Spec: {}
+- Product: {}
+- Adapter: {}
+- Profile: {}
+- Target source: {}
+- Staged workspace: {}
+- Max iterations: {}
+- Continuity file: {}
+
+## Allowed Paths
+{}
+
+## Denied Paths
+{}
+
+## Visible Success Conditions
+{}
+
+## Return Artifacts
+{}
+
+## Query Terms
+{}
+
+## Guardrails
+{}
+
+## Required Checks
+{}
+",
+        envelope.job_id,
+        envelope.spec_id,
+        envelope.product,
+        envelope.adapter,
+        envelope.profile,
+        envelope.target_source,
+        envelope.staged_workspace,
+        envelope.max_iterations,
+        envelope
+            .continuity_file
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        render_list(&envelope.allowed_paths, "No allowed paths recorded."),
+        render_list(&envelope.denied_paths, "No denied paths recorded."),
+        render_list(
+            &envelope.visible_success_conditions,
+            "No visible success conditions recorded.",
+        ),
+        render_list(&envelope.return_artifacts, "No return artifacts recorded."),
+        render_list(&envelope.query_terms, "No query terms recorded."),
+        render_list(&envelope.guardrails, "No guardrails recorded."),
+        render_list(&envelope.required_checks, "No required checks recorded."),
+    )
+}
+
+fn render_plan_review_chain_markdown(chain: &PlanReviewChainArtifact) -> String {
+    let stages = chain
+        .stages
+        .iter()
+        .map(|stage| {
+            format!(
+                "### {}
+- owner: {}
+- summary: {}
+- evidence:
+{}",
+                stage.stage,
+                stage.owner,
+                stage.summary,
+                render_list(&stage.evidence, "No evidence recorded for this stage."),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("
+
+");
+    format!(
+        "# Trail Review Chain
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Generated at: {}
+
+## Review Stages
+{}
+
+## Final Execution Plan
+{}
+",
+        chain.run_id,
+        chain.spec_id,
+        chain.product,
+        chain.generated_at,
+        stages,
+        render_list(
+            &chain.final_execution_plan,
+            "No final execution plan steps were captured.",
+        ),
+    )
+}
+
+fn fallback_worker_value(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+
+fn build_retriever_command_plan(spec_obj: &Spec, staged_product: &Path) -> Result<Vec<RetrieverPlannedCommand>> {
+    let mut commands = Vec::new();
+    for raw_cmd in &spec_obj.test_commands {
+        let trimmed = raw_cmd.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        commands.push(RetrieverPlannedCommand {
+            label: trimmed.to_string(),
+            raw_command: trimmed.to_string(),
+            source: "spec.test_commands".to_string(),
+            rationale: "The spec declared this command as visible execution evidence for the run.".to_string(),
+        });
+    }
+    if !commands.is_empty() {
+        return Ok(commands);
+    }
+
+    let cargo_manifest = staged_product.join("Cargo.toml");
+    let package_json = staged_product.join("package.json");
+    let pyproject_toml = staged_product.join("pyproject.toml");
+    let requirements_txt = staged_product.join("requirements.txt");
+    let go_mod = staged_product.join("go.mod");
+
+    if cargo_manifest.exists() {
+        commands.push(RetrieverPlannedCommand {
+            label: "cargo check --quiet".to_string(),
+            raw_command: "cargo check --quiet".to_string(),
+            source: "manifest_inference".to_string(),
+            rationale: "Cargo manifest detected; a lightweight Rust compile check is the safest bounded forge default.".to_string(),
+        });
+    } else if package_json.exists() {
+        if let Some((program, args, label)) = detect_node_bootstrap(staged_product) {
+            commands.push(RetrieverPlannedCommand {
+                label: label.clone(),
+                raw_command: if args.is_empty() {
+                    program.to_string()
+                } else {
+                    format!("{} {}", program, args.join(" "))
+                },
+                source: "manifest_inference".to_string(),
+                rationale: "The Node workspace needs dependency/bootstrap preparation before bounded visible execution can continue.".to_string(),
+            });
+        }
+        let scripts = detect_package_scripts(&package_json)?;
+        if scripts.contains(&"build".to_string()) {
+            if command_available("npm") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "npm run build".to_string(),
+                    raw_command: "npm run build".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "package.json declares a build script, so the forge uses that as visible execution evidence.".to_string(),
+                });
+            } else if staged_product.join("pnpm-lock.yaml").exists() && command_available("pnpm") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "pnpm build".to_string(),
+                    raw_command: "pnpm build".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "pnpm lockfile detected; the forge uses pnpm build as visible execution evidence.".to_string(),
+                });
+            } else if staged_product.join("yarn.lock").exists() && command_available("yarn") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "yarn build".to_string(),
+                    raw_command: "yarn build".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "yarn lockfile detected; the forge uses yarn build as visible execution evidence.".to_string(),
+                });
+            }
+        } else if scripts.contains(&"test".to_string()) {
+            if command_available("npm") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "npm run test".to_string(),
+                    raw_command: "npm run test".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "package.json declares a test script, so the forge uses that as visible execution evidence.".to_string(),
+                });
+            } else if staged_product.join("pnpm-lock.yaml").exists() && command_available("pnpm") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "pnpm test".to_string(),
+                    raw_command: "pnpm test".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "pnpm lockfile detected; the forge uses pnpm test as visible execution evidence.".to_string(),
+                });
+            } else if staged_product.join("yarn.lock").exists() && command_available("yarn") {
+                commands.push(RetrieverPlannedCommand {
+                    label: "yarn test".to_string(),
+                    raw_command: "yarn test".to_string(),
+                    source: "manifest_inference".to_string(),
+                    rationale: "yarn lockfile detected; the forge uses yarn test as visible execution evidence.".to_string(),
+                });
+            }
+        }
+    } else if go_mod.exists() && command_available("go") {
+        commands.push(RetrieverPlannedCommand {
+            label: "go test ./...".to_string(),
+            raw_command: "go test ./...".to_string(),
+            source: "manifest_inference".to_string(),
+            rationale: "go.mod detected; the forge uses go test as bounded visible execution evidence.".to_string(),
+        });
+    } else if pyproject_toml.exists() || requirements_txt.exists() {
+        if let Some(python_command) = detect_python_command() {
+            let run_pytest = staged_product.join("tests").exists() || pyproject_mentions_pytest(&pyproject_toml)?;
+            let raw_command = if run_pytest {
+                if command_available("pytest") {
+                    "pytest -q".to_string()
+                } else {
+                    format!("{} -m pytest -q", python_command)
+                }
+            } else {
+                format!("{} -m compileall .", python_command)
+            };
+            commands.push(RetrieverPlannedCommand {
+                label: raw_command.clone(),
+                raw_command,
+                source: "manifest_inference".to_string(),
+                rationale: "Python project detected; the forge uses pytest or compileall as bounded visible execution evidence.".to_string(),
+            });
+        }
+    }
+
+    Ok(commands)
+}
+
+fn evaluate_retriever_hook(
+    packet: &WorkerTaskEnvelope,
+    planned: &RetrieverPlannedCommand,
+) -> (String, Vec<String>) {
+    let raw = planned.raw_command.to_lowercase();
+    let mut reasons = Vec::new();
+
+    for denied in &packet.denied_paths {
+        let normalized = denied.replace('\\', "/").to_lowercase();
+        if !normalized.is_empty() && raw.contains(&normalized) {
+            reasons.push(format!("Command references denied path {}.", denied));
+        }
+    }
+
+    for forbidden in [
+        "factory/scenarios/hidden",
+        "factory/memory",
+        ".harkonnen/project-memory",
+        "git reset --hard",
+        "git checkout --",
+        "rm -rf /",
+    ] {
+        if raw.contains(forbidden) {
+            reasons.push(format!("Command matched forbidden pattern '{}'.", forbidden));
+        }
+    }
+
+    if reasons.is_empty() {
+        (
+            "allow".to_string(),
+            vec!["Command stayed within the bounded forge policy surface.".to_string()],
+        )
+    } else {
+        ("deny".to_string(), reasons)
+    }
+}
+
+fn render_retriever_hooks_markdown(artifact: &RetrieverHookArtifact) -> String {
+    let sections = if artifact.records.is_empty() {
+        "No forge hook records were captured.".to_string()
+    } else {
+        artifact
+            .records
+            .iter()
+            .map(|record| format!(
+                "### {} :: {}
+- decision: {}
+- tool: {}
+- command: {}
+- source: {}
+- rationale: {}
+- reasons: {}
+- passed: {}
+- exit_code: {}
+- log: {}
+- created_at: {}",
+                record.stage,
+                record.command_label,
+                record.decision,
+                record.tool,
+                record.raw_command,
+                record.source,
+                record.rationale,
+                if record.reasons.is_empty() { "none".to_string() } else { record.reasons.join(" | ") },
+                record.passed.map(|value| if value { "true" } else { "false" }.to_string()).unwrap_or_else(|| "n/a".to_string()),
+                record.exit_code.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_string()),
+                record.log_artifact.clone().unwrap_or_else(|| "n/a".to_string()),
+                record.created_at,
+            ))
+            .collect::<Vec<_>>()
+            .join("
+
+")
+    };
+    format!(
+        "# Retriever Forge Hooks
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Adapter: {}
+- Profile: {}
+- Generated at: {}
+
+## Records
+{}
+",
+        artifact.run_id,
+        artifact.spec_id,
+        artifact.product,
+        artifact.adapter,
+        artifact.profile,
+        artifact.generated_at,
+        sections,
+    )
+}
+
+fn render_retriever_execution_markdown(report: &RetrieverExecutionArtifact) -> String {
+    let command_sections = if report.executed_commands.is_empty() {
+        "No retriever-forge commands were executed.".to_string()
+    } else {
+        report
+            .executed_commands
+            .iter()
+            .map(|command| format!(
+                "### {}
+- source: {}
+- rationale: {}
+- command: {}
+- passed: {}
+- exit_code: {}
+- log: {}",
+                command.label,
+                command.source,
+                command.rationale,
+                command.raw_command,
+                if command.passed { "true" } else { "false" },
+                command
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                command.log_artifact,
+            ))
+            .collect::<Vec<_>>()
+            .join("
+
+")
+    };
+    format!(
+        "# Retriever Execution Report
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Adapter: {}
+- Profile: {}
+- Generated at: {}
+- Passed: {}
+- Task packet artifact: {}
+- Review chain artifact: {}
+- Dispatch artifact: {}
+- Continuity artifact: {}
+- Hook artifact: {}
+
+## Summary
+{}
+
+## Commands
+{}
+
+## Returned Artifacts
+{}
+",
+        report.run_id,
+        report.spec_id,
+        report.product,
+        report.adapter,
+        report.profile,
+        report.generated_at,
+        if report.passed { "true" } else { "false" },
+        report.task_packet_artifact,
+        report.review_chain_artifact,
+        report.dispatch_artifact,
+        report.continuity_artifact,
+        report.hook_artifact,
+        report.summary,
+        command_sections,
+        render_list(&report.returned_artifacts, "No artifacts were returned."),
+    )
+}
+
+fn render_retriever_dispatch_markdown(dispatch: &RetrieverDispatchArtifact) -> String {
+    format!(
+        "# Retriever Dispatch
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Adapter: {}
+- Profile: {}
+- Generated at: {}
+- Task packet artifact: {}
+- Review chain artifact: {}
+- Continuity artifact: {}
+
+## Dispatch Summary
+{}
+
+## Constraints Applied
+{}
+
+## Next Actions
+{}
+
+## Visible Success Conditions
+{}
+
+## Return Artifacts
+{}
+",
+        dispatch.run_id,
+        dispatch.spec_id,
+        dispatch.product,
+        dispatch.adapter,
+        dispatch.profile,
+        dispatch.generated_at,
+        dispatch.task_packet_artifact,
+        dispatch.review_chain_artifact,
+        dispatch.continuity_artifact,
+        dispatch.dispatch_summary,
+        render_list(&dispatch.constraints_applied, "No constraints were captured."),
+        render_list(&dispatch.next_actions, "No next actions were captured."),
+        render_list(
+            &dispatch.visible_success_conditions,
+            "No visible success conditions were captured.",
+        ),
+        render_list(&dispatch.return_artifacts, "No return artifacts were captured."),
+    )
 }
 
 fn render_project_resume_packet_markdown(packet: &ProjectResumePacket) -> String {

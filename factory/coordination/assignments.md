@@ -11,11 +11,11 @@
 
 ---
 
-| AI     | Task                                      | Owns (files/areas)            | Started     | Note |
-|--------|-------------------------------------------|-------------------------------|-------------|------|
-| Codex  | Fix pre-existing compile errors (briefing/CoobieBriefing/memory_hits/build_* fns) + Gemini handoff tasks | src/, Cargo.toml, Cargo.lock, ui/src/ | session-001 | Gemini at limit — taking all Gemini work |
-| Claude | capacity.rs + CLI wiring + lamdet corpus scenario | src/capacity.rs, src/scenarios.rs, src/models.rs, factory/specs/, factory/scenarios/ | session-002 | Near limit — pinned agents only |
-| Gemini | —                                         | —                             | —           | At daily quota limit |
+| AI     | Task                              | Primary files                     | Started     | Status               |
+|--------|-----------------------------------|-----------------------------------|-------------|----------------------|
+| Codex  | Fix orchestrator.rs compile errors| src/, Cargo.toml, ui/src/         | session-001 | BLOCKER — see below  |
+| Claude | tesseract scene API + UI          | src/tesseract.rs, src/api.rs      | session-003 | Done — needs build   |
+| Gemini | —                                 | —                                 | —           | At daily quota limit |
 
 ---
 

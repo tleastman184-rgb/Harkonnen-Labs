@@ -14,6 +14,7 @@ Priority items:
 - Require retries to declare what changed relative to the previous failed strategy before claiming progress.
 - Add a formal plan-review residue chain before execution: initial plan, gap analysis, ruthless review, Coobie critique, and final bounded execution plan should all leave evidence.
 - Preserve worker-session continuity separately from factory truth so resumability helps execution without becoming the acceptance authority.
+- Record pre/post forge command hook evidence so exploration residue includes what Keeper allowed, denied, and why instead of only final command outcomes.
 - Record which mitigation steps actually reduced stale-memory severity so the next run can reuse successful evidence paths instead of merely re-reading the same warning.
 
 Expected outcome:

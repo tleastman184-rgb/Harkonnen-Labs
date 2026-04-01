@@ -9,8 +9,11 @@ Purpose: borrow the strongest orchestration mechanics from OpenAgent while keepi
 Priority items:
 - Treat any OpenAgent-like system as an inner worker harness for exploration, planning, execution, and visible verification only.
 - Keep hidden scenarios, policy, causal memory, digital-twin truth, and release acceptance outside the worker harness.
-- Add a bounded worker adapter that hands the harness an explicit task envelope with allowed paths, denied paths, visible success conditions, and required return artifacts.
-- Build a pre-execution quality gate: Scout draft plan, gap review, ruthless plan review, Coobie causal critique, then Mason or worker execution.
+- Implemented foundation: a retriever-themed bounded forge contract now emits `retriever_task_packet`, `trail_review_chain`, `retriever_dispatch`, and `trail-state` artifacts for any spec that declares a worker harness.
+- Implemented executor layer: Harkonnen now runs a real bounded retriever forge executor that consumes the packet, writes retriever execution evidence, and updates trail-state continuity.
+- Borrowed from claw-code: add pre/post forge command hooks with Keeper-style allow/deny decisions and Coobie-readable payloads before relying only on final forge summaries.
+- Borrowed from claw-code: keep hierarchical repo-local instruction discovery in mind for `.harkonnen/` context layering, but treat operator slash commands as lower priority than hook evidence and continuity.
+- Next build layer: let Coobie score returned forge artifacts and hook evidence to critique or route future forge attempts.
 - Preserve worker continuity in a separate state file so resumability helps long jobs without replacing Harkonnen's run DB, blackboard, or artifact truth.
 - Add hierarchical repo-local context and skill bundles under `.harkonnen/` so external repos can preload focused context into the worker harness.
 - Explore safer edit substrates inspired by hash-anchored editing so external-codebase modifications fail closed when context drifts.
