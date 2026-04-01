@@ -302,6 +302,32 @@ Coobie Preflight
         report.push_str(&format!("Generated: {}
 ", briefing.generated_at));
         report.push_str(&format!(
+            "Project memory root: {}
+",
+            briefing
+                .project_memory_root
+                .clone()
+                .unwrap_or_else(|| "not recorded".to_string())
+        ));
+        report.push_str(&format!(
+            "Project memory hits: {}
+",
+            if briefing.project_memory_hits.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.project_memory_hits.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Core memory hits: {}
+",
+            if briefing.core_memory_hits.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.core_memory_hits.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
             "Domain signals: {}
 ",
             if briefing.domain_signals.is_empty() {

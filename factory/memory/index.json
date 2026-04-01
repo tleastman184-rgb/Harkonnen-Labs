@@ -158,6 +158,19 @@
       "created_at": "2026-03-30T23:01:28.419336279+00:00"
     },
     {
+      "id": "project-memory-split",
+      "tags": [
+        "coobie",
+        "memory",
+        "project-memory",
+        "core-memory",
+        "workflow"
+      ],
+      "summary": "Separate project-local learnings from Harkonnen core memory; promote only strong cross-project patterns into the core store.",
+      "content": "Coobie should maintain a two-layer durable memory model.\n\n- Project memory lives with the active repo in `.harkonnen/project-memory/` and should hold repo-specific truths, runtime facts, oracle semantics, and local failure modes.\n- Core memory in `factory/memory/` should retain only strong cross-project lessons, universal factory patterns, and durable guardrails.\n- Runs should retrieve both layers, but new repo-specific run summaries and lessons should be written back to project memory by default.\n",
+      "created_at": "2026-04-01T01:09:25.862470964+00:00"
+    },
+    {
       "id": "reference-oracle-scenario-pattern",
       "tags": [
         "workflow",

@@ -77,6 +77,13 @@ and do not touch those functions.
   `push_unique(&mut blackboard.artifact_refs, "corpus_results.json")` after validation completes)
 - The pre-existing compile errors need to be resolved before any of this can run
 
+**Exploration log (added 2026-03-31):**
+`write_exploration_log` is now called in the Flint phase before `package_artifacts`. It writes
+`factory/workspaces/<run-id>/run/exploration_log.md` using Residue five-field format per episode:
+strategy / outcome / failure_constraint / surviving_structure / reformulation.
+`causal_summary.md` is written by the existing Coobie ingest path (already present, no change needed).
+`lamdet_corpus_hidden.yaml` now checks for both `exploration_log.md` and `causal_summary.md`.
+
 ---
 
 ## Completed This Session

@@ -9,6 +9,12 @@ use crate::models::{
 };
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct AttemptThreshold {
+    pub attempt: usize,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct HiddenScenarioFile {
     pub id: String,
     pub spec_id: String,
@@ -32,10 +38,17 @@ pub enum HiddenScenarioCheck {
     TestExitCode { equals: i32, label: String },
     /// Check that a numeric field in a JSON artifact is >= value.
     MetricGte { artifact: String, field: String, value: f64 },
+    /// Check that a numeric field in a JSON artifact is >= the threshold selected for this run attempt.
+    MetricGteByAttempt {
+        artifact: String,
+        field: String,
+        thresholds: Vec<AttemptThreshold>,
+    },
     /// Check that a field in a JSON artifact equals value (JSON comparison).
     MetricEq { artifact: String, field: String, value: JsonValue },
     /// Check that any .md artifact in the run dir contains all required tag strings.
     MemoryEntryExists { tags: Vec<String> },
+    ExplorationLogExists,
 }
 
 pub fn load_hidden_scenarios(root: &Path, spec_id: &str) -> Result<Vec<HiddenScenarioFile>> {
@@ -81,6 +94,7 @@ fn collect_scenarios(
 pub fn evaluate_hidden_scenarios(
     scenarios: &[HiddenScenarioFile],
     run_status: &str,
+    run_attempt: usize,
     events: &[RunEvent],
     validation: &ValidationSummary,
     twin: &TwinEnvironment,
@@ -106,7 +120,7 @@ pub fn evaluate_hidden_scenarios(
             let checks = scenario
                 .checks
                 .iter()
-                .map(|check| evaluate_check(check, run_status, events, validation, twin, agent_executions, run_dir))
+                .map(|check| evaluate_check(check, run_status, run_attempt, events, validation, twin, agent_executions, run_dir))
                 .collect::<Vec<_>>();
             let passed = checks.iter().all(|check| check.passed);
             HiddenScenarioEvaluation {
@@ -132,6 +146,7 @@ pub fn evaluate_hidden_scenarios(
 fn evaluate_check(
     check: &HiddenScenarioCheck,
     run_status: &str,
+    run_attempt: usize,
     events: &[RunEvent],
     validation: &ValidationSummary,
     twin: &TwinEnvironment,
@@ -242,6 +257,35 @@ fn evaluate_check(
                 },
             }
         }
+        HiddenScenarioCheck::MetricGteByAttempt { artifact, field, thresholds } => {
+            let selected = match threshold_for_attempt(thresholds, run_attempt) {
+                Some(value) => value,
+                None => {
+                    return HiddenScenarioCheckResult {
+                        kind: format!("metric_gte_by_attempt({artifact}.{field})"),
+                        passed: false,
+                        details: "no thresholds were configured for adaptive metric check".to_string(),
+                    }
+                }
+            };
+            let kind = format!("metric_gte_by_attempt({artifact}.{field} >= {selected} @ attempt {run_attempt})");
+            let json = match read_json_artifact(&run_dir.join(artifact)) {
+                Ok(v) => v,
+                Err(msg) => return HiddenScenarioCheckResult { kind, passed: false, details: msg },
+            };
+            match json_field(&json, field).and_then(|v| v.as_f64()) {
+                Some(n) => HiddenScenarioCheckResult {
+                    kind,
+                    passed: n >= selected,
+                    details: format!("actual: {n}, required >= {selected} for attempt {run_attempt}"),
+                },
+                None => HiddenScenarioCheckResult {
+                    kind,
+                    passed: false,
+                    details: format!("field path '{field}' not found or not numeric in {artifact}"),
+                },
+            }
+        }
         HiddenScenarioCheck::MetricEq { artifact, field, value } => {
             let kind = format!("metric_eq({artifact}.{field} == {value})");
             let json = match read_json_artifact(&run_dir.join(artifact)) {
@@ -284,7 +328,31 @@ fn evaluate_check(
                 },
             }
         }
+        HiddenScenarioCheck::ExplorationLogExists => {
+            let path = run_dir.join("exploration_log.md");
+            HiddenScenarioCheckResult {
+                kind: "exploration_log_exists".to_string(),
+                passed: path.exists(),
+                details: path.display().to_string(),
+            }
+        }
     }
+}
+
+fn threshold_for_attempt(thresholds: &[AttemptThreshold], run_attempt: usize) -> Option<f64> {
+    if thresholds.is_empty() {
+        return None;
+    }
+
+    let mut ordered = thresholds.to_vec();
+    ordered.sort_by_key(|threshold| threshold.attempt);
+
+    ordered
+        .iter()
+        .rev()
+        .find(|threshold| run_attempt >= threshold.attempt)
+        .or_else(|| ordered.first())
+        .map(|threshold| threshold.value)
 }
 
 fn json_field<'a>(json: &'a JsonValue, field_path: &str) -> Option<&'a JsonValue> {

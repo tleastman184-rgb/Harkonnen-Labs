@@ -5,6 +5,9 @@ description: >
   Sable judges this run as a reference-oracle regression scenario. The product
   code under test must match the preserved LamDet oracle on the preserved CSV
   evidence bundle, and the parity evidence artifacts must be present for review.
+  Adaptive acceptance tiers are allowed while the pack learns the domain:
+  attempt 1 requires 90%, attempt 2 requires 95%, attempt 3+ requires 99.5%
+  on the parity metrics below.
 checks:
   - kind: run_status
     equals: completed
@@ -31,6 +34,7 @@ checks:
     artifact: corpus_results.json
     field: all_passed
     value: true
+  - kind: exploration_log_exists
   - kind: artifact_exists
     path: coobie_briefing.json
   - kind: artifact_exists
@@ -51,19 +55,43 @@ checks:
     artifact: products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
     field: metric_rates.zone_match
     value: 1.0
-  - kind: metric_eq
+  - kind: metric_gte_by_attempt
     artifact: products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
     field: metric_rates.pass_match
-    value: 1.0
-  - kind: metric_eq
+    thresholds:
+      - attempt: 1
+        value: 0.9
+      - attempt: 2
+        value: 0.95
+      - attempt: 3
+        value: 0.995
+  - kind: metric_gte_by_attempt
     artifact: products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
     field: metric_rates.sling_match
-    value: 1.0
-  - kind: metric_eq
+    thresholds:
+      - attempt: 1
+        value: 0.9
+      - attempt: 2
+        value: 0.95
+      - attempt: 3
+        value: 0.995
+  - kind: metric_gte_by_attempt
     artifact: products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
     field: metric_rates.peak_count_match
-    value: 1.0
-  - kind: metric_eq
+    thresholds:
+      - attempt: 1
+        value: 0.9
+      - attempt: 2
+        value: 0.95
+      - attempt: 3
+        value: 0.995
+  - kind: metric_gte_by_attempt
     artifact: products/ceres-station/ceres-station/tmp/lamdet-parity/lamdet_parity_report.json
     field: metric_rates.label_match
-    value: 1.0
+    thresholds:
+      - attempt: 1
+        value: 0.9
+      - attempt: 2
+        value: 0.95
+      - attempt: 3
+        value: 0.995

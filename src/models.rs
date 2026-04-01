@@ -128,10 +128,16 @@ pub struct CoobieBriefing {
     pub domain_signals: Vec<String>,
     pub prior_report_count: usize,
     pub memory_hits: Vec<String>,
+    #[serde(default)]
+    pub core_memory_hits: Vec<String>,
+    #[serde(default)]
+    pub project_memory_hits: Vec<String>,
     pub relevant_lessons: Vec<LessonRecord>,
     pub prior_causes: Vec<PriorCauseSignal>,
     pub project_components: Vec<ProjectComponent>,
     pub scenario_blueprint: Option<ScenarioBlueprint>,
+    #[serde(default)]
+    pub project_memory_root: Option<String>,
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
     pub regulatory_considerations: Vec<String>,

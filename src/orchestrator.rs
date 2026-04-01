@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ pub struct RunRequest {
     pub failure_harness: Option<FailureHarness>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TargetGitMetadata {
     branch: Option<String>,
     commit: Option<String>,
@@ -62,7 +62,7 @@ struct TargetGitMetadata {
     clean: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TargetSourceMetadata {
     label: String,
     source_kind: String,
@@ -84,6 +84,7 @@ struct ExecutionOutput {
     validation: ValidationSummary,
     hidden_scenarios: HiddenScenarioSummary,
     run_dir: PathBuf,
+    memory_context: MemoryContextBundle,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,66 @@ struct CommandOutcome {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryContextBundle {
+    memory_hits: Vec<String>,
+    core_memory_hits: Vec<String>,
+    project_memory_hits: Vec<String>,
+    project_memory_root: Option<String>,
+    core_memory_ids: Vec<String>,
+    project_memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollectedMemoryHits {
+    hits: Vec<String>,
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExplorationEntry {
+    phase: String,
+    episode_id: String,
+    agent: String,
+    strategy: String,
+    outcome: String,
+    failure_constraint: String,
+    surviving_structure: String,
+    reformulation: String,
+    artifacts: Vec<String>,
+    parameters: Vec<String>,
+    open_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExplorationLogArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    generated_at: String,
+    entries: Vec<ExplorationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeadEndRegistryEntry {
+    registry_id: String,
+    run_id: String,
+    spec_id: String,
+    product: String,
+    phase: String,
+    agent: String,
+    strategy: String,
+    failure_constraint: String,
+    surviving_structure: String,
+    reformulation: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DeadEndRegistry {
+    entries: Vec<DeadEndRegistryEntry>,
 }
 
 impl AppContext {
@@ -154,6 +215,22 @@ impl AppContext {
                     "completed_with_issues"
                 };
                 self.update_run_status(&run_id, final_status).await?;
+                if let Err(error) = self
+                    .record_memory_context_outcome(&target_source, &output.memory_context, final_status == "completed")
+                    .await
+                {
+                    let _ = self
+                        .record_event(
+                            &run_id,
+                            None,
+                            "memory",
+                            "coobie",
+                            "warning",
+                            &format!("Memory manifest outcome tracking skipped: {error}"),
+                            &log_path,
+                        )
+                        .await;
+                }
 
                 let lessons = match self.consolidate_run(&run_id).await {
                     Ok(lessons) => lessons,
@@ -289,19 +366,21 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        let memory_hits = self.retrieve_coobie_memory_context(&query_terms).await?;
+        let memory_context = self
+            .retrieve_coobie_memory_context(target_source, &query_terms)
+            .await?;
         let briefing = self
             .build_coobie_briefing(
                 spec_obj,
                 target_source,
                 &query_terms,
                 &domain_signals,
-                &memory_hits,
+                &memory_context,
             )
             .await?;
         tokio::fs::write(
             run_dir.join("memory_context.md"),
-            format_memory_context(&memory_hits),
+            format_memory_context_bundle(&memory_context),
         )
         .await?;
         self.write_json_file(&run_dir.join("coobie_briefing.json"), &briefing)
@@ -760,10 +839,12 @@ impl AppContext {
             "completed_with_issues"
         };
         let events_so_far = self.list_run_events(run_id).await?;
+        let run_attempt = self.run_attempt_number(run_id).await?;
         let hidden_definitions = scenarios::load_hidden_scenarios(&self.paths.scenarios, &spec_obj.id)?;
         let mut hidden_scenarios = scenarios::evaluate_hidden_scenarios(
             &hidden_definitions,
             predicted_final_status,
+            run_attempt,
             &events_so_far,
             &validation,
             &twin,
@@ -855,31 +936,46 @@ impl AppContext {
                 log_path,
             )
             .await?;
-        self.memory_store
-            .store(
-                &format!("run-{}", run_id),
-                vec![
-                    "run".to_string(),
-                    spec_obj.id.clone(),
-                    target_source.label.clone(),
-                    if validation.passed && hidden_scenarios.passed {
-                        "completed".to_string()
-                    } else {
-                        "completed-with-issues".to_string()
-                    },
-                ],
-                &format!("Run {} for {}", run_id, spec_obj.title),
-                &format!(
-                    "Spec: {}\nProduct: {}\nVisible validation passed: {}\nHidden scenarios passed: {}\nRecommended steps: {}\n\nTop memory hits:\n{}",
-                    spec_obj.id,
-                    target_source.label,
-                    validation.passed,
-                    hidden_scenarios.passed,
-                    intent.recommended_steps.join(", "),
-                    memory_hits.join("\n\n")
-                ),
-            )
-            .await?;
+        self.store_project_memory_entry(
+            target_source,
+            &format!("run-{}", run_id),
+            vec![
+                "run".to_string(),
+                "project-memory".to_string(),
+                spec_obj.id.clone(),
+                target_source.label.clone(),
+                if validation.passed && hidden_scenarios.passed {
+                    "completed".to_string()
+                } else {
+                    "completed-with-issues".to_string()
+                },
+            ],
+            &format!("Run {} for {}", run_id, spec_obj.title),
+            &format!(
+                "Spec: {}
+Product: {}
+Visible validation passed: {}
+Hidden scenarios passed: {}
+Recommended steps: {}
+
+Project memory root: {}
+
+Top memory hits:
+{}",
+                spec_obj.id,
+                target_source.label,
+                validation.passed,
+                hidden_scenarios.passed,
+                intent.recommended_steps.join(", "),
+                self.project_harkonnen_dir(target_source)
+                    .join("project-memory")
+                    .display(),
+                memory_context.memory_hits.join("
+
+")
+            ),
+        )
+        .await?;
         let memory_store_end = self
             .record_event(
                 run_id,
@@ -932,6 +1028,18 @@ impl AppContext {
             &mut agent_executions,
         )
         .await?;
+        // Write exploration log before sealing the artifact bundle.
+        if let Err(e) = self
+            .write_exploration_log(run_id, spec_obj, target_source, &run_dir)
+            .await
+        {
+            tracing::warn!("exploration log write failed: {e}");
+        } else {
+            push_unique(&mut blackboard.artifact_refs, "exploration_log.md");
+            push_unique(&mut blackboard.artifact_refs, "exploration_log.json");
+            push_unique(&mut blackboard.artifact_refs, "dead_end_registry_snapshot.json");
+            let _ = self.sync_blackboard(&blackboard, Some(&run_dir)).await;
+        }
         self.package_artifacts(run_id).await?;
         let artifacts_end = self
             .record_event(
@@ -1003,36 +1111,220 @@ impl AppContext {
             validation,
             hidden_scenarios,
             run_dir,
+            memory_context,
         })
     }
 
-    async fn retrieve_coobie_memory_context(&self, query_terms: &[String]) -> Result<Vec<String>> {
+    async fn retrieve_coobie_memory_context(
+        &self,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+    ) -> Result<MemoryContextBundle> {
+        let project_store = self.project_memory_store(target_source).await?;
+        let mut project_memory = self
+            .collect_memory_hits(&project_store, query_terms, "project memory")
+            .await?;
+        if let Some(project_context_hit) = self.read_project_context_hit(target_source).await? {
+            project_memory.hits.insert(0, project_context_hit);
+        }
+
+        let mut core_memory = self
+            .collect_memory_hits(&self.memory_store, query_terms, "core memory")
+            .await?;
+
+        project_memory.ids.sort();
+        project_memory.ids.dedup();
+        core_memory.ids.sort();
+        core_memory.ids.dedup();
+        project_store.mark_entries_loaded(&project_memory.ids).await?;
+        self.memory_store.mark_entries_loaded(&core_memory.ids).await?;
+
+        let mut memory_hits = Vec::new();
+        let mut seen = HashSet::new();
+        for hit in project_memory.hits.iter().chain(core_memory.hits.iter()) {
+            if seen.insert(hit.clone()) {
+                memory_hits.push(hit.clone());
+            }
+        }
+
+        project_memory.hits.truncate(6);
+        core_memory.hits.truncate(6);
+        memory_hits.truncate(12);
+
+        if memory_hits.is_empty() {
+            memory_hits.push(format!(
+                "No relevant project or core memory found for Coobie preflight queries: {}",
+                query_terms.join(", ")
+            ));
+        }
+
+        Ok(MemoryContextBundle {
+            memory_hits,
+            core_memory_hits: core_memory.hits,
+            project_memory_hits: project_memory.hits,
+            project_memory_root: Some(project_store.root.display().to_string()),
+            core_memory_ids: core_memory.ids,
+            project_memory_ids: project_memory.ids,
+        })
+    }
+
+    async fn collect_memory_hits(
+        &self,
+        store: &MemoryStore,
+        query_terms: &[String],
+        source_label: &str,
+    ) -> Result<CollectedMemoryHits> {
         let mut hits = Vec::new();
+        let mut ids = Vec::new();
         let mut seen = HashSet::new();
 
         for term in query_terms {
             if term.trim().is_empty() {
                 continue;
             }
-            for hit in self.memory_store.retrieve_context(term).await? {
+            for hit in store.retrieve_context(term).await? {
                 if hit.contains("No memories found") || hit.contains("Memory not initialized") {
                     continue;
                 }
-                if seen.insert(hit.clone()) {
-                    hits.push(hit);
+                if let Some(id) = extract_memory_entry_id(&hit) {
+                    ids.push(id);
+                }
+                let labeled_hit = format!("[{source_label}] {hit}");
+                if seen.insert(labeled_hit.clone()) {
+                    hits.push(labeled_hit);
                 }
             }
         }
 
-        if hits.is_empty() {
-            Ok(vec![format!(
-                "No memories found for Coobie preflight queries: {}",
-                query_terms.join(", ")
-            )])
-        } else {
-            hits.truncate(10);
-            Ok(hits)
+        Ok(CollectedMemoryHits { hits, ids })
+    }
+
+    async fn record_memory_context_outcome(
+        &self,
+        target_source: &TargetSourceMetadata,
+        memory_context: &MemoryContextBundle,
+        success: bool,
+    ) -> Result<()> {
+        let project_store = self.project_memory_store(target_source).await?;
+        project_store
+            .record_outcome(&memory_context.project_memory_ids, success)
+            .await?;
+        self.memory_store
+            .record_outcome(&memory_context.core_memory_ids, success)
+            .await?;
+        Ok(())
+    }
+
+    async fn project_memory_store(&self, target_source: &TargetSourceMetadata) -> Result<MemoryStore> {
+        let store = MemoryStore::new(self.project_harkonnen_dir(target_source).join("project-memory"));
+        self.ensure_project_memory_bootstrap(target_source, &store).await?;
+        store.reindex().await?;
+        Ok(store)
+    }
+
+    async fn ensure_project_memory_bootstrap(
+        &self,
+        target_source: &TargetSourceMetadata,
+        store: &MemoryStore,
+    ) -> Result<()> {
+        let harkonnen_dir = self.project_harkonnen_dir(target_source);
+        tokio::fs::create_dir_all(&harkonnen_dir).await?;
+        tokio::fs::create_dir_all(&store.root).await?;
+        tokio::fs::create_dir_all(store.root.join("imports")).await?;
+
+        let project_context_path = harkonnen_dir.join("project-context.md");
+        if !project_context_path.exists() {
+            let context = format!(
+                "# Project Context
+
+- Project: {}
+- Source path: {}
+- Project memory root: {}
+
+## Coobie Memory Split
+- Put repo-specific lessons, runtime facts, ports, protocols, datasets, oracle semantics, and commissioning notes in `.harkonnen/project-memory/`.
+- Keep only strong cross-project or factory-wide learnings in Harkonnen core memory.
+- Update this file with stable project facts Coobie should always read before planning.
+",
+                target_source.label,
+                target_source.source_path,
+                store.root.display(),
+            );
+            tokio::fs::write(&project_context_path, context).await?;
         }
+
+        let guide_path = store.root.join("00-project-memory-guide.md");
+        if !guide_path.exists() {
+            let guide = format!(
+                "---
+tags: [project-memory, coobie, repo-local, guidance]
+summary: Repo-local Coobie memory guide for {}
+---
+# Project Memory Guide
+
+This directory is the durable home for knowledge that should travel with this repo.
+
+Store here:
+- domain facts specific to this product
+- runtime/API details
+- dataset and oracle semantics
+- line-specific tuning or commissioning lessons
+- accepted mitigations and known failure modes
+
+Do not keep everything in Harkonnen core memory. Promote only durable cross-project patterns to the factory memory store.
+",
+                target_source.label,
+            );
+            tokio::fs::write(&guide_path, guide).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_project_context_hit(
+        &self,
+        target_source: &TargetSourceMetadata,
+    ) -> Result<Option<String>> {
+        let path = self.project_harkonnen_dir(target_source).join("project-context.md");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let snippet = trimmed.chars().take(600).collect::<String>();
+        Ok(Some(format!(
+            "[project context] [{}] {}",
+            path.display(),
+            snippet
+        )))
+    }
+
+    fn project_harkonnen_dir(&self, target_source: &TargetSourceMetadata) -> PathBuf {
+        PathBuf::from(&target_source.source_path).join(".harkonnen")
+    }
+
+    async fn store_project_memory_entry(
+        &self,
+        target_source: &TargetSourceMetadata,
+        id: &str,
+        tags: Vec<String>,
+        summary: &str,
+        content: &str,
+    ) -> Result<()> {
+        let store = self.project_memory_store(target_source).await?;
+        store.store(id, tags, summary, content).await
+    }
+
+    async fn target_source_for_run(&self, run_id: &str) -> Result<Option<TargetSourceMetadata>> {
+        let path = self.run_dir(run_id).join("target_source.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        Ok(Some(serde_json::from_str(&raw)?))
     }
 
     async fn find_relevant_lessons(
@@ -1176,7 +1468,7 @@ impl AppContext {
         target_source: &TargetSourceMetadata,
         query_terms: &[String],
         domain_signals: &[String],
-        memory_hits: &[String],
+        memory_context: &MemoryContextBundle,
     ) -> Result<CoobieBriefing> {
         let relevant_lessons = self.find_relevant_lessons(query_terms, domain_signals).await?;
         let prior_causes = self.summarize_prior_causes(5).await?;
@@ -1186,10 +1478,10 @@ impl AppContext {
         .fetch_one(&self.pool)
         .await?
         .get::<i64, _>("cnt") as usize;
-        let application_risks = build_application_risks(spec_obj, domain_signals, memory_hits, &prior_causes);
+        let application_risks = build_application_risks(spec_obj, domain_signals, &memory_context.memory_hits, &prior_causes);
         let environment_risks = build_environment_risks(spec_obj, domain_signals);
         let regulatory_considerations = build_regulatory_considerations(spec_obj, domain_signals);
-        let recommended_guardrails = build_recommended_guardrails(spec_obj, domain_signals, memory_hits, &prior_causes);
+        let recommended_guardrails = build_recommended_guardrails(spec_obj, domain_signals, &memory_context.memory_hits, &prior_causes);
         let required_checks = build_required_checks(spec_obj, domain_signals, &regulatory_considerations);
         let open_questions = build_coobie_open_questions(spec_obj, domain_signals, &regulatory_considerations);
 
@@ -1199,11 +1491,14 @@ impl AppContext {
             query_terms: query_terms.to_vec(),
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
-            memory_hits: memory_hits.to_vec(),
+            memory_hits: memory_context.memory_hits.clone(),
+            core_memory_hits: memory_context.core_memory_hits.clone(),
+            project_memory_hits: memory_context.project_memory_hits.clone(),
             relevant_lessons,
             prior_causes,
             project_components: spec_obj.project_components.clone(),
             scenario_blueprint: spec_obj.scenario_blueprint.clone(),
+            project_memory_root: memory_context.project_memory_root.clone(),
             application_risks,
             environment_risks,
             regulatory_considerations,
@@ -2187,6 +2482,209 @@ TWIN SERVICES:
         })
     }
 
+    /// Build and write `exploration_log.md` to the run directory.
+    ///
+    /// One entry per episode, using the Residue five-field format:
+    /// strategy / outcome / failure_constraint / surviving_structure / reformulation.
+    /// Coobie reads this during consolidation for lesson extraction.
+    async fn write_exploration_log(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        run_dir: &Path,
+    ) -> Result<()> {
+        let episodes = self.list_run_episodes(run_id).await?;
+        let mut lines = Vec::new();
+        let mut entries = Vec::new();
+
+        lines.push("# Exploration Log".to_string());
+        lines.push(format!("run: {run_id}"));
+        lines.push(format!("spec: {} - {}", spec_obj.id, spec_obj.title));
+        lines.push(format!("product: {}", target_source.label));
+        lines.push(format!("generated: {}", Utc::now().to_rfc3339()));
+        lines.push(String::new());
+
+        for (i, episode) in episodes.iter().enumerate() {
+            let events = self
+                .list_events_for_episode(&episode.episode_id)
+                .await
+                .unwrap_or_default();
+
+            let outcome = episode.outcome.as_deref().unwrap_or("unknown").to_string();
+            let confidence = episode
+                .confidence
+                .map(|c| format!("{:.2}", c))
+                .unwrap_or_else(|| "unknown".to_string());
+            let agent = events
+                .first()
+                .map(|event| event.agent.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let strategy = events
+                .first()
+                .map(|event| format!("{} - {}", event.agent, event.message))
+                .unwrap_or_else(|| format!("{} phase", episode.phase));
+            let failure_constraint = if matches!(outcome.as_str(), "failure" | "blocked") {
+                events
+                    .iter()
+                    .rev()
+                    .find(|event| event.status != "running")
+                    .map(|event| event.message.clone())
+                    .unwrap_or_else(|| "no constraint recorded".to_string())
+            } else {
+                "none".to_string()
+            };
+            let surviving_structure = events
+                .iter()
+                .rev()
+                .find(|event| event.status == "complete")
+                .map(|event| event.message.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let reformulation = match outcome.as_str() {
+                "success" => format!("{} phase completed with confidence {confidence}", episode.phase),
+                "failure" | "blocked" => {
+                    format!("{} phase failed; preserve surviving structure and change strategy on retry", episode.phase)
+                }
+                _ => format!("{} phase outcome: {outcome}", episode.phase),
+            };
+            let artifacts = phase_artifact_hints(&episode.phase);
+            let parameters = vec![
+                format!("confidence={confidence}"),
+                format!("event_count={}", events.len()),
+            ];
+            let open_questions = if matches!(outcome.as_str(), "failure" | "blocked") {
+                vec![format!(
+                    "What changed would let the {} phase succeed without repeating '{}' ?",
+                    episode.phase, failure_constraint
+                )]
+            } else {
+                Vec::new()
+            };
+
+            let entry = ExplorationEntry {
+                phase: episode.phase.clone(),
+                episode_id: episode.episode_id.clone(),
+                agent,
+                strategy,
+                outcome,
+                failure_constraint,
+                surviving_structure,
+                reformulation,
+                artifacts,
+                parameters,
+                open_questions,
+            };
+
+            lines.push(format!("## Exploration {}", i + 1));
+            lines.push("```yaml".to_string());
+            lines.push(format!("phase: {}", entry.phase));
+            lines.push(format!("episode: {}", entry.episode_id));
+            lines.push(format!("agent: {}", entry.agent));
+            lines.push(format!("strategy: {}", entry.strategy));
+            lines.push(format!("outcome: {}", entry.outcome));
+            lines.push(format!("failure_constraint: {}", entry.failure_constraint));
+            lines.push(format!("surviving_structure: {}", entry.surviving_structure));
+            lines.push(format!("reformulation: {}", entry.reformulation));
+            lines.push(format!("artifacts: {}", format_yaml_list(&entry.artifacts)));
+            lines.push(format!("parameters: {}", format_yaml_list(&entry.parameters)));
+            lines.push(format!("open_questions: {}", format_yaml_list(&entry.open_questions)));
+            lines.push("```".to_string());
+            lines.push(String::new());
+
+            entries.push(entry);
+        }
+
+        let passed = entries.iter().filter(|entry| entry.outcome == "success").count();
+        let failed = entries
+            .iter()
+            .filter(|entry| matches!(entry.outcome.as_str(), "failure" | "blocked"))
+            .count();
+        lines.push("## Summary".to_string());
+        lines.push(format!("total_explorations: {}", entries.len()));
+        lines.push(format!("passed: {passed}"));
+        lines.push(format!("failed: {failed}"));
+        lines.push(format!(
+            "spec_tags: {}",
+            std::iter::once(spec_obj.id.as_str())
+                .chain(spec_obj.scope.iter().map(|scope| scope.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        lines.push(String::new());
+
+        tokio::fs::write(run_dir.join("exploration_log.md"), lines.join("\n"))
+            .await
+            .context("writing exploration_log.md")?;
+        self.write_json_file(
+            &run_dir.join("exploration_log.json"),
+            &ExplorationLogArtifact {
+                run_id: run_id.to_string(),
+                spec_id: spec_obj.id.clone(),
+                product: target_source.label.clone(),
+                generated_at: Utc::now().to_rfc3339(),
+                entries: entries.clone(),
+            },
+        )
+        .await?;
+        self.update_dead_end_registry(run_id, spec_obj, target_source, &entries, run_dir)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_dead_end_registry(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        entries: &[ExplorationEntry],
+        run_dir: &Path,
+    ) -> Result<()> {
+        let state_dir = self.paths.factory.join("state");
+        tokio::fs::create_dir_all(&state_dir).await?;
+        let registry_path = state_dir.join("dead_ends.json");
+        let mut registry = if registry_path.exists() {
+            let raw = tokio::fs::read_to_string(&registry_path).await?;
+            serde_json::from_str::<DeadEndRegistry>(&raw).unwrap_or_default()
+        } else {
+            DeadEndRegistry::default()
+        };
+
+        for entry in entries {
+            if !matches!(entry.outcome.as_str(), "failure" | "blocked") {
+                continue;
+            }
+            let registry_id = format!("{}:{}", run_id, entry.episode_id);
+            if registry.entries.iter().any(|existing| existing.registry_id == registry_id) {
+                continue;
+            }
+            registry.entries.push(DeadEndRegistryEntry {
+                registry_id,
+                run_id: run_id.to_string(),
+                spec_id: spec_obj.id.clone(),
+                product: target_source.label.clone(),
+                phase: entry.phase.clone(),
+                agent: entry.agent.clone(),
+                strategy: entry.strategy.clone(),
+                failure_constraint: entry.failure_constraint.clone(),
+                surviving_structure: entry.surviving_structure.clone(),
+                reformulation: entry.reformulation.clone(),
+                created_at: Utc::now().to_rfc3339(),
+            });
+        }
+
+        registry.entries.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        self.write_json_file(&registry_path, &registry).await?;
+        let snapshot = registry
+            .entries
+            .iter()
+            .filter(|entry| entry.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.write_json_file(&run_dir.join("dead_end_registry_snapshot.json"), &snapshot)
+            .await?;
+        Ok(())
+    }
+
     async fn write_json_file<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
         let content = serde_json::to_string_pretty(value)?;
         tokio::fs::write(path, content)
@@ -2259,6 +2757,25 @@ TWIN SERVICES:
 
     fn run_dir(&self, run_id: &str) -> PathBuf {
         self.workspace_root(run_id).join("run")
+    }
+
+    async fn run_attempt_number(&self, run_id: &str) -> Result<usize> {
+        let Some(run) = self.get_run(run_id).await? else {
+            bail!("run not found for hidden scenario evaluation: {run_id}");
+        };
+
+        let rows = sqlx::query(
+            "SELECT run_id FROM runs WHERE spec_id = ?1 AND product = ?2 ORDER BY created_at ASC, run_id ASC",
+        )
+        .bind(&run.spec_id)
+        .bind(&run.product)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .position(|row| row.get::<String, _>("run_id") == run_id)
+            .map(|index| index + 1)
+            .ok_or_else(|| anyhow::anyhow!("run {run_id} missing from attempt history"))
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>> {
@@ -2443,6 +2960,7 @@ TWIN SERVICES:
     async fn consolidate_run(&self, run_id: &str) -> Result<Vec<LessonRecord>> {
         let episodes = self.list_run_episodes(run_id).await?;
         let prior_lessons = self.list_lessons().await?;
+        let target_source = self.target_source_for_run(run_id).await?;
         let mut new_lessons = Vec::new();
 
         for episode in episodes {
@@ -2478,6 +2996,7 @@ TWIN SERVICES:
                 tags: vec![
                     "lesson".to_string(),
                     "causal".to_string(),
+                    "project-memory".to_string(),
                     episode.phase.clone(),
                     events
                         .last()
@@ -2490,26 +3009,55 @@ TWIN SERVICES:
                 created_at: Utc::now(),
             };
             self.insert_lesson(&lesson).await?;
-            self.memory_store
-                .store(
+
+            let lesson_body = format!(
+                "Source episode: {}
+Phase: {}
+Intervention: {}
+Observed pattern: {}",
+                episode.episode_id,
+                episode.phase,
+                lesson
+                    .intervention
+                    .clone()
+                    .unwrap_or_else(|| "No intervention recorded yet".to_string()),
+                pattern
+            );
+
+            if let Some(target_source) = &target_source {
+                self.store_project_memory_entry(
+                    target_source,
                     &lesson.lesson_id,
                     lesson.tags.clone(),
                     &lesson.pattern,
-                    &format!(
-                        "Source episode: {}\nPhase: {}\nIntervention: {}\nObserved pattern: {}",
-                        episode.episode_id,
-                        episode.phase,
-                        lesson
-                            .intervention
-                            .clone()
-                            .unwrap_or_else(|| "No intervention recorded yet".to_string()),
-                        pattern
-                    ),
+                    &lesson_body,
                 )
                 .await?;
+            } else {
+                self.memory_store
+                    .store(
+                        &lesson.lesson_id,
+                        lesson.tags.clone(),
+                        &lesson.pattern,
+                        &lesson_body,
+                    )
+                    .await?;
+            }
+
+            if should_promote_to_core_memory(&lesson.tags) {
+                self.memory_store
+                    .store(
+                        &lesson.lesson_id,
+                        lesson.tags.clone(),
+                        &lesson.pattern,
+                        &lesson_body,
+                    )
+                    .await?;
+            }
+
             new_lessons.push(lesson);
 
-            // Ingest into Coobie causal engine (partial — full ingest happens post-execution)
+            // Ingest into Coobie causal engine (partial - full ingest happens post-execution)
             let intake_episode = crate::models::FactoryEpisode {
                 run_id: run_id.to_string(),
                 product: String::new(),
@@ -3264,7 +3812,100 @@ fn format_memory_context(memory_hits: &[String]) -> String {
     if memory_hits.is_empty() {
         "No memory hits collected for this run.".to_string()
     } else {
-        memory_hits.join("\n\n---\n\n")
+        memory_hits.join("
+
+---
+
+")
+    }
+}
+
+fn format_memory_context_bundle(bundle: &MemoryContextBundle) -> String {
+    let mut sections = Vec::new();
+    sections.push("Coobie Memory Context".to_string());
+    sections.push("=====================".to_string());
+    sections.push(format!(
+        "Project memory root: {}",
+        bundle
+            .project_memory_root
+            .clone()
+            .unwrap_or_else(|| "not available".to_string())
+    ));
+    sections.push(String::new());
+    sections.push("Project Memory Hits".to_string());
+    sections.push("-------------------".to_string());
+    sections.push(format_memory_context(&bundle.project_memory_hits));
+    sections.push(String::new());
+    sections.push("Core Memory Hits".to_string());
+    sections.push("----------------".to_string());
+    sections.push(format_memory_context(&bundle.core_memory_hits));
+    sections.push(String::new());
+    sections.push("Combined Memory Hits".to_string());
+    sections.push("--------------------".to_string());
+    sections.push(format_memory_context(&bundle.memory_hits));
+    sections.join("
+") + "
+"
+}
+
+fn should_promote_to_core_memory(tags: &[String]) -> bool {
+    tags.iter().any(|tag| {
+        matches!(
+            tag.to_ascii_lowercase().as_str(),
+            "core" | "universal" | "cross-project" | "factory"
+        )
+    })
+}
+
+fn extract_memory_entry_id(hit: &str) -> Option<String> {
+    let start = hit.find('[')?;
+    let end = hit[start + 1..].find(']')? + start + 1;
+    let id = hit[start + 1..end].trim();
+    if id.is_empty() || id.contains("memory") || id.contains("context") {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn format_yaml_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|item| format!("\"{}\"", item.replace('"', "'")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn phase_artifact_hints(phase: &str) -> Vec<String> {
+    match phase {
+        "memory" => vec![
+            "memory_context.md".to_string(),
+            "coobie_briefing.json".to_string(),
+            "coobie_preflight_response.md".to_string(),
+        ],
+        "intake" => vec!["intent.json".to_string()],
+        "implementation" => vec!["implementation_plan.md".to_string()],
+        "tools" => vec!["tool_plan.md".to_string()],
+        "twin" => vec!["twin.json".to_string(), "twin_narrative.md".to_string()],
+        "validation" => vec![
+            "validation.json".to_string(),
+            "validation_output.log".to_string(),
+            "corpus_results.json".to_string(),
+        ],
+        "hidden_scenarios" => vec!["hidden_scenarios.json".to_string()],
+        "artifacts" => vec![
+            "exploration_log.md".to_string(),
+            "exploration_log.json".to_string(),
+            "dead_end_registry_snapshot.json".to_string(),
+        ],
+        _ => Vec::new(),
     }
 }
 

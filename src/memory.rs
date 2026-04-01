@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -15,6 +16,16 @@ pub struct MemoryEntry {
     pub summary: String,
     pub content: String,
     pub created_at: String,
+    #[serde(default)]
+    pub recall_count: i64,
+    #[serde(default)]
+    pub last_recalled: Option<String>,
+    #[serde(default)]
+    pub loaded_for_run_count: i64,
+    #[serde(default)]
+    pub contributed_to_success_count: i64,
+    #[serde(default)]
+    pub contributed_to_failure_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,6 +49,15 @@ pub struct MemoryIndex {
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryEntryStats {
+    recall_count: i64,
+    last_recalled: Option<String>,
+    loaded_for_run_count: i64,
+    contributed_to_success_count: i64,
+    contributed_to_failure_count: i64,
 }
 
 impl MemoryStore {
@@ -82,13 +102,18 @@ impl MemoryStore {
         tokio::fs::create_dir_all(&self.root).await?;
         tokio::fs::create_dir_all(self.root.join("imports")).await?;
 
+        let existing_index = read_memory_index_if_present(&self.root.join("index.json")).await?;
+        let existing_stats = memory_entry_stats_map(existing_index.as_ref());
+
         let mut entries = Vec::new();
         collect_entries(&self.root, &self.root, &mut entries)?;
+        for entry in &mut entries {
+            apply_memory_entry_stats(entry, existing_stats.get(&entry.id));
+        }
         entries.sort_by(|left, right| left.id.cmp(&right.id));
 
         let index = MemoryIndex { entries };
-        let json = serde_json::to_string_pretty(&index).context("serializing memory index")?;
-        tokio::fs::write(self.root.join("index.json"), json).await?;
+        write_memory_index(&self.root.join("index.json"), &index).await?;
 
         Ok(())
     }
@@ -104,29 +129,30 @@ impl MemoryStore {
             ]);
         }
 
-        let json = tokio::fs::read_to_string(&index_path).await?;
-        let index: MemoryIndex = serde_json::from_str(&json).context("reading memory index")?;
-
+        let index = read_memory_index(&index_path).await?;
         let q = query.to_lowercase();
-        let hits: Vec<String> = index
+        let mut hits = index
             .entries
             .iter()
-            .filter(|e| {
-                e.summary.to_lowercase().contains(&q)
-                    || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
-                    || e.content.to_lowercase().contains(&q)
-            })
-            .map(|e| {
-                let snippet = &e.content[..e.content.len().min(400)];
-                format!("[{}] {}
-{}", e.id, e.summary, snippet)
-            })
-            .collect();
+            .filter(|entry| memory_matches(entry, &q))
+            .map(|entry| (memory_match_score(entry, &q), entry))
+            .collect::<Vec<_>>();
 
-        if hits.is_empty() {
+        hits.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
+
+        let rendered = hits
+            .into_iter()
+            .map(|(_, entry)| {
+                let snippet = &entry.content[..entry.content.len().min(400)];
+                format!("[{}] {}
+{}", entry.id, entry.summary, snippet)
+            })
+            .collect::<Vec<_>>();
+
+        if rendered.is_empty() {
             Ok(vec![format!("No memories found for: {query}")])
         } else {
-            Ok(hits)
+            Ok(rendered)
         }
     }
 
@@ -152,6 +178,63 @@ summary: {}
         );
         tokio::fs::write(self.root.join(filename), doc).await?;
         self.reindex().await?;
+        Ok(())
+    }
+
+    pub async fn mark_entries_loaded(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_fresh_index().await?;
+        let index_path = self.root.join("index.json");
+        if !index_path.exists() {
+            return Ok(());
+        }
+
+        let mut index = read_memory_index(&index_path).await?;
+        let id_set = ids.iter().cloned().collect::<HashSet<_>>();
+        let now = Utc::now().to_rfc3339();
+        let mut changed = false;
+        for entry in &mut index.entries {
+            if id_set.contains(&entry.id) {
+                entry.recall_count += 1;
+                entry.loaded_for_run_count += 1;
+                entry.last_recalled = Some(now.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            write_memory_index(&index_path, &index).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn record_outcome(&self, ids: &[String], success: bool) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_fresh_index().await?;
+        let index_path = self.root.join("index.json");
+        if !index_path.exists() {
+            return Ok(());
+        }
+
+        let mut index = read_memory_index(&index_path).await?;
+        let id_set = ids.iter().cloned().collect::<HashSet<_>>();
+        let mut changed = false;
+        for entry in &mut index.entries {
+            if id_set.contains(&entry.id) {
+                if success {
+                    entry.contributed_to_success_count += 1;
+                } else {
+                    entry.contributed_to_failure_count += 1;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            write_memory_index(&index_path, &index).await?;
+        }
         Ok(())
     }
 
@@ -293,6 +376,83 @@ summary: {}
     }
 }
 
+async fn read_memory_index_if_present(path: &Path) -> Result<Option<MemoryIndex>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(read_memory_index(path).await?))
+}
+
+async fn read_memory_index(path: &Path) -> Result<MemoryIndex> {
+    let json = tokio::fs::read_to_string(path).await?;
+    serde_json::from_str(&json).context("reading memory index")
+}
+
+async fn write_memory_index(path: &Path, index: &MemoryIndex) -> Result<()> {
+    let json = serde_json::to_string_pretty(index).context("serializing memory index")?;
+    tokio::fs::write(path, json).await?;
+    Ok(())
+}
+
+fn memory_entry_stats_map(index: Option<&MemoryIndex>) -> HashMap<String, MemoryEntryStats> {
+    index
+        .map(|index| {
+            index
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        MemoryEntryStats {
+                            recall_count: entry.recall_count,
+                            last_recalled: entry.last_recalled.clone(),
+                            loaded_for_run_count: entry.loaded_for_run_count,
+                            contributed_to_success_count: entry.contributed_to_success_count,
+                            contributed_to_failure_count: entry.contributed_to_failure_count,
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_memory_entry_stats(entry: &mut MemoryEntry, stats: Option<&MemoryEntryStats>) {
+    let Some(stats) = stats else {
+        return;
+    };
+    entry.recall_count = stats.recall_count;
+    entry.last_recalled = stats.last_recalled.clone();
+    entry.loaded_for_run_count = stats.loaded_for_run_count;
+    entry.contributed_to_success_count = stats.contributed_to_success_count;
+    entry.contributed_to_failure_count = stats.contributed_to_failure_count;
+}
+
+fn memory_matches(entry: &MemoryEntry, query: &str) -> bool {
+    entry.summary.to_lowercase().contains(query)
+        || entry.tags.iter().any(|tag| tag.to_lowercase().contains(query))
+        || entry.content.to_lowercase().contains(query)
+}
+
+fn memory_match_score(entry: &MemoryEntry, query: &str) -> i64 {
+    let mut score = 0_i64;
+    let summary = entry.summary.to_lowercase();
+    let content = entry.content.to_lowercase();
+    if summary.contains(query) {
+        score += 40;
+    }
+    if entry.tags.iter().any(|tag| tag.to_lowercase().contains(query)) {
+        score += 25;
+    }
+    if content.contains(query) {
+        score += 15;
+    }
+    score += entry.contributed_to_success_count * 10;
+    score -= entry.contributed_to_failure_count * 4;
+    score += entry.recall_count.min(20);
+    score
+}
+
 fn collect_entries(root: &Path, current: &Path, entries: &mut Vec<MemoryEntry>) -> Result<()> {
     for dent in std::fs::read_dir(current).with_context(|| format!("reading {}", current.display()))? {
         let dent = dent?;
@@ -318,6 +478,11 @@ fn collect_entries(root: &Path, current: &Path, entries: &mut Vec<MemoryEntry>) 
                 summary,
                 content: body,
                 created_at: file_created_at(&path)?,
+                recall_count: 0,
+                last_recalled: None,
+                loaded_for_run_count: 0,
+                contributed_to_success_count: 0,
+                contributed_to_failure_count: 0,
             });
             continue;
         }

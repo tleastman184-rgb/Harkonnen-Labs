@@ -48,6 +48,8 @@ checks:
     path: corpus_results.json
   - kind: artifact_exists
     path: causal_summary.md
+  - kind: artifact_exists
+    path: exploration_log.md
 
   # Twin services must be present (workspace_fs confirms workspace isolation held)
   - kind: twin_service_present
@@ -55,8 +57,8 @@ checks:
   - kind: twin_service_present
     service: state_db
 
-  # Coobie must have recorded a causal summary referencing the lamdet corpus run
+  # exploration_log.md must reference lamdet spec (written by orchestrator before Flint seals bundle)
   - kind: memory_entry_exists
     tags:
-      - lamdet
-      - corpus
+      - lamdet-corpus-validation
+      - Exploration

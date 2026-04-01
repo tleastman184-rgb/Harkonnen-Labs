@@ -546,6 +546,10 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
     };
 
     let pidgin = crate::pidgin::coobie_briefing_pidgin(briefing);
+    let project_memory_root = briefing
+        .project_memory_root
+        .clone()
+        .unwrap_or_else(|| "not recorded".to_string());
 
     format!(
         "# Coobie Preflight Response
@@ -553,6 +557,17 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
 {}
 
 I reviewed prior memory and causal history for `{}` targeting `{}`.
+
+## Memory Sources
+- Project memory root: {}
+- Project memory hits: {}
+- Core memory hits: {}
+
+## Project Memory Context
+{}
+
+## Core Memory Context
+{}
 
 ## Domain Signals
 {}
@@ -587,6 +602,17 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
         pidgin,
         briefing.spec_id,
         briefing.product,
+        project_memory_root,
+        briefing.project_memory_hits.len(),
+        briefing.core_memory_hits.len(),
+        render_bullet_lines(
+            &briefing.project_memory_hits,
+            "No project-local memory hits were retrieved yet.",
+        ),
+        render_bullet_lines(
+            &briefing.core_memory_hits,
+            "No Harkonnen core memory hits were retrieved yet.",
+        ),
         render_bullet_lines(&briefing.domain_signals, "No domain signals were detected yet."),
         render_component_lines(&briefing.project_components),
         render_blueprint_lines(briefing.scenario_blueprint.as_ref()),
