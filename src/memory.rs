@@ -1,9 +1,12 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::setup::SetupConfig;
 
@@ -71,6 +74,37 @@ pub struct MemoryIndex {
     pub entries: Vec<MemoryEntry>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MemoryIngestOptions {
+    pub id: Option<String>,
+    pub summary: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub provenance: MemoryProvenance,
+    pub keep_asset: bool,
+    pub scope_tag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryIngestResult {
+    pub note_path: PathBuf,
+    pub asset_path: Option<PathBuf>,
+    pub title: String,
+    pub extracted_chars: usize,
+    pub memory_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedMemorySource {
+    title: String,
+    source_kind: String,
+    source_locator: String,
+    text: String,
+    media_kind: String,
+    extension_tag: Option<String>,
+    asset_source_path: Option<PathBuf>,
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 /// File-backed memory store rooted at `factory/memory/`.
@@ -116,7 +150,8 @@ impl MemoryStore {
         println!("Imports folder:    {}", self.root.join("imports").display());
         println!();
         println!("Coobie will auto-refresh her local index when memory files change.");
-        println!("Import docs/images/PDFs with: harkonnen memory import <file>");
+        println!("Import raw assets with:    harkonnen memory import <file>");
+        println!("Ingest docs or URLs with: harkonnen memory ingest <file-or-url>");
         println!();
 
         if setup.setup.anythingllm.unwrap_or(false) {
@@ -410,6 +445,83 @@ impl MemoryStore {
         Ok(note_path)
     }
 
+    pub async fn ingest_source(
+        &self,
+        source: &str,
+        options: MemoryIngestOptions,
+    ) -> Result<MemoryIngestResult> {
+        tokio::fs::create_dir_all(&self.root).await?;
+        tokio::fs::create_dir_all(self.root.join("imports")).await?;
+
+        let extracted = extract_memory_source(source).await?;
+        let note_id = next_available_memory_id(
+            &self.root,
+            options.id.as_deref().unwrap_or(&extracted.title),
+        );
+        let mut provenance = options.provenance.clone();
+        if provenance.source_label.is_none() {
+            provenance.source_label = Some(extracted.title.clone());
+        }
+        if provenance.source_kind.is_none() {
+            provenance.source_kind = Some(extracted.source_kind.clone());
+        }
+        if provenance.source_path.is_none() {
+            provenance.source_path = Some(extracted.source_locator.clone());
+        }
+
+        let imported_asset = if options.keep_asset {
+            if let Some(asset_source_path) = extracted.asset_source_path.as_ref() {
+                Some(
+                    copy_asset_to_imports(
+                        &self.root.join("imports"),
+                        asset_source_path,
+                        &note_id,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut tags = vec!["ingested".to_string(), "document".to_string()];
+        append_unique_tag(&mut tags, extracted.media_kind.clone());
+        if let Some(extension_tag) = extracted.extension_tag.clone() {
+            append_unique_tag(&mut tags, extension_tag);
+        }
+        if let Some(scope_tag) = options.scope_tag.clone() {
+            append_unique_tag(&mut tags, scope_tag);
+        }
+        for tag in options.tags {
+            append_unique_tag(&mut tags, tag);
+        }
+
+        let summary = options
+            .summary
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_ingest_summary(&extracted));
+        let note_body = render_ingested_memory_body(
+            &extracted,
+            imported_asset.as_ref(),
+            options.notes.as_deref(),
+        );
+        let note_doc = render_memory_document(&tags, &summary, &note_body, &provenance);
+        let note_path = self.root.join(format!("{}.md", sanitize_memory_id(&note_id)));
+        tokio::fs::write(&note_path, note_doc).await?;
+        self.reindex().await?;
+
+        Ok(MemoryIngestResult {
+            note_path,
+            asset_path: imported_asset,
+            title: extracted.title,
+            extracted_chars: extracted.text.chars().count(),
+            memory_root: self.root.clone(),
+        })
+    }
+
     async fn ensure_fresh_index(&self) -> Result<()> {
         let index_path = self.root.join("index.json");
         if !index_path.exists() {
@@ -438,6 +550,488 @@ impl MemoryStore {
         }
         Ok(())
     }
+}
+
+
+fn append_unique_tag(tags: &mut Vec<String>, tag: String) {
+    let normalized = tag.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    if !tags.iter().any(|existing| existing == normalized) {
+        tags.push(normalized.to_string());
+    }
+}
+
+fn next_available_memory_id(root: &Path, raw: &str) -> String {
+    let mut base = sanitize_memory_id(raw);
+    if base.is_empty() {
+        base = format!("memory-ingest-{}", Utc::now().format("%Y%m%d%H%M%S"));
+    }
+    let candidate = root.join(format!("{}.md", base));
+    if !candidate.exists() {
+        return base;
+    }
+    format!("{}-{}", base, Utc::now().format("%Y%m%d%H%M%S"))
+}
+
+async fn copy_asset_to_imports(imports_dir: &Path, source: &Path, note_id: &str) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(imports_dir).await?;
+    let ext = source.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let mut path = asset_path_for(imports_dir, note_id, ext);
+    if path.exists() {
+        path = asset_path_for(
+            imports_dir,
+            &format!("{}-asset-{}", note_id, Utc::now().format("%Y%m%d%H%M%S")),
+            ext,
+        );
+    }
+    tokio::fs::copy(source, &path)
+        .await
+        .with_context(|| format!("copying {} -> {}", source.display(), path.display()))?;
+    Ok(path)
+}
+
+fn default_ingest_summary(extracted: &ExtractedMemorySource) -> String {
+    match extracted.source_kind.as_str() {
+        "url" => format!("Ingested web knowledge: {}", extracted.title),
+        _ => format!("Ingested {} document: {}", extracted.media_kind, extracted.title),
+    }
+}
+
+fn render_ingested_memory_body(
+    extracted: &ExtractedMemorySource,
+    imported_asset: Option<&PathBuf>,
+    notes: Option<&str>,
+) -> String {
+    let highlights = summarize_extracted_text(&extracted.text, 12);
+    let rel_asset = imported_asset
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not stored".to_string());
+    let extracted_text = truncate_for_memory(&extracted.text, 120_000);
+    format!(
+        "# Ingested Knowledge\n\n- Title: {}\n- Source kind: {}\n- Source locator: {}\n- Imported asset: {}\n- Ingested at: {}\n- Extracted chars: {}\n\n## Notes\n{}\n\n## Distilled Highlights\n{}\n\n## Extracted Text\n{}\n",
+        extracted.title,
+        extracted.source_kind,
+        extracted.source_locator,
+        rel_asset,
+        Utc::now().to_rfc3339(),
+        extracted.text.chars().count(),
+        notes
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("No additional notes were provided."),
+        render_highlight_lines(&highlights),
+        extracted_text,
+    )
+}
+
+fn render_highlight_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return "- No distilled highlights were extracted automatically yet.".to_string();
+    }
+    lines
+        .iter()
+        .map(|line| format!("- {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_extracted_text(text: &str, limit: usize) -> Vec<String> {
+    let mut highlights = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() < 18 {
+            continue;
+        }
+        if trimmed.chars().all(|ch| !ch.is_alphanumeric()) {
+            continue;
+        }
+        if highlights.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        highlights.push(trimmed.to_string());
+        if highlights.len() >= limit {
+            break;
+        }
+    }
+    highlights
+}
+
+fn truncate_for_memory(text: &str, max_chars: usize) -> String {
+    let collected = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        format!("{}\n\n[truncated after {} chars during ingest]", collected, max_chars)
+    } else {
+        collected
+    }
+}
+
+async fn extract_memory_source(source: &str) -> Result<ExtractedMemorySource> {
+    if is_url_source(source) {
+        extract_memory_source_from_url(source).await
+    } else {
+        extract_memory_source_from_file(Path::new(source)).await
+    }
+}
+
+fn is_url_source(source: &str) -> bool {
+    let lower = source.to_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+async fn extract_memory_source_from_url(source: &str) -> Result<ExtractedMemorySource> {
+    let client = reqwest::Client::builder().build()?;
+    let response = client
+        .get(source)
+        .header("User-Agent", "Harkonnen-Labs/0.1 memory-ingest")
+        .send()
+        .await?
+        .error_for_status()?;
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    let url_path = reqwest::Url::parse(source)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+
+    if content_type.contains("pdf") || url_path.to_lowercase().ends_with(".pdf") {
+        let bytes = response.bytes().await?;
+        return extract_remote_binary_to_text(source, &bytes, "pdf").await;
+    }
+    if content_type.contains("word") || url_path.to_lowercase().ends_with(".docx") {
+        let bytes = response.bytes().await?;
+        return extract_remote_binary_to_text(source, &bytes, "docx").await;
+    }
+    if content_type.contains("presentation") || url_path.to_lowercase().ends_with(".pptx") {
+        let bytes = response.bytes().await?;
+        return extract_remote_binary_to_text(source, &bytes, "pptx").await;
+    }
+
+    let raw = response.text().await?;
+    let is_html = content_type.contains("html")
+        || raw.to_lowercase().contains("<html")
+        || raw.to_lowercase().contains("<body");
+    let title = if is_html {
+        extract_html_title(&raw).unwrap_or_else(|| derive_title_from_source(source))
+    } else {
+        derive_title_from_source(source)
+    };
+    let text = if is_html {
+        html_to_text(&raw)
+    } else {
+        raw
+    };
+    let text = normalize_ingested_text(&text);
+    if text.trim().is_empty() {
+        bail!("no extractable text found at {}", source);
+    }
+    Ok(ExtractedMemorySource {
+        title,
+        source_kind: "url".to_string(),
+        source_locator: source.to_string(),
+        text,
+        media_kind: if is_html { "html".to_string() } else { "text".to_string() },
+        extension_tag: Some(if is_html { "html".to_string() } else { "txt".to_string() }),
+        asset_source_path: None,
+    })
+}
+
+async fn extract_remote_binary_to_text(source: &str, bytes: &[u8], ext: &str) -> Result<ExtractedMemorySource> {
+    let temp_path = std::env::temp_dir().join(format!(
+        "harkonnen-memory-ingest-{}.{}",
+        Uuid::new_v4(),
+        ext
+    ));
+    tokio::fs::write(&temp_path, bytes).await?;
+    let result = extract_memory_source_from_file(&temp_path).await;
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    let mut extracted = result?;
+    extracted.source_kind = "url".to_string();
+    extracted.source_locator = source.to_string();
+    extracted.asset_source_path = None;
+    Ok(extracted)
+}
+
+async fn extract_memory_source_from_file(source: &Path) -> Result<ExtractedMemorySource> {
+    if !source.exists() {
+        bail!("memory ingest source not found: {}", source.display());
+    }
+    if !source.is_file() {
+        bail!("memory ingest source is not a file: {}", source.display());
+    }
+
+    let canonical = source.canonicalize()?;
+    let ext = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let title = derive_title_from_path(&canonical);
+    let media_kind = detect_media_kind(&canonical).to_string();
+    let raw_text = match ext.as_str() {
+        "txt" | "md" | "csv" | "json" | "toml" | "yaml" | "yml" | "log" => {
+            tokio::fs::read_to_string(&canonical).await?
+        }
+        "html" | "htm" | "xml" => {
+            let raw = tokio::fs::read_to_string(&canonical).await?;
+            html_to_text(&raw)
+        }
+        "pdf" => extract_pdf_text(&canonical).await?,
+        "docx" => extract_docx_text(&canonical).await?,
+        "pptx" => extract_pptx_text(&canonical).await?,
+        "doc" | "ppt" | "odt" | "odp" => extract_with_libreoffice(&canonical).await?,
+        _ => match tokio::fs::read_to_string(&canonical).await {
+            Ok(text) => text,
+            Err(_) => bail!(
+                "unsupported ingest format for {}. Use memory import for raw asset storage or convert it to txt/pdf/docx/pptx/html first",
+                canonical.display()
+            ),
+        },
+    };
+    let text = normalize_ingested_text(&raw_text);
+    if text.trim().is_empty() {
+        bail!("no extractable text found in {}", canonical.display());
+    }
+    Ok(ExtractedMemorySource {
+        title,
+        source_kind: "file".to_string(),
+        source_locator: canonical.display().to_string(),
+        text,
+        media_kind,
+        extension_tag: if ext.is_empty() { None } else { Some(ext) },
+        asset_source_path: Some(canonical),
+    })
+}
+
+async fn extract_pdf_text(source: &Path) -> Result<String> {
+    let output = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(source)
+        .arg("-")
+        .output()
+        .await
+        .with_context(|| format!("running pdftotext for {}", source.display()))?;
+    if !output.status.success() {
+        bail!(
+            "pdftotext failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn extract_docx_text(source: &Path) -> Result<String> {
+    extract_zip_text_with_python(source, "docx").await
+}
+
+async fn extract_pptx_text(source: &Path) -> Result<String> {
+    extract_zip_text_with_python(source, "pptx").await
+}
+
+async fn extract_zip_text_with_python(source: &Path, mode: &str) -> Result<String> {
+    let script = if mode == "docx" {
+        r#"import html, re, sys, zipfile
+path = sys.argv[1]
+parts = []
+with zipfile.ZipFile(path) as zf:
+    names = sorted(name for name in zf.namelist() if name.startswith('word/') and name.endswith('.xml'))
+    for name in names:
+        data = zf.read(name).decode('utf-8', 'ignore')
+        data = re.sub(r'</w:p[^>]*>', '\n', data)
+        data = re.sub(r'<[^>]+>', ' ', data)
+        data = html.unescape(data)
+        data = re.sub(r'\s+', ' ', data)
+        data = re.sub(r' ?\n ?', '\n', data)
+        if data.strip():
+            parts.append(data.strip())
+print('\n\n'.join(parts))"#
+    } else {
+        r#"import html, re, sys, zipfile
+path = sys.argv[1]
+parts = []
+with zipfile.ZipFile(path) as zf:
+    names = sorted(name for name in zf.namelist() if name.startswith('ppt/slides/') and name.endswith('.xml'))
+    for name in names:
+        data = zf.read(name).decode('utf-8', 'ignore')
+        data = re.sub(r'</a:p[^>]*>', '\n', data)
+        data = re.sub(r'<[^>]+>', ' ', data)
+        data = html.unescape(data)
+        data = re.sub(r'\s+', ' ', data)
+        data = re.sub(r' ?\n ?', '\n', data)
+        if data.strip():
+            parts.append(data.strip())
+print('\n\n'.join(parts))"#
+    };
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(source)
+        .output()
+        .await
+        .with_context(|| format!("extracting zipped office text from {}", source.display()))?;
+    if !output.status.success() {
+        bail!(
+            "python office extractor failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn extract_with_libreoffice(source: &Path) -> Result<String> {
+    let out_dir = std::env::temp_dir().join(format!("harkonnen-memory-lo-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&out_dir).await?;
+    let output = Command::new("libreoffice")
+        .arg("--headless")
+        .arg("--convert-to")
+        .arg("txt:Text")
+        .arg("--outdir")
+        .arg(&out_dir)
+        .arg(source)
+        .output()
+        .await
+        .with_context(|| format!("running libreoffice for {}", source.display()))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_dir_all(&out_dir).await;
+        bail!(
+            "libreoffice conversion failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut entries = tokio::fs::read_dir(&out_dir).await?;
+    let mut text = None;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("txt") {
+            text = Some(tokio::fs::read_to_string(&path).await?);
+            break;
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&out_dir).await;
+    text.with_context(|| format!("libreoffice did not produce a txt output for {}", source.display()))
+}
+
+fn derive_title_from_path(source: &Path) -> String {
+    source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.replace(['_', '-'], " "))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| source.display().to_string())
+}
+
+fn derive_title_from_source(source: &str) -> String {
+    source
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .map(|value| value.replace(['_', '-'], " "))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| source.to_string())
+}
+
+fn extract_html_title(raw: &str) -> Option<String> {
+    let lower = raw.to_lowercase();
+    let start = lower.find("<title")?;
+    let after_open = lower[start..].find('>')? + start + 1;
+    let end = lower[after_open..].find("</title>")? + after_open;
+    let title = raw[after_open..end].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(decode_basic_html_entities(title))
+    }
+}
+
+fn html_to_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut tag = String::new();
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+
+    for ch in raw.chars() {
+        if in_tag {
+            if ch == '>' {
+                let lowered = tag.trim().to_lowercase();
+                if lowered.starts_with("script") {
+                    in_script = true;
+                } else if lowered.starts_with("/script") {
+                    in_script = false;
+                } else if lowered.starts_with("style") {
+                    in_style = true;
+                } else if lowered.starts_with("/style") {
+                    in_style = false;
+                } else if lowered.starts_with("br")
+                    || lowered.starts_with("/p")
+                    || lowered.starts_with("/div")
+                    || lowered.starts_with("/li")
+                    || lowered.starts_with("/tr")
+                    || lowered.starts_with("h1")
+                    || lowered.starts_with("h2")
+                    || lowered.starts_with("h3")
+                    || lowered.starts_with("/h1")
+                    || lowered.starts_with("/h2")
+                    || lowered.starts_with("/h3")
+                {
+                    out.push('\n');
+                }
+                tag.clear();
+                in_tag = false;
+            } else {
+                tag.push(ch);
+            }
+            continue;
+        }
+
+        if ch == '<' {
+            in_tag = true;
+            tag.clear();
+            continue;
+        }
+
+        if !in_script && !in_style {
+            out.push(ch);
+        }
+    }
+
+    normalize_ingested_text(&decode_basic_html_entities(&out))
+}
+
+fn decode_basic_html_entities(raw: &str) -> String {
+    raw.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn normalize_ingested_text(raw: &str) -> String {
+    let mut normalized = String::new();
+    let mut blank_run = 0usize;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                normalized.push('\n');
+            }
+            continue;
+        }
+        blank_run = 0;
+        normalized.push_str(trimmed);
+        normalized.push('\n');
+    }
+    normalized.trim().to_string()
 }
 
 async fn read_memory_index_if_present(path: &Path) -> Result<Option<MemoryIndex>> {

@@ -7,6 +7,18 @@ It sits one layer below [COOBIE.md](./COOBIE.md):
 - `COOBIE.md` explains the memory strategy
 - `COOBIE_SPEC.md` explains how to build it
 
+## Current implementation notes
+
+The repo now implements an important subset of this design already:
+
+- file-backed durable memory with indexed Markdown notes
+- extracted ingest from files and URLs into either core memory or repo-local project memory
+- project continuity artifacts under `.harkonnen/` for external repos
+- exploration logs, dead-end registry, stale-memory mitigation history, and retriever-forge evidence that Coobie can cite during preflight
+- self-tuning manifest signals such as recall counts, load counts, and contribution counts
+
+The sections below still describe the target architecture, but they should be read as a layered build plan on top of a non-trivial current implementation, not a greenfield spec.
+
 ## Design Thesis
 
 Coobie should not be implemented as a single vector store with summaries attached.
@@ -307,11 +319,12 @@ Role:
 
 Recommended paths:
 
-- `factory/memory/notes/`
+- `factory/memory/`
 - `factory/memory/imports/`
-- `factory/memory/reflections/`
-- `factory/memory/extracted/`
 - `factory/memory/index.json`
+- `<repo>/.harkonnen/project-memory/`
+- `<repo>/.harkonnen/project-memory/imports/`
+- `<repo>/.harkonnen/project-manifest.json` and related continuity artifacts
 
 ### SQLite
 

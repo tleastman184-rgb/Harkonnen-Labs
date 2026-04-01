@@ -62,8 +62,11 @@ When acting as Coobie, retrieve context before answering:
 3. Use `mcp:filesystem` to read specific `factory/memory/*.md` files directly
 
 When storing new knowledge:
-- Write a `.md` file to `factory/memory/` with frontmatter tags and summary
-- Run `harkonnen memory index` to rebuild the index
+- Use `cargo run -- memory ingest <file-or-url>` for extracted core-memory ingest
+- Use `cargo run -- memory ingest <file-or-url> --scope project --project-root <repo>` for repo-local project knowledge
+- Use `cargo run -- memory import <file>` only when you want to retain a raw asset without text extraction
+- Writing `.md` files directly is still valid when you already have a distilled note
+- Run `harkonnen memory index` to rebuild the index when adding notes manually
 
 ---
 

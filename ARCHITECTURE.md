@@ -4,6 +4,19 @@ Harkonnen Labs is a local-first, spec-driven AI software factory. Humans define 
 
 This document is the conceptual north star for the MVP scaffold in this repository and the next layers we build on top of it.
 
+## Current implementation snapshot
+
+The current build is no longer just a bare scaffold. Today Harkonnen includes:
+
+- core and project-local Coobie memory with a durable split between `factory/memory/` and `<repo>/.harkonnen/project-memory/`
+- extracted document and URL ingest for PDFs, text files, office docs, HTML, and websites
+- repo-local continuity artifacts such as `project-scan`, `resume-packet`, `strategy-register`, `memory-status`, and `stale-memory-history`
+- a residue-style exploration log and dead-end registry
+- stale-memory severity scoring plus mitigation planning and outcome tracking
+- a bounded retriever-themed inner forge with plan review, execution reports, and hook artifacts
+
+The architecture below still describes the target model, but these capabilities are already live in the current repo.
+
 ## What Harkonnen Labs Is
 
 Harkonnen Labs is not a chatbot, not just an IDE assistant, and not a thin wrapper around code generation. It is a factory system with a clear separation between the factory itself and the product it builds.
@@ -279,6 +292,7 @@ Recommended local stack:
 
 - filesystem is the source of truth for durable memory
 - SQLite holds structured run state and early team memory
+- repo-local `.harkonnen/` state carries project-specific continuity when Harkonnen works on an external codebase
 - Qdrant is the optional semantic index for long-term memory
 - Redis is optional hot memory for shared coordination, not the canonical record
 - AnythingLLM remains an optional local retrieval accelerator
@@ -286,9 +300,11 @@ Recommended local stack:
 Current repo mapping:
 
 - [src/memory.rs](./src/memory.rs)
+- [src/orchestrator.rs](./src/orchestrator.rs)
 - [factory/agents/profiles/coobie.yaml](./factory/agents/profiles/coobie.yaml)
 - [COOBIE.md](./COOBIE.md)
-- [factory/memory](./factory/memory) once populated
+- [factory/memory](./factory/memory)
+- project-local `<repo>/.harkonnen/project-memory/` on external codebases
 
 ### 5. Hidden Scenario System
 

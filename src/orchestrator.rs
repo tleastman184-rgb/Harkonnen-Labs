@@ -17,7 +17,7 @@ use crate::{
     config::Paths,
     db,
     llm::{self, LlmRequest},
-    memory::{MemoryEntry, MemoryProvenance, MemoryStore},
+    memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
         AgentExecution, BlackboardState, CoobieBriefing, CoobieEvidenceCitation, EpisodeRecord,
         HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
@@ -225,6 +225,7 @@ struct WorkerTaskEnvelope {
     max_iterations: u32,
     continuity_file: Option<String>,
     query_terms: Vec<String>,
+    preferred_commands: Vec<String>,
     guardrails: Vec<String>,
     required_checks: Vec<String>,
 }
@@ -301,6 +302,12 @@ struct RetrieverCommandExecution {
     raw_command: String,
     source: String,
     rationale: String,
+    #[serde(default)]
+    was_preferred: bool,
+    #[serde(default)]
+    preference_rank: Option<usize>,
+    #[serde(default)]
+    preference_outcome: Option<String>,
     passed: bool,
     exit_code: Option<i32>,
     stdout: String,
@@ -323,6 +330,14 @@ struct RetrieverExecutionArtifact {
     hook_artifact: String,
     passed: bool,
     summary: String,
+    #[serde(default)]
+    preferred_commands_offered: Vec<String>,
+    #[serde(default)]
+    preferred_commands_selected: Vec<String>,
+    #[serde(default)]
+    preferred_commands_helped: Vec<String>,
+    #[serde(default)]
+    preferred_commands_stale: Vec<String>,
     executed_commands: Vec<RetrieverCommandExecution>,
     returned_artifacts: Vec<String>,
 }
@@ -376,6 +391,72 @@ impl AppContext {
             blackboard: Arc::new(RwLock::new(BlackboardState::default())),
             coobie,
         })
+    }
+
+    pub async fn ingest_memory_source(
+        &self,
+        source: &str,
+        scope: &str,
+        project_root: Option<&str>,
+        id: Option<&str>,
+        summary: Option<&str>,
+        notes: Option<&str>,
+        tags: Vec<String>,
+        keep_asset: bool,
+    ) -> Result<MemoryIngestResult> {
+        let normalized_scope = scope.trim().to_lowercase();
+        match normalized_scope.as_str() {
+            "core" => {
+                self.memory_store
+                    .ingest_source(
+                        source,
+                        MemoryIngestOptions {
+                            id: id.map(|value| value.to_string()),
+                            summary: summary.map(|value| value.to_string()),
+                            notes: notes.map(|value| value.to_string()),
+                            tags,
+                            provenance: MemoryProvenance::default(),
+                            keep_asset,
+                            scope_tag: Some("core-memory".to_string()),
+                        },
+                    )
+                    .await
+            }
+            "project" => {
+                let project_root = project_root
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context("project memory ingest requires --project-root <repo-path>")?;
+                let target_source = self.resolve_memory_ingest_target(project_root).await?;
+                let store = self.project_memory_store(&target_source).await?;
+                let result = store
+                    .ingest_source(
+                        source,
+                        MemoryIngestOptions {
+                            id: id.map(|value| value.to_string()),
+                            summary: summary.map(|value| value.to_string()),
+                            notes: notes.map(|value| value.to_string()),
+                            tags,
+                            provenance: project_memory_provenance(
+                                &target_source,
+                                None,
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                vec!["project-memory-ingest".to_string()],
+                            ),
+                            keep_asset,
+                            scope_tag: Some("project-memory".to_string()),
+                        },
+                    )
+                    .await?;
+                self.refresh_project_resume_packet(&target_source, &store).await?;
+                Ok(result)
+            }
+            _ => bail!("unsupported memory ingest scope: {scope}"),
+        }
     }
 
     pub async fn start_run(&self, req: RunRequest) -> Result<RunRecord> {
@@ -2082,6 +2163,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         Vec<CoobieEvidenceCitation>,
         Vec<CoobieEvidenceCitation>,
         Vec<CoobieEvidenceCitation>,
+        Vec<CoobieEvidenceCitation>,
     )> {
         let resume_packet = self.load_project_resume_packet(target_source).await?;
         let exploration = self
@@ -2107,7 +2189,21 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 domain_signals,
             )
             .await?;
-        Ok((exploration, strategy, mitigation, forge))
+        let forge_preference_outcomes = self
+            .collect_relevant_preferred_forge_outcome_citations(
+                spec_obj,
+                target_source,
+                query_terms,
+                domain_signals,
+            )
+            .await?;
+        Ok((
+            exploration,
+            strategy,
+            mitigation,
+            forge,
+            forge_preference_outcomes,
+        ))
     }
 
     async fn collect_relevant_exploration_citations(
@@ -2392,6 +2488,261 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         Ok(scored.into_iter().map(|(_, _, citation)| citation).take(4).collect())
     }
 
+
+    async fn collect_preferred_retriever_forge_commands(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<Vec<String>> {
+        let runs = self.list_runs(40).await?;
+        let mut scores = HashMap::<String, (i32, chrono::DateTime<Utc>)>::new();
+
+        for run in runs {
+            if run.product != target_source.label {
+                continue;
+            }
+            let report_path = self.run_dir(&run.run_id).join("retriever_execution_report.json");
+            if !report_path.exists() {
+                continue;
+            }
+            let report_raw = match tokio::fs::read_to_string(&report_path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<RetrieverExecutionArtifact>(&report_raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let haystack = format!(
+                "{} {} {} {} {} {}",
+                run.spec_id,
+                run.product,
+                report.adapter,
+                report.profile,
+                report.summary,
+                report
+                    .executed_commands
+                    .iter()
+                    .map(|command| format!(
+                        "{} {} {} {} {}",
+                        command.label,
+                        command.raw_command,
+                        command.source,
+                        command.rationale,
+                        if command.passed { "pass" } else { "fail" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let mut run_score = score_briefing_evidence(
+                &haystack,
+                &spec_obj.id,
+                &target_source.label,
+                query_terms,
+                domain_signals,
+            );
+            if run.spec_id == spec_obj.id {
+                run_score += 8;
+            }
+            if report.passed {
+                run_score += 10;
+            }
+            run_score += (report.preferred_commands_helped.len() as i32) * 2;
+            run_score -= report.preferred_commands_stale.len() as i32;
+            if run_score <= 0 {
+                continue;
+            }
+
+            for command in &report.executed_commands {
+                let mut score = run_score;
+                if command.source == "spec.test_commands" {
+                    score += 2;
+                }
+                if command.was_preferred {
+                    score += 3;
+                }
+                match command.preference_outcome.as_deref() {
+                    Some("helped") => score += 6,
+                    Some("did_not_help") => score -= 5,
+                    _ => {}
+                }
+                if command.passed {
+                    score += 4;
+                } else {
+                    score -= 6;
+                }
+                if score <= 0 {
+                    continue;
+                }
+                let entry = scores
+                    .entry(command.raw_command.clone())
+                    .or_insert((0, run.created_at));
+                entry.0 += score;
+                if run.created_at > entry.1 {
+                    entry.1 = run.created_at;
+                }
+            }
+        }
+
+        let mut ranked = scores.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .0
+                .cmp(&left.1.0)
+                .then_with(|| right.1.1.cmp(&left.1.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(ranked.into_iter().map(|(command, _)| command).take(5).collect())
+    }
+
+    async fn collect_relevant_preferred_forge_outcome_citations(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<Vec<CoobieEvidenceCitation>> {
+        let runs = self.list_runs(40).await?;
+        let mut scored = Vec::<(i32, chrono::DateTime<Utc>, CoobieEvidenceCitation)>::new();
+
+        for run in runs {
+            if run.product != target_source.label {
+                continue;
+            }
+            let report_path = self.run_dir(&run.run_id).join("retriever_execution_report.json");
+            if !report_path.exists() {
+                continue;
+            }
+            let report_raw = match tokio::fs::read_to_string(&report_path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<RetrieverExecutionArtifact>(&report_raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            for command in report.executed_commands.iter().filter(|command| command.was_preferred) {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {} {}",
+                    run.spec_id,
+                    run.product,
+                    report.adapter,
+                    report.profile,
+                    report.summary,
+                    command.label,
+                    command.raw_command,
+                    command.preference_outcome.clone().unwrap_or_default(),
+                    command.rationale,
+                );
+                let mut score = score_briefing_evidence(
+                    &haystack,
+                    &spec_obj.id,
+                    &target_source.label,
+                    query_terms,
+                    domain_signals,
+                );
+                if run.spec_id == spec_obj.id {
+                    score += 8;
+                }
+                match command.preference_outcome.as_deref() {
+                    Some("helped") => score += 12,
+                    Some("did_not_help") => score += 7,
+                    _ => score += 2,
+                }
+                if report.preferred_commands_helped.iter().any(|value| value == &command.raw_command) {
+                    score += 3;
+                }
+                if report.preferred_commands_stale.iter().any(|value| value == &command.raw_command) {
+                    score += 2;
+                }
+                if score <= 0 {
+                    continue;
+                }
+                let summary = match command.preference_outcome.as_deref() {
+                    Some("helped") => format!(
+                        "preferred command '{}' kept helping in retriever forge run {}",
+                        command.raw_command, run.run_id
+                    ),
+                    Some("did_not_help") => format!(
+                        "preferred command '{}' went stale in retriever forge run {}",
+                        command.raw_command, run.run_id
+                    ),
+                    _ => format!(
+                        "preferred command '{}' was selected in retriever forge run {}",
+                        command.raw_command, run.run_id
+                    ),
+                };
+                scored.push((
+                    score,
+                    run.created_at,
+                    CoobieEvidenceCitation {
+                        citation_id: format!(
+                            "forge-preference:{}:{}",
+                            run.run_id,
+                            stable_key_fragment(&command.raw_command)
+                        ),
+                        source_type: "retriever_forge_preference_outcome".to_string(),
+                        run_id: run.run_id.clone(),
+                        episode_id: None,
+                        phase: "retriever_forge".to_string(),
+                        agent: "coobie".to_string(),
+                        summary,
+                        evidence: format!(
+                            "preference_rank={}; preference_outcome={}; run_passed={}; selected={}; helped={}; stale={}",
+                            command
+                                .preference_rank
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            command
+                                .preference_outcome
+                                .clone()
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            if report.passed { "true" } else { "false" },
+                            if report
+                                .preferred_commands_selected
+                                .iter()
+                                .any(|value| value == &command.raw_command)
+                            {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                            if report
+                                .preferred_commands_helped
+                                .iter()
+                                .any(|value| value == &command.raw_command)
+                            {
+                                "true"
+                            } else {
+                                "false"
+                            },
+                            if report
+                                .preferred_commands_stale
+                                .iter()
+                                .any(|value| value == &command.raw_command)
+                            {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        ),
+                    },
+                ));
+            }
+        }
+
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        Ok(scored
+            .into_iter()
+            .map(|(_, _, citation)| citation)
+            .take(5)
+            .collect())
+    }
+
     async fn collect_relevant_strategy_register_citations(
         &self,
         spec_obj: &Spec,
@@ -2470,8 +2821,17 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             strategy_register_citations,
             mitigation_history_citations,
             forge_evidence_citations,
+            preferred_forge_outcome_citations,
         ) = self
             .collect_briefing_evidence_citations(spec_obj, target_source, query_terms, domain_signals)
+            .await?;
+        let preferred_forge_commands = self
+            .collect_preferred_retriever_forge_commands(
+                spec_obj,
+                target_source,
+                query_terms,
+                domain_signals,
+            )
             .await?;
         let resume_packet = self.load_project_resume_packet(target_source).await?;
         let prior_report_count = sqlx::query(
@@ -2516,6 +2876,12 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             &mut required_checks,
             &mut open_questions,
         );
+        apply_preferred_forge_outcome_context(
+            &preferred_forge_outcome_citations,
+            &mut recommended_guardrails,
+            &mut required_checks,
+            &mut open_questions,
+        );
 
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
@@ -2533,6 +2899,8 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             strategy_register_citations,
             mitigation_history_citations,
             forge_evidence_citations,
+            preferred_forge_outcome_citations,
+            preferred_forge_commands,
             relevant_lessons,
             prior_causes,
             project_components: spec_obj.project_components.clone(),
@@ -2749,12 +3117,21 @@ TOOL SURFACE:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "trail-state.json".to_string());
         let hook_artifact_name = "retriever_forge_hooks.json".to_string();
-        let command_plan = build_retriever_command_plan(spec_obj, staged_product)?;
+        let command_plan = build_retriever_command_plan(spec_obj, staged_product, &packet)?;
+        let preferred_rank_map = packet
+            .preferred_commands
+            .iter()
+            .enumerate()
+            .map(|(idx, command)| (command.as_str(), idx + 1))
+            .collect::<HashMap<_, _>>();
         let logs_dir = run_dir.join("retriever-forge");
         tokio::fs::create_dir_all(&logs_dir).await?;
 
         let mut executed_commands = Vec::new();
         let mut hook_records = Vec::new();
+        let mut preferred_commands_selected = Vec::new();
+        let mut preferred_commands_helped = Vec::new();
+        let mut preferred_commands_stale = Vec::new();
         let mut returned_artifacts = vec![
             "retriever_execution_report.json".to_string(),
             "retriever_execution_report.md".to_string(),
@@ -2780,6 +3157,11 @@ TOOL SURFACE:
             });
 
             let log_artifact = format!("retriever-forge/command-{:02}.log", idx + 1);
+            let preference_rank = preferred_rank_map.get(planned.raw_command.as_str()).copied();
+            let was_preferred = preference_rank.is_some();
+            if was_preferred {
+                push_unique(&mut preferred_commands_selected, &planned.raw_command);
+            }
             if decision == "deny" {
                 all_passed = false;
                 let denied_message = if reasons.is_empty() {
@@ -2804,11 +3186,21 @@ TOOL SURFACE:
                 );
                 tokio::fs::write(run_dir.join(&log_artifact), log_body).await?;
                 returned_artifacts.push(log_artifact.clone());
+                if was_preferred {
+                    push_unique(&mut preferred_commands_stale, &planned.raw_command);
+                }
                 executed_commands.push(RetrieverCommandExecution {
                     label: planned.label.clone(),
                     raw_command: planned.raw_command.clone(),
                     source: planned.source.clone(),
                     rationale: planned.rationale.clone(),
+                    was_preferred,
+                    preference_rank,
+                    preference_outcome: Some(if was_preferred {
+                        "did_not_help".to_string()
+                    } else {
+                        "not_preferred".to_string()
+                    }),
                     passed: false,
                     exit_code: None,
                     stdout: String::new(),
@@ -2866,12 +3258,30 @@ TOOL SURFACE:
             if !outcome.success {
                 all_passed = false;
             }
+            if was_preferred {
+                if outcome.success {
+                    push_unique(&mut preferred_commands_helped, &planned.raw_command);
+                } else {
+                    push_unique(&mut preferred_commands_stale, &planned.raw_command);
+                }
+            }
             returned_artifacts.push(log_artifact.clone());
             executed_commands.push(RetrieverCommandExecution {
                 label: planned.label.clone(),
                 raw_command: planned.raw_command.clone(),
                 source: planned.source.clone(),
                 rationale: planned.rationale.clone(),
+                was_preferred,
+                preference_rank,
+                preference_outcome: Some(if was_preferred {
+                    if outcome.success {
+                        "helped".to_string()
+                    } else {
+                        "did_not_help".to_string()
+                    }
+                } else {
+                    "not_preferred".to_string()
+                }),
                 passed: outcome.success,
                 exit_code: outcome.code,
                 stdout: outcome.stdout.clone(),
@@ -2919,23 +3329,37 @@ TOOL SURFACE:
         )
         .await?;
 
+        let preferred_summary = if packet.preferred_commands.is_empty() {
+            "No prior preferred command paths were offered.".to_string()
+        } else {
+            format!(
+                "Preferred offered={}, selected={}, helped={}, stale={}",
+                packet.preferred_commands.len(),
+                preferred_commands_selected.len(),
+                preferred_commands_helped.len(),
+                preferred_commands_stale.len()
+            )
+        };
         let summary = if executed_commands.is_empty() {
             format!(
-                "Retriever forge found no runnable command plan for '{}' and returned no visible execution evidence.",
-                target_source.label
+                "Retriever forge found no runnable command plan for '{}' and returned no visible execution evidence. {}",
+                target_source.label,
+                preferred_summary
             )
         } else if all_passed {
             format!(
-                "Retriever forge completed {} command(s) for '{}' and returned normalized visible execution evidence with hook records.",
+                "Retriever forge completed {} command(s) for '{}' and returned normalized visible execution evidence with hook records. {}",
                 executed_commands.len(),
-                target_source.label
+                target_source.label,
+                preferred_summary
             )
         } else {
             format!(
-                "Retriever forge hit visible execution failures for '{}' ({} command(s), {} failed or denied).",
+                "Retriever forge hit visible execution failures for '{}' ({} command(s), {} failed or denied). {}",
                 target_source.label,
                 executed_commands.len(),
-                executed_commands.iter().filter(|command| !command.passed).count()
+                executed_commands.iter().filter(|command| !command.passed).count(),
+                preferred_summary
             )
         };
 
@@ -2953,6 +3377,10 @@ TOOL SURFACE:
             hook_artifact: hook_artifact_name.clone(),
             passed: all_passed,
             summary: summary.clone(),
+            preferred_commands_offered: packet.preferred_commands.clone(),
+            preferred_commands_selected,
+            preferred_commands_helped,
+            preferred_commands_stale,
             executed_commands,
             returned_artifacts: returned_artifacts.clone(),
         };
@@ -3638,6 +4066,37 @@ TWIN SERVICES:
         Ok(TargetSourceMetadata {
             label,
             source_kind,
+            source_path: canonical.display().to_string(),
+            git,
+        })
+    }
+
+    async fn resolve_memory_ingest_target(&self, project_root: &str) -> Result<TargetSourceMetadata> {
+        let candidate = PathBuf::from(project_root);
+        let source_path = if candidate.is_absolute() {
+            candidate
+        } else {
+            self.paths.root.join(candidate)
+        };
+
+        if !source_path.exists() {
+            bail!("project memory root not found: {}", source_path.display());
+        }
+        if !source_path.is_dir() {
+            bail!("project memory root is not a directory: {}", source_path.display());
+        }
+
+        let canonical = source_path.canonicalize()?;
+        let label = canonical
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| canonical.display().to_string());
+        let git = self.capture_git_metadata(&canonical).await?;
+
+        Ok(TargetSourceMetadata {
+            label,
+            source_kind: "path".to_string(),
             source_path: canonical.display().to_string(),
             git,
         })
@@ -6053,6 +6512,41 @@ fn apply_forge_evidence_context(
     open_questions.dedup();
 }
 
+fn apply_preferred_forge_outcome_context(
+    citations: &[CoobieEvidenceCitation],
+    recommended_guardrails: &mut Vec<String>,
+    required_checks: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    if citations.is_empty() {
+        return;
+    }
+
+    for citation in citations.iter().take(4) {
+        let summary = citation.summary.to_lowercase();
+        if summary.contains("kept helping") {
+            recommended_guardrails.push(format!(
+                "Prefer the previously helpful bounded command path cited in {} unless current repo evidence contradicts it.",
+                citation.citation_id
+            ));
+        }
+        if summary.contains("went stale") {
+            required_checks.push(format!(
+                "Explain why the stale preferred command path cited in {} should be trusted again before reusing it.",
+                citation.citation_id
+            ));
+            open_questions.push(format!(
+                "What changed since preferred command evidence {} caused that path to go stale?",
+                citation.citation_id
+            ));
+        }
+    }
+
+    recommended_guardrails.dedup();
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
 fn build_coobie_open_questions(
     spec_obj: &Spec,
     domain_signals: &[String],
@@ -6189,6 +6683,7 @@ fn build_worker_task_envelope(
         max_iterations: worker_harness.max_iterations.unwrap_or(6),
         continuity_file: worker_harness.continuity_file.clone(),
         query_terms: briefing.query_terms.clone(),
+        preferred_commands: briefing.preferred_forge_commands.clone(),
         guardrails: briefing.recommended_guardrails.clone(),
         required_checks: briefing.required_checks.clone(),
     }
@@ -6263,6 +6758,24 @@ fn build_plan_review_chain(
             .collect(),
     });
     stages.push(PlanReviewStage {
+        stage: "forge_preference_review".to_string(),
+        owner: "coobie".to_string(),
+        summary: if briefing.preferred_forge_commands.is_empty() {
+            "Coobie found no previously successful bounded command paths strong enough to bias the forge plan yet.".to_string()
+        } else {
+            format!(
+                "Coobie prefers {} previously successful bounded command path(s) for '{}' before the forge invents a new route.",
+                briefing.preferred_forge_commands.len(),
+                target_source.label
+            )
+        },
+        evidence: if briefing.preferred_forge_commands.is_empty() {
+            vec!["No preferred retriever-forge commands recovered from prior successful runs.".to_string()]
+        } else {
+            briefing.preferred_forge_commands.iter().take(5).cloned().collect()
+        },
+    });
+    stages.push(PlanReviewStage {
         stage: "final_execution_plan".to_string(),
         owner: "mason".to_string(),
         summary: format!(
@@ -6328,6 +6841,9 @@ fn render_worker_task_envelope_markdown(envelope: &WorkerTaskEnvelope) -> String
 ## Query Terms
 {}
 
+## Preferred Commands
+{}
+
 ## Guardrails
 {}
 
@@ -6354,6 +6870,10 @@ fn render_worker_task_envelope_markdown(envelope: &WorkerTaskEnvelope) -> String
         ),
         render_list(&envelope.return_artifacts, "No return artifacts recorded."),
         render_list(&envelope.query_terms, "No query terms recorded."),
+        render_list(
+            &envelope.preferred_commands,
+            "No preferred retriever-forge commands were recorded.",
+        ),
         render_list(&envelope.guardrails, "No guardrails recorded."),
         render_list(&envelope.required_checks, "No required checks recorded."),
     )
@@ -6416,7 +6936,11 @@ fn fallback_worker_value(value: &str, fallback: &str) -> String {
 }
 
 
-fn build_retriever_command_plan(spec_obj: &Spec, staged_product: &Path) -> Result<Vec<RetrieverPlannedCommand>> {
+fn build_retriever_command_plan(
+    spec_obj: &Spec,
+    staged_product: &Path,
+    packet: &WorkerTaskEnvelope,
+) -> Result<Vec<RetrieverPlannedCommand>> {
     let mut commands = Vec::new();
     for raw_cmd in &spec_obj.test_commands {
         let trimmed = raw_cmd.trim();
@@ -6431,7 +6955,10 @@ fn build_retriever_command_plan(spec_obj: &Spec, staged_product: &Path) -> Resul
         });
     }
     if !commands.is_empty() {
-        return Ok(commands);
+        return Ok(apply_preferred_retriever_command_order(
+            commands,
+            &packet.preferred_commands,
+        ));
     }
 
     let cargo_manifest = staged_product.join("Cargo.toml");
@@ -6536,7 +7063,54 @@ fn build_retriever_command_plan(spec_obj: &Spec, staged_product: &Path) -> Resul
         }
     }
 
-    Ok(commands)
+    Ok(apply_preferred_retriever_command_order(
+        commands,
+        &packet.preferred_commands,
+    ))
+}
+
+fn apply_preferred_retriever_command_order(
+    mut commands: Vec<RetrieverPlannedCommand>,
+    preferred_commands: &[String],
+) -> Vec<RetrieverPlannedCommand> {
+    if commands.is_empty() || preferred_commands.is_empty() {
+        return commands;
+    }
+
+    let preferred_positions = preferred_commands
+        .iter()
+        .enumerate()
+        .map(|(idx, command)| (command.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+
+    commands.sort_by(|left, right| {
+        let left_rank = preferred_positions
+            .get(left.raw_command.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        let right_rank = preferred_positions
+            .get(right.raw_command.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    for command in &mut commands {
+        if let Some(rank) = preferred_positions.get(command.raw_command.as_str()) {
+            command.rationale = format!(
+                "{} Preferred because Coobie saw this bounded command path succeed in prior similar forge runs (preference rank {}).",
+                command.rationale,
+                rank + 1
+            );
+            if command.source == "manifest_inference" {
+                command.source = "manifest_inference+forge_memory".to_string();
+            }
+        }
+    }
+
+    commands
 }
 
 fn evaluate_retriever_hook(
@@ -6648,6 +7222,9 @@ fn render_retriever_execution_markdown(report: &RetrieverExecutionArtifact) -> S
 - source: {}
 - rationale: {}
 - command: {}
+- preferred: {}
+- preference_rank: {}
+- preference_outcome: {}
 - passed: {}
 - exit_code: {}
 - log: {}",
@@ -6655,6 +7232,15 @@ fn render_retriever_execution_markdown(report: &RetrieverExecutionArtifact) -> S
                 command.source,
                 command.rationale,
                 command.raw_command,
+                if command.was_preferred { "true" } else { "false" },
+                command
+                    .preference_rank
+                    .map(|rank| rank.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                command
+                    .preference_outcome
+                    .clone()
+                    .unwrap_or_else(|| "n/a".to_string()),
                 if command.passed { "true" } else { "false" },
                 command
                     .exit_code
@@ -6682,6 +7268,10 @@ fn render_retriever_execution_markdown(report: &RetrieverExecutionArtifact) -> S
 - Dispatch artifact: {}
 - Continuity artifact: {}
 - Hook artifact: {}
+- Preferred commands offered: {}
+- Preferred commands selected: {}
+- Preferred commands helped: {}
+- Preferred commands stale: {}
 
 ## Summary
 {}
@@ -6704,6 +7294,10 @@ fn render_retriever_execution_markdown(report: &RetrieverExecutionArtifact) -> S
         report.dispatch_artifact,
         report.continuity_artifact,
         report.hook_artifact,
+        render_list(&report.preferred_commands_offered, "No preferred commands were offered."),
+        render_list(&report.preferred_commands_selected, "No preferred commands were selected."),
+        render_list(&report.preferred_commands_helped, "No preferred commands helped in this run."),
+        render_list(&report.preferred_commands_stale, "No preferred commands went stale in this run."),
         report.summary,
         command_sections,
         render_list(&report.returned_artifacts, "No artifacts were returned."),

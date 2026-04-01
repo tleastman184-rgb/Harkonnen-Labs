@@ -21,6 +21,7 @@ Agents do the implementation work.
 
 ## Docs
 
+- [Agent Context](./AGENTS.md)
 - [Architecture](./ARCHITECTURE.md)
 - [Setup Guide](./SETUP.md)
 - [Coobie Memory](./COOBIE.md)
@@ -40,6 +41,9 @@ Agents do the implementation work.
 
 ```bash
 cargo run -- setup check
+cargo run -- memory init
+cargo run -- memory ingest ./docs/ISA-18.2.pdf
+cargo run -- memory ingest https://example.com/gmp-guidance --scope project --project-root ../some-other-repo
 cargo run -- spec validate factory/specs/examples/sample_feature.yaml
 cargo run -- run start factory/specs/examples/sample_feature.yaml --product sample-app
 cargo run -- run start factory/specs/examples/sample_feature.yaml --product-path ../some-other-repo
@@ -53,3 +57,10 @@ To stamp a Claude-only Labrador pack into another repo, use:
 ```bash
 cargo run -- setup claude-pack --target-path ../SPO --project-name SPO --project-type winccoa --winccoa
 ```
+
+## Current highlights
+
+- Coobie now has a split memory model: Harkonnen core memory in `factory/memory/` and repo-local project memory in `<repo>/.harkonnen/project-memory/`.
+- `memory ingest` can extract and store knowledge from local files or URLs into either core or project memory, while optionally keeping the original source asset alongside the Markdown note.
+- External repos now get continuity artifacts such as `project-scan`, `resume-packet`, `strategy-register`, `memory-status`, and `stale-memory-history` under `.harkonnen/`.
+- Coobie cites exploration logs, dead ends, stale-memory mitigation outcomes, and retriever-forge evidence during preflight so prior runs directly shape new runs.

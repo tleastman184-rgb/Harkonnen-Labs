@@ -685,6 +685,12 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 ## Retriever Forge Evidence Coobie Is Citing
 {}
 
+## Preferred Forge Outcomes Coobie Is Citing
+{}
+
+## Preferred Retriever Forge Commands
+{}
+
 ## Guardrails I Want The Pack To Follow
 {}
 
@@ -743,6 +749,14 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
         render_citations(
             &briefing.forge_evidence_citations,
             "No prior retriever-forge evidence was elevated for this run yet.",
+        ),
+        render_citations(
+            &briefing.preferred_forge_outcome_citations,
+            "No prior preferred-command outcomes were elevated for this run yet.",
+        ),
+        render_bullet_lines(
+            &briefing.preferred_forge_commands,
+            "No preferred retriever-forge commands were recovered from prior successful runs yet.",
         ),
         render_bullet_lines(
             &briefing.recommended_guardrails,

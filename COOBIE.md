@@ -4,7 +4,19 @@ For the implementation-facing module, trait, and TypeDB plan, see [COOBIE_SPEC.m
 
 Coobie is the local memory engineer for Harkonnen Labs.
 
-Her job is not just to fetch notes. She manages three memory layers so the Labrador pack can stay coherent across a run, across sessions, and across a multi-agent workflow.
+Her job is not just to fetch notes. She manages memory, continuity, and causal reuse so the Labrador pack can stay coherent across a run, across sessions, and across external codebases.
+
+## Current implementation status
+
+Today Coobie already supports:
+
+- core memory in `factory/memory/`
+- project-local memory in `<repo>/.harkonnen/project-memory/`
+- `memory ingest` for local files and URLs
+- extracted Markdown notes plus optional retained source assets
+- project continuity artifacts such as `project-scan`, `resume-packet`, `strategy-register`, `memory-status`, and `stale-memory-history`
+- residue-style exploration logs, dead-end evidence, and retriever-forge evidence citations in preflight
+- stale-memory risk scoring, mitigation planning, and mitigation outcome tracking
 
 ## Design Goal
 
@@ -56,15 +68,18 @@ This layer holds:
 
 Canonical local source of truth:
 
-- `factory/memory/notes/` or top-level memory markdown
-- `factory/memory/imports/` for imported assets
-- `factory/memory/reflections/` for consolidated run learning
-- `factory/memory/index.json` as the local search index
+- `factory/memory/` for Harkonnen core memory
+- `factory/memory/imports/` for retained core source assets
+- `<repo>/.harkonnen/project-memory/` for repo-specific durable memory
+- `<repo>/.harkonnen/project-memory/imports/` for retained project-local source assets
+- `factory/memory/index.json` and `<repo>/.harkonnen/project-memory/index.json` as local search indexes
 
 Current implementation status:
 
-- local markdown and asset import are live
+- local markdown and raw asset import are live
+- extracted ingest from files and URLs is live
 - local auto-refresh indexing is live
+- project-local continuity artifacts are live
 - AnythingLLM sync is available as an optional local accelerator
 
 Recommended local semantic accelerator:
@@ -180,18 +195,20 @@ Status: implemented.
 
 ### Phase B: Extraction
 
-Add local extractors so imported assets become more searchable locally.
+Status: largely implemented for text-forward sources.
 
-Recommended tools:
+Current extractors support:
 
-- `poppler-utils` for `pdftotext`
-- `tesseract-ocr` for OCR on images and scanned PDFs
-- optional `libreoffice --headless` or `pandoc` for office docs
+- local text-like files such as `txt`, `md`, `csv`, `json`, `toml`, `yaml`, `html`, and logs
+- PDFs via `pdftotext`
+- `docx` and `pptx` via local zip/XML extraction
+- older office formats via `libreoffice --headless` fallback when available
+- websites and direct URLs via `memory ingest`
 
-Result:
+Remaining gaps:
 
-- Coobie gets real extracted text sidecars
-- Qdrant and AnythingLLM both get better input
+- OCR for scanned PDFs and images
+- deeper semantic chunking beyond extracted full-text notes
 
 ### Phase C: Qdrant
 
@@ -244,10 +261,25 @@ Initialize memory:
 cargo run -- memory init
 ```
 
-Import a document, PDF, or image asset:
+Import a raw document, PDF, or image asset without extraction:
 
 ```bash
 cargo run -- memory import /path/to/file.pdf --summary "Factory setup guide" --tags setup,docs
+```
+
+Ingest a document or website into core memory with extraction:
+
+```bash
+cargo run -- memory ingest /path/to/ISA-18.2.pdf --summary "ISA-18.2 alarm management standard" --tags standards,alarms
+```
+
+Ingest a source into project-local memory:
+
+```bash
+cargo run -- memory ingest https://example.com/gmp-guidance \
+  --scope project \
+  --project-root ../some-product-repo \
+  --tags gmp,regulatory
 ```
 
 Search Coobie's local memory:

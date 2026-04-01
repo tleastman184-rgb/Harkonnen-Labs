@@ -132,6 +132,7 @@ pub enum MemoryCommands {
     Init,
     Search(MemorySearchArgs),
     Import(MemoryImportArgs),
+    Ingest(MemoryIngestArgs),
 }
 
 #[derive(Args, Debug)]
@@ -150,6 +151,25 @@ pub struct MemoryImportArgs {
     pub notes: Option<String>,
     #[arg(long, value_delimiter = ',')]
     pub tags: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct MemoryIngestArgs {
+    pub source: String,
+    #[arg(long, default_value = "core", value_parser = ["core", "project"])]
+    pub scope: String,
+    #[arg(long)]
+    pub project_root: Option<String>,
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub summary: Option<String>,
+    #[arg(long)]
+    pub notes: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub tags: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub no_asset: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -381,6 +401,27 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
                 )
                 .await?;
             println!("Imported memory note: {}", note_path.display());
+        }
+        MemoryCommands::Ingest(args) => {
+            let result = app
+                .ingest_memory_source(
+                    &args.source,
+                    &args.scope,
+                    args.project_root.as_deref(),
+                    args.id.as_deref(),
+                    args.summary.as_deref(),
+                    args.notes.as_deref(),
+                    args.tags,
+                    !args.no_asset,
+                )
+                .await?;
+            println!("Ingested memory note: {}", result.note_path.display());
+            if let Some(asset_path) = result.asset_path {
+                println!("Stored source asset: {}", asset_path.display());
+            }
+            println!("Extracted title: {}", result.title);
+            println!("Extracted chars: {}", result.extracted_chars);
+            println!("Memory root: {}", result.memory_root.display());
         }
     }
     Ok(())

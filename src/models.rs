@@ -195,6 +195,10 @@ pub struct CoobieBriefing {
     pub mitigation_history_citations: Vec<CoobieEvidenceCitation>,
     #[serde(default)]
     pub forge_evidence_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub preferred_forge_outcome_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub preferred_forge_commands: Vec<String>,
     pub relevant_lessons: Vec<LessonRecord>,
     pub prior_causes: Vec<PriorCauseSignal>,
     pub project_components: Vec<ProjectComponent>,

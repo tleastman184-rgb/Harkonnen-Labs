@@ -446,6 +446,24 @@ Coobie Preflight
             }
         ));
         report.push_str(&format!(
+            "Preferred forge outcome citations: {}
+",
+            if briefing.preferred_forge_outcome_citations.is_empty() {
+                "none".to_string()
+            } else {
+                render_citation_lines(&briefing.preferred_forge_outcome_citations).join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Preferred retriever forge commands: {}
+",
+            if briefing.preferred_forge_commands.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.preferred_forge_commands.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
             "Regulatory considerations: {}
 ",
             if briefing.regulatory_considerations.is_empty() {

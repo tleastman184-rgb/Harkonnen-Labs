@@ -65,6 +65,7 @@ cargo run -- run report <run-id>               # Print run report
 cargo run -- artifact package <run-id>         # Package artifacts for a run
 cargo run -- memory init                       # Seed Coobie's memory, print backend setup
 cargo run -- memory index                      # Rebuild index.json from md files
+cargo run -- memory ingest <file-or-url>       # Extract docs/web content into core or project memory
 cargo run -- setup check                       # Verify active setup (providers + MCP)
 ```
 
@@ -269,6 +270,8 @@ cargo run -- memory init          # write seed docs + build index
 
 To store a new fact in Coobie's memory, either:
 - Write a `.md` file to `factory/memory/` and run `harkonnen memory index`
+- Use `cargo run -- memory ingest <file-or-url>` to extract text from documents or websites into core memory
+- Use `cargo run -- memory ingest <file-or-url> --scope project --project-root <repo>` to write repo-local knowledge into `<repo>/.harkonnen/project-memory/`
 - Ask Coobie directly during a run: "Coobie, store this pattern for future runs"
 
 ---
@@ -313,7 +316,7 @@ security_expectations: [auth, secrets, isolation]
 - Run creation, status, reporting, and persistence in SQLite
 - Per-run workspace isolation
 - Artifact packaging
-- File-backed memory store with keyword retrieval and import support (Coobie)
+- File-backed memory store with keyword retrieval, raw asset import, and extracted document/URL ingest into core or project memory (Coobie)
 - `setup check`, `setup init`, and `setup claude-pack`
 - Agent profile loading and provider routing display
 - Provider-aware LLM routing for Claude, Gemini, and OpenAI/Codex
