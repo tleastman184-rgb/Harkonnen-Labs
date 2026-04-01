@@ -48,6 +48,8 @@ pub enum HiddenScenarioCheck {
     MetricEq { artifact: String, field: String, value: JsonValue },
     /// Check that any .md artifact in the run dir contains all required tag strings.
     MemoryEntryExists { tags: Vec<String> },
+    /// Check that the named artifact's raw text contains all required snippets.
+    ArtifactContainsAll { path: String, contains_all: Vec<String> },
     ExplorationLogExists,
 }
 
@@ -325,6 +327,34 @@ fn evaluate_check(
                     "found matching memory entry in run artifacts".to_string()
                 } else {
                     format!("no .md artifact contains all tags: [{}]", tags.join(", "))
+                },
+            }
+        }
+        HiddenScenarioCheck::ArtifactContainsAll { path, contains_all } => {
+            let kind = format!("artifact_contains_all({path})");
+            let target = run_dir.join(path);
+            let content = match std::fs::read_to_string(&target) {
+                Ok(content) => content,
+                Err(error) => {
+                    return HiddenScenarioCheckResult {
+                        kind,
+                        passed: false,
+                        details: format!("could not read {}: {error}", target.display()),
+                    }
+                }
+            };
+            let missing = contains_all
+                .iter()
+                .filter(|needle| !content.contains(needle.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            HiddenScenarioCheckResult {
+                kind,
+                passed: missing.is_empty(),
+                details: if missing.is_empty() {
+                    format!("all required snippets found in {}", target.display())
+                } else {
+                    format!("missing snippets in {}: {}", target.display(), missing.join(", "))
                 },
             }
         }

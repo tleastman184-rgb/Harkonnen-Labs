@@ -146,6 +146,7 @@ export default function CausalTesseract({ onClose }) {
           <span className="legend-item conn">arcs = causal trail</span>
         </div>
 
+        <button className="tesseract-back" onClick={onClose} title="Back to Pack Board (Esc)">← Pack Board</button>
         <button className="tesseract-close" onClick={onClose} title="Close (Esc)">✕</button>
       </div>
 
@@ -341,6 +342,27 @@ export default function CausalTesseract({ onClose }) {
         .legend-item.outer { color: #5a8acc; }
         .legend-item.inner { color: #c2a372; }
         .legend-item.conn  { color: #8a6ab0; }
+
+        .tesseract-back {
+          padding: 0.35rem 0.85rem;
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 999px;
+          color: var(--text-secondary);
+          font-size: 0.7rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          cursor: pointer;
+          transition: color 0.15s, border-color 0.15s, background 0.15s;
+          flex-shrink: 0;
+        }
+
+        .tesseract-back:hover {
+          color: var(--text-primary);
+          border-color: rgba(255, 255, 255, 0.3);
+          background: rgba(255, 255, 255, 0.09);
+        }
 
         .tesseract-close {
           background: none;

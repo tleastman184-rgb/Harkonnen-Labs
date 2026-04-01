@@ -1,0 +1,73 @@
+schema: causal-evidence-bundle
+version: 1
+purpose: >
+  Machine-readable schema reference for time-series, video, image, and log
+  annotation bundles used to teach Coobie pattern matching and cause/effect.
+scopes:
+  - project
+  - core_candidate
+source_kinds:
+  - timeseries
+  - video
+  - image
+  - log
+  - operator_note
+annotation_types:
+  - event
+  - window
+  - causal_window
+  - pattern_example
+  - negative_example
+claim_relations:
+  - caused
+  - contributed_to
+  - correlated_with
+  - invalidated
+  - responded_to
+required_top_level:
+  - schema_version
+  - project
+  - sources
+  - annotations
+source_fields:
+  source_id: stable identifier for the evidence source
+  kind: one of source_kinds
+  label: human-readable source name
+  uri: repo-relative path, URL, or external URI
+  channels: optional timeseries keys
+  tags: optional categorical labels
+  metadata: optional freeform key/value map
+annotation_fields:
+  annotation_id: stable identifier
+  annotation_type: one of annotation_types
+  title: short summary
+  status: draft|reviewed|approved
+  promote_to_memory: none|project|core_candidate
+  source_ids: referenced source identifiers
+  time_range: optional start/end window
+  labels: pattern or domain labels
+  tags: optional categorical labels
+  anchors: evidence anchor list
+  claims: causal or behavioral claim list
+  notes: freeform analyst note
+anchor_fields:
+  anchor_id: stable identifier
+  source_id: referenced source identifier
+  kind: signal_window|video_window|frame|region|log_event
+  signal_keys: optional channel keys
+  sample_index: optional discrete sample pointer
+  frame_index: optional frame pointer
+  timestamp_ms: optional timestamp in milliseconds
+  time_range: optional local window
+  region: optional x/y/width/height
+claim_fields:
+  claim_id: stable identifier
+  relation: one of claim_relations
+  cause: text label for the upstream factor
+  effect: text label for the downstream factor
+  confidence: optional 0.0-1.0 confidence
+  evidence_anchor_ids: anchor ids supporting the claim
+  notes: analyst note
+promotion_guidance:
+  project: use for repo-specific patterns, runtime facts, and local failure semantics
+  core_candidate: use only after repeated confirmation or cross-project reuse

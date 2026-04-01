@@ -12,6 +12,7 @@ Today Coobie already supports:
 
 - core memory in `factory/memory/`
 - project-local memory in `<repo>/.harkonnen/project-memory/`
+- repo-local causal evidence bundles in `<repo>/.harkonnen/evidence/` for annotated time-series, video, images, and logs
 - `memory ingest` for local files and URLs
 - extracted Markdown notes plus optional retained source assets
 - project continuity artifacts such as `project-scan`, `resume-packet`, `strategy-register`, `memory-status`, and `stale-memory-history`

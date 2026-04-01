@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react';
 import AgentCard from './components/AgentCard';
 import CoobieSignalPanel from './components/CoobieSignalPanel';
 import CausalTesseract from './visualization/tesseract/CausalTesseract';
+import CausalWorkbench from './components/CausalWorkbench';
+import FactoryFloor from './components/FactoryFloor';
+import NewRunFlow from './components/NewRunFlow';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000/api';
 
@@ -104,6 +107,9 @@ function App() {
   const [policyEvents, setPolicyEvents] = useState([]);
   const [capacity, setCapacity] = useState(null);
   const [showTesseract, setShowTesseract] = useState(false);
+  const [showWorkbench, setShowWorkbench] = useState(false);
+  const [showNewRun, setShowNewRun] = useState(false);
+  const [causalReport, setCausalReport] = useState(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -247,6 +253,20 @@ function App() {
     };
   }, []);
 
+  // Fetch causal report for active run (used by workbench)
+  useEffect(() => {
+    if (!activeRunId) { setCausalReport(null); return undefined; }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/runs/${activeRunId}/causal-report`);
+        if (!cancelled) setCausalReport(data);
+      } catch { if (!cancelled) setCausalReport(null); }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [activeRunId]);
+
   const run = runState?.run || null;
   const events = runState?.events || [];
   const blackboard = runState?.blackboard || null;
@@ -299,43 +319,56 @@ function App() {
             {run?.status || 'idle'}
           </div>
           <button
-            className="tesseract-toggle"
-            onClick={() => setShowTesseract(true)}
-            title="Open Coobie Causal Tesseract"
+            className="tesseract-toggle new-run-btn"
+            onClick={() => setShowNewRun(true)}
+            title="Start a new factory run"
           >
-            Tesseract
+            + New Run
           </button>
+          <div className="header-btn-row">
+            <button
+              className="tesseract-toggle"
+              onClick={() => setShowTesseract(true)}
+              title="Open Coobie Causal Tesseract"
+            >
+              Tesseract
+            </button>
+            <button
+              className="tesseract-toggle workbench-btn"
+              onClick={() => setShowWorkbench(true)}
+              title="Open Causal Workbench — annotate run timeline for Coobie"
+            >
+              Workbench
+            </button>
+          </div>
         </div>
       </header>
 
+      {showNewRun && (
+        <NewRunFlow
+          onClose={() => setShowNewRun(false)}
+          onRunStarted={(runId) => { setActiveRunId(runId); setShowNewRun(false); }}
+        />
+      )}
       {showTesseract && <CausalTesseract onClose={() => setShowTesseract(false)} />}
+      {showWorkbench && (
+        <CausalWorkbench
+          runId={activeRunId}
+          events={events}
+          causalReport={causalReport}
+          onClose={() => setShowWorkbench(false)}
+        />
+      )}
 
       {error ? <div className="error-banner">API error: {error}</div> : null}
 
       <main className="dashboard-grid">
         <section className="main-column">
-          <Panel title="01 · Intake & Planning">
-            <div className="agent-grid two-up">
-              {planningAgents.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} />
-              ))}
-            </div>
-          </Panel>
-
-          <Panel title="02 · Implementation & Action">
-            <div className="agent-grid three-up">
-              {actionAgents.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} variant={agent.id === 'mason' ? 'light' : 'dark'} />
-              ))}
-            </div>
-          </Panel>
-
-          <Panel title="03 · Verification & Bundling">
-            <div className="agent-grid three-up">
-              {verificationAgents.map((agent) => (
-                <AgentCard key={agent.id} agent={agent} />
-              ))}
-            </div>
+          <Panel title="Factory Floor">
+            <FactoryFloor
+              agents={agents}
+              onOpenWorkbench={() => setShowWorkbench(true)}
+            />
           </Panel>
 
           <Panel title="Run Timeline">
@@ -910,6 +943,39 @@ function App() {
         .tesseract-toggle:hover {
           background: rgba(194, 163, 114, 0.15);
           border-color: rgba(194, 163, 114, 0.6);
+        }
+
+        .header-btn-row {
+          display: flex;
+          gap: 0.5rem;
+        }
+
+        .workbench-btn {
+          background: rgba(90, 138, 204, 0.08);
+          border-color: rgba(90, 138, 204, 0.35);
+          color: #5a8acc;
+        }
+
+        .workbench-btn:hover:not(:disabled) {
+          background: rgba(90, 138, 204, 0.15);
+          border-color: rgba(90, 138, 204, 0.6);
+        }
+
+        .workbench-btn:disabled {
+          opacity: 0.35;
+          cursor: default;
+        }
+
+        .new-run-btn {
+          background: rgba(143,174,124,0.1);
+          border-color: rgba(143,174,124,0.4);
+          color: #8fae7c;
+          font-size: 0.78rem;
+        }
+
+        .new-run-btn:hover {
+          background: rgba(143,174,124,0.18);
+          border-color: rgba(143,174,124,0.65);
         }
 
         .timeline-list {

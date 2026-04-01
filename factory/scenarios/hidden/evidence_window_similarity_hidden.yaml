@@ -1,0 +1,66 @@
+id: evidence-window-similarity-hidden
+spec_id: evidence-window-similarity
+title: Hidden acceptance for reviewed evidence-window retrieval
+description: >
+  Sable judges this run as an evidence-window similarity scenario. Coobie must
+  recover reviewed evidence windows and promoted causal evidence from the
+  project-local teaching set, surface them in preflight artifacts, and carry the
+  resulting guidance into the implementation plan without mutating raw evidence.
+checks:
+  - kind: run_status
+    equals: completed
+  - kind: event_present
+    phase: intake
+    agent: scout
+  - kind: event_present
+    phase: memory
+    agent: coobie
+  - kind: event_present
+    phase: validation
+    agent: bramble
+  - kind: event_present
+    phase: hidden_scenarios
+    agent: sable
+  - kind: validation_passed
+  - kind: agent_executed
+    agent: mason
+  - kind: twin_service_present
+    service: workspace_fs
+  - kind: artifact_exists
+    path: coobie_briefing.json
+  - kind: artifact_exists
+    path: coobie_preflight_response.md
+  - kind: artifact_exists
+    path: implementation_plan.md
+  - kind: artifact_exists
+    path: evidence_match_report.json
+  - kind: metric_eq
+    artifact: coobie_briefing.json
+    field: scenario_blueprint.pattern
+    value: evidence_window_similarity
+  - kind: artifact_contains_all
+    path: coobie_briefing.json
+    contains_all:
+      - nearest_evidence_window_citations
+      - ann_pressure_drop_001
+      - evidence_causal_exemplar_citations
+      - Pressure drop after tension spike
+  - kind: artifact_contains_all
+    path: coobie_preflight_response.md
+    contains_all:
+      - Nearest Reviewed Evidence Windows
+      - Pressure drop after tension spike
+      - Causal Chains Coobie Wants Probed
+      - Compare the current run against the nearest reviewed evidence windows
+  - kind: artifact_contains_all
+    path: implementation_plan.md
+    contains_all:
+      - Nearest Reviewed Evidence Windows
+      - Causal Chains To Probe
+      - Compare the current run against the nearest reviewed evidence windows
+  - kind: artifact_contains_all
+    path: evidence_match_report.json
+    contains_all:
+      - "match_type"
+      - Pressure drop after tension spike
+      - ann_pressure_drop_001

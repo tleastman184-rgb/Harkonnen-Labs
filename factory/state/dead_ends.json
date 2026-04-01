@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "registry_id": "62cbbd8e-39f9-48ad-83d2-b29dab468e3c:hidden_scenarios-289c5a13-9598-4a81-acd8-aa1c4615363c",
+      "run_id": "62cbbd8e-39f9-48ad-83d2-b29dab468e3c",
+      "spec_id": "evidence-window-similarity",
+      "product": "harkonnen-evidence-e2e",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-01T19:12:53.054550495+00:00"
+    },
+    {
+      "registry_id": "05c65dcc-3d19-4b97-a8d7-3b58e763534e:hidden_scenarios-99c854d9-0da1-4d2e-8c56-db75baf75cd8",
+      "run_id": "05c65dcc-3d19-4b97-a8d7-3b58e763534e",
+      "spec_id": "evidence-window-similarity",
+      "product": "harkonnen-evidence-e2e",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-01T19:17:34.983223616+00:00"
+    }
+  ]
+}

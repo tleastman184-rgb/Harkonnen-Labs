@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -20,7 +21,7 @@ use crate::{
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
         AgentExecution, BlackboardState, CoobieBriefing, CoobieEvidenceCitation, EpisodeRecord,
-        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
+        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport, EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
         IntentPackage, LessonRecord, PriorCauseSignal, ProjectResumeRisk, RunEvent, RunRecord, ScenarioResult,
         Spec, TwinEnvironment, TwinService, ValidationSummary, WorkerHarnessConfig,
     },
@@ -114,6 +115,12 @@ struct CollectedMemoryHits {
     ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EvidencePromotionResult {
+    pub promoted_ids: Vec<String>,
+    pub skipped_annotations: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExplorationEntry {
     phase: String,
@@ -182,6 +189,58 @@ struct ProjectResumePacket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoLocalContextEntry {
+    label: String,
+    path: String,
+    category: String,
+    scope: String,
+    summary: String,
+    relevance: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrieverContextBundleArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    generated_at: String,
+    project_root: String,
+    context_entries: Vec<RepoLocalContextEntry>,
+    skill_entries: Vec<RepoLocalContextEntry>,
+    preload_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrailDriftGuardEntry {
+    role: String,
+    path: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrailDriftGuardArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    generated_at: String,
+    tracked_entries: Vec<TrailDriftGuardEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrailDriftCheckArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    generated_at: String,
+    guard_artifact: String,
+    passed: bool,
+    summary: String,
+    verified_paths: Vec<String>,
+    changed_paths: Vec<String>,
+    missing_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StaleMemoryMitigationStatusEntry {
     memory_id: String,
     severity: String,
@@ -224,6 +283,11 @@ struct WorkerTaskEnvelope {
     return_artifacts: Vec<String>,
     max_iterations: u32,
     continuity_file: Option<String>,
+    context_bundle_artifact: Option<String>,
+    trail_drift_guard_artifact: Option<String>,
+    repo_local_context_paths: Vec<String>,
+    repo_local_skill_paths: Vec<String>,
+    repo_local_context_notes: Vec<String>,
     query_terms: Vec<String>,
     preferred_commands: Vec<String>,
     guardrails: Vec<String>,
@@ -258,6 +322,8 @@ struct RetrieverDispatchArtifact {
     generated_at: String,
     task_packet_artifact: String,
     review_chain_artifact: String,
+    context_bundle_artifact: String,
+    trail_drift_guard_artifact: String,
     continuity_artifact: String,
     dispatch_summary: String,
     constraints_applied: Vec<String>,
@@ -457,6 +523,642 @@ impl AppContext {
             }
             _ => bail!("unsupported memory ingest scope: {scope}"),
         }
+    }
+
+    pub async fn init_project_evidence(&self, project_root: &Path) -> Result<PathBuf> {
+        let harkonnen_dir = self.repo_harkonnen_dir(project_root);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        Ok(harkonnen_dir.join("evidence"))
+    }
+
+    pub async fn list_project_evidence_bundles(&self, project_root: &str) -> Result<Vec<String>> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let harkonnen_dir = self.project_harkonnen_dir(&target_source);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        let annotations_dir = harkonnen_dir.join("evidence").join("annotations");
+        let mut bundles = Vec::new();
+        let mut reader = tokio::fs::read_dir(&annotations_dir).await?;
+        while let Some(entry) = reader.next_entry().await? {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != "yaml" && ext != "yml" && ext != "json" {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+                bundles.push(name.to_string());
+            }
+        }
+        bundles.sort();
+        Ok(bundles)
+    }
+
+    pub async fn load_project_evidence_bundle(
+        &self,
+        project_root: &str,
+        bundle_name: &str,
+    ) -> Result<Option<EvidenceAnnotationBundle>> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let path = self.project_evidence_bundle_path(&target_source, bundle_name).await?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        Ok(Some(parse_evidence_bundle_text(&raw)?))
+    }
+
+    pub async fn load_project_evidence_history(
+        &self,
+        project_root: &str,
+        bundle_name: &str,
+        annotation_id: Option<&str>,
+    ) -> Result<Vec<EvidenceAnnotationHistoryEvent>> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let path = self.project_evidence_history_path(&target_source, bundle_name).await?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let mut events = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<EvidenceAnnotationHistoryEvent>(trimmed) else {
+                continue;
+            };
+            if let Some(annotation_id) = annotation_id.filter(|value| !value.trim().is_empty()) {
+                if event.annotation_id != annotation_id {
+                    continue;
+                }
+            }
+            events.push(event);
+        }
+        events.sort_by(|left, right| left.occurred_at.cmp(&right.occurred_at).then_with(|| left.event_id.cmp(&right.event_id)));
+        Ok(events)
+    }
+
+    pub async fn save_project_evidence_bundle(
+        &self,
+        project_root: &str,
+        bundle_name: &str,
+        bundle: &EvidenceAnnotationBundle,
+    ) -> Result<PathBuf> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let path = self.project_evidence_bundle_path(&target_source, bundle_name).await?;
+        let previous = if path.exists() {
+            let raw = tokio::fs::read_to_string(&path).await?;
+            Some(parse_evidence_bundle_text(&raw)?)
+        } else {
+            None
+        };
+        let mut normalized = bundle.clone();
+        if normalized.project.trim().is_empty() {
+            normalized.project = target_source.label.clone();
+        }
+        validate_evidence_bundle(&normalized)?;
+        let raw = serde_yaml::to_string(&normalized)?;
+        tokio::fs::write(&path, raw).await?;
+        let history_events = collect_bundle_save_history_events(bundle_name, previous.as_ref(), &normalized);
+        self.append_project_evidence_history_events(&target_source, bundle_name, &history_events)
+            .await?;
+        Ok(path)
+    }
+
+    pub async fn upsert_project_evidence_annotation(
+        &self,
+        project_root: &str,
+        bundle_name: &str,
+        scenario: Option<&str>,
+        dataset: Option<&str>,
+        notes: &[String],
+        sources: &[EvidenceSource],
+        annotation: &EvidenceAnnotation,
+    ) -> Result<(PathBuf, EvidenceAnnotationBundle)> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let path = self.project_evidence_bundle_path(&target_source, bundle_name).await?;
+        let mut bundle = if path.exists() {
+            let raw = tokio::fs::read_to_string(&path).await?;
+            parse_evidence_bundle_text(&raw)?
+        } else {
+            EvidenceAnnotationBundle {
+                schema_version: 1,
+                project: target_source.label.clone(),
+                scenario: scenario.unwrap_or_default().to_string(),
+                dataset: dataset.unwrap_or_default().to_string(),
+                notes: Vec::new(),
+                sources: Vec::new(),
+                annotations: Vec::new(),
+            }
+        };
+        if bundle.project.trim().is_empty() {
+            bundle.project = target_source.label.clone();
+        }
+        if let Some(scenario) = scenario.filter(|value| !value.trim().is_empty()) {
+            bundle.scenario = scenario.trim().to_string();
+        }
+        if let Some(dataset) = dataset.filter(|value| !value.trim().is_empty()) {
+            bundle.dataset = dataset.trim().to_string();
+        }
+        for note in notes {
+            push_unique(&mut bundle.notes, note);
+        }
+        for source in sources {
+            if let Some(existing) = bundle
+                .sources
+                .iter_mut()
+                .find(|candidate| candidate.source_id == source.source_id)
+            {
+                *existing = source.clone();
+            } else {
+                bundle.sources.push(source.clone());
+            }
+        }
+
+        let mut normalized_annotation = annotation.clone();
+        if normalized_annotation.annotation_id.trim().is_empty() {
+            normalized_annotation.annotation_id = format!("ann_{}", Uuid::new_v4().simple());
+        }
+        let previous_annotation = bundle
+            .annotations
+            .iter()
+            .find(|candidate| candidate.annotation_id == normalized_annotation.annotation_id)
+            .cloned();
+        if normalized_annotation.status.trim().is_empty() {
+            normalized_annotation.status = "draft".to_string();
+        }
+        let now = Utc::now().to_rfc3339();
+        if normalized_annotation.created_at.trim().is_empty() {
+            normalized_annotation.created_at = now.clone();
+        }
+        normalized_annotation.updated_at = now;
+
+        if let Some(existing) = bundle
+            .annotations
+            .iter_mut()
+            .find(|candidate| candidate.annotation_id == normalized_annotation.annotation_id)
+        {
+            *existing = normalized_annotation.clone();
+        } else {
+            bundle.annotations.push(normalized_annotation.clone());
+        }
+
+        validate_evidence_bundle(&bundle)?;
+        let raw = serde_yaml::to_string(&bundle)?;
+        tokio::fs::write(&path, raw).await?;
+
+        let history_event = build_annotation_history_event(
+            bundle_name,
+            &normalized_annotation,
+            if previous_annotation.is_some() { "updated" } else { "created" },
+            previous_annotation.as_ref().map(|value| effective_annotation_status(value)),
+            Some(annotation_history_actor(&normalized_annotation)),
+            if previous_annotation.is_some() {
+                Some("Annotation updated via upsert.".to_string())
+            } else {
+                Some("Annotation created via upsert.".to_string())
+            },
+            Vec::new(),
+        );
+        self.append_project_evidence_history_events(&target_source, bundle_name, &[history_event])
+            .await?;
+        Ok((path, bundle))
+    }
+
+    pub async fn review_project_evidence_annotation(
+        &self,
+        project_root: &str,
+        bundle_name: &str,
+        annotation_id: &str,
+        status: &str,
+        reviewed_by: Option<&str>,
+        review_note: Option<&str>,
+        promote_scope: Option<&str>,
+    ) -> Result<(PathBuf, EvidenceAnnotationBundle, EvidencePromotionResult)> {
+        if annotation_id.trim().is_empty() {
+            bail!("annotation_id cannot be empty");
+        }
+
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let path = self.project_evidence_bundle_path(&target_source, bundle_name).await?;
+        if !path.exists() {
+            bail!("evidence bundle '{}' not found", bundle_name);
+        }
+
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let mut bundle = parse_evidence_bundle_text(&raw)?;
+        let normalized_status = normalize_annotation_review_status(status)?;
+        let now = Utc::now().to_rfc3339();
+        let mut history_events = Vec::new();
+
+        {
+            let annotation = bundle
+                .annotations
+                .iter_mut()
+                .find(|candidate| candidate.annotation_id == annotation_id)
+                .with_context(|| format!("annotation '{}' not found in bundle '{}'", annotation_id, bundle_name))?;
+
+            let previous_status = effective_annotation_status(annotation);
+            let actor = reviewed_by
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| annotation_history_actor(annotation));
+
+            annotation.status = normalized_status.to_string();
+            annotation.updated_at = now.clone();
+            match normalized_status {
+                "draft" => {
+                    annotation.reviewed_by.clear();
+                    annotation.reviewed_at.clear();
+                }
+                _ => {
+                    annotation.reviewed_at = now.clone();
+                    if let Some(reviewed_by) = reviewed_by.filter(|value| !value.trim().is_empty()) {
+                        annotation.reviewed_by = reviewed_by.trim().to_string();
+                    }
+                }
+            }
+
+            if let Some(review_note) = review_note.filter(|value| !value.trim().is_empty()) {
+                let reviewer = reviewed_by
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        if annotation.reviewed_by.trim().is_empty() {
+                            None
+                        } else {
+                            Some(annotation.reviewed_by.trim())
+                        }
+                    });
+                let prefix = match reviewer {
+                    Some(name) => format!("Review [{} by {}]", normalized_status, name),
+                    None => format!("Review [{}]", normalized_status),
+                };
+                append_annotation_note(&mut annotation.notes, &format!("{}: {}", prefix, review_note.trim()));
+            }
+
+            history_events.push(build_annotation_history_event(
+                bundle_name,
+                annotation,
+                "status_changed",
+                Some(previous_status),
+                Some(actor),
+                review_note.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+                Vec::new(),
+            ));
+        }
+
+        validate_evidence_bundle(&bundle)?;
+        let serialized = serde_yaml::to_string(&bundle)?;
+        tokio::fs::write(&path, serialized).await?;
+
+        let promotion = if let Some(scope) = promote_scope.filter(|value| !value.trim().is_empty()) {
+            let single_annotation = bundle
+                .annotations
+                .iter()
+                .find(|candidate| candidate.annotation_id == annotation_id)
+                .cloned()
+                .with_context(|| format!("annotation '{}' not found after review update", annotation_id))?;
+            let mut single_bundle = bundle.clone();
+            single_bundle.annotations = vec![single_annotation.clone()];
+            let promotion = self.promote_evidence_bundle(&path, &single_bundle, scope, Some(project_root))
+                .await?;
+            if !promotion.promoted_ids.is_empty() {
+                history_events.push(build_annotation_history_event(
+                    bundle_name,
+                    &single_annotation,
+                    "promoted",
+                    Some(effective_annotation_status(&single_annotation)),
+                    Some(annotation_history_actor(&single_annotation)),
+                    Some(format!("Promoted to {} memory.", scope.trim())),
+                    promotion.promoted_ids.clone(),
+                ));
+            }
+            promotion
+        } else {
+            EvidencePromotionResult::default()
+        };
+
+        self.append_project_evidence_history_events(&target_source, bundle_name, &history_events)
+            .await?;
+
+        Ok((path, bundle, promotion))
+    }
+
+    pub async fn promote_evidence_bundle(
+        &self,
+        bundle_path: &Path,
+        bundle: &EvidenceAnnotationBundle,
+        scope: &str,
+        project_root: Option<&str>,
+    ) -> Result<EvidencePromotionResult> {
+        let normalized_scope = scope.trim().to_lowercase();
+        let target_source = if normalized_scope == "project" || normalized_scope == "follow-bundle" {
+            match project_root {
+                Some(root) if !root.trim().is_empty() => Some(self.resolve_memory_ingest_target(root).await?),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if normalized_scope == "project" && target_source.is_none() {
+            bail!("project evidence promotion requires --project-root <repo-path>");
+        }
+
+        let mut result = EvidencePromotionResult::default();
+        for annotation in &bundle.annotations {
+            let destination = match resolve_evidence_promotion_destination(annotation, &normalized_scope) {
+                Some(destination) => destination,
+                None => {
+                    result.skipped_annotations.push(format!(
+                        "{} (promotion disabled or unsupported scope)",
+                        annotation.annotation_id
+                    ));
+                    continue;
+                }
+            };
+            if !annotation_is_review_ready(annotation) {
+                result.skipped_annotations.push(format!(
+                    "{} (status {} is not review-ready)",
+                    annotation.annotation_id,
+                    if annotation.status.trim().is_empty() { "draft" } else { annotation.status.trim() }
+                ));
+                continue;
+            }
+
+            let memory_id = build_evidence_memory_id(bundle, annotation);
+            let summary = build_evidence_memory_summary(bundle, annotation);
+            let content = render_evidence_memory_body(bundle_path, bundle, annotation);
+            let tags = build_evidence_memory_tags(bundle, annotation, destination);
+            let source_uris = collect_evidence_source_uris(bundle, annotation);
+
+            match destination {
+                "project" => {
+                    let target_source = target_source
+                        .as_ref()
+                        .context("project evidence promotion requires target source context")?;
+                    let provenance = build_evidence_memory_provenance(bundle_path, bundle, annotation, target_source, &source_uris);
+                    self.store_project_memory_entry(
+                        target_source,
+                        &memory_id,
+                        tags,
+                        &summary,
+                        &content,
+                        provenance,
+                    )
+                    .await?;
+                }
+                "core" => {
+                    let provenance = target_source
+                        .as_ref()
+                        .map(|target_source| build_evidence_memory_provenance(bundle_path, bundle, annotation, target_source, &source_uris))
+                        .unwrap_or_else(|| MemoryProvenance {
+                            source_label: Some(bundle.project.clone()),
+                            source_kind: Some("causal-evidence-bundle".to_string()),
+                            source_path: Some(bundle_path.display().to_string()),
+                            observed_paths: source_uris.clone(),
+                            observed_surfaces: bundle.sources.iter().map(|source| source.kind.clone()).collect(),
+                            stale_when: vec!["evidence sources, dataset semantics, or reviewed causal interpretation change".to_string()],
+                            ..MemoryProvenance::default()
+                        });
+                    self.memory_store
+                        .store_with_metadata(&memory_id, tags, &summary, &content, provenance)
+                        .await?;
+                }
+                _ => unreachable!(),
+            }
+            result.promoted_ids.push(memory_id);
+        }
+
+        if let Some(target_source) = target_source.as_ref() {
+            let store = self.project_memory_store(target_source).await?;
+            self.refresh_project_resume_packet(target_source, &store).await?;
+        }
+
+        Ok(result)
+    }
+
+    pub async fn search_similar_evidence_windows(
+        &self,
+        project_root: &str,
+        spec_id: Option<&str>,
+        query_terms: &[String],
+        labels: &[String],
+        claims: &[String],
+        sources: &[String],
+        time_span_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<EvidenceWindowMatch>> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let harkonnen_dir = self.project_harkonnen_dir(&target_source);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        let annotations_dir = harkonnen_dir.join("evidence").join("annotations");
+        if !annotations_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let normalized_labels = labels
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let normalized_claims = claims
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let normalized_sources = sources
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+
+        let mut effective_terms = Vec::new();
+        for value in query_terms
+            .iter()
+            .chain(labels.iter())
+            .chain(claims.iter())
+            .chain(sources.iter())
+        {
+            push_unique(&mut effective_terms, value);
+        }
+        if let Some(spec_id) = spec_id.filter(|value| !value.trim().is_empty()) {
+            push_unique(&mut effective_terms, spec_id);
+        }
+        push_unique(&mut effective_terms, &target_source.label);
+
+        let mut scored = Vec::<EvidenceWindowMatch>::new();
+        let mut reader = tokio::fs::read_dir(&annotations_dir).await?;
+        while let Some(entry) = reader.next_entry().await? {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != "yaml" && ext != "yml" {
+                continue;
+            }
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let bundle = match serde_yaml::from_str::<EvidenceAnnotationBundle>(&raw) {
+                Ok(bundle) => bundle,
+                Err(_) => continue,
+            };
+
+            for annotation in &bundle.annotations {
+                if !annotation_is_review_ready(annotation) {
+                    continue;
+                }
+
+                let matched_sources = bundle
+                    .sources
+                    .iter()
+                    .filter(|source| annotation.source_ids.iter().any(|id| id == &source.source_id))
+                    .map(|source| format!("{}:{}:{}", source.source_id, source.kind, source.label))
+                    .collect::<Vec<_>>();
+                let claim_summary = annotation
+                    .claims
+                    .iter()
+                    .map(|claim| format!("{}:{}->{}", claim.relation, claim.cause, claim.effect))
+                    .collect::<Vec<_>>();
+                let time_summary = render_evidence_time_range_summary(annotation.time_range.as_ref());
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {} {} {} {}",
+                    bundle.project,
+                    bundle.scenario,
+                    bundle.dataset,
+                    annotation.annotation_id,
+                    annotation.annotation_type,
+                    annotation.title,
+                    annotation.labels.join(" "),
+                    annotation.tags.join(" "),
+                    annotation.notes,
+                    matched_sources.join(" "),
+                    claim_summary.join(" "),
+                );
+                let mut score = score_briefing_evidence(
+                    &haystack,
+                    spec_id.unwrap_or_default(),
+                    &target_source.label,
+                    &effective_terms,
+                    &[],
+                );
+                if bundle.project == target_source.label {
+                    score += 8;
+                }
+
+                let normalized_annotation_terms = annotation
+                    .labels
+                    .iter()
+                    .chain(annotation.tags.iter())
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>();
+                let normalized_claim_terms = annotation
+                    .claims
+                    .iter()
+                    .flat_map(|claim| {
+                        [claim.relation.clone(), claim.cause.clone(), claim.effect.clone()]
+                            .into_iter()
+                    })
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>();
+                let normalized_source_terms = matched_sources
+                    .iter()
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                let matched_labels = collect_overlapping_terms(&normalized_labels, &normalized_annotation_terms);
+                let matched_claims = collect_overlapping_terms(&normalized_claims, &normalized_claim_terms);
+                let matched_source_terms = collect_overlapping_terms(&normalized_sources, &normalized_source_terms);
+
+                score += overlap_bonus(&normalized_labels, &normalized_annotation_terms, 12);
+                score += overlap_bonus(&normalized_claims, &normalized_claim_terms, 12);
+                score += overlap_bonus(&normalized_sources, &normalized_source_terms, 10);
+
+                let time_span_delta_ms = if let (Some(target_span), Some(candidate_span)) = (
+                    time_span_ms,
+                    annotation_time_span_ms(annotation.time_range.as_ref()),
+                ) {
+                    score += time_span_similarity_bonus(target_span, candidate_span);
+                    Some((target_span - candidate_span).abs())
+                } else {
+                    None
+                };
+                if score <= 0 {
+                    continue;
+                }
+
+                let title = if annotation.title.trim().is_empty() {
+                    annotation.annotation_id.clone()
+                } else {
+                    annotation.title.trim().to_string()
+                };
+                scored.push(EvidenceWindowMatch {
+                    score,
+                    project: bundle.project.clone(),
+                    scenario: bundle.scenario.clone(),
+                    dataset: bundle.dataset.clone(),
+                    bundle_path: path.display().to_string(),
+                    annotation_id: annotation.annotation_id.clone(),
+                    annotation_type: annotation.annotation_type.clone(),
+                    title: title.clone(),
+                    time_summary,
+                    labels: annotation.labels.clone(),
+                    claims: claim_summary.clone(),
+                    sources: matched_sources.clone(),
+                    matched_labels,
+                    matched_claims,
+                    matched_sources: matched_source_terms,
+                    time_span_delta_ms,
+                    citation: CoobieEvidenceCitation {
+                        citation_id: format!("evidence-window:{}:{}", path.display(), annotation.annotation_id),
+                        source_type: "evidence_annotation_window".to_string(),
+                        run_id: "annotation".to_string(),
+                        episode_id: Some(annotation.annotation_id.clone()),
+                        phase: annotation.annotation_type.clone(),
+                        agent: "coobie".to_string(),
+                        summary: format!(
+                            "nearest prior evidence window '{}' from scenario '{}'",
+                            title,
+                            if bundle.scenario.trim().is_empty() { "unspecified" } else { bundle.scenario.trim() }
+                        ),
+                        evidence: format!(
+                            "bundle={}; dataset={}; time={}; labels={}; claims={}; sources={}",
+                            path.display(),
+                            if bundle.dataset.trim().is_empty() { "unspecified" } else { bundle.dataset.trim() },
+                            render_evidence_time_range_summary(annotation.time_range.as_ref()),
+                            if annotation.labels.is_empty() { "none".to_string() } else { annotation.labels.join(" | ") },
+                            if claim_summary.is_empty() { "none".to_string() } else { claim_summary.join(" | ") },
+                            if matched_sources.is_empty() { "none".to_string() } else { matched_sources.join(" | ") }
+                        ),
+                    },
+                });
+            }
+        }
+
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.annotation_id.cmp(&left.annotation_id))
+        });
+        scored.truncate(limit.max(1).min(20));
+        Ok(scored)
     }
 
     pub async fn start_run(&self, req: RunRequest) -> Result<RunRecord> {
@@ -682,6 +1384,7 @@ impl AppContext {
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
 
         let mut agent_executions = Vec::new();
+        let mut retriever_context_bundle: Option<RetrieverContextBundleArtifact> = None;
         let query_terms = build_coobie_query_terms(spec_obj, target_source);
         let domain_signals = infer_domain_signals(spec_obj, target_source, &query_terms);
 
@@ -716,6 +1419,9 @@ impl AppContext {
                 &memory_context,
             )
             .await?;
+        let evidence_match_report = self
+            .build_evidence_match_report(spec_obj, target_source, &briefing)
+            .await?;
         tokio::fs::write(
             run_dir.join("memory_context.md"),
             format_memory_context_bundle(&memory_context),
@@ -728,9 +1434,21 @@ impl AppContext {
             &briefing.coobie_response,
         )
         .await?;
+        self.write_json_file(
+            &run_dir.join("evidence_match_report.json"),
+            &evidence_match_report,
+        )
+        .await?;
+        tokio::fs::write(
+            run_dir.join("evidence_match_report.md"),
+            render_evidence_match_report(&evidence_match_report),
+        )
+        .await?;
         push_unique(&mut blackboard.artifact_refs, "memory_context.md");
         push_unique(&mut blackboard.artifact_refs, "coobie_briefing.json");
         push_unique(&mut blackboard.artifact_refs, "coobie_preflight_response.md");
+        push_unique(&mut blackboard.artifact_refs, "evidence_match_report.json");
+        push_unique(&mut blackboard.artifact_refs, "evidence_match_report.md");
         self.write_agent_execution(
             &profiles,
             "coobie",
@@ -867,6 +1585,38 @@ impl AppContext {
         )
         .await?;
         if let Some(worker_harness) = &spec_obj.worker_harness {
+            let context_bundle = build_retriever_context_bundle(
+                run_id,
+                spec_obj,
+                target_source,
+                &staged_product,
+                &query_terms,
+            )?;
+            self.write_json_file(&run_dir.join("retriever_context_bundle.json"), &context_bundle)
+                .await?;
+            tokio::fs::write(
+                run_dir.join("retriever_context_bundle.md"),
+                render_retriever_context_bundle_markdown(&context_bundle),
+            )
+            .await?;
+            push_unique(&mut blackboard.artifact_refs, "retriever_context_bundle.json");
+            push_unique(&mut blackboard.artifact_refs, "retriever_context_bundle.md");
+            let drift_guard = build_trail_drift_guard(
+                run_id,
+                spec_obj,
+                target_source,
+                &staged_product,
+                &context_bundle,
+            )?;
+            self.write_json_file(&run_dir.join("trail_drift_guard.json"), &drift_guard)
+                .await?;
+            tokio::fs::write(
+                run_dir.join("trail_drift_guard.md"),
+                render_trail_drift_guard_markdown(&drift_guard),
+            )
+            .await?;
+            push_unique(&mut blackboard.artifact_refs, "trail_drift_guard.json");
+            push_unique(&mut blackboard.artifact_refs, "trail_drift_guard.md");
             let envelope = build_worker_task_envelope(
                 run_id,
                 spec_obj,
@@ -876,6 +1626,7 @@ impl AppContext {
                 &workspace_root,
                 &run_dir,
                 &staged_product,
+                &context_bundle,
             );
             self.write_json_file(&run_dir.join("retriever_task_packet.json"), &envelope)
                 .await?;
@@ -886,6 +1637,7 @@ impl AppContext {
             .await?;
             push_unique(&mut blackboard.artifact_refs, "retriever_task_packet.json");
             push_unique(&mut blackboard.artifact_refs, "retriever_task_packet.md");
+            retriever_context_bundle = Some(context_bundle);
         }
         let workspace_end = self
             .record_event(
@@ -942,6 +1694,7 @@ impl AppContext {
                 &intent,
                 &briefing,
                 &implementation_plan,
+                retriever_context_bundle.as_ref(),
             );
             self.write_json_file(&run_dir.join("trail_review_chain.json"), &plan_review_chain)
                 .await?;
@@ -963,6 +1716,8 @@ impl AppContext {
                 .await?;
             push_unique(&mut blackboard.artifact_refs, "retriever_dispatch.json");
             push_unique(&mut blackboard.artifact_refs, "retriever_dispatch.md");
+            push_unique(&mut blackboard.artifact_refs, &dispatch.context_bundle_artifact);
+            push_unique(&mut blackboard.artifact_refs, &dispatch.trail_drift_guard_artifact);
             push_unique(&mut blackboard.artifact_refs, &dispatch.continuity_artifact);
             self.write_agent_execution(
                 &profiles,
@@ -1643,6 +2398,9 @@ Top memory hits:
         if let Some(mitigation_history_hit) = self.read_project_stale_memory_history_hit(target_source).await? {
             project_memory.hits.insert(project_memory.hits.len().min(5), mitigation_history_hit);
         }
+        for bundle_hit in self.collect_repo_local_context_hits(target_source, query_terms, 4)? {
+            project_memory.hits.push(bundle_hit);
+        }
 
         let mut core_memory = self
             .collect_memory_hits(&self.memory_store, query_terms, "core memory")
@@ -1739,6 +2497,96 @@ Top memory hits:
         Ok(store)
     }
 
+    async fn ensure_project_evidence_bootstrap(&self, harkonnen_dir: &Path) -> Result<()> {
+        let evidence_dir = harkonnen_dir.join("evidence");
+        let raw_dir = evidence_dir.join("raw");
+        let annotations_dir = evidence_dir.join("annotations");
+        let causal_dir = evidence_dir.join("causal");
+        let manifests_dir = evidence_dir.join("manifests");
+        let history_dir = evidence_dir.join("history");
+        tokio::fs::create_dir_all(&raw_dir).await?;
+        tokio::fs::create_dir_all(&annotations_dir).await?;
+        tokio::fs::create_dir_all(&causal_dir).await?;
+        tokio::fs::create_dir_all(&manifests_dir).await?;
+        tokio::fs::create_dir_all(&history_dir).await?;
+        let guide_path = evidence_dir.join("00-evidence-guide.md");
+        if !guide_path.exists() {
+            tokio::fs::write(&guide_path, "# Evidence Guide
+
+- Keep raw evidence in evidence/raw/.
+- Store annotation bundles in evidence/annotations/.
+- Store reviewed causal summaries in evidence/causal/.
+- Audit annotation changes in evidence/history/.
+").await?;
+        }
+        let sample_bundle = annotations_dir.join("sample-causal-window.yaml");
+        if !sample_bundle.exists() {
+            tokio::fs::write(&sample_bundle, "schema_version: 1
+project: example-project
+scenario: pressure-instability-review
+dataset: historian-shift-a
+notes:
+  - Draft example showing how to link timeseries, video, and causal claims for Coobie.
+sources:
+  - source_id: historian_pressure
+    kind: timeseries
+    label: Wellhead pressure
+    uri: .harkonnen/evidence/raw/historian-pressure.csv
+    channels: [pressure_psi]
+    tags: [historian, pressure]
+  - source_id: pad_camera_01
+    kind: video
+    label: Pad camera 01
+    uri: .harkonnen/evidence/raw/pad-camera-01.mp4
+    tags: [video, operator]
+annotations:
+  - annotation_id: ann_pressure_drop_001
+    annotation_type: causal_window
+    title: Pressure drop after tension spike
+    status: draft
+    promote_to_memory: project
+    source_ids: [historian_pressure, pad_camera_01]
+    time_range:
+      start_ms: 120000
+      end_ms: 135000
+    labels: [pressure_instability, operator_intervention]
+    tags: [teaching-set, review]
+    anchors:
+      - anchor_id: anchor_pressure_spike
+        source_id: historian_pressure
+        kind: signal_window
+        signal_keys: [pressure_psi]
+        timestamp_ms: 121500
+        time_range:
+          start_ms: 121000
+          end_ms: 123000
+        notes: Pressure spike leading into drop.
+      - anchor_id: anchor_operator_action
+        source_id: pad_camera_01
+        kind: video_window
+        frame_index: 3645
+        timestamp_ms: 124000
+        time_range:
+          start_ms: 123500
+          end_ms: 126500
+        notes: Operator adjusts equipment shortly before recovery.
+    claims:
+      - claim_id: claim_001
+        relation: contributed_to
+        cause: wireline_tension_spike
+        effect: pressure_drop
+        confidence: 0.78
+        evidence_anchor_ids: [anchor_pressure_spike, anchor_operator_action]
+        notes: Review whether operator action is response or cause.
+    notes: Candidate teaching example for Coobie pattern matching and causal review.
+    created_by: jerry
+    created_at: 2026-04-01T00:00:00Z
+    updated_at: 2026-04-01T00:00:00Z
+").await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_project_memory_bootstrap(
         &self,
         target_source: &TargetSourceMetadata,
@@ -1746,8 +2594,11 @@ Top memory hits:
     ) -> Result<()> {
         let harkonnen_dir = self.project_harkonnen_dir(target_source);
         tokio::fs::create_dir_all(&harkonnen_dir).await?;
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
         tokio::fs::create_dir_all(&store.root).await?;
         tokio::fs::create_dir_all(store.root.join("imports")).await?;
+        tokio::fs::create_dir_all(harkonnen_dir.join("contexts")).await?;
+        tokio::fs::create_dir_all(harkonnen_dir.join("skills")).await?;
 
         let project_context_path = harkonnen_dir.join("project-context.md");
         if !project_context_path.exists() {
@@ -1757,6 +2608,7 @@ Top memory hits:
 - Project: {}
 - Source path: {}
 - Project memory root: {}
+- Evidence root: {}
 - Project scan: {}
 - Project manifest: {}
 - Resume packet: {}
@@ -1772,6 +2624,7 @@ Top memory hits:
                 target_source.label,
                 target_source.source_path,
                 store.root.display(),
+                harkonnen_dir.join("evidence").display(),
                 harkonnen_dir.join("project-scan.md").display(),
                 harkonnen_dir.join("project-manifest.json").display(),
                 harkonnen_dir.join("resume-packet.md").display(),
@@ -1790,6 +2643,47 @@ Top memory hits:
         if !project_scan_path.exists() {
             let scan = render_project_scan_markdown(&manifest);
             tokio::fs::write(&project_scan_path, scan).await?;
+        }
+
+        let instructions_md = harkonnen_dir.join("instructions.md");
+        if !instructions_md.exists() {
+            tokio::fs::write(
+                &instructions_md,
+                format!(
+                    "# Repo Instructions
+
+- Project: {}
+- Use this file for repo-wide instructions that the retriever forge should preload before acting.
+- Put scoped context in `.harkonnen/contexts/` and reusable workflow or domain bundles in `.harkonnen/skills/`.
+",
+                    target_source.label
+                ),
+            )
+            .await?;
+        }
+        let contexts_guide = harkonnen_dir.join("contexts").join("00-context-bundle-guide.md");
+        if !contexts_guide.exists() {
+            tokio::fs::write(
+                &contexts_guide,
+                "# Context Bundle Guide
+
+- Add focused markdown context here for subsystems, interfaces, deployment surfaces, or domains.
+- Prefer small, scoped files whose names match the subsystem or runtime surface they describe.
+",
+            )
+            .await?;
+        }
+        let skills_guide = harkonnen_dir.join("skills").join("00-skill-bundle-guide.md");
+        if !skills_guide.exists() {
+            tokio::fs::write(
+                &skills_guide,
+                "# Skill Bundle Guide
+
+- Add markdown skill bundles here for repeatable repo-specific workflows.
+- Examples: commissioning-checklist, historian-replay-debugging, plc-handshake-validation.
+",
+            )
+            .await?;
         }
 
         let resume_packet_md = harkonnen_dir.join("resume-packet.md");
@@ -1918,6 +2812,35 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         Ok(Some(format!("[stale memory history] [{}] {}", path.display(), trimmed.chars().take(800).collect::<String>())))
     }
 
+    fn collect_repo_local_context_hits(
+        &self,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let harkonnen_dir = self.project_harkonnen_dir(target_source);
+        let (context_entries, skill_entries) = discover_repo_local_context_entries(
+            &harkonnen_dir,
+            Some(target_source),
+            None,
+            query_terms,
+        )?;
+        let mut hits = Vec::new();
+        for entry in context_entries
+            .into_iter()
+            .chain(skill_entries.into_iter())
+            .take(limit)
+        {
+            hits.push(format!(
+                "[repo-local {}] [{}] {}",
+                entry.category,
+                entry.path,
+                entry.summary
+            ));
+        }
+        Ok(hits)
+    }
+
     async fn read_project_scan_hit(
         &self,
         target_source: &TargetSourceMetadata,
@@ -1981,7 +2904,11 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
     }
 
     fn project_harkonnen_dir(&self, target_source: &TargetSourceMetadata) -> PathBuf {
-        PathBuf::from(&target_source.source_path).join(".harkonnen")
+        self.repo_harkonnen_dir(Path::new(&target_source.source_path))
+    }
+
+    fn repo_harkonnen_dir(&self, project_root: &Path) -> PathBuf {
+        project_root.join(".harkonnen")
     }
 
     async fn store_project_memory_entry(
@@ -2743,6 +3670,284 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             .collect())
     }
 
+    async fn collect_evidence_memory_exemplar_citations(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<(Vec<CoobieEvidenceCitation>, Vec<CoobieEvidenceCitation>)> {
+        let project_store = self.project_memory_store(target_source).await?;
+        let project_entries = project_store.list_entries().await?;
+        let core_entries = self.memory_store.list_entries().await?;
+        let mut pattern_scored = Vec::<(i32, String, CoobieEvidenceCitation)>::new();
+        let mut causal_scored = Vec::<(i32, String, CoobieEvidenceCitation)>::new();
+
+        for (scope, entries) in [("project", project_entries), ("core", core_entries)] {
+            for entry in entries {
+                if !entry.tags.iter().any(|tag| matches!(
+                    tag.as_str(),
+                    "evidence"
+                        | "causal-evidence"
+                        | "pattern_example"
+                        | "pattern-example"
+                        | "causal_window"
+                        | "causal-window"
+                        | "negative_example"
+                        | "negative-example"
+                )) {
+                    continue;
+                }
+
+                let haystack = format!(
+                    "{} {} {} {} {} {}",
+                    entry.id,
+                    entry.summary,
+                    entry.tags.join(" "),
+                    entry.content,
+                    entry.provenance.source_kind.clone().unwrap_or_default(),
+                    entry.provenance.observed_surfaces.join(" "),
+                );
+                let mut score = score_briefing_evidence(
+                    &haystack,
+                    &spec_obj.id,
+                    &target_source.label,
+                    query_terms,
+                    domain_signals,
+                );
+                if entry.provenance.source_label.as_deref() == Some(target_source.label.as_str()) {
+                    score += 8;
+                }
+                if entry
+                    .tags
+                    .iter()
+                    .any(|tag| matches!(tag.as_str(), "causal_window" | "causal-window"))
+                {
+                    score += 5;
+                }
+                if entry.tags.iter().any(|tag| {
+                    matches!(
+                        tag.as_str(),
+                        "pattern_example" | "pattern-example" | "negative_example" | "negative-example"
+                    )
+                }) {
+                    score += 5;
+                }
+                if score <= 0 {
+                    continue;
+                }
+
+                let is_pattern = entry.tags.iter().any(|tag| {
+                    matches!(
+                        tag.as_str(),
+                        "pattern_example" | "pattern-example" | "negative_example" | "negative-example"
+                    )
+                });
+                let citation = CoobieEvidenceCitation {
+                    citation_id: format!("evidence-memory:{}:{}", scope, entry.id),
+                    source_type: format!("{}_evidence_memory", scope),
+                    run_id: entry
+                        .provenance
+                        .source_run_id
+                        .clone()
+                        .unwrap_or_else(|| "memory".to_string()),
+                    episode_id: None,
+                    phase: format!("{}_memory", scope),
+                    agent: "coobie".to_string(),
+                    summary: if is_pattern {
+                        format!("pattern exemplar from {} memory: {}", scope, entry.summary)
+                    } else {
+                        format!("causal exemplar from {} memory: {}", scope, entry.summary)
+                    },
+                    evidence: format!(
+                        "memory_id={}; tags={}; source_kind={}; observed_paths={}",
+                        entry.id,
+                        entry.tags.join(" | "),
+                        entry.provenance
+                            .source_kind
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        if entry.provenance.observed_paths.is_empty() {
+                            "none".to_string()
+                        } else {
+                            entry.provenance.observed_paths.join(" | ")
+                        }
+                    ),
+                };
+
+                if is_pattern {
+                    pattern_scored.push((score, entry.created_at.clone(), citation));
+                } else {
+                    causal_scored.push((score, entry.created_at.clone(), citation));
+                }
+            }
+        }
+
+        pattern_scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        causal_scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        Ok((
+            pattern_scored
+                .into_iter()
+                .map(|(_, _, citation)| citation)
+                .take(4)
+                .collect(),
+            causal_scored
+                .into_iter()
+                .map(|(_, _, citation)| citation)
+                .take(4)
+                .collect(),
+        ))
+    }
+
+    async fn collect_nearest_evidence_window_citations(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+    ) -> Result<Vec<CoobieEvidenceCitation>> {
+        let harkonnen_dir = self.project_harkonnen_dir(target_source);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        let annotations_dir = harkonnen_dir.join("evidence").join("annotations");
+        if !annotations_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored = Vec::<(i32, String, CoobieEvidenceCitation)>::new();
+        let mut reader = tokio::fs::read_dir(&annotations_dir).await?;
+        while let Some(entry) = reader.next_entry().await? {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != "yaml" && ext != "yml" {
+                continue;
+            }
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let bundle = match serde_yaml::from_str::<EvidenceAnnotationBundle>(&raw) {
+                Ok(bundle) => bundle,
+                Err(_) => continue,
+            };
+
+            for annotation in &bundle.annotations {
+                if !annotation_is_review_ready(annotation) {
+                    continue;
+                }
+
+                let matched_sources = bundle
+                    .sources
+                    .iter()
+                    .filter(|source| annotation.source_ids.iter().any(|id| id == &source.source_id))
+                    .map(|source| format!("{}:{}:{}", source.source_id, source.kind, source.label))
+                    .collect::<Vec<_>>();
+                let anchor_summary = annotation
+                    .anchors
+                    .iter()
+                    .map(|anchor| format!("{}:{}:{}", anchor.anchor_id, anchor.kind, anchor.label))
+                    .collect::<Vec<_>>();
+                let claim_summary = annotation
+                    .claims
+                    .iter()
+                    .map(|claim| format!("{}:{}->{}", claim.relation, claim.cause, claim.effect))
+                    .collect::<Vec<_>>();
+                let time_summary = render_evidence_time_range_summary(annotation.time_range.as_ref());
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    bundle.project,
+                    bundle.scenario,
+                    bundle.dataset,
+                    bundle.notes.join(" "),
+                    annotation.annotation_id,
+                    annotation.annotation_type,
+                    annotation.title,
+                    annotation.labels.join(" "),
+                    annotation.tags.join(" "),
+                    annotation.notes,
+                    matched_sources.join(" "),
+                    claim_summary.join(" "),
+                    anchor_summary.join(" "),
+                );
+                let mut score = score_briefing_evidence(
+                    &haystack,
+                    &spec_obj.id,
+                    &target_source.label,
+                    query_terms,
+                    domain_signals,
+                );
+                if bundle.project == target_source.label {
+                    score += 8;
+                }
+                if annotation.annotation_type.eq_ignore_ascii_case("causal_window") {
+                    score += 6;
+                }
+                if !annotation.claims.is_empty() {
+                    score += 5;
+                }
+                if !annotation.anchors.is_empty() {
+                    score += 3;
+                }
+                if score <= 0 {
+                    continue;
+                }
+
+                let title = if annotation.title.trim().is_empty() {
+                    annotation.annotation_id.clone()
+                } else {
+                    annotation.title.trim().to_string()
+                };
+                let bundle_name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("annotation-bundle");
+                scored.push((
+                    score,
+                    if annotation.updated_at.trim().is_empty() {
+                        annotation.created_at.clone()
+                    } else {
+                        annotation.updated_at.clone()
+                    },
+                    CoobieEvidenceCitation {
+                        citation_id: format!("evidence-window:{}:{}", bundle_name, annotation.annotation_id),
+                        source_type: "evidence_annotation_window".to_string(),
+                        run_id: "annotation".to_string(),
+                        episode_id: Some(annotation.annotation_id.clone()),
+                        phase: annotation.annotation_type.clone(),
+                        agent: "coobie".to_string(),
+                        summary: format!(
+                            "nearest prior evidence window '{}' from scenario '{}'",
+                            title,
+                            if bundle.scenario.trim().is_empty() { "unspecified" } else { bundle.scenario.trim() }
+                        ),
+                        evidence: format!(
+                            "bundle={}; dataset={}; time={}; labels={}; claims={}; sources={}",
+                            path.display(),
+                            if bundle.dataset.trim().is_empty() { "unspecified" } else { bundle.dataset.trim() },
+                            time_summary,
+                            if annotation.labels.is_empty() { "none".to_string() } else { annotation.labels.join(" | ") },
+                            if claim_summary.is_empty() { "none".to_string() } else { claim_summary.join(" | ") },
+                            if matched_sources.is_empty() { "none".to_string() } else { matched_sources.join(" | ") }
+                        ),
+                    },
+                ));
+            }
+        }
+
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        Ok(scored
+            .into_iter()
+            .map(|(_, _, citation)| citation)
+            .take(5)
+            .collect())
+    }
+
     async fn collect_relevant_strategy_register_citations(
         &self,
         spec_obj: &Spec,
@@ -2825,6 +4030,17 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         ) = self
             .collect_briefing_evidence_citations(spec_obj, target_source, query_terms, domain_signals)
             .await?;
+        let (evidence_pattern_exemplar_citations, evidence_causal_exemplar_citations) = self
+            .collect_evidence_memory_exemplar_citations(spec_obj, target_source, query_terms, domain_signals)
+            .await?;
+        let nearest_evidence_window_citations = self
+            .collect_nearest_evidence_window_citations(spec_obj, target_source, query_terms, domain_signals)
+            .await?;
+        let pattern_matching_focus =
+            build_pattern_matching_focus(&evidence_pattern_exemplar_citations);
+        let causal_chain_focus =
+            build_causal_chain_focus(&evidence_causal_exemplar_citations);
+        let mut enriched_query_terms = query_terms.to_vec();
         let preferred_forge_commands = self
             .collect_preferred_retriever_forge_commands(
                 spec_obj,
@@ -2882,11 +4098,27 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             &mut required_checks,
             &mut open_questions,
         );
+        apply_evidence_exemplar_context(
+            &evidence_pattern_exemplar_citations,
+            &evidence_causal_exemplar_citations,
+            &pattern_matching_focus,
+            &causal_chain_focus,
+            &mut enriched_query_terms,
+            &mut recommended_guardrails,
+            &mut required_checks,
+            &mut open_questions,
+        );
+        apply_nearest_evidence_window_context(
+            &nearest_evidence_window_citations,
+            &mut enriched_query_terms,
+            &mut required_checks,
+            &mut open_questions,
+        );
 
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
             product: target_source.label.clone(),
-            query_terms: query_terms.to_vec(),
+            query_terms: enriched_query_terms,
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
             memory_hits: memory_context.memory_hits.clone(),
@@ -2898,6 +4130,11 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             exploration_citations,
             strategy_register_citations,
             mitigation_history_citations,
+            evidence_pattern_exemplar_citations,
+            evidence_causal_exemplar_citations,
+            nearest_evidence_window_citations,
+            pattern_matching_focus,
+            causal_chain_focus,
             forge_evidence_citations,
             preferred_forge_outcome_citations,
             preferred_forge_commands,
@@ -2917,6 +4154,193 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         };
         briefing.coobie_response = crate::coobie::render_coobie_briefing_response(&briefing);
         Ok(briefing)
+    }
+
+    async fn build_evidence_match_report(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        briefing: &CoobieBriefing,
+    ) -> Result<EvidenceMatchReport> {
+        let mut labels = Vec::new();
+        let mut claims = Vec::new();
+        let mut sources = Vec::new();
+
+        if let Some(blueprint) = &spec_obj.scenario_blueprint {
+            for topic in &blueprint.coobie_memory_topics {
+                push_unique(&mut labels, topic);
+            }
+        }
+        for component in &spec_obj.project_components {
+            for note in &component.notes {
+                push_unique(&mut labels, note);
+            }
+        }
+        for citation in briefing
+            .nearest_evidence_window_citations
+            .iter()
+            .chain(briefing.evidence_causal_exemplar_citations.iter())
+        {
+            for value in parse_citation_field_values(&citation.evidence, "labels") {
+                push_unique(&mut labels, &value);
+            }
+            for value in parse_citation_field_values(&citation.evidence, "claims") {
+                push_unique(&mut claims, &value);
+            }
+            for value in parse_citation_field_values(&citation.evidence, "sources") {
+                push_unique(&mut sources, &value);
+            }
+        }
+
+        let time_span_ms = briefing
+            .nearest_evidence_window_citations
+            .iter()
+            .find_map(|citation| parse_citation_time_span_ms(&citation.evidence));
+
+        let matches = self
+            .search_similar_evidence_windows(
+                &target_source.source_path,
+                Some(&spec_obj.id),
+                &briefing.query_terms,
+                &labels,
+                &claims,
+                &sources,
+                time_span_ms,
+                8,
+            )
+            .await?;
+
+        let assessments = matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, window)| build_evidence_match_assessment(index + 1, window))
+            .collect::<Vec<_>>();
+
+        let mut summary = vec![format!(
+            "Compared {} reviewed evidence window candidate(s) for spec '{}'.",
+            assessments.len(), spec_obj.id
+        )];
+        if let Some(best) = assessments.first() {
+            summary.push(format!(
+                "Top result: {} [{}] score={} confidence={:.0}%.",
+                best.window.title,
+                best.match_type,
+                best.score,
+                best.confidence * 100.0
+            ));
+        } else {
+            summary.push("No reviewed evidence windows matched the current query context.".to_string());
+        }
+        if !labels.is_empty() {
+            summary.push(format!("Labels compared: {}", labels.join(", ")));
+        }
+        if !claims.is_empty() {
+            summary.push(format!("Claims compared: {}", claims.join(" | ")));
+        }
+        if !sources.is_empty() {
+            summary.push(format!("Sources compared: {}", sources.join(" | ")));
+        }
+
+        Ok(EvidenceMatchReport {
+            spec_id: spec_obj.id.clone(),
+            product: target_source.label.clone(),
+            query_source: "coobie_briefing".to_string(),
+            selected_window_summary: assessments.first().map(|assessment| {
+                format!(
+                    "{} [{}] {}",
+                    assessment.window.title,
+                    assessment.window.annotation_id,
+                    assessment.window.time_summary
+                )
+            }),
+            query_terms: briefing.query_terms.clone(),
+            labels,
+            claims,
+            sources,
+            time_span_ms,
+            summary,
+            assessments,
+            generated_at: Utc::now(),
+        })
+    }
+
+    pub async fn build_evidence_match_report_from_query(
+        &self,
+        project_root: &str,
+        spec_id: Option<&str>,
+        query_source: &str,
+        selected_window_summary: Option<String>,
+        query_terms: &[String],
+        labels: &[String],
+        claims: &[String],
+        sources: &[String],
+        time_span_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<EvidenceMatchReport> {
+        let target_source = self.resolve_memory_ingest_target(project_root).await?;
+        let matches = self
+            .search_similar_evidence_windows(
+                project_root,
+                spec_id,
+                query_terms,
+                labels,
+                claims,
+                sources,
+                time_span_ms,
+                limit,
+            )
+            .await?;
+        let assessments = matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, window)| build_evidence_match_assessment(index + 1, window))
+            .collect::<Vec<_>>();
+        let resolved_spec_id = spec_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("ad_hoc_evidence_match")
+            .to_string();
+        let mut summary = vec![format!(
+            "Compared {} reviewed evidence window candidate(s) for spec '{}'.",
+            assessments.len(), resolved_spec_id
+        )];
+        if let Some(selected) = selected_window_summary.as_ref() {
+            summary.push(format!("Selected window: {}", selected));
+        }
+        if let Some(best) = assessments.first() {
+            summary.push(format!(
+                "Top result: {} [{}] score={} confidence={:.0}%.",
+                best.window.title,
+                best.match_type,
+                best.score,
+                best.confidence * 100.0
+            ));
+        } else {
+            summary.push("No reviewed evidence windows matched the current query context.".to_string());
+        }
+        if !labels.is_empty() {
+            summary.push(format!("Labels compared: {}", labels.join(", ")));
+        }
+        if !claims.is_empty() {
+            summary.push(format!("Claims compared: {}", claims.join(" | ")));
+        }
+        if !sources.is_empty() {
+            summary.push(format!("Sources compared: {}", sources.join(" | ")));
+        }
+
+        Ok(EvidenceMatchReport {
+            spec_id: resolved_spec_id,
+            product: target_source.label,
+            query_source: query_source.to_string(),
+            selected_window_summary,
+            query_terms: query_terms.to_vec(),
+            labels: labels.to_vec(),
+            claims: claims.to_vec(),
+            sources: sources.to_vec(),
+            time_span_ms,
+            summary,
+            assessments,
+            generated_at: Utc::now(),
+        })
     }
 
     async fn scout_intake(&self, spec_obj: &Spec, briefing: &CoobieBriefing) -> Result<IntentPackage> {
@@ -3127,6 +4551,17 @@ TOOL SURFACE:
         let logs_dir = run_dir.join("retriever-forge");
         tokio::fs::create_dir_all(&logs_dir).await?;
 
+        let drift_guard_raw = tokio::fs::read_to_string(run_dir.join("trail_drift_guard.json")).await?;
+        let drift_guard = serde_json::from_str::<TrailDriftGuardArtifact>(&drift_guard_raw)?;
+        let drift_check = verify_trail_drift_guard(run_id, spec_obj, target_source, &drift_guard)?;
+        self.write_json_file(&run_dir.join("trail_drift_check.json"), &drift_check)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("trail_drift_check.md"),
+            render_trail_drift_check_markdown(&drift_check),
+        )
+        .await?;
+
         let mut executed_commands = Vec::new();
         let mut hook_records = Vec::new();
         let mut preferred_commands_selected = Vec::new();
@@ -3137,9 +4572,41 @@ TOOL SURFACE:
             "retriever_execution_report.md".to_string(),
             hook_artifact_name.clone(),
             "retriever_forge_hooks.md".to_string(),
+            "trail_drift_guard.json".to_string(),
+            "trail_drift_guard.md".to_string(),
+            "trail_drift_check.json".to_string(),
+            "trail_drift_check.md".to_string(),
         ];
-        let mut all_passed = true;
-        for (idx, planned) in command_plan.iter().enumerate() {
+        let mut all_passed = drift_check.passed;
+        let mut drift_failure_summary = None;
+        if !drift_check.passed {
+            hook_records.push(RetrieverHookRecord {
+                stage: "pre_execution_guard".to_string(),
+                decision: "deny".to_string(),
+                tool: "trail_drift_guard".to_string(),
+                command_label: "trail drift guard".to_string(),
+                raw_command: "guarded workspace fingerprint verification".to_string(),
+                source: "trail_drift_guard".to_string(),
+                rationale: "The retriever forge must fail closed when guarded code-under-test or repo-local context paths drift after planning.".to_string(),
+                reasons: drift_check
+                    .changed_paths
+                    .iter()
+                    .cloned()
+                    .chain(drift_check.missing_paths.iter().cloned())
+                    .collect(),
+                passed: Some(false),
+                exit_code: None,
+                log_artifact: None,
+                created_at: Utc::now().to_rfc3339(),
+            });
+            drift_failure_summary = Some(format!(
+                "Retriever forge halted before execution for '{}' because guarded workspace paths drifted after planning. {}",
+                target_source.label,
+                drift_check.summary
+            ));
+        }
+        if drift_check.passed {
+            for (idx, planned) in command_plan.iter().enumerate() {
             let (decision, reasons) = evaluate_retriever_hook(&packet, planned);
             hook_records.push(RetrieverHookRecord {
                 stage: "pre_tool_use".to_string(),
@@ -3307,6 +4774,7 @@ TOOL SURFACE:
                 created_at: Utc::now().to_rfc3339(),
             });
         }
+        }
 
         if executed_commands.is_empty() {
             all_passed = false;
@@ -3340,7 +4808,9 @@ TOOL SURFACE:
                 preferred_commands_stale.len()
             )
         };
-        let summary = if executed_commands.is_empty() {
+        let summary = if let Some(summary) = drift_failure_summary {
+            summary
+        } else if executed_commands.is_empty() {
             format!(
                 "Retriever forge found no runnable command plan for '{}' and returned no visible execution evidence. {}",
                 target_source.label,
@@ -4100,6 +5570,49 @@ TWIN SERVICES:
             source_path: canonical.display().to_string(),
             git,
         })
+    }
+
+    async fn project_evidence_bundle_path(
+        &self,
+        target_source: &TargetSourceMetadata,
+        bundle_name: &str,
+    ) -> Result<PathBuf> {
+        let filename = normalize_evidence_bundle_name(bundle_name)?;
+        let harkonnen_dir = self.project_harkonnen_dir(target_source);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        Ok(harkonnen_dir.join("evidence").join("annotations").join(filename))
+    }
+
+    async fn project_evidence_history_path(
+        &self,
+        target_source: &TargetSourceMetadata,
+        bundle_name: &str,
+    ) -> Result<PathBuf> {
+        let filename = normalize_evidence_bundle_name(bundle_name)?;
+        let history_name = format!("{}.history.jsonl", filename);
+        let harkonnen_dir = self.project_harkonnen_dir(target_source);
+        self.ensure_project_evidence_bootstrap(&harkonnen_dir).await?;
+        Ok(harkonnen_dir.join("evidence").join("history").join(history_name))
+    }
+
+    async fn append_project_evidence_history_events(
+        &self,
+        target_source: &TargetSourceMetadata,
+        bundle_name: &str,
+        events: &[EvidenceAnnotationHistoryEvent],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let path = self.project_evidence_history_path(target_source, bundle_name).await?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path).await?;
+        for event in events {
+            let line = serde_json::to_string(event)?;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
+        file.flush().await?;
+        Ok(())
     }
 
     async fn capture_git_metadata(&self, source: &Path) -> Result<Option<TargetGitMetadata>> {
@@ -4978,6 +6491,14 @@ TWIN SERVICES:
             generated_at: Utc::now().to_rfc3339(),
             task_packet_artifact: "retriever_task_packet.json".to_string(),
             review_chain_artifact: "trail_review_chain.json".to_string(),
+            context_bundle_artifact: packet
+                .context_bundle_artifact
+                .clone()
+                .unwrap_or_else(|| "retriever_context_bundle.json".to_string()),
+            trail_drift_guard_artifact: packet
+                .trail_drift_guard_artifact
+                .clone()
+                .unwrap_or_else(|| "trail_drift_guard.json".to_string()),
             continuity_artifact: continuity_file.clone(),
             dispatch_summary: format!(
                 "Dispatch retriever forge '{}' for '{}' with {} allowed path(s) and {} visible success condition(s).",
@@ -5834,6 +7355,22 @@ fn build_implementation_plan(
         &briefing.open_questions,
         "No open questions captured by Coobie.",
     );
+    let pattern_matching_focus = render_list(
+        &briefing.pattern_matching_focus,
+        "No pattern-matching focus was derived from promoted evidence exemplars.",
+    );
+    let causal_chain_focus = render_list(
+        &briefing.causal_chain_focus,
+        "No causal-chain focus was derived from promoted evidence exemplars.",
+    );
+    let nearest_evidence_windows = render_list(
+        &briefing
+            .nearest_evidence_window_citations
+            .iter()
+            .map(|citation| format!("{} [{}]", citation.summary, citation.evidence))
+            .collect::<Vec<_>>(),
+        "No reviewed evidence windows were retrieved from project annotation bundles.",
+    );
     let git_summary = match &target_source.git {
         Some(git) => format!(
             "branch={} commit={} remote={} clean={}",
@@ -5895,6 +7432,15 @@ fn build_implementation_plan(
 ## Open Questions
 {}
 
+## Pattern Matching Focus
+{}
+
+## Causal Chains To Probe
+{}
+
+## Nearest Reviewed Evidence Windows
+{}
+
 ## Prior Context
 {}
 
@@ -5919,6 +7465,9 @@ fn build_implementation_plan(
         guardrails,
         required_checks,
         open_questions,
+        pattern_matching_focus,
+        causal_chain_focus,
+        nearest_evidence_windows,
         memory_summary,
         briefing.coobie_response,
     )
@@ -5946,7 +7495,6 @@ fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadat
     {
         terms.push(value.clone());
     }
-
     for component in &spec_obj.project_components {
         terms.push(component.name.clone());
         terms.push(component.role.clone());
@@ -6547,6 +8095,113 @@ fn apply_preferred_forge_outcome_context(
     open_questions.dedup();
 }
 
+fn build_pattern_matching_focus(citations: &[CoobieEvidenceCitation]) -> Vec<String> {
+    let mut focus = Vec::new();
+    for citation in citations.iter().take(4) {
+        push_unique(
+            &mut focus,
+            &format!(
+                "Pattern-match the current evidence against promoted exemplar: {}",
+                citation.summary
+            ),
+        );
+    }
+    focus
+}
+
+fn build_causal_chain_focus(citations: &[CoobieEvidenceCitation]) -> Vec<String> {
+    let mut focus = Vec::new();
+    for citation in citations.iter().take(4) {
+        push_unique(
+            &mut focus,
+            &format!(
+                "Probe whether the current run repeats this cause/effect/intervention chain: {}",
+                citation.summary
+            ),
+        );
+    }
+    focus
+}
+
+fn apply_evidence_exemplar_context(
+    pattern_citations: &[CoobieEvidenceCitation],
+    causal_citations: &[CoobieEvidenceCitation],
+    pattern_focus: &[String],
+    causal_focus: &[String],
+    query_terms: &mut Vec<String>,
+    recommended_guardrails: &mut Vec<String>,
+    required_checks: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    for focus in pattern_focus.iter().take(3) {
+        push_unique(query_terms, focus);
+    }
+    for focus in causal_focus.iter().take(3) {
+        push_unique(query_terms, focus);
+    }
+
+    for citation in pattern_citations.iter().take(3) {
+        push_unique(query_terms, &citation.summary);
+        push_unique(query_terms, &format!("pattern exemplar {}", citation.summary));
+    }
+    for citation in causal_citations.iter().take(3) {
+        push_unique(query_terms, &citation.summary);
+        push_unique(query_terms, &format!("causal exemplar {}", citation.summary));
+    }
+
+    if !pattern_citations.is_empty() {
+        recommended_guardrails.push(
+            "When promoted pattern exemplars exist, search for similar windows, shapes, or timelines before inventing a fresh classification story.".to_string(),
+        );
+        required_checks.push(
+            "Compare current evidence against the cited pattern exemplars and record why each candidate window matches or differs.".to_string(),
+        );
+        open_questions.push(
+            "Which current windows most closely resemble the promoted pattern exemplars, and what important differences remain?".to_string(),
+        );
+    }
+
+    if !causal_citations.is_empty() {
+        recommended_guardrails.push(
+            "When promoted causal exemplars exist, reason in explicit cause -> effect -> intervention chains instead of isolated anomalies.".to_string(),
+        );
+        required_checks.push(
+            "Trace whether the current run shows the same preconditions, effect window, and intervention outcome as the cited causal exemplars.".to_string(),
+        );
+        open_questions.push(
+            "Which intervention, missing intervention, or causal precondition distinguishes the current run from the promoted causal exemplars?".to_string(),
+        );
+    }
+
+    recommended_guardrails.dedup();
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
+fn apply_nearest_evidence_window_context(
+    citations: &[CoobieEvidenceCitation],
+    query_terms: &mut Vec<String>,
+    required_checks: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    if citations.is_empty() {
+        return;
+    }
+
+    for citation in citations.iter().take(3) {
+        push_unique(query_terms, &citation.summary);
+    }
+    required_checks.push(
+        "Compare the current run against the nearest reviewed evidence windows and record why each is a match, near-match, or mismatch.".to_string(),
+    );
+    open_questions.push(
+        "Which retrieved prior evidence window is the closest match to the current behavior, and does it confirm the same explanation or reveal a new branch?".to_string(),
+    );
+
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
 fn build_coobie_open_questions(
     spec_obj: &Spec,
     domain_signals: &[String],
@@ -6619,12 +8274,21 @@ fn build_worker_task_envelope(
     workspace_root: &Path,
     run_dir: &Path,
     staged_product: &Path,
+    context_bundle: &RetrieverContextBundleArtifact,
 ) -> WorkerTaskEnvelope {
     let mut allowed_paths = vec![staged_product.display().to_string()];
     allowed_paths.push(run_dir.join("spec.yaml").display().to_string());
     allowed_paths.push(run_dir.join("intent.json").display().to_string());
     allowed_paths.push(run_dir.join("coobie_briefing.json").display().to_string());
     allowed_paths.push(run_dir.join("coobie_preflight_response.md").display().to_string());
+
+    for entry in context_bundle
+        .context_entries
+        .iter()
+        .chain(context_bundle.skill_entries.iter())
+    {
+        push_unique(&mut allowed_paths, &entry.path);
+    }
 
     for component in &spec_obj.project_components {
         if worker_harness.allowed_components.is_empty()
@@ -6682,6 +8346,19 @@ fn build_worker_task_envelope(
         return_artifacts,
         max_iterations: worker_harness.max_iterations.unwrap_or(6),
         continuity_file: worker_harness.continuity_file.clone(),
+        context_bundle_artifact: Some("retriever_context_bundle.json".to_string()),
+        trail_drift_guard_artifact: Some("trail_drift_guard.json".to_string()),
+        repo_local_context_paths: context_bundle
+            .context_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        repo_local_skill_paths: context_bundle
+            .skill_entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        repo_local_context_notes: context_bundle.preload_notes.clone(),
         query_terms: briefing.query_terms.clone(),
         preferred_commands: briefing.preferred_forge_commands.clone(),
         guardrails: briefing.recommended_guardrails.clone(),
@@ -6696,6 +8373,7 @@ fn build_plan_review_chain(
     intent: &IntentPackage,
     briefing: &CoobieBriefing,
     implementation_plan: &str,
+    context_bundle: Option<&RetrieverContextBundleArtifact>,
 ) -> PlanReviewChainArtifact {
     let mut stages = Vec::new();
     stages.push(PlanReviewStage {
@@ -6719,6 +8397,30 @@ fn build_plan_review_chain(
             vec!["No ambiguity notes recorded.".to_string()]
         } else {
             intent.ambiguity_notes.clone()
+        },
+    });
+    stages.push(PlanReviewStage {
+        stage: "repo_local_context_review".to_string(),
+        owner: "coobie".to_string(),
+        summary: match context_bundle {
+            Some(bundle) => format!(
+                "Loaded {} repo-local context file(s) and {} skill bundle(s) for '{}' before forge execution.",
+                bundle.context_entries.len(),
+                bundle.skill_entries.len(),
+                target_source.label
+            ),
+            None => "No repo-local context bundle was attached to the forge plan.".to_string(),
+        },
+        evidence: match context_bundle {
+            Some(bundle) => bundle
+                .preload_notes
+                .iter()
+                .cloned()
+                .chain(bundle.context_entries.iter().take(4).map(|entry| format!("{} [{}]", entry.label, entry.path)))
+                .chain(bundle.skill_entries.iter().take(4).map(|entry| format!("{} [{}]", entry.label, entry.path)))
+                .take(10)
+                .collect(),
+            None => vec!["No repo-local context or skill bundles were discovered for this run.".to_string()],
         },
     });
     stages.push(PlanReviewStage {
@@ -6838,6 +8540,18 @@ fn render_worker_task_envelope_markdown(envelope: &WorkerTaskEnvelope) -> String
 ## Return Artifacts
 {}
 
+## Repo-Local Context Notes
+{}
+
+## Repo-Local Context Paths
+{}
+
+## Repo-Local Skill Paths
+{}
+
+## Trail Drift Guard Artifact
+{}
+
 ## Query Terms
 {}
 
@@ -6869,6 +8583,22 @@ fn render_worker_task_envelope_markdown(envelope: &WorkerTaskEnvelope) -> String
             "No visible success conditions recorded.",
         ),
         render_list(&envelope.return_artifacts, "No return artifacts recorded."),
+        render_list(
+            &envelope.repo_local_context_notes,
+            "No repo-local context notes were recorded.",
+        ),
+        render_list(
+            &envelope.repo_local_context_paths,
+            "No repo-local context paths were attached.",
+        ),
+        render_list(
+            &envelope.repo_local_skill_paths,
+            "No repo-local skill paths were attached.",
+        ),
+        envelope
+            .trail_drift_guard_artifact
+            .clone()
+            .unwrap_or_else(|| "No trail drift guard artifact was attached.".to_string()),
         render_list(&envelope.query_terms, "No query terms recorded."),
         render_list(
             &envelope.preferred_commands,
@@ -7316,6 +9046,8 @@ fn render_retriever_dispatch_markdown(dispatch: &RetrieverDispatchArtifact) -> S
 - Generated at: {}
 - Task packet artifact: {}
 - Review chain artifact: {}
+- Context bundle artifact: {}
+- Trail drift guard artifact: {}
 - Continuity artifact: {}
 
 ## Dispatch Summary
@@ -7341,6 +9073,8 @@ fn render_retriever_dispatch_markdown(dispatch: &RetrieverDispatchArtifact) -> S
         dispatch.generated_at,
         dispatch.task_packet_artifact,
         dispatch.review_chain_artifact,
+        dispatch.context_bundle_artifact,
+        dispatch.trail_drift_guard_artifact,
         dispatch.continuity_artifact,
         dispatch.dispatch_summary,
         render_list(&dispatch.constraints_applied, "No constraints were captured."),
@@ -7350,6 +9084,503 @@ fn render_retriever_dispatch_markdown(dispatch: &RetrieverDispatchArtifact) -> S
             "No visible success conditions were captured.",
         ),
         render_list(&dispatch.return_artifacts, "No return artifacts were captured."),
+    )
+}
+
+fn build_retriever_context_bundle(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    staged_product: &Path,
+    query_terms: &[String],
+) -> Result<RetrieverContextBundleArtifact> {
+    let harkonnen_dir = staged_product.join(".harkonnen");
+    let (context_entries, skill_entries) = discover_repo_local_context_entries(
+        &harkonnen_dir,
+        Some(target_source),
+        Some(spec_obj),
+        query_terms,
+    )?;
+    let preload_notes = build_repo_local_preload_notes(&context_entries, &skill_entries, target_source);
+    Ok(RetrieverContextBundleArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        generated_at: Utc::now().to_rfc3339(),
+        project_root: staged_product.display().to_string(),
+        context_entries,
+        skill_entries,
+        preload_notes,
+    })
+}
+
+fn discover_repo_local_context_entries(
+    harkonnen_dir: &Path,
+    target_source: Option<&TargetSourceMetadata>,
+    spec_obj: Option<&Spec>,
+    query_terms: &[String],
+) -> Result<(Vec<RepoLocalContextEntry>, Vec<RepoLocalContextEntry>)> {
+    let mut paths = Vec::new();
+    for name in [
+        "project-context.md",
+        "project-scan.md",
+        "resume-packet.md",
+        "strategy-register.md",
+        "memory-status.md",
+        "stale-memory-history.md",
+        "instructions.md",
+        "launch-guide.md",
+    ] {
+        let path = harkonnen_dir.join(name);
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    collect_markdown_paths(&harkonnen_dir.join("contexts"), &mut paths)?;
+    collect_markdown_paths(&harkonnen_dir.join("skills"), &mut paths)?;
+
+    let mut entries = Vec::new();
+    for path in paths {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let summary = summarize_repo_local_document(&raw);
+        let rel = path
+            .strip_prefix(harkonnen_dir.parent().unwrap_or(harkonnen_dir))
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let lower_rel = rel.to_lowercase();
+        let category = if lower_rel.contains("/skills/") {
+            "skill".to_string()
+        } else if lower_rel.ends_with("instructions.md") {
+            "instruction".to_string()
+        } else {
+            "context".to_string()
+        };
+        let scope = if lower_rel.contains("/skills/") {
+            "skills".to_string()
+        } else if lower_rel.contains("/contexts/") {
+            "contexts".to_string()
+        } else {
+            "project".to_string()
+        };
+        let relevance = score_repo_local_document(&rel, &raw, target_source, spec_obj, query_terms);
+        entries.push(RepoLocalContextEntry {
+            label: path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("context")
+                .replace('-', " "),
+            path: path.display().to_string(),
+            category,
+            scope,
+            summary,
+            relevance,
+        });
+    }
+
+    entries.sort_by(|left, right| right.relevance.cmp(&left.relevance).then_with(|| left.path.cmp(&right.path)));
+    let mut context_entries = Vec::new();
+    let mut skill_entries = Vec::new();
+    for entry in entries {
+        if entry.category == "skill" {
+            if skill_entries.len() < 8 {
+                skill_entries.push(entry);
+            }
+        } else if context_entries.len() < 12 {
+            context_entries.push(entry);
+        }
+    }
+    Ok((context_entries, skill_entries))
+}
+
+fn collect_markdown_paths(root: &Path, acc: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.exists() || !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_markdown_paths(&path, acc)?;
+            continue;
+        }
+        let is_md = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if is_md && !acc.iter().any(|existing| existing == &path) {
+            acc.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn summarize_repo_local_document(raw: &str) -> String {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+            continue;
+        }
+        return trimmed.chars().take(220).collect();
+    }
+    raw.trim().chars().take(220).collect()
+}
+
+fn score_repo_local_document(
+    rel_path: &str,
+    raw: &str,
+    target_source: Option<&TargetSourceMetadata>,
+    spec_obj: Option<&Spec>,
+    query_terms: &[String],
+) -> i32 {
+    let mut score = 0;
+    let haystack = format!("{}
+{}", rel_path.to_lowercase(), raw.to_lowercase());
+    if rel_path.ends_with("instructions.md") {
+        score += 40;
+    }
+    for (name, boost) in [
+        ("project-context.md", 36),
+        ("project-scan.md", 32),
+        ("resume-packet.md", 28),
+        ("strategy-register.md", 24),
+        ("memory-status.md", 22),
+        ("stale-memory-history.md", 20),
+    ] {
+        if rel_path.ends_with(name) {
+            score += boost;
+        }
+    }
+    if rel_path.contains("/contexts/") {
+        score += 14;
+    }
+    if rel_path.contains("/skills/") {
+        score += 12;
+    }
+    for term in query_terms {
+        let needle = term.trim().to_lowercase();
+        if needle.len() >= 3 && haystack.contains(&needle) {
+            score += 6;
+        }
+    }
+    if let Some(target_source) = target_source {
+        let label = target_source.label.to_lowercase();
+        if !label.is_empty() && haystack.contains(&label) {
+            score += 6;
+        }
+    }
+    if let Some(spec_obj) = spec_obj {
+        for component in &spec_obj.project_components {
+            for value in [&component.name, &component.role, &component.kind] {
+                let needle = value.trim().to_lowercase();
+                if needle.len() >= 3 && haystack.contains(&needle) {
+                    score += 5;
+                }
+            }
+        }
+        if let Some(blueprint) = &spec_obj.scenario_blueprint {
+            for value in blueprint
+                .code_under_test
+                .iter()
+                .chain(blueprint.runtime_surfaces.iter())
+                .chain(blueprint.coobie_memory_topics.iter())
+            {
+                let needle = value.trim().to_lowercase();
+                if needle.len() >= 3 && haystack.contains(&needle) {
+                    score += 4;
+                }
+            }
+        }
+    }
+    score
+}
+
+fn build_repo_local_preload_notes(
+    context_entries: &[RepoLocalContextEntry],
+    skill_entries: &[RepoLocalContextEntry],
+    target_source: &TargetSourceMetadata,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !context_entries.is_empty() {
+        notes.push(format!(
+            "Load {} repo-local context file(s) for '{}' before forge execution.",
+            context_entries.len(),
+            target_source.label
+        ));
+        if let Some(first) = context_entries.first() {
+            notes.push(format!("Start with '{}' because it is the highest-relevance repo-local context document.", first.label));
+        }
+    } else {
+        notes.push("No repo-local context files were discovered beyond the default project bootstrap files.".to_string());
+    }
+    if !skill_entries.is_empty() {
+        notes.push(format!(
+            "Preload {} repo-local skill bundle(s) so the forge inherits product-specific workflows before inventing new ones.",
+            skill_entries.len()
+        ));
+    } else {
+        notes.push("No repo-local skill bundles were discovered yet; add markdown files under `.harkonnen/skills/` for repeatable workflows.".to_string());
+    }
+    notes
+}
+
+fn render_retriever_context_bundle_markdown(bundle: &RetrieverContextBundleArtifact) -> String {
+    let context_lines = bundle
+        .context_entries
+        .iter()
+        .map(|entry| format!(
+            "- {} [{} | relevance={}] {}",
+            entry.label, entry.path, entry.relevance, entry.summary
+        ))
+        .collect::<Vec<_>>();
+    let skill_lines = bundle
+        .skill_entries
+        .iter()
+        .map(|entry| format!(
+            "- {} [{} | relevance={}] {}",
+            entry.label, entry.path, entry.relevance, entry.summary
+        ))
+        .collect::<Vec<_>>();
+    format!(
+        "# Retriever Context Bundle
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Generated at: {}
+- Project root: {}
+
+## Preload Notes
+{}
+
+## Context Entries
+{}
+
+## Skill Entries
+{}
+",
+        bundle.run_id,
+        bundle.spec_id,
+        bundle.product,
+        bundle.generated_at,
+        bundle.project_root,
+        render_list(&bundle.preload_notes, "No preload notes were generated."),
+        render_list(&context_lines, "No repo-local context entries were discovered."),
+        render_list(&skill_lines, "No repo-local skill entries were discovered."),
+    )
+}
+
+fn build_trail_drift_guard(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    staged_product: &Path,
+    context_bundle: &RetrieverContextBundleArtifact,
+) -> Result<TrailDriftGuardArtifact> {
+    let tracked_entries = collect_trail_drift_guard_entries(spec_obj, staged_product, context_bundle)?;
+    Ok(TrailDriftGuardArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        generated_at: Utc::now().to_rfc3339(),
+        tracked_entries,
+    })
+}
+
+fn collect_trail_drift_guard_entries(
+    spec_obj: &Spec,
+    staged_product: &Path,
+    context_bundle: &RetrieverContextBundleArtifact,
+) -> Result<Vec<TrailDriftGuardEntry>> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for rel in collect_spec_code_under_test_paths(spec_obj) {
+        let path = staged_product.join(&rel);
+        if !path.exists() {
+            continue;
+        }
+        let display = path.display().to_string();
+        if seen.insert(display.clone()) {
+            entries.push(TrailDriftGuardEntry {
+                role: "code_under_test".to_string(),
+                path: display,
+                fingerprint: fingerprint_trail_drift_target(&path)?,
+            });
+        }
+    }
+    for entry in context_bundle
+        .context_entries
+        .iter()
+        .chain(context_bundle.skill_entries.iter())
+    {
+        let path = PathBuf::from(&entry.path);
+        if !path.exists() {
+            continue;
+        }
+        let display = path.display().to_string();
+        if seen.insert(display.clone()) {
+            entries.push(TrailDriftGuardEntry {
+                role: format!("repo_local_{}", entry.category),
+                path: display,
+                fingerprint: fingerprint_trail_drift_target(&path)?,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn verify_trail_drift_guard(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    guard: &TrailDriftGuardArtifact,
+) -> Result<TrailDriftCheckArtifact> {
+    let mut verified_paths = Vec::new();
+    let mut changed_paths = Vec::new();
+    let mut missing_paths = Vec::new();
+    for entry in &guard.tracked_entries {
+        let path = Path::new(&entry.path);
+        if !path.exists() {
+            missing_paths.push(format!("{} [{}]", entry.role, entry.path));
+            continue;
+        }
+        let fingerprint = fingerprint_trail_drift_target(path)?;
+        if fingerprint == entry.fingerprint {
+            verified_paths.push(format!("{} [{}]", entry.role, entry.path));
+        } else {
+            changed_paths.push(format!("{} [{}]", entry.role, entry.path));
+        }
+    }
+    let passed = changed_paths.is_empty() && missing_paths.is_empty();
+    let summary = if passed {
+        format!(
+            "Verified {} guarded path(s) without drift before retriever execution.",
+            verified_paths.len()
+        )
+    } else {
+        format!(
+            "Guarded workspace drift detected: {} changed path(s), {} missing path(s).",
+            changed_paths.len(),
+            missing_paths.len()
+        )
+    };
+    Ok(TrailDriftCheckArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        generated_at: Utc::now().to_rfc3339(),
+        guard_artifact: "trail_drift_guard.json".to_string(),
+        passed,
+        summary,
+        verified_paths,
+        changed_paths,
+        missing_paths,
+    })
+}
+
+fn fingerprint_trail_drift_target(path: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    collect_paths_for_drift_fingerprint(path, path, &mut files)?;
+    let mut hasher = DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    for file in files {
+        let rel = file
+            .strip_prefix(path)
+            .or_else(|_| file.strip_prefix(path.parent().unwrap_or(path)))
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        rel.hash(&mut hasher);
+        let data = std::fs::read(&file)?;
+        data.len().hash(&mut hasher);
+        data.hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn collect_paths_for_drift_fingerprint(root: &Path, path: &Path, acc: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_file() {
+        acc.push(path.to_path_buf());
+        return Ok(());
+    }
+    if path.is_dir() {
+        let mut children = std::fs::read_dir(path)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            collect_paths_for_drift_fingerprint(root, &child, acc)?;
+        }
+        if acc.is_empty() && path == root {
+            acc.push(path.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn render_trail_drift_guard_markdown(artifact: &TrailDriftGuardArtifact) -> String {
+    let lines = artifact
+        .tracked_entries
+        .iter()
+        .map(|entry| format!("- {} [{}] fingerprint={}", entry.role, entry.path, entry.fingerprint))
+        .collect::<Vec<_>>();
+    format!(
+        "# Trail Drift Guard
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Generated at: {}
+
+## Tracked Entries
+{}
+",
+        artifact.run_id,
+        artifact.spec_id,
+        artifact.product,
+        artifact.generated_at,
+        render_list(&lines, "No guarded paths were recorded."),
+    )
+}
+
+fn render_trail_drift_check_markdown(artifact: &TrailDriftCheckArtifact) -> String {
+    format!(
+        "# Trail Drift Check
+
+- Run: {}
+- Spec: {}
+- Product: {}
+- Generated at: {}
+- Guard artifact: {}
+- Passed: {}
+
+## Summary
+{}
+
+## Verified Paths
+{}
+
+## Changed Paths
+{}
+
+## Missing Paths
+{}
+",
+        artifact.run_id,
+        artifact.spec_id,
+        artifact.product,
+        artifact.generated_at,
+        artifact.guard_artifact,
+        if artifact.passed { "true" } else { "false" },
+        artifact.summary,
+        render_list(&artifact.verified_paths, "No guarded paths were verified."),
+        render_list(&artifact.changed_paths, "No guarded paths changed."),
+        render_list(&artifact.missing_paths, "No guarded paths went missing."),
     )
 }
 
@@ -7379,6 +9610,685 @@ fn render_project_resume_packet_markdown(packet: &ProjectResumePacket) -> String
         render_target_git_summary(packet.current_git.as_ref()),
         render_list(&packet.summary, "No resume summary generated yet."),
         risk_lines,
+    )
+}
+
+fn render_evidence_time_range_summary(time_range: Option<&EvidenceTimeRange>) -> String {
+    match time_range {
+        Some(range) => {
+            if let (Some(start), Some(end)) = (range.start_ms, range.end_ms) {
+                return format!("{}..{} ms", start, end);
+            }
+            if let (Some(start), Some(end)) = (range.start_iso.as_deref(), range.end_iso.as_deref()) {
+                return format!("{}..{}", start, end);
+            }
+            if let Some(start) = range.start_ms {
+                return format!("start={} ms", start);
+            }
+            if let Some(end) = range.end_ms {
+                return format!("end={} ms", end);
+            }
+            if let Some(start) = range.start_iso.as_deref() {
+                return format!("start={}", start);
+            }
+            if let Some(end) = range.end_iso.as_deref() {
+                return format!("end={}", end);
+            }
+            "unspecified".to_string()
+        }
+        None => "unspecified".to_string(),
+    }
+}
+
+fn annotation_time_span_ms(time_range: Option<&EvidenceTimeRange>) -> Option<i64> {
+    let range = time_range?;
+    match (range.start_ms, range.end_ms) {
+        (Some(start), Some(end)) if end >= start => Some(end - start),
+        _ => None,
+    }
+}
+
+fn overlap_bonus(needles: &[String], haystack: &[String], per_match: i32) -> i32 {
+    let mut score = 0;
+    for needle in needles {
+        if haystack.iter().any(|candidate| candidate.contains(needle) || needle.contains(candidate)) {
+            score += per_match;
+        }
+    }
+    score
+}
+
+fn time_span_similarity_bonus(target_span: i64, candidate_span: i64) -> i32 {
+    if target_span <= 0 || candidate_span <= 0 {
+        return 0;
+    }
+    let delta = (target_span - candidate_span).abs() as f64;
+    let base = target_span.max(candidate_span) as f64;
+    let ratio = delta / base;
+    if ratio <= 0.10 {
+        20
+    } else if ratio <= 0.25 {
+        12
+    } else if ratio <= 0.50 {
+        6
+    } else {
+        0
+    }
+}
+
+fn collect_overlapping_terms(needles: &[String], haystack: &[String]) -> Vec<String> {
+    let mut matches = Vec::new();
+    for needle in needles {
+        if haystack
+            .iter()
+            .any(|candidate| candidate.contains(needle) || needle.contains(candidate))
+        {
+            push_unique(&mut matches, needle);
+        }
+    }
+    matches
+}
+
+fn classify_evidence_match(window: &EvidenceWindowMatch) -> String {
+    if window.score >= 90
+        || (!window.matched_claims.is_empty() && window.matched_labels.len() >= 2)
+        || (!window.matched_sources.is_empty() && window.matched_labels.len() >= 2)
+    {
+        "match".to_string()
+    } else if window.score >= 45 || !window.matched_labels.is_empty() || !window.matched_claims.is_empty() {
+        "near_match".to_string()
+    } else {
+        "mismatch".to_string()
+    }
+}
+
+fn confidence_from_match_score(score: i32) -> f64 {
+    ((score as f64) / 120.0).clamp(0.0, 1.0)
+}
+
+fn build_evidence_match_rationale(window: &EvidenceWindowMatch, match_type: &str) -> Vec<String> {
+    let mut rationale = Vec::new();
+    if !window.matched_labels.is_empty() {
+        rationale.push(format!("matched labels: {}", window.matched_labels.join(", ")));
+    }
+    if !window.matched_claims.is_empty() {
+        rationale.push(format!("matched claims: {}", window.matched_claims.join(" | ")));
+    }
+    if !window.matched_sources.is_empty() {
+        rationale.push(format!("matched sources: {}", window.matched_sources.join(" | ")));
+    }
+    if let Some(delta) = window.time_span_delta_ms {
+        rationale.push(format!("time-span delta: {} ms", delta));
+    }
+    if rationale.is_empty() {
+        rationale.push("match classification is based on broad query overlap only".to_string());
+    }
+    rationale.push(format!("classified as {} from similarity score {}", match_type, window.score));
+    rationale
+}
+
+fn build_evidence_match_assessment(rank: usize, window: EvidenceWindowMatch) -> EvidenceMatchAssessment {
+    let match_type = classify_evidence_match(&window);
+    let confidence = confidence_from_match_score(window.score);
+    let rationale = build_evidence_match_rationale(&window, &match_type);
+    EvidenceMatchAssessment {
+        rank,
+        match_type,
+        score: window.score,
+        confidence,
+        rationale,
+        window,
+    }
+}
+
+fn parse_citation_field_values(evidence: &str, field: &str) -> Vec<String> {
+    let prefix = format!("{}=", field);
+    evidence
+        .split(';')
+        .find_map(|segment| {
+            let trimmed = segment.trim();
+            trimmed.strip_prefix(&prefix).map(|value| {
+                value
+                    .split('|')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty() && part != "none")
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn parse_citation_time_span_ms(evidence: &str) -> Option<i64> {
+    let raw = evidence
+        .split(';')
+        .find_map(|segment| segment.trim().strip_prefix("time="))?
+        .trim();
+    let raw = raw.strip_suffix(" ms").unwrap_or(raw);
+    let (start, end) = raw.split_once("..")?;
+    let start = start.trim().parse::<i64>().ok()?;
+    let end = end.trim().parse::<i64>().ok()?;
+    (end >= start).then_some(end - start)
+}
+
+fn render_evidence_match_report(report: &EvidenceMatchReport) -> String {
+    let mut lines = vec![
+        "# Evidence Match Report".to_string(),
+        String::new(),
+        format!("- Spec: {}", report.spec_id),
+        format!("- Product: {}", report.product),
+        format!("- Generated: {}", report.generated_at.to_rfc3339()),
+    ];
+    if !report.summary.is_empty() {
+        lines.push(String::new());
+        lines.push("## Summary".to_string());
+        for item in &report.summary {
+            lines.push(format!("- {}", item));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Assessments".to_string());
+    if report.assessments.is_empty() {
+        lines.push("- No reviewed evidence windows matched the current context.".to_string());
+        return lines.join("\n");
+    }
+    for assessment in &report.assessments {
+        lines.push(format!(
+            "- #{} {} [{}] score={} confidence={:.0}%",
+            assessment.rank,
+            assessment.window.title,
+            assessment.match_type,
+            assessment.score,
+            assessment.confidence * 100.0
+        ));
+        lines.push(format!("  scenario={} dataset={} time={}", assessment.window.scenario, assessment.window.dataset, assessment.window.time_summary));
+        if !assessment.rationale.is_empty() {
+            lines.push(format!("  rationale={}", assessment.rationale.join(" | ")));
+        }
+    }
+    lines.join("\n")
+}
+
+fn parse_evidence_bundle_text(raw: &str) -> Result<EvidenceAnnotationBundle> {
+    serde_yaml::from_str(raw)
+        .or_else(|_| serde_json::from_str(raw))
+        .context("failed to parse evidence bundle")
+}
+
+fn validate_evidence_bundle(bundle: &EvidenceAnnotationBundle) -> Result<()> {
+    if bundle.schema_version == 0 {
+        bail!("schema_version must be >= 1");
+    }
+    let source_ids = bundle
+        .sources
+        .iter()
+        .map(|source| source.source_id.trim())
+        .collect::<HashSet<_>>();
+    for annotation in &bundle.annotations {
+        if annotation.annotation_id.trim().is_empty() {
+            bail!("annotation_id cannot be empty");
+        }
+        let anchor_ids = annotation
+            .anchors
+            .iter()
+            .map(|anchor| anchor.anchor_id.as_str())
+            .collect::<HashSet<_>>();
+        for source_id in &annotation.source_ids {
+            if !source_ids.contains(source_id.trim()) {
+                bail!(
+                    "annotation '{}' references unknown source '{}'",
+                    annotation.annotation_id,
+                    source_id
+                );
+            }
+        }
+        for anchor in &annotation.anchors {
+            if anchor.anchor_id.trim().is_empty() {
+                bail!(
+                    "annotation '{}' has anchor with empty anchor_id",
+                    annotation.annotation_id
+                );
+            }
+            if !source_ids.contains(anchor.source_id.trim()) {
+                bail!(
+                    "annotation '{}' anchor '{}' references unknown source '{}'",
+                    annotation.annotation_id,
+                    anchor.anchor_id,
+                    anchor.source_id
+                );
+            }
+        }
+        for claim in &annotation.claims {
+            if claim.claim_id.trim().is_empty() {
+                bail!(
+                    "annotation '{}' has claim with empty claim_id",
+                    annotation.annotation_id
+                );
+            }
+            for anchor_id in &claim.evidence_anchor_ids {
+                if !anchor_ids.contains(anchor_id.as_str()) {
+                    bail!(
+                        "annotation '{}' claim '{}' references unknown anchor '{}'",
+                        annotation.annotation_id,
+                        claim.claim_id,
+                        anchor_id
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_evidence_bundle_name(bundle_name: &str) -> Result<String> {
+    let trimmed = bundle_name.trim();
+    if trimmed.is_empty() {
+        bail!("bundle_name cannot be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        bail!("bundle_name must be a plain filename");
+    }
+    let mut normalized = trimmed.to_string();
+    let lower = normalized.to_ascii_lowercase();
+    if !lower.ends_with(".yaml") && !lower.ends_with(".yml") && !lower.ends_with(".json") {
+        normalized.push_str(".yaml");
+    }
+    Ok(normalized)
+}
+
+fn normalize_annotation_review_status(status: &str) -> Result<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok("draft"),
+        "reviewed" => Ok("reviewed"),
+        "approved" => Ok("approved"),
+        other => bail!("unsupported evidence annotation status '{}'", other),
+    }
+}
+
+fn append_annotation_note(notes: &mut String, entry: &str) {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if notes.trim().is_empty() {
+        notes.push_str(trimmed);
+        return;
+    }
+    if notes.contains(trimmed) {
+        return;
+    }
+    notes.push_str("\n\n");
+    notes.push_str(trimmed);
+}
+
+fn effective_annotation_status(annotation: &EvidenceAnnotation) -> String {
+    let status = annotation.status.trim();
+    if status.is_empty() {
+        "draft".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+fn annotation_history_actor(annotation: &EvidenceAnnotation) -> String {
+    if !annotation.reviewed_by.trim().is_empty() {
+        annotation.reviewed_by.trim().to_string()
+    } else if !annotation.created_by.trim().is_empty() {
+        annotation.created_by.trim().to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn build_annotation_history_event(
+    bundle_name: &str,
+    annotation: &EvidenceAnnotation,
+    event_type: &str,
+    previous_status: Option<String>,
+    actor: Option<String>,
+    note: Option<String>,
+    promoted_ids: Vec<String>,
+) -> EvidenceAnnotationHistoryEvent {
+    EvidenceAnnotationHistoryEvent {
+        event_id: format!("eah_{}", Uuid::new_v4().simple()),
+        bundle_name: normalize_evidence_bundle_name(bundle_name).unwrap_or_else(|_| bundle_name.trim().to_string()),
+        annotation_id: annotation.annotation_id.clone(),
+        annotation_title: annotation.title.clone(),
+        event_type: event_type.to_string(),
+        status: effective_annotation_status(annotation),
+        previous_status: previous_status.unwrap_or_default(),
+        actor: actor.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| annotation_history_actor(annotation)),
+        note: note.unwrap_or_default(),
+        promoted_ids,
+        occurred_at: if !annotation.updated_at.trim().is_empty() {
+            annotation.updated_at.clone()
+        } else if !annotation.reviewed_at.trim().is_empty() {
+            annotation.reviewed_at.clone()
+        } else if !annotation.created_at.trim().is_empty() {
+            annotation.created_at.clone()
+        } else {
+            Utc::now().to_rfc3339()
+        },
+    }
+}
+
+fn annotations_equal(left: &EvidenceAnnotation, right: &EvidenceAnnotation) -> bool {
+    serde_json::to_string(left).ok() == serde_json::to_string(right).ok()
+}
+
+fn collect_bundle_save_history_events(
+    bundle_name: &str,
+    previous: Option<&EvidenceAnnotationBundle>,
+    current: &EvidenceAnnotationBundle,
+) -> Vec<EvidenceAnnotationHistoryEvent> {
+    let mut events = Vec::new();
+    let previous_map = previous
+        .map(|bundle| {
+            bundle
+                .annotations
+                .iter()
+                .map(|annotation| (annotation.annotation_id.clone(), annotation.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    for annotation in &current.annotations {
+        match previous_map.get(&annotation.annotation_id) {
+            None => events.push(build_annotation_history_event(
+                bundle_name,
+                annotation,
+                "created",
+                None,
+                Some(annotation_history_actor(annotation)),
+                Some("Annotation created through bundle save.".to_string()),
+                Vec::new(),
+            )),
+            Some(previous_annotation) if !annotations_equal(previous_annotation, annotation) => events.push(build_annotation_history_event(
+                bundle_name,
+                annotation,
+                "updated",
+                Some(effective_annotation_status(previous_annotation)),
+                Some(annotation_history_actor(annotation)),
+                Some("Annotation updated through bundle save.".to_string()),
+                Vec::new(),
+            )),
+            _ => {}
+        }
+    }
+
+    if let Some(previous) = previous {
+        for annotation in &previous.annotations {
+            if current
+                .annotations
+                .iter()
+                .any(|candidate| candidate.annotation_id == annotation.annotation_id)
+            {
+                continue;
+            }
+            let mut removed = annotation.clone();
+            removed.status = "removed".to_string();
+            removed.updated_at = Utc::now().to_rfc3339();
+            events.push(build_annotation_history_event(
+                bundle_name,
+                &removed,
+                "removed",
+                Some(effective_annotation_status(annotation)),
+                Some(annotation_history_actor(annotation)),
+                Some("Annotation removed through bundle save.".to_string()),
+                Vec::new(),
+            ));
+        }
+    }
+
+    events
+}
+
+fn annotation_is_review_ready(annotation: &EvidenceAnnotation) -> bool {
+    let status = annotation.status.trim().to_ascii_lowercase();
+    matches!(status.as_str(), "reviewed" | "approved")
+}
+
+fn resolve_evidence_promotion_destination<'a>(annotation: &EvidenceAnnotation, scope: &'a str) -> Option<&'a str> {
+    match scope {
+        "project" => Some("project"),
+        "core" => Some("core"),
+        "follow-bundle" => match annotation.promote_to_memory.trim().to_ascii_lowercase().as_str() {
+            "project" => Some("project"),
+            "core" | "core_candidate" => Some("core"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn build_evidence_memory_id(bundle: &EvidenceAnnotationBundle, annotation: &EvidenceAnnotation) -> String {
+    format!(
+        "evidence-{}-{}",
+        slugify_memory_fragment(&bundle.project),
+        slugify_memory_fragment(&annotation.annotation_id)
+    )
+}
+
+fn slugify_memory_fragment(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn build_evidence_memory_summary(bundle: &EvidenceAnnotationBundle, annotation: &EvidenceAnnotation) -> String {
+    let title = if annotation.title.trim().is_empty() {
+        annotation.annotation_id.as_str()
+    } else {
+        annotation.title.trim()
+    };
+    if bundle.scenario.trim().is_empty() {
+        format!("Causal evidence: {}", title)
+    } else {
+        format!("Causal evidence for {}: {}", bundle.scenario.trim(), title)
+    }
+}
+
+fn build_evidence_memory_tags(
+    bundle: &EvidenceAnnotationBundle,
+    annotation: &EvidenceAnnotation,
+    destination: &str,
+) -> Vec<String> {
+    let mut tags = vec![
+        "evidence".to_string(),
+        "causal".to_string(),
+        "causal-evidence".to_string(),
+        annotation.annotation_type.trim().to_ascii_lowercase(),
+        destination.to_string() + "-memory",
+    ];
+    if !bundle.dataset.trim().is_empty() {
+        tags.push(slugify_memory_fragment(&bundle.dataset));
+    }
+    for value in annotation.labels.iter().chain(annotation.tags.iter()) {
+        let slug = slugify_memory_fragment(value);
+        if !slug.is_empty() {
+            tags.push(slug);
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn collect_evidence_source_uris(bundle: &EvidenceAnnotationBundle, annotation: &EvidenceAnnotation) -> Vec<String> {
+    let mut paths = Vec::new();
+    for source in &bundle.sources {
+        if annotation.source_ids.iter().any(|id| id == &source.source_id) && !source.uri.trim().is_empty() {
+            let normalized = normalize_project_path(&source.uri);
+            if !normalized.is_empty() && !paths.iter().any(|existing| existing == &normalized) {
+                paths.push(normalized);
+            }
+        }
+    }
+    paths
+}
+
+fn render_evidence_memory_body(
+    bundle_path: &Path,
+    bundle: &EvidenceAnnotationBundle,
+    annotation: &EvidenceAnnotation,
+) -> String {
+    let source_lines = bundle
+        .sources
+        .iter()
+        .filter(|source| annotation.source_ids.iter().any(|id| id == &source.source_id))
+        .map(render_evidence_source_line)
+        .collect::<Vec<_>>()
+        .join("
+");
+    let anchor_lines = annotation
+        .anchors
+        .iter()
+        .map(|anchor| {
+            format!(
+                "- {} [{}] source={} signal_keys={} frame_index={:?} timestamp_ms={:?}",
+                anchor.anchor_id,
+                anchor.kind,
+                anchor.source_id,
+                if anchor.signal_keys.is_empty() { "none".to_string() } else { anchor.signal_keys.join(", ") },
+                anchor.frame_index,
+                anchor.timestamp_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("
+");
+    let claim_lines = annotation
+        .claims
+        .iter()
+        .map(|claim| {
+            format!(
+                "- {}: {} -> {} (confidence={}) anchors={} notes={}",
+                claim.relation,
+                claim.cause,
+                claim.effect,
+                claim.confidence
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                if claim.evidence_anchor_ids.is_empty() { "none".to_string() } else { claim.evidence_anchor_ids.join(", ") },
+                if claim.notes.trim().is_empty() { "none".to_string() } else { claim.notes.trim().to_string() }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("
+");
+
+    format!(
+        "Bundle: {}
+Project: {}
+Scenario: {}
+Dataset: {}
+Annotation: {}
+Status: {}
+Reviewed by: {}
+Reviewed at: {}
+Promote to memory: {}
+Time range: {:?} - {:?} ms
+
+Bundle notes:
+{}
+
+Labels: {}
+Tags: {}
+
+Sources:
+{}
+
+Anchors:
+{}
+
+Claims:
+{}
+
+Annotation notes:
+{}
+",
+        bundle_path.display(),
+        bundle.project,
+        if bundle.scenario.trim().is_empty() { "n/a" } else { bundle.scenario.trim() },
+        if bundle.dataset.trim().is_empty() { "n/a" } else { bundle.dataset.trim() },
+        annotation.annotation_id,
+        if annotation.status.trim().is_empty() { "draft" } else { annotation.status.trim() },
+        if annotation.reviewed_by.trim().is_empty() { "n/a" } else { annotation.reviewed_by.trim() },
+        if annotation.reviewed_at.trim().is_empty() { "n/a" } else { annotation.reviewed_at.trim() },
+        if annotation.promote_to_memory.trim().is_empty() { "none" } else { annotation.promote_to_memory.trim() },
+        annotation.time_range.as_ref().and_then(|range| range.start_ms),
+        annotation.time_range.as_ref().and_then(|range| range.end_ms),
+        if bundle.notes.is_empty() {
+            "- none".to_string()
+        } else {
+            bundle
+                .notes
+                .iter()
+                .map(|note| format!("- {}", note))
+                .collect::<Vec<_>>()
+                .join("
+")
+        },
+        if annotation.labels.is_empty() { "none".to_string() } else { annotation.labels.join(", ") },
+        if annotation.tags.is_empty() { "none".to_string() } else { annotation.tags.join(", ") },
+        if source_lines.is_empty() { "- none".to_string() } else { source_lines },
+        if anchor_lines.is_empty() { "- none".to_string() } else { anchor_lines },
+        if claim_lines.is_empty() { "- none".to_string() } else { claim_lines },
+        if annotation.notes.trim().is_empty() { "none".to_string() } else { annotation.notes.trim().to_string() },
+    )
+}
+
+fn render_evidence_source_line(source: &EvidenceSource) -> String {
+    format!(
+        "- {} [{}] uri={} channels={} tags={}",
+        source.source_id,
+        source.kind,
+        if source.uri.trim().is_empty() { "n/a" } else { source.uri.trim() },
+        if source.channels.is_empty() { "none".to_string() } else { source.channels.join(", ") },
+        if source.tags.is_empty() { "none".to_string() } else { source.tags.join(", ") },
+    )
+}
+
+fn build_evidence_memory_provenance(
+    bundle_path: &Path,
+    bundle: &EvidenceAnnotationBundle,
+    annotation: &EvidenceAnnotation,
+    target_source: &TargetSourceMetadata,
+    source_uris: &[String],
+) -> MemoryProvenance {
+    let mut observed_paths = vec![normalize_project_path(&bundle_path.display().to_string())];
+    for path in source_uris {
+        if !observed_paths.iter().any(|existing| existing == path) {
+            observed_paths.push(path.clone());
+        }
+    }
+    let mut observed_surfaces = bundle
+        .sources
+        .iter()
+        .filter(|source| annotation.source_ids.iter().any(|id| id == &source.source_id))
+        .map(|source| format!("{}:{}", source.kind, source.label))
+        .collect::<Vec<_>>();
+    observed_surfaces.sort();
+    observed_surfaces.dedup();
+
+    project_memory_provenance(
+        target_source,
+        None,
+        None,
+        Vec::new(),
+        vec!["evidence sources, dataset semantics, or reviewed causal interpretation change".to_string()],
+        observed_paths,
+        Vec::new(),
+        observed_surfaces,
     )
 }
 

@@ -58,6 +58,239 @@ pub struct WorkerHarnessConfig {
     pub continuity_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceTimeRange {
+    #[serde(default)]
+    pub start_ms: Option<i64>,
+    #[serde(default)]
+    pub end_ms: Option<i64>,
+    #[serde(default)]
+    pub start_iso: Option<String>,
+    #[serde(default)]
+    pub end_iso: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceSource {
+    pub source_id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceRegion {
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceAnchor {
+    pub anchor_id: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub signal_keys: Vec<String>,
+    #[serde(default)]
+    pub sample_index: Option<i64>,
+    #[serde(default)]
+    pub frame_index: Option<i64>,
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub time_range: Option<EvidenceTimeRange>,
+    #[serde(default)]
+    pub region: Option<EvidenceRegion>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceCausalClaim {
+    pub claim_id: String,
+    #[serde(default)]
+    pub relation: String,
+    #[serde(default)]
+    pub cause: String,
+    #[serde(default)]
+    pub effect: String,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub evidence_anchor_ids: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceAnnotation {
+    #[serde(default)]
+    pub annotation_id: String,
+    #[serde(default)]
+    pub annotation_type: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub promote_to_memory: String,
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+    #[serde(default)]
+    pub time_range: Option<EvidenceTimeRange>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub anchors: Vec<EvidenceAnchor>,
+    #[serde(default)]
+    pub claims: Vec<EvidenceCausalClaim>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub reviewed_by: String,
+    #[serde(default)]
+    pub reviewed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceAnnotationBundle {
+    #[serde(default = "default_evidence_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub scenario: String,
+    #[serde(default)]
+    pub dataset: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<EvidenceSource>,
+    #[serde(default)]
+    pub annotations: Vec<EvidenceAnnotation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvidenceAnnotationHistoryEvent {
+    pub event_id: String,
+    #[serde(default)]
+    pub bundle_name: String,
+    #[serde(default)]
+    pub annotation_id: String,
+    #[serde(default)]
+    pub annotation_title: String,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub previous_status: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub promoted_ids: Vec<String>,
+    #[serde(default)]
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceWindowMatch {
+    pub score: i32,
+    pub project: String,
+    pub scenario: String,
+    pub dataset: String,
+    pub bundle_path: String,
+    pub annotation_id: String,
+    pub annotation_type: String,
+    pub title: String,
+    #[serde(default)]
+    pub time_summary: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub matched_labels: Vec<String>,
+    #[serde(default)]
+    pub matched_claims: Vec<String>,
+    #[serde(default)]
+    pub matched_sources: Vec<String>,
+    #[serde(default)]
+    pub time_span_delta_ms: Option<i64>,
+    pub citation: CoobieEvidenceCitation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceMatchAssessment {
+    pub rank: usize,
+    pub match_type: String,
+    pub score: i32,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub rationale: Vec<String>,
+    pub window: EvidenceWindowMatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceMatchReport {
+    pub spec_id: String,
+    pub product: String,
+    #[serde(default)]
+    pub query_source: String,
+    #[serde(default)]
+    pub selected_window_summary: Option<String>,
+    #[serde(default)]
+    pub query_terms: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub time_span_ms: Option<i64>,
+    #[serde(default)]
+    pub summary: Vec<String>,
+    #[serde(default)]
+    pub assessments: Vec<EvidenceMatchAssessment>,
+    pub generated_at: DateTime<Utc>,
+}
+
+fn default_evidence_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
     pub id: String,
@@ -193,6 +426,16 @@ pub struct CoobieBriefing {
     pub strategy_register_citations: Vec<CoobieEvidenceCitation>,
     #[serde(default)]
     pub mitigation_history_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub evidence_pattern_exemplar_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub evidence_causal_exemplar_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub nearest_evidence_window_citations: Vec<CoobieEvidenceCitation>,
+    #[serde(default)]
+    pub pattern_matching_focus: Vec<String>,
+    #[serde(default)]
+    pub causal_chain_focus: Vec<String>,
     #[serde(default)]
     pub forge_evidence_citations: Vec<CoobieEvidenceCitation>,
     #[serde(default)]

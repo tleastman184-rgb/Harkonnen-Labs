@@ -7,6 +7,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::capacity::CapacityState;
+use crate::models::EvidenceAnnotationBundle;
 use crate::config::Paths;
 use crate::claude_pack::{export_claude_pack, ClaudePackRequest};
 use crate::orchestrator::{AppContext, FailureHarness, RunRequest};
@@ -42,6 +43,10 @@ pub enum Commands {
     Memory {
         #[command(subcommand)]
         command: MemoryCommands,
+    },
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommands,
     },
     Setup {
         #[command(subcommand)]
@@ -135,6 +140,13 @@ pub enum MemoryCommands {
     Ingest(MemoryIngestArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub enum EvidenceCommands {
+    Init(EvidenceInitArgs),
+    Validate(EvidenceValidateArgs),
+    Promote(EvidencePromoteArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct MemorySearchArgs {
     pub query: String,
@@ -170,6 +182,26 @@ pub struct MemoryIngestArgs {
     pub tags: Vec<String>,
     #[arg(long, default_value_t = false)]
     pub no_asset: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EvidenceInitArgs {
+    #[arg(long)]
+    pub project_root: String,
+}
+
+#[derive(Args, Debug)]
+pub struct EvidenceValidateArgs {
+    pub file: String,
+}
+
+#[derive(Args, Debug)]
+pub struct EvidencePromoteArgs {
+    pub file: String,
+    #[arg(long, default_value = "follow-bundle", value_parser = ["follow-bundle", "project", "core"])]
+    pub scope: String,
+    #[arg(long)]
+    pub project_root: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -422,6 +454,134 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
             println!("Extracted title: {}", result.title);
             println!("Extracted chars: {}", result.extracted_chars);
             println!("Memory root: {}", result.memory_root.display());
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_evidence(command: EvidenceCommands, app: AppContext) -> Result<()> {
+    match command {
+        EvidenceCommands::Init(args) => {
+            let evidence_root = app.init_project_evidence(Path::new(&args.project_root)).await?;
+            println!("Project evidence root: {}", evidence_root.display());
+            println!("Annotation bundles: {}", evidence_root.join("annotations").display());
+            println!("Causal records: {}", evidence_root.join("causal").display());
+        }
+        EvidenceCommands::Validate(args) => {
+            let bundle = load_evidence_bundle(Path::new(&args.file))?;
+            validate_evidence_bundle(&bundle)?;
+            println!(
+                "Evidence bundle valid: project='{}' scenario='{}' sources={} annotations={}",
+                bundle.project,
+                bundle.scenario,
+                bundle.sources.len(),
+                bundle.annotations.len()
+            );
+        }
+        EvidenceCommands::Promote(args) => {
+            let bundle = load_evidence_bundle(Path::new(&args.file))?;
+            validate_evidence_bundle(&bundle)?;
+            let result = app
+                .promote_evidence_bundle(
+                    Path::new(&args.file),
+                    &bundle,
+                    &args.scope,
+                    args.project_root.as_deref(),
+                )
+                .await?;
+            println!(
+                "Promoted {} annotation(s); skipped {}.",
+                result.promoted_ids.len(),
+                result.skipped_annotations.len()
+            );
+            for id in result.promoted_ids {
+                println!("Promoted memory: {}", id);
+            }
+            for skipped in result.skipped_annotations {
+                println!("Skipped annotation: {}", skipped);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_evidence_bundle(path: &Path) -> Result<EvidenceAnnotationBundle> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read evidence bundle: {}", path.display()))?;
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ext == "json" {
+        return serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse evidence json: {}", path.display()));
+    }
+    serde_yaml::from_str(&raw)
+        .or_else(|_| serde_json::from_str(&raw))
+        .with_context(|| format!("failed to parse evidence bundle: {}", path.display()))
+}
+
+fn validate_evidence_bundle(bundle: &EvidenceAnnotationBundle) -> Result<()> {
+    if bundle.schema_version == 0 {
+        bail!("schema_version must be >= 1");
+    }
+    let source_ids = bundle
+        .sources
+        .iter()
+        .map(|source| source.source_id.trim())
+        .collect::<HashSet<_>>();
+    for annotation in &bundle.annotations {
+        if annotation.annotation_id.trim().is_empty() {
+            bail!("annotation_id cannot be empty");
+        }
+        let anchor_ids = annotation
+            .anchors
+            .iter()
+            .map(|anchor| anchor.anchor_id.as_str())
+            .collect::<HashSet<_>>();
+        for source_id in &annotation.source_ids {
+            if !source_ids.contains(source_id.trim()) {
+                bail!(
+                    "annotation '{}' references unknown source '{}'",
+                    annotation.annotation_id,
+                    source_id
+                );
+            }
+        }
+        for anchor in &annotation.anchors {
+            if anchor.anchor_id.trim().is_empty() {
+                bail!(
+                    "annotation '{}' has anchor with empty anchor_id",
+                    annotation.annotation_id
+                );
+            }
+            if !source_ids.contains(anchor.source_id.trim()) {
+                bail!(
+                    "annotation '{}' anchor '{}' references unknown source '{}'",
+                    annotation.annotation_id,
+                    anchor.anchor_id,
+                    anchor.source_id
+                );
+            }
+        }
+        for claim in &annotation.claims {
+            if claim.claim_id.trim().is_empty() {
+                bail!(
+                    "annotation '{}' has claim with empty claim_id",
+                    annotation.annotation_id
+                );
+            }
+            for anchor_id in &claim.evidence_anchor_ids {
+                if !anchor_ids.contains(anchor_id.as_str()) {
+                    bail!(
+                        "annotation '{}' claim '{}' references unknown anchor '{}'",
+                        annotation.annotation_id,
+                        claim.claim_id,
+                        anchor_id
+                    );
+                }
+            }
         }
     }
     Ok(())

@@ -142,11 +142,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "04-spec-format",
@@ -179,11 +179,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "coobie-causaloid-roadmap",
@@ -236,8 +236,8 @@
         "factory"
       ],
       "summary": "Coobie roadmap for borrowing OpenAgent-style worker-harness ideas without surrendering Harkonnen truth",
-      "content": "# Coobie OpenAgent Roadmap\n\nPurpose: borrow the strongest orchestration mechanics from OpenAgent while keeping Harkonnen as the outer factory governor.\n\nPriority items:\n- Treat any OpenAgent-like system as an inner worker harness for exploration, planning, execution, and visible verification only.\n- Keep hidden scenarios, policy, causal memory, digital-twin truth, and release acceptance outside the worker harness.\n- Implemented foundation: a retriever-themed bounded forge contract now emits `retriever_task_packet`, `trail_review_chain`, `retriever_dispatch`, and `trail-state` artifacts for any spec that declares a worker harness.\n- Implemented executor layer: Harkonnen now runs a real bounded retriever forge executor that consumes the packet, writes retriever execution evidence, and updates trail-state continuity.\n- Borrowed from claw-code: add pre/post forge command hooks with Keeper-style allow/deny decisions and Coobie-readable payloads before relying only on final forge summaries.\n- Borrowed from claw-code: keep hierarchical repo-local instruction discovery in mind for `.harkonnen/` context layering, but treat operator slash commands as lower priority than hook evidence and continuity.\n- Next build layer: let Coobie score returned forge artifacts and hook evidence to critique or route future forge attempts.\n- Preserve worker continuity in a separate state file so resumability helps long jobs without replacing Harkonnen's run DB, blackboard, or artifact truth.\n- Add hierarchical repo-local context and skill bundles under `.harkonnen/` so external repos can preload focused context into the worker harness.\n- Explore safer edit substrates inspired by hash-anchored editing so external-codebase modifications fail closed when context drifts.\n\nExpected outcome:\n- Harkonnen can use an OpenAgent-style forge for disciplined planning and execution while Coobie, Sable, Keeper, Ash, and Flint still decide what is true, allowed, hidden, and accepted.\n",
-      "created_at": "2026-04-01T16:52:41.515174233+00:00",
+      "content": "# Coobie OpenAgent Roadmap\n\nPurpose: borrow the strongest orchestration mechanics from OpenAgent while keeping Harkonnen as the outer factory governor.\n\nPriority items:\n- Treat any OpenAgent-like system as an inner worker harness for exploration, planning, execution, and visible verification only.\n- Keep hidden scenarios, policy, causal memory, digital-twin truth, and release acceptance outside the worker harness.\n- Implemented foundation: a retriever-themed bounded forge contract now emits `retriever_task_packet`, `trail_review_chain`, `retriever_dispatch`, and `trail-state` artifacts for any spec that declares a worker harness.\n- Implemented executor layer: Harkonnen now runs a real bounded retriever forge executor that consumes the packet, writes retriever execution evidence, and updates trail-state continuity.\n- Borrowed from claw-code: add pre/post forge command hooks with Keeper-style allow/deny decisions and Coobie-readable payloads before relying only on final forge summaries.\n- Borrowed from claw-code: keep hierarchical repo-local instruction discovery in mind for `.harkonnen/` context layering, but treat operator slash commands as lower priority than hook evidence and continuity.\n- Next build layer: let Coobie score returned forge artifacts and hook evidence to critique or route future forge attempts.\n- Preserve worker continuity in a separate state file so resumability helps long jobs without replacing Harkonnen's run DB, blackboard, or artifact truth.\n- Implemented: hierarchical repo-local context and skill bundles under `.harkonnen/` now feed Coobie preflight and the retriever forge through `retriever_context_bundle` artifacts.\n- Implemented foundation: `trail_drift_guard` and `trail_drift_check` now fingerprint code-under-test and repo-local context paths so the forge fails closed when the staged workspace drifts after planning.\n- Next layer: evolve the drift guard into a richer edit substrate with line- or region-level anchors for future code-modifying worker harnesses.\n\nExpected outcome:\n- Harkonnen can use an OpenAgent-style forge for disciplined planning and execution while Coobie, Sable, Keeper, Ash, and Flint still decide what is true, allowed, hidden, and accepted.\n",
+      "created_at": "2026-04-01T18:05:21.518679989+00:00",
       "provenance": {
         "source_label": null,
         "source_kind": null,
@@ -256,11 +256,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "coobie-residue-roadmap",
@@ -295,11 +295,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "coobie-solitaire-agents-roadmap",
@@ -314,8 +314,8 @@
         "factory"
       ],
       "summary": "Coobie roadmap for self-tuning memory manifests inspired by Solitaire-for-Agents",
-      "content": "# Coobie Solitaire-for-Agents Roadmap\n\nPurpose: make memory retrieval self-correcting so the most useful project and core memories arrive in context before work begins.\n\nPriority items:\n- Keep product-local memory in the repo under `.harkonnen/project-memory/` and retain only cross-project learnings in Harkonnen core memory.\n- Track which memory entries were loaded, recalled, and associated with successful or failed runs.\n- Rank retrieval by demonstrated usefulness rather than keyword match alone.\n- Preload likely-relevant project memory, core memory, prior dead ends, and proven success patterns before planning begins.\n- Capture lightweight agent-behavior lessons when a role repeatedly over-plans, under-validates, or skips evidence.\n- Distinguish worker-session memory from Coobie memory: resumable harness state is short-horizon convenience, while Coobie remains the durable causal source of truth.\n- Preload hierarchical repo-local context and scoped skill bundles so external worker harnesses start informed without reading the whole world.\n- Feed prior mitigation outcomes back into memory ranking so revalidated memories earn trust and unresolved memories are surfaced with stronger caution.\n\nExpected outcome:\n- Coobie becomes a practical long-memory Labrador for the pack: concise, anticipatory, increasingly better at surfacing the right lessons before the run drifts, and careful about what belongs to worker convenience versus durable factory truth.\n",
-      "created_at": "2026-04-01T15:20:15.187941504+00:00",
+      "content": "# Coobie Solitaire-for-Agents Roadmap\n\nPurpose: make memory retrieval self-correcting so the most useful project and core memories arrive in context before work begins.\n\nPriority items:\n- Keep product-local memory in the repo under `.harkonnen/project-memory/` and retain only cross-project learnings in Harkonnen core memory.\n- Track which memory entries were loaded, recalled, and associated with successful or failed runs.\n- Rank retrieval by demonstrated usefulness rather than keyword match alone.\n- Preload likely-relevant project memory, core memory, prior dead ends, and proven success patterns before planning begins.\n- Capture lightweight agent-behavior lessons when a role repeatedly over-plans, under-validates, or skips evidence.\n- Distinguish worker-session memory from Coobie memory: resumable harness state is short-horizon convenience, while Coobie remains the durable causal source of truth.\n- Implemented foundation: hierarchical repo-local context and scoped skill bundles are now discovered under `.harkonnen/`, cited by Coobie, and attached to the worker harness before execution.\n- Feed prior mitigation outcomes back into memory ranking so revalidated memories earn trust and unresolved memories are surfaced with stronger caution.\n\nExpected outcome:\n- Coobie becomes a practical long-memory Labrador for the pack: concise, anticipatory, increasingly better at surfacing the right lessons before the run drifts, and careful about what belongs to worker convenience versus durable factory truth.\n",
+      "created_at": "2026-04-01T17:45:12.022571897+00:00",
       "provenance": {
         "source_label": null,
         "source_kind": null,
@@ -405,11 +405,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "lamdet-middle-peak-sling-note",
@@ -655,11 +655,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
-      "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "recall_count": 6,
+      "last_recalled": "2026-04-01T19:31:49.204003451+00:00",
+      "loaded_for_run_count": 6,
+      "contributed_to_success_count": 4,
+      "contributed_to_failure_count": 2
     },
     {
       "id": "run-28a77447-2921-4022-ac30-fc79e17a1742",

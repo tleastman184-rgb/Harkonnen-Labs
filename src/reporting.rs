@@ -437,6 +437,51 @@ Coobie Preflight
             }
         ));
         report.push_str(&format!(
+            "Pattern exemplar citations: {}
+",
+            if briefing.evidence_pattern_exemplar_citations.is_empty() {
+                "none".to_string()
+            } else {
+                render_citation_lines(&briefing.evidence_pattern_exemplar_citations).join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Causal exemplar citations: {}
+",
+            if briefing.evidence_causal_exemplar_citations.is_empty() {
+                "none".to_string()
+            } else {
+                render_citation_lines(&briefing.evidence_causal_exemplar_citations).join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Nearest reviewed evidence windows: {}
+",
+            if briefing.nearest_evidence_window_citations.is_empty() {
+                "none".to_string()
+            } else {
+                render_citation_lines(&briefing.nearest_evidence_window_citations).join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Pattern matching focus: {}
+",
+            if briefing.pattern_matching_focus.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.pattern_matching_focus.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
+            "Causal chain focus: {}
+",
+            if briefing.causal_chain_focus.is_empty() {
+                "none".to_string()
+            } else {
+                briefing.causal_chain_focus.join(" | ")
+            }
+        ));
+        report.push_str(&format!(
             "Retriever forge citations: {}
 ",
             if briefing.forge_evidence_citations.is_empty() {

@@ -1,0 +1,64 @@
+id: evidence-window-similarity
+title: Evidence Window Similarity Check
+purpose: Validate that Coobie retrieves reviewed pressure-drop evidence windows and turns them into actionable preflight guidance.
+scope:
+  - inspect a project repo with reviewed annotation bundles
+  - retrieve similar prior evidence windows for pressure_drop and tension_spike behavior
+  - generate a preflight plan that references nearest evidence slices
+constraints:
+  - remain local-first
+  - do not modify raw evidence
+inputs:
+  - reviewed annotation bundles in .harkonnen/evidence/annotations
+  - project repo path supplied at run start
+outputs:
+  - coobie briefing with nearest evidence windows
+  - implementation plan with evidence-window guidance
+  - evidence_match_report.json summarizing nearest reviewed windows as matches, near_matches, or mismatches
+  - run record and artifacts
+acceptance_criteria:
+  - run completes and writes coobie_briefing.json
+  - nearest reviewed evidence windows are cited in the briefing
+  - pattern matching and causal chain focus are present
+forbidden_behaviors:
+  - deleting unrelated files
+  - ignoring reviewed evidence windows when they match the scenario
+rollback_requirements:
+  - retain evidence artifacts and project memory
+dependencies:
+  - sqlite
+  - tokio
+performance_expectations:
+  - preflight should complete quickly on a small local repo
+security_expectations:
+  - constrain file access to the provided product path
+project_components:
+  - name: project_source
+    role: code_under_test
+    kind: source_tree
+    path: src/lib.rs
+    notes:
+      - pressure_drop
+      - tension_spike
+  - name: reviewed_annotations
+    role: dataset
+    kind: evidence_bundle
+    path: .harkonnen/evidence/annotations/sample-causal-window.yaml
+    notes:
+      - pressure_drop
+      - operator_intervention
+scenario_blueprint:
+  pattern: evidence_window_similarity
+  objective: retrieve nearest reviewed evidence windows for pressure_drop behavior
+  code_under_test:
+    - src/lib.rs
+  datasets:
+    - .harkonnen/evidence/annotations/sample-causal-window.yaml
+  coobie_memory_topics:
+    - pressure_drop
+    - tension_spike
+    - operator_intervention
+  required_artifacts:
+    - coobie_briefing.json
+    - coobie_preflight_response.md
+    - evidence_match_report.json

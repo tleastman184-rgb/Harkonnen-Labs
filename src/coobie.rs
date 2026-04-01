@@ -682,6 +682,21 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 ## Prior Mitigation Outcomes Coobie Is Citing
 {}
 
+## Pattern Exemplars Coobie Is Citing
+{}
+
+## Causal Exemplars Coobie Is Citing
+{}
+
+## Nearest Reviewed Evidence Windows
+{}
+
+## Pattern Matching Focus
+{}
+
+## Causal Chains Coobie Wants Probed
+{}
+
 ## Retriever Forge Evidence Coobie Is Citing
 {}
 
@@ -745,6 +760,26 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
         render_citations(
             &briefing.mitigation_history_citations,
             "No prior stale-memory mitigation outcomes were elevated for this run yet.",
+        ),
+        render_citations(
+            &briefing.evidence_pattern_exemplar_citations,
+            "No pattern exemplars from promoted evidence memory were elevated for this run yet.",
+        ),
+        render_citations(
+            &briefing.evidence_causal_exemplar_citations,
+            "No causal exemplars from promoted evidence memory were elevated for this run yet.",
+        ),
+        render_citations(
+            &briefing.nearest_evidence_window_citations,
+            "No reviewed evidence windows were retrieved from project annotation bundles yet.",
+        ),
+        render_bullet_lines(
+            &briefing.pattern_matching_focus,
+            "No pattern-matching focus was derived from promoted evidence exemplars yet.",
+        ),
+        render_bullet_lines(
+            &briefing.causal_chain_focus,
+            "No causal-chain focus was derived from promoted evidence exemplars yet.",
         ),
         render_citations(
             &briefing.forge_evidence_citations,

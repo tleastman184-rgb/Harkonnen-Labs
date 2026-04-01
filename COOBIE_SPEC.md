@@ -13,6 +13,7 @@ The repo now implements an important subset of this design already:
 
 - file-backed durable memory with indexed Markdown notes
 - extracted ingest from files and URLs into either core memory or repo-local project memory
+- repo-local causal evidence bundles and annotation validation for teaching Coobie pattern examples and cause/effect windows
 - project continuity artifacts under `.harkonnen/` for external repos
 - exploration logs, dead-end registry, stale-memory mitigation history, and retriever-forge evidence that Coobie can cite during preflight
 - self-tuning manifest signals such as recall counts, load counts, and contribution counts

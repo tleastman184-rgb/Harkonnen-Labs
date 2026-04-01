@@ -66,6 +66,9 @@ cargo run -- artifact package <run-id>         # Package artifacts for a run
 cargo run -- memory init                       # Seed Coobie's memory, print backend setup
 cargo run -- memory index                      # Rebuild index.json from md files
 cargo run -- memory ingest <file-or-url>       # Extract docs/web content into core or project memory
+cargo run -- evidence init --project-root <repo> # Bootstrap repo-local evidence/annotation storage
+cargo run -- evidence validate <file>          # Validate a causal evidence annotation bundle
+cargo run -- evidence promote <file>           # Promote reviewed evidence into project/core Coobie memory
 cargo run -- setup check                       # Verify active setup (providers + MCP)
 ```
 
@@ -272,6 +275,8 @@ To store a new fact in Coobie's memory, either:
 - Write a `.md` file to `factory/memory/` and run `harkonnen memory index`
 - Use `cargo run -- memory ingest <file-or-url>` to extract text from documents or websites into core memory
 - Use `cargo run -- memory ingest <file-or-url> --scope project --project-root <repo>` to write repo-local knowledge into `<repo>/.harkonnen/project-memory/`
+- Use `cargo run -- evidence init --project-root <repo>` to create `.harkonnen/evidence/` for time-series/video/log annotation bundles and causal evidence records
+- Use cargo run -- evidence promote <file> --scope project --project-root <repo> to turn reviewed annotation bundles into durable Coobie memory for future runs
 - Ask Coobie directly during a run: "Coobie, store this pattern for future runs"
 
 ---
@@ -317,6 +322,7 @@ security_expectations: [auth, secrets, isolation]
 - Per-run workspace isolation
 - Artifact packaging
 - File-backed memory store with keyword retrieval, raw asset import, and extracted document/URL ingest into core or project memory (Coobie)
+- Repo-local evidence bootstrap and annotation bundle validation for time-series/video/log causal evidence under `.harkonnen/evidence/`
 - `setup check`, `setup init`, and `setup claude-pack`
 - Agent profile loading and provider routing display
 - Provider-aware LLM routing for Claude, Gemini, and OpenAI/Codex

@@ -13,7 +13,7 @@ Priority items:
 - Preload likely-relevant project memory, core memory, prior dead ends, and proven success patterns before planning begins.
 - Capture lightweight agent-behavior lessons when a role repeatedly over-plans, under-validates, or skips evidence.
 - Distinguish worker-session memory from Coobie memory: resumable harness state is short-horizon convenience, while Coobie remains the durable causal source of truth.
-- Preload hierarchical repo-local context and scoped skill bundles so external worker harnesses start informed without reading the whole world.
+- Implemented foundation: hierarchical repo-local context and scoped skill bundles are now discovered under `.harkonnen/`, cited by Coobie, and attached to the worker harness before execution.
 - Feed prior mitigation outcomes back into memory ranking so revalidated memories earn trust and unresolved memories are surfaced with stronger caution.
 
 Expected outcome:

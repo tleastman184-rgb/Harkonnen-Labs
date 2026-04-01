@@ -15,8 +15,9 @@ Priority items:
 - Borrowed from claw-code: keep hierarchical repo-local instruction discovery in mind for `.harkonnen/` context layering, but treat operator slash commands as lower priority than hook evidence and continuity.
 - Next build layer: let Coobie score returned forge artifacts and hook evidence to critique or route future forge attempts.
 - Preserve worker continuity in a separate state file so resumability helps long jobs without replacing Harkonnen's run DB, blackboard, or artifact truth.
-- Add hierarchical repo-local context and skill bundles under `.harkonnen/` so external repos can preload focused context into the worker harness.
-- Explore safer edit substrates inspired by hash-anchored editing so external-codebase modifications fail closed when context drifts.
+- Implemented: hierarchical repo-local context and skill bundles under `.harkonnen/` now feed Coobie preflight and the retriever forge through `retriever_context_bundle` artifacts.
+- Implemented foundation: `trail_drift_guard` and `trail_drift_check` now fingerprint code-under-test and repo-local context paths so the forge fails closed when the staged workspace drifts after planning.
+- Next layer: evolve the drift guard into a richer edit substrate with line- or region-level anchors for future code-modifying worker harnesses.
 
 Expected outcome:
 - Harkonnen can use an OpenAgent-style forge for disciplined planning and execution while Coobie, Sable, Keeper, Ash, and Flint still decide what is true, allowed, hidden, and accepted.

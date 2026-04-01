@@ -35,11 +35,11 @@ patterns:
       - dataset
       - evidence_artifact
     factory_expectations:
-      - Scout and Coobie prepare a retriever task packet with explicit allowed paths, denied paths, visible success conditions, and required return artifacts.
+      - Scout and Coobie prepare a retriever task packet with explicit allowed paths, denied paths, visible success conditions, required return artifacts, and a repo-local context bundle sourced from `.harkonnen/`.
       - The worker harness may explore, plan, execute, and run visible verification, but it cannot access hidden scenarios, Keeper policy internals, or Coobie's core causal memory directly.
       - Coobie critiques the plan before execution and can require plan revisions when known dead ends, stale memories, or causal hazards are ignored.
       - Worker-session continuity remains a harness concern; Harkonnen DB state, blackboard truth, and acceptance state remain external and authoritative.
-      - The forge returns normalized execution evidence such as retriever_execution_report, retriever_forge_hooks, and command logs before Bramble, Ash, Sable, Keeper, and Flint perform independent factory-owned evaluation.
+      - The forge returns normalized execution evidence such as retriever_execution_report, retriever_forge_hooks, trail_drift_check, and command logs before Bramble, Ash, Sable, Keeper, and Flint perform independent factory-owned evaluation.
 component_roles:
   code_under_test:
     meaning: Product-owned code or configuration that Harkonnen may change during the run.

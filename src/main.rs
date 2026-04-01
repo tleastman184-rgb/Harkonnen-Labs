@@ -47,6 +47,10 @@ async fn main() -> Result<()> {
             let app = AppContext::bootstrap().await?;
             cli::handle_memory(command, app).await?
         }
+        Commands::Evidence { command } => {
+            let app = AppContext::bootstrap().await?;
+            cli::handle_evidence(command, app).await?
+        }
         Commands::Setup { command } => {
             // setup check doesn't need the DB — just path + config discovery
             let paths = config::Paths::discover()?;

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::{
     coobie::CausalReport,
-    models::{AgentExecution, BlackboardState, CoobieBriefing, LessonRecord, RunEvent, RunRecord},
+    models::{AgentExecution, BlackboardState, CoobieBriefing, EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchReport, EvidenceSource, LessonRecord, RunEvent, RunRecord},
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
     tesseract,
@@ -32,6 +32,7 @@ struct RunStateResponse {
     causal_report: Option<CausalReport>,
     coobie_preflight_response: Option<String>,
     coobie_report_response: Option<String>,
+    evidence_match_report: Option<EvidenceMatchReport>,
     coobie_translations: Vec<PidginTranslation>,
 }
 
@@ -103,6 +104,140 @@ struct HeartbeatRequest {
     agent: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct EvidenceBundlesQuery {
+    project_root: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceBundleQuery {
+    project_root: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceHistoryQuery {
+    project_root: String,
+    bundle_name: String,
+    #[serde(default)]
+    annotation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceBundleSaveRequest {
+    project_root: String,
+    bundle_name: String,
+    bundle: EvidenceAnnotationBundle,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceAnnotationUpsertRequest {
+    project_root: String,
+    bundle_name: String,
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    dataset: Option<String>,
+    #[serde(default)]
+    notes: Vec<String>,
+    #[serde(default)]
+    sources: Vec<EvidenceSource>,
+    annotation: EvidenceAnnotation,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceAnnotationReviewRequest {
+    project_root: String,
+    bundle_name: String,
+    annotation_id: String,
+    status: String,
+    #[serde(default)]
+    reviewed_by: Option<String>,
+    #[serde(default)]
+    review_note: Option<String>,
+    #[serde(default)]
+    promote_scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceBundleSaveResponse {
+    bundle_name: String,
+    path: String,
+    bundle: EvidenceAnnotationBundle,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceAnnotationReviewResponse {
+    bundle_name: String,
+    path: String,
+    annotation_id: String,
+    status: String,
+    promoted_ids: Vec<String>,
+    skipped_annotations: Vec<String>,
+    bundle: EvidenceAnnotationBundle,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimilarEvidenceQuery {
+    project_root: String,
+    #[serde(default)]
+    spec_id: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    labels: Option<String>,
+    #[serde(default)]
+    claims: Option<String>,
+    #[serde(default)]
+    sources: Option<String>,
+    #[serde(default)]
+    time_span_ms: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct EvidenceMatchWindowInput {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    annotation_type: Option<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    claims: Vec<String>,
+    #[serde(default)]
+    sources: Vec<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    start_ms: Option<i64>,
+    #[serde(default)]
+    end_ms: Option<i64>,
+    #[serde(default)]
+    time_span_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvidenceMatchReportRequest {
+    project_root: String,
+    #[serde(default)]
+    spec_id: Option<String>,
+    #[serde(default)]
+    query_terms: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    claims: Vec<String>,
+    #[serde(default)]
+    sources: Vec<String>,
+    #[serde(default)]
+    time_span_ms: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    selected_window: Option<EvidenceMatchWindowInput>,
+}
+
 pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -121,9 +256,19 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
         .route("/api/runs/:id/causal-report", get(get_causal_report))
+        .route("/api/runs/:id/evidence-match-report", get(get_run_evidence_match_report))
+        .route("/api/evidence/bundles", get(list_evidence_bundles))
+        .route("/api/evidence/bundles/:name", get(get_evidence_bundle))
+        .route("/api/evidence/history", get(get_evidence_history))
+        .route("/api/evidence/bundles/save", post(post_evidence_bundle_save))
+        .route("/api/evidence/annotations/upsert", post(post_evidence_annotation_upsert))
+        .route("/api/evidence/annotations/review", post(post_evidence_annotation_review))
+        .route("/api/evidence/similar", get(get_similar_evidence_windows))
+        .route("/api/evidence/match-report", post(post_evidence_match_report))
         .route("/api/capacity", get(get_capacity))
         .route("/api/tesseract/scene", get(get_tesseract_scene))
         .route("/api/runs/start", post(start_run))
+        .route("/api/runs/:id/artifacts", get(list_run_artifacts))
         .route("/api/runs/:id/artifacts/:name", get(get_run_artifact))
         .route("/api/runs/:id/memory-note", post(add_memory_note))
         .route("/api/scout/draft", post(scout_draft))
@@ -289,6 +434,170 @@ async fn get_coobie_signals(
     }
 }
 
+async fn list_evidence_bundles(
+    Query(query): Query<EvidenceBundlesQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.list_project_evidence_bundles(&query.project_root).await {
+        Ok(bundles) => (StatusCode::OK, Json(bundles)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_evidence_bundle(
+    Path(name): Path<String>,
+    Query(query): Query<EvidenceBundleQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.load_project_evidence_bundle(&query.project_root, &name).await {
+        Ok(Some(bundle)) => (StatusCode::OK, Json(bundle)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Evidence bundle not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_evidence_history(
+    Query(query): Query<EvidenceHistoryQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app
+        .load_project_evidence_history(
+            &query.project_root,
+            &query.bundle_name,
+            query.annotation_id.as_deref(),
+        )
+        .await
+    {
+        Ok(history) => {
+            let history: Vec<EvidenceAnnotationHistoryEvent> = history;
+            (StatusCode::OK, Json(history)).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_evidence_bundle_save(
+    State(app): State<AppContext>,
+    Json(request): Json<EvidenceBundleSaveRequest>,
+) -> impl IntoResponse {
+    let bundle = request.bundle;
+    match app
+        .save_project_evidence_bundle(&request.project_root, &request.bundle_name, &bundle)
+        .await
+    {
+        Ok(path) => (
+            StatusCode::OK,
+            Json(EvidenceBundleSaveResponse {
+                bundle_name: request.bundle_name,
+                path: path.display().to_string(),
+                bundle,
+            }),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_evidence_annotation_upsert(
+    State(app): State<AppContext>,
+    Json(request): Json<EvidenceAnnotationUpsertRequest>,
+) -> impl IntoResponse {
+    match app
+        .upsert_project_evidence_annotation(
+            &request.project_root,
+            &request.bundle_name,
+            request.scenario.as_deref(),
+            request.dataset.as_deref(),
+            &request.notes,
+            &request.sources,
+            &request.annotation,
+        )
+        .await
+    {
+        Ok((path, bundle)) => (
+            StatusCode::OK,
+            Json(EvidenceBundleSaveResponse {
+                bundle_name: request.bundle_name,
+                path: path.display().to_string(),
+                bundle,
+            }),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_evidence_annotation_review(
+    State(app): State<AppContext>,
+    Json(request): Json<EvidenceAnnotationReviewRequest>,
+) -> impl IntoResponse {
+    match app
+        .review_project_evidence_annotation(
+            &request.project_root,
+            &request.bundle_name,
+            &request.annotation_id,
+            &request.status,
+            request.reviewed_by.as_deref(),
+            request.review_note.as_deref(),
+            request.promote_scope.as_deref(),
+        )
+        .await
+    {
+        Ok((path, bundle, promotion)) => (
+            StatusCode::OK,
+            Json(EvidenceAnnotationReviewResponse {
+                bundle_name: request.bundle_name,
+                path: path.display().to_string(),
+                annotation_id: request.annotation_id,
+                status: request.status,
+                promoted_ids: promotion.promoted_ids,
+                skipped_annotations: promotion.skipped_annotations,
+                bundle,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("unsupported evidence annotation status")
+                || message.contains("annotation_id cannot be empty")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, message).into_response()
+        }
+    }
+}
+
+async fn get_similar_evidence_windows(
+    Query(query): Query<SimilarEvidenceQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let query_terms = split_csv_field(query.query.as_deref());
+    let labels = split_csv_field(query.labels.as_deref());
+    let claims = split_csv_field(query.claims.as_deref());
+    let sources = split_csv_field(query.sources.as_deref());
+    match app
+        .search_similar_evidence_windows(
+            &query.project_root,
+            query.spec_id.as_deref(),
+            &query_terms,
+            &labels,
+            &claims,
+            &sources,
+            query.time_span_ms,
+            query.limit.unwrap_or(5),
+        )
+        .await
+    {
+        Ok(matches) => (StatusCode::OK, Json(matches)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn get_causal_report(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -303,6 +612,85 @@ async fn get_causal_report(
             }
         }
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_evidence_match_report(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let report_path = app.paths.workspaces.join(&id).join("run").join("evidence_match_report.json");
+            match read_optional_json::<EvidenceMatchReport>(&report_path).await {
+                Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
+                Ok(None) => (StatusCode::NOT_FOUND, "Evidence match report not yet generated").into_response(),
+                Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn post_evidence_match_report(
+    State(app): State<AppContext>,
+    Json(request): Json<EvidenceMatchReportRequest>,
+) -> impl IntoResponse {
+    let mut query_terms = request.query_terms;
+    let mut labels = request.labels;
+    let mut claims = request.claims;
+    let mut sources = request.sources;
+    let mut time_span_ms = request.time_span_ms;
+    let mut query_source = "api_query".to_string();
+    let mut selected_window_summary = None;
+
+    if let Some(window) = request.selected_window {
+        query_source = "selected_window".to_string();
+        if let Some(title) = window.title.as_deref() {
+            push_unique_string(&mut query_terms, title);
+        }
+        if let Some(annotation_type) = window.annotation_type.as_deref() {
+            push_unique_string(&mut query_terms, annotation_type);
+        }
+        if let Some(notes) = window.notes.as_deref() {
+            push_unique_string(&mut query_terms, notes);
+        }
+        for label in &window.labels {
+            push_unique_string(&mut labels, label);
+        }
+        for claim in &window.claims {
+            push_unique_string(&mut claims, claim);
+        }
+        for source in &window.sources {
+            push_unique_string(&mut sources, source);
+        }
+        if time_span_ms.is_none() {
+            time_span_ms = window.time_span_ms.or_else(|| match (window.start_ms, window.end_ms) {
+                (Some(start), Some(end)) if end >= start => Some(end - start),
+                _ => None,
+            });
+        }
+        selected_window_summary = Some(render_selected_window_summary(&window, time_span_ms));
+    }
+
+    match app
+        .build_evidence_match_report_from_query(
+            &request.project_root,
+            request.spec_id.as_deref(),
+            &query_source,
+            selected_window_summary,
+            &query_terms,
+            &labels,
+            &claims,
+            &sources,
+            time_span_ms,
+            request.limit.unwrap_or(8),
+        )
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -325,6 +713,7 @@ async fn build_run_state(app: &AppContext, id: &str) -> anyhow::Result<Option<Ru
     let causal_report = read_optional_json::<CausalReport>(&run_dir.join("causal_report.json")).await?;
     let coobie_preflight_response = read_optional_text(&run_dir.join("coobie_preflight_response.md")).await?;
     let coobie_report_response = read_optional_text(&run_dir.join("coobie_report_response.md")).await?;
+    let evidence_match_report = read_optional_json::<EvidenceMatchReport>(&run_dir.join("evidence_match_report.json")).await?;
     let coobie_translations = load_coobie_translations(&run_dir).await?;
 
     Ok(Some(RunStateResponse {
@@ -337,6 +726,7 @@ async fn build_run_state(app: &AppContext, id: &str) -> anyhow::Result<Option<Ru
         causal_report,
         coobie_preflight_response,
         coobie_report_response,
+        evidence_match_report,
         coobie_translations,
     }))
 }
@@ -347,6 +737,47 @@ async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Resul
     }
     let raw = tokio::fs::read_to_string(path).await?;
     Ok(Some(serde_json::from_str::<T>(&raw)?))
+}
+
+fn split_csv_field(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !values.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+        values.push(trimmed.to_string());
+    }
+}
+
+fn render_selected_window_summary(window: &EvidenceMatchWindowInput, time_span_ms: Option<i64>) -> String {
+    let title = window
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("selected-window");
+    let annotation_type = window
+        .annotation_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("annotation");
+    let labels = if window.labels.is_empty() {
+        "none".to_string()
+    } else {
+        window.labels.join(", ")
+    };
+    let span = time_span_ms
+        .map(|value| format!("{} ms", value))
+        .unwrap_or_else(|| "unspecified".to_string());
+    format!("{} [{}] labels={} span={}", title, annotation_type, labels, span)
 }
 
 async fn read_optional_text(path: &FsPath) -> anyhow::Result<Option<String>> {
@@ -1104,6 +1535,33 @@ async fn get_capacity(State(app): State<AppContext>) -> impl IntoResponse {
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(_) => (StatusCode::NOT_FOUND, "capacity.json not found").into_response(),
+    }
+}
+
+async fn list_run_artifacts(
+    Path(run_id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let run_dir = app.paths.workspaces.join(&run_id).join("run");
+    match tokio::fs::read_dir(&run_dir).await {
+        Ok(mut dir) => {
+            let mut files: Vec<serde_json::Value> = Vec::new();
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let ext = std::path::Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                files.push(serde_json::json!({ "name": name, "ext": ext, "size": size }));
+            }
+            files.sort_by(|a, b| {
+                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+            });
+            (StatusCode::OK, Json(files)).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "run directory not found").into_response(),
     }
 }
 
