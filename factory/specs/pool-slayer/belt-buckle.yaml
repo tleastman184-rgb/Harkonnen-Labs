@@ -1,0 +1,104 @@
+id: belt-buckle
+title: Belt Buckle LP Strategy
+purpose: Three-tiered concentrated liquidity position manager for SOL/USDC on Orca, maximizing fee income by deploying capital across blade, middle, and anchor ranges with threshold-based rebalancing and full capital protection.
+scope:
+  - deploy three concurrent LP positions in a single Orca SOL/USDC pool
+  - monitor positions every 15 minutes using volatility-aware triggers
+  - rebalance only the layer that is out of range
+  - detect volatility regime and adjust range widths accordingly
+  - harvest yield automatically when pending fees exceed threshold
+  - execute emergency exit closing all positions and swapping all SOL to USDC
+constraints:
+  - single pool only — Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+  - maximum 6 rebalances per day across all layers
+  - minimum 30 minute cooldown between rebalances of the same layer
+  - never rebalance when SOL trend exceeds 2 percent in 30 minutes
+  - always maintain 1.5 SOL liquid for gas fees
+inputs:
+  - total capital in USD
+  - Solana wallet private key
+  - Solana RPC URL
+  - Anthropic API key for regime detection
+outputs:
+  - three open Orca LP positions with position mint addresses persisted
+  - rebalance event log with cost and fee earned per event
+  - daily summary report sent via Telegram
+  - emergency exit confirmation with final USDC balance
+acceptance_criteria:
+  - all three layers open successfully within 60 seconds of start
+  - blade layer rebalances independently without closing middle or anchor
+  - anchor breach triggers full redeploy of all three layers
+  - emergency exit converts 100 percent of SOL to USDC before confirming safe
+  - cost-benefit check prevents rebalances that cost more than 3 days of fees
+  - volatility regime switches range widths within one check cycle
+forbidden_behaviors:
+  - reinvesting all yield back into positions without taking profit
+  - chasing price during a strong SOL trend
+  - closing positions without completing the USDC swap on emergency exit
+  - opening positions with less than 1.5 SOL liquid reserve
+rollback_requirements:
+  - on failed open revert capital to wallet
+  - on failed rebalance retain original position until retry succeeds
+  - on failed emergency exit retry USDC swap until confirmed
+dependencies:
+  - orca-whirlpools-sdk
+  - solana-web3.js
+  - jupiter lite-api for swaps
+  - coingecko API for SOL price
+  - telegram API for alerts
+performance_expectations:
+  - position check cycle completes within 10 seconds
+  - rebalance completes within 30 seconds of trigger
+  - emergency exit completes within 60 seconds
+security_expectations:
+  - private key never logged or transmitted
+  - all transactions signed locally
+  - emergency exit cannot be cancelled once triggered
+layers:
+  blade:
+    allocation: 0.20
+    target_yield_pct_daily: 8.0
+    range_width_pct: 1.5
+    rebalance_priority: high
+  middle:
+    allocation: 0.60
+    target_yield_pct_daily: 5.0
+    range_width_pct: 2.5
+    rebalance_priority: medium
+  anchor:
+    allocation: 0.20
+    target_yield_pct_daily: 3.0
+    range_width_pct: 4.0
+    rebalance_priority: full_redeploy
+volatility_regimes:
+  low:
+    atr_max_pct: 1.0
+    blade_width: 1.0
+    middle_width: 1.8
+    anchor_width: 3.0
+  normal:
+    atr_max_pct: 3.0
+    blade_width: 1.5
+    middle_width: 2.5
+    anchor_width: 4.0
+  elevated:
+    atr_max_pct: 6.0
+    blade_width: 0.0
+    middle_width: 3.5
+    anchor_width: 6.0
+  extreme:
+    atr_max_pct: 999
+    action: do_nothing
+keeper_rules:
+  - id: yield-harvest
+    trigger: pending_yield_usd > 50
+    action: harvest and send 50 percent to reserve wallet
+  - id: sol-crash
+    trigger: sol_price_change_1h_pct < -15
+    action: emergency_exit
+  - id: max-rebalances
+    trigger: daily_rebalance_count >= 6
+    action: pause until next day
+  - id: trend-filter
+    trigger: sol_price_change_30m_pct > 2
+    action: skip rebalance
