@@ -1,0 +1,36 @@
+id: belt-buckle-phase1-hidden
+spec_id: belt-buckle-phase1
+title: Hidden acceptance for Belt Buckle Phase 1
+description: Verify the factory produced a complete implementation plan covering position open, close, SOL reserve protection, and mint persistence with all failure paths addressed.
+checks:
+  - kind: run_status
+    equals: completed
+  - kind: event_present
+    phase: intake
+    agent: scout
+  - kind: event_present
+    phase: implementation
+    agent: mason
+  - kind: event_present
+    phase: twin
+    agent: ash
+  - kind: event_present
+    phase: validation
+    agent: bramble
+  - kind: validation_passed
+  - kind: artifact_exists
+    path: implementation_plan.md
+  - kind: artifact_exists
+    path: twin.json
+  - kind: artifact_exists
+    path: validation.json
+  - kind: agent_executed
+    agent: mason
+  - kind: agent_executed
+    agent: coobie
+  - kind: twin_service_present
+    service: workspace_fs
+  - kind: twin_service_present
+    service: orca_whirlpools_sdk
+  - kind: twin_service_present
+    service: solana_web3_js

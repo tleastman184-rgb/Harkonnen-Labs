@@ -1,0 +1,45 @@
+id: belt-buckle-phase1
+title: Belt Buckle Phase 1 — Position Open and Close
+purpose: Implement and validate the ability to open and close a single Orca SOL/USDC concentrated liquidity position with correct tick calculation, position mint persistence, and SOL reserve protection.
+scope:
+  - open one Orca position at a specified price range
+  - persist position mint address to disk before returning
+  - close position and return funds to wallet
+  - enforce 1.5 SOL liquid reserve before opening
+constraints:
+  - single pool only — Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+  - private key never logged
+  - position mint written to disk before any further action
+inputs:
+  - wallet private key from .env
+  - RPC URL from .env
+  - price range lower and upper bounds
+  - position size in USD
+outputs:
+  - position mint address persisted to positions.json
+  - confirmation log with entry price and tick indices
+acceptance_criteria:
+  - position opens successfully on Orca mainnet
+  - position mint address saved before function returns
+  - SOL balance check prevents open if balance below 1.5 SOL
+  - position closes and returns correct SOL and USDC to wallet
+forbidden_behaviors:
+  - logging private key
+  - opening position without checking SOL reserve
+  - returning success before mint address is persisted
+rollback_requirements:
+  - on failed open revert capital to wallet
+dependencies:
+  - orca-whirlpools-sdk
+  - solana-web3.js
+performance_expectations:
+  - position open completes within 30 seconds
+security_expectations:
+  - private key never logged or transmitted
+hidden_scenarios:
+  - id: insufficient_sol_reserve
+    description: Attempt to open position with only 0.5 SOL liquid — must be rejected
+  - id: rpc_timeout_on_open
+    description: RPC times out during position open — must roll back cleanly
+  - id: mint_persistence_failure
+    description: Disk write fails after position opens — must detect and alert

@@ -102,3 +102,12 @@ keeper_rules:
   - id: trend-filter
     trigger: sol_price_change_30m_pct > 2
     action: skip rebalance
+
+open_questions_resolved:
+  OQ1_slippage_tolerance_pct: 1.0
+  OQ2_price_staleness_seconds: 60
+  OQ3_range_widths_by_regime: "see volatility_regimes section"
+  OQ4_fee_harvest_threshold_usd: 25.0
+  OQ5_regime_detection: "ATR from DexScreener only — no LLM call"
+  OQ6_telegram: "read from .env TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"
+  OQ7_fee_payback_definition: "trailing_24h_fee_rate * 3 days"
