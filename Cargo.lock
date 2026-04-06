@@ -659,6 +659,7 @@ dependencies = [
  "chrono",
  "clap",
  "deep_causality",
+ "dotenvy",
  "reqwest",
  "serde",
  "serde_json",

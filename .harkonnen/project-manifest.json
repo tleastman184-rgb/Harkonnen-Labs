@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-04-06T18:19:00.128221981+00:00",
+  "label": "Harkonnen-Labs",
+  "source_kind": "path",
+  "source_path": "/media/earthling/Caleb's Files1/Harkonnen-Labs",
+  "project_memory_root": "/media/earthling/Caleb's Files1/Harkonnen-Labs/.harkonnen/project-memory",
+  "git": {
+    "branch": "main",
+    "commit": "b7317ee56bb58e89d028e7f18c649c6107461b9a",
+    "remote_origin": "https://github.com/durinwinter/Harkonnen-Labs.git",
+    "clean": false,
+    "changed_paths": [
+      "argo.lock",
+      "argo.toml",
+      "actory/memory/index.json",
+      "actory/state/dead_ends.json",
+      "rc/main.rs",
+      "rc/models.rs",
+      "rc/orchestrator.rs",
+      "rc/workspace.rs",
+      ".harkonnen/",
+      "factory/specs/drafts/wire_fallback_for.yaml"
+    ]
+  },
+  "detected_files": [
+    "Cargo.toml",
+    "README.md"
+  ],
+  "detected_directories": [
+    "src",
+    "ui",
+    "scripts"
+  ],
+  "likely_commands": [
+    "cargo check",
+    "cargo test -q"
+  ],
+  "runtime_hints": [
+    "Repo appears to contain both backend and UI surfaces.",
+    "Repo already contains Harkonnen-local continuity files."
+  ]
+}

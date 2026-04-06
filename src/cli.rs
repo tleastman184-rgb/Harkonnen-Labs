@@ -648,6 +648,11 @@ fn handle_setup_check(paths: &Paths) -> Result<()> {
     print_provider_status("claude", s.providers.claude.as_ref());
     print_provider_status("gemini", s.providers.gemini.as_ref());
     print_provider_status("codex", s.providers.codex.as_ref());
+    let mut extra_names: Vec<&String> = s.providers.extras.keys().collect();
+    extra_names.sort();
+    for name in extra_names {
+        print_provider_status(name, s.providers.extras.get(name));
+    }
 
     print_agent_routing(paths, s)?;
 

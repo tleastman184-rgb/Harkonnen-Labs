@@ -2,7 +2,7 @@ name: mason
 display_name: Mason
 role: build_retriever
 # Uses setup default — swap to Gemini/Codex on high-volume code generation runs
-provider: default
+provider: claude-sonnet
 model_override: ~
 responsibilities:
   - generate_code

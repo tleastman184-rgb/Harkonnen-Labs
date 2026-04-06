@@ -51,6 +51,71 @@
       "surviving_structure": "none",
       "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
       "created_at": "2026-04-02T00:24:16.791939430+00:00"
+    },
+    {
+      "registry_id": "d63dd0b2-1179-4b03-b1a4-be371fce5b47:hidden_scenarios-281ce3b5-9e46-43cd-a9aa-8f1c3de193f8",
+      "run_id": "d63dd0b2-1179-4b03-b1a4-be371fce5b47",
+      "spec_id": "sample-feature",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 2 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-06T17:52:18.485989581+00:00"
+    },
+    {
+      "registry_id": "1647810b-cc75-474a-a65a-4da98ada47da:hidden_scenarios-77951de8-3754-4beb-89d4-2f25f67edb2b",
+      "run_id": "1647810b-cc75-474a-a65a-4da98ada47da",
+      "spec_id": "wire-fallback-for",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-06T17:55:50.107751047+00:00"
+    },
+    {
+      "registry_id": "c4ee92c5-2d93-40ae-bdfc-4cc98ee9e049:hidden_scenarios-44c0a6ed-cdd8-44cd-ad10-179ed769ffe6",
+      "run_id": "c4ee92c5-2d93-40ae-bdfc-4cc98ee9e049",
+      "spec_id": "wire-fallback-for",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-06T18:02:24.830364639+00:00"
+    },
+    {
+      "registry_id": "9d66fcca-f152-409c-8b17-1caa6df47abc:hidden_scenarios-3a2f8730-116c-463f-bb5a-0e08ec33e3bd",
+      "run_id": "9d66fcca-f152-409c-8b17-1caa6df47abc",
+      "spec_id": "wire-fallback-for",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-06T18:05:32.224445876+00:00"
+    },
+    {
+      "registry_id": "bd89b27f-45c1-4a8a-a893-bc067a05b459:hidden_scenarios-f488d905-029f-45ab-addb-5f77bb64727a",
+      "run_id": "bd89b27f-45c1-4a8a-a893-bc067a05b459",
+      "spec_id": "wire-fallback-for",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-06T18:18:59.584401504+00:00"
     }
   ]
 }

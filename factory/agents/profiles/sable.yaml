@@ -2,7 +2,7 @@ name: sable
 display_name: Sable
 role: scenario_retriever
 # Pins to Claude — evaluation integrity requires a trusted, consistent judge
-provider: claude
+provider: claude-opus
 model_override: ~
 responsibilities:
   - execute_hidden_scenarios

@@ -470,6 +470,8 @@ struct MasonEditApplicationArtifact {
     summary: String,
     proposal_generated: bool,
     changed_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5584,6 +5586,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because the spec did not resolve any code-under-test paths inside the staged workspace.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5601,6 +5604,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because no bounded text file context could be loaded for the editable paths.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5617,6 +5621,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because no live LLM provider is configured for Mason in the active setup.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5732,6 +5737,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     summary: format!("Mason edit lane failed before applying edits: {}", error),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5754,6 +5760,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5774,6 +5781,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                         .to_string(),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5792,6 +5800,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5810,6 +5819,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5847,6 +5857,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                 },
                 proposal_generated: true,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5879,6 +5890,42 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                 target_source.label
             )
         };
+
+        // If git_branch is requested and there are real changes, commit them to a
+        // new branch in the source repo so a proper diff is always available.
+        let git_branch = if spec_obj
+            .worker_harness
+            .as_ref()
+            .map(|h| h.git_branch)
+            .unwrap_or(false)
+            && !changed_files.is_empty()
+        {
+            let source_root = PathBuf::from(&target_source.source_path);
+            let short_run = &run_id[..8];
+            let branch_name = format!("mason/{}-{}", spec_obj.id, short_run);
+            match mason_commit_branch(
+                &source_root,
+                &staged_product,
+                &changed_files,
+                &branch_name,
+                &spec_obj.title,
+                run_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("Mason committed edits to branch {}", branch_name);
+                    Some(branch_name)
+                }
+                Err(e) => {
+                    tracing::warn!("Mason git branch commit failed ({}), continuing", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let application = MasonEditApplicationArtifact {
             run_id: run_id.to_string(),
             spec_id: spec_obj.id.clone(),
@@ -5888,6 +5935,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
             summary,
             proposal_generated: true,
             changed_files,
+            git_branch,
         };
         self.write_mason_edit_application(run_dir, &application)
             .await?;
@@ -15265,6 +15313,116 @@ fn path_allowed_for_edit(path: &str, editable_paths: &[String]) -> bool {
         let root = normalize_project_path(root);
         root == "." || path == root || path.starts_with(&format!("{root}/"))
     })
+}
+
+/// Create a git branch in `source_root`, copy the changed files from the
+/// staged workspace, commit them, and restore the original branch.
+///
+/// The branch is named `mason/<spec-id>-<short-run-id>` and is created from
+/// whatever branch is currently checked out (typically main/master). This gives
+/// reviewers a proper `git diff main...mason/<branch>` without touching live
+/// working-tree files outside a controlled commit.
+async fn mason_commit_branch(
+    source_root: &Path,
+    staged_product: &Path,
+    changed_files: &[String],
+    branch_name: &str,
+    spec_title: &str,
+    run_id: &str,
+) -> Result<()> {
+    // Capture the current branch so we can restore it.
+    let current_branch = {
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(source_root)
+            .output()
+            .await
+            .context("git rev-parse HEAD")?;
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Create and switch to the new branch.
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", branch_name])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git checkout -b")?;
+    if !checkout.status.success() {
+        anyhow::bail!(
+            "git checkout -b {} failed: {}",
+            branch_name,
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+
+    // Copy each changed file from the staged workspace into the real repo.
+    for rel_path in changed_files {
+        let src = staged_product.join(rel_path);
+        let dst = source_root.join(rel_path);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::copy(&src, &dst)
+            .await
+            .with_context(|| format!("copying {} to branch workspace", rel_path))?;
+    }
+
+    // Stage changed files.
+    let mut add_args = vec!["add", "--"];
+    let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+    add_args.extend(file_refs.iter());
+    let add = Command::new("git")
+        .args(&add_args)
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git add")?;
+    if !add.status.success() {
+        // Restore branch before bailing.
+        let _ = Command::new("git")
+            .args(["checkout", &current_branch])
+            .current_dir(source_root)
+            .output()
+            .await;
+        anyhow::bail!("git add failed: {}", String::from_utf8_lossy(&add.stderr));
+    }
+
+    // Commit.
+    let message = format!(
+        "mason: {} [run:{}]\n\nAutomated edit by Mason agent.\nSpec: {}\nRun: {}",
+        spec_title,
+        &run_id[..8],
+        spec_title,
+        run_id,
+    );
+    let commit = Command::new("git")
+        .args(["commit", "-m", &message])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git commit")?;
+    if !commit.status.success() {
+        let _ = Command::new("git")
+            .args(["checkout", &current_branch])
+            .current_dir(source_root)
+            .output()
+            .await;
+        anyhow::bail!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    // Restore original branch.
+    Command::new("git")
+        .args(["checkout", &current_branch])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git checkout restore")?;
+
+    Ok(())
 }
 
 fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {

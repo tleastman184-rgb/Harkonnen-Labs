@@ -58,6 +58,10 @@ pub struct WorkerHarnessConfig {
     pub continuity_file: Option<String>,
     #[serde(default)]
     pub llm_edits: bool,
+    /// When true, Mason commits its edits to a new git branch in the source repo
+    /// (mason/<spec-id>-<short-run-id>) so a real diff is always available.
+    #[serde(default)]
+    pub git_branch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

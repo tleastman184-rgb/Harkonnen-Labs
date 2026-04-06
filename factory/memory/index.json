@@ -65,11 +65,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 4,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 4,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 4
     },
     {
       "id": "02-setup-guide",
@@ -102,11 +102,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 4,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 4,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 4
     },
     {
       "id": "03-mcp-tools",
@@ -142,11 +142,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-01T22:12:39.363461780+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 17,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 17,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 8
     },
     {
       "id": "04-spec-format",
@@ -179,11 +179,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-01T22:12:39.363461780+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 17,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 17,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 8
     },
     {
       "id": "coobie-causaloid-roadmap",
@@ -256,11 +256,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-01T22:12:39.363461780+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 17,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 17,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 8
     },
     {
       "id": "coobie-residue-roadmap",
@@ -295,11 +295,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-01T22:12:39.363461780+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 17,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 17,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 8
     },
     {
       "id": "coobie-solitaire-agents-roadmap",
@@ -334,11 +334,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 4,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 4,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 4
     },
     {
       "id": "imports__coobie-memory-note",
@@ -405,11 +405,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-01T22:12:39.363461780+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 17,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 17,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 8
     },
     {
       "id": "lamdet-middle-peak-sling-note",
@@ -442,11 +442,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 2,
-      "last_recalled": "2026-04-02T00:24:48.288448535+00:00",
-      "loaded_for_run_count": 2,
+      "recall_count": 6,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 6,
       "contributed_to_success_count": 1,
-      "contributed_to_failure_count": 1
+      "contributed_to_failure_count": 5
     },
     {
       "id": "lesson-hidden-scenarios-a4f5609e-3750-4c9c-ac15-cbfc8d5f689c",
@@ -655,11 +655,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 8,
-      "last_recalled": "2026-04-02T00:24:48.288448535+00:00",
-      "loaded_for_run_count": 8,
+      "recall_count": 12,
+      "last_recalled": "2026-04-06T18:17:57.488763685+00:00",
+      "loaded_for_run_count": 12,
       "contributed_to_success_count": 5,
-      "contributed_to_failure_count": 3
+      "contributed_to_failure_count": 7
     },
     {
       "id": "run-28a77447-2921-4022-ac30-fc79e17a1742",
@@ -690,11 +690,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-2cb199d2-104c-4de0-9ffb-6bdf94adca6f",
@@ -725,11 +725,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-490a1b4a-ad36-4e72-9808-1aa15d93d428",
@@ -795,11 +795,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-78ee0229-27f5-4e72-bafc-87627f88d14b",
@@ -830,11 +830,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-c0714e93-cd90-48a4-b6ed-92a5211d8c72",
@@ -865,11 +865,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-d0b28f3a-edf6-4c8d-a05f-306c83f5c660",
@@ -900,11 +900,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-d2ad10f9-8023-42ff-b792-f16c2d595887",
@@ -935,11 +935,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-deeb16be-8955-4af0-8506-c5d161fbfb60",
@@ -970,11 +970,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-e3a682f3-000c-427a-8d22-842b3241cdfe",
@@ -1005,11 +1005,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     },
     {
       "id": "run-eb899cbb-802f-4149-a169-db167b0bc6d7",
@@ -1040,11 +1040,11 @@
         "superseded_by": null,
         "challenged_by": []
       },
-      "recall_count": 0,
-      "last_recalled": null,
-      "loaded_for_run_count": 0,
+      "recall_count": 5,
+      "last_recalled": "2026-04-06T17:52:00.623676882+00:00",
+      "loaded_for_run_count": 5,
       "contributed_to_success_count": 0,
-      "contributed_to_failure_count": 0
+      "contributed_to_failure_count": 1
     }
   ]
 }

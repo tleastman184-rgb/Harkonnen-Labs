@@ -2,7 +2,7 @@ name: bramble
 display_name: Bramble
 role: test_retriever
 # Uses setup default — test generation benefits from cost-effective models at scale
-provider: default
+provider: claude-sonnet
 model_override: ~
 responsibilities:
   - generate_tests

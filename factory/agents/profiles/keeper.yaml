@@ -2,7 +2,7 @@ name: keeper
 display_name: Keeper
 role: boundary_retriever
 # Pins to Claude — policy enforcement must be reliable and not cost-optimized away
-provider: claude
+provider: claude-sonnet
 model_override: ~
 responsibilities:
   - enforce_policy

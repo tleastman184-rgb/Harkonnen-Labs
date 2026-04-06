@@ -59,6 +59,10 @@ pub struct ProvidersConfig {
     pub claude: Option<ProviderConfig>,
     pub gemini: Option<ProviderConfig>,
     pub codex: Option<ProviderConfig>,
+    /// Any additional named providers (e.g. claude-opus, claude-haiku, claude-sonnet).
+    /// TOML: [providers.claude-opus] type = "anthropic" model = "..." ...
+    #[serde(flatten)]
+    pub extras: HashMap<String, ProviderConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -167,6 +171,7 @@ impl SetupConfig {
                 claude: Some(default_provider_config("claude")),
                 gemini: None,
                 codex: None,
+                extras: HashMap::new(),
             },
             routing: None,
             mcp: None,
@@ -183,6 +188,11 @@ impl SetupConfig {
 
     pub fn resolve_provider(&self, name: &str) -> Option<&ProviderConfig> {
         let resolved = self.resolve_provider_name(name);
+        // Check extras (named tiers like claude-opus, claude-haiku) first,
+        // then fall back to the three canonical named fields.
+        if let Some(p) = self.providers.extras.get(&resolved) {
+            return Some(p);
+        }
         match resolved.as_str() {
             "claude" => self.providers.claude.as_ref(),
             "gemini" => self.providers.gemini.as_ref(),

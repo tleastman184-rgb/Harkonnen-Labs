@@ -2,7 +2,7 @@ name: flint
 display_name: Flint
 role: artifact_retriever
 # Uses setup default — packaging is mechanical and low-risk
-provider: default
+provider: claude-haiku
 model_override: ~
 responsibilities:
   - collect_outputs

@@ -2,7 +2,7 @@ name: scout
 display_name: Scout
 role: spec_retriever
 # Pins to Claude — spec interpretation requires reliable instruction-following
-provider: claude
+provider: claude-opus
 model_override: ~
 responsibilities:
   - parse_specs
