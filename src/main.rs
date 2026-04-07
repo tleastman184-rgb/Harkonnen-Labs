@@ -1,6 +1,7 @@
 mod agents;
 mod api;
 mod capacity;
+mod embeddings;
 mod claude_pack;
 mod cli;
 mod config;

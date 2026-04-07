@@ -332,6 +332,20 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+            entry_id    TEXT NOT NULL,
+            memory_root TEXT NOT NULL,
+            embedding   BLOB NOT NULL,
+            embedded_at TEXT NOT NULL,
+            PRIMARY KEY (entry_id, memory_root)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 

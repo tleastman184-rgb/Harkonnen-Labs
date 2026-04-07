@@ -41,6 +41,9 @@ pub struct AppContext {
     pub memory_store: MemoryStore,
     pub blackboard: Arc<RwLock<BlackboardState>>,
     pub coobie: crate::coobie::SqliteCoobie,
+    /// Semantic memory — None if fastembed failed to initialise (e.g. first run
+    /// with no internet, or ONNX runtime unavailable). Falls back to keyword.
+    pub embedding_store: Option<crate::embeddings::EmbeddingStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -583,12 +586,26 @@ impl AppContext {
         let pool = db::init_db(&paths).await?;
         let memory_store = MemoryStore::new(paths.memory.clone());
         let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
+        let embedding_store = match crate::embeddings::EmbeddingStore::new(pool.clone()).await {
+            Ok(es) => {
+                tracing::info!("semantic memory (fastembed BGESmallENV15) ready");
+                Some(es)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "semantic memory unavailable ({}); Coobie will use keyword search",
+                    e
+                );
+                None
+            }
+        };
         Ok(Self {
             paths,
             pool,
             memory_store,
             blackboard: Arc::new(RwLock::new(BlackboardState::default())),
             coobie,
+            embedding_store,
         })
     }
 
@@ -3161,21 +3178,41 @@ Top memory hits:
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
 
-        for term in query_terms {
-            if term.trim().is_empty() {
+        // Build a single semantic query from the first 15 non-empty terms.
+        let semantic_query = query_terms
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let raw_hits: Vec<String> = if semantic_query.is_empty() {
+            vec![]
+        } else if let Some(es) = self.embedding_store.as_ref() {
+            // Semantic path: one cosine search over the full memory index.
+            store.retrieve_context_hybrid(&semantic_query, es).await?
+        } else {
+            // Keyword fallback: iterate terms as before.
+            let mut kw = Vec::new();
+            for term in query_terms {
+                if !term.trim().is_empty() {
+                    kw.extend(store.retrieve_context(term).await?);
+                }
+            }
+            kw
+        };
+
+        for hit in raw_hits {
+            if hit.contains("No memories found") || hit.contains("Memory not initialized") {
                 continue;
             }
-            for hit in store.retrieve_context(term).await? {
-                if hit.contains("No memories found") || hit.contains("Memory not initialized") {
-                    continue;
-                }
-                if let Some(id) = extract_memory_entry_id(&hit) {
-                    ids.push(id);
-                }
-                let labeled_hit = format!("[{source_label}] {hit}");
-                if seen.insert(labeled_hit.clone()) {
-                    hits.push(labeled_hit);
-                }
+            if let Some(id) = extract_memory_entry_id(&hit) {
+                ids.push(id);
+            }
+            let labeled_hit = format!("[{source_label}] {hit}");
+            if seen.insert(labeled_hit.clone()) {
+                hits.push(labeled_hit);
             }
         }
 
