@@ -419,6 +419,25 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
         }
         MemoryCommands::Init => {
             app.memory_store.init(&app.paths.setup).await?;
+
+            // Pre-embed all memory entries so semantic search is ready immediately
+            // on the next run. The model downloads once (~33MB) on first call.
+            match &app.embedding_store {
+                Some(es) => {
+                    let entries = app.memory_store.list_entries().await?;
+                    let root = app.memory_store.root.display().to_string();
+                    let count = entries.len();
+                    print!("Embedding {count} memory entries for semantic search...");
+                    match es.ensure_embedded(&entries, &root).await {
+                        Ok(()) => println!(" done."),
+                        Err(e) => println!("\nEmbedding failed (will retry on next run): {e}"),
+                    }
+                }
+                None => {
+                    println!("Semantic embedding unavailable — memory init complete without embeddings.");
+                    println!("Embeddings will be generated automatically on the next `cargo run`.");
+                }
+            }
         }
         MemoryCommands::Search(args) => {
             let hits = app.memory_store.retrieve_context(&args.query).await?;
