@@ -1,7 +1,7 @@
 # Strategy Register
 
 - Project: Harkonnen-Labs
-- Entries: 14
+- Entries: 15
 
 - [d63dd0b2-1179-4b03-b1a4-be371fce5b47:hidden_scenarios-281ce3b5-9e46-43cd-a9aa-8f1c3de193f8] phase=hidden_scenarios agent=sable strategy=sable - pack is workin
 thasrealnotgrate
@@ -69,6 +69,11 @@ Evaluating hidden scenarios failure_constraint=thasnotgrate
 thasrealnotgrate
 Hidden scenario evaluation finished: 4 scenario(s) reformulation=hidden_scenarios phase failed; preserve surviving structure and change strategy on retry
 - [b5db6db6-0a13-494e-91a5-663af6cd8c2a:hidden_scenarios-b456dea5-e17e-496a-9934-b8c429129e09] phase=hidden_scenarios agent=sable strategy=sable - pack is workin
+thasrealnotgrate
+Evaluating hidden scenarios failure_constraint=thasnotgrate
+thasrealnotgrate
+Hidden scenario evaluation finished: 1 scenario(s) reformulation=hidden_scenarios phase failed; preserve surviving structure and change strategy on retry
+- [567e9116-b313-4696-9dbb-bb7ecdad6ef6:hidden_scenarios-efb339d6-1c2c-4928-b2d3-27f80a48ff8a] phase=hidden_scenarios agent=sable strategy=sable - pack is workin
 thasrealnotgrate
 Evaluating hidden scenarios failure_constraint=thasnotgrate
 thasrealnotgrate
