@@ -2644,16 +2644,54 @@ next_actions={}",
         let hidden_definitions =
             scenarios::load_hidden_scenarios(&self.paths.scenarios, &spec_obj.id)?;
         let mut hidden_scenarios = if req.run_hidden_scenarios {
-            scenarios::evaluate_hidden_scenarios(
-                &hidden_definitions,
-                predicted_final_status,
-                run_attempt,
-                &events_so_far,
-                &validation,
-                &twin,
-                &agent_executions,
-                &run_dir,
-            )
+            if hidden_definitions.is_empty() {
+                // No predefined scenarios — ask Sable to generate them from the run context.
+                tracing::info!("No predefined hidden scenarios for spec '{}' — invoking Sable to generate", spec_obj.id);
+                match scenarios::sable_generate_and_evaluate(
+                    &spec_obj,
+                    &self.paths.setup,
+                    predicted_final_status,
+                    run_attempt,
+                    &events_so_far,
+                    &validation,
+                    &twin,
+                    &agent_executions,
+                    &run_dir,
+                )
+                .await
+                {
+                    Some((summary, rationale)) => {
+                        // Save Sable's generation rationale as an artifact.
+                        let _ = tokio::fs::write(
+                            run_dir.join("sable_scenario_rationale.md"),
+                            format!("# Sable Generated Scenario Rationale\n\n{rationale}"),
+                        )
+                        .await;
+                        summary
+                    }
+                    None => HiddenScenarioSummary {
+                        passed: false,
+                        results: vec![HiddenScenarioEvaluation {
+                            scenario_id: "sable_generation_failed".to_string(),
+                            title: "Sable scenario generation unavailable".to_string(),
+                            passed: false,
+                            details: "Sable could not generate hidden scenarios (provider unavailable or LLM error).".to_string(),
+                            checks: vec![],
+                        }],
+                    },
+                }
+            } else {
+                scenarios::evaluate_hidden_scenarios(
+                    &hidden_definitions,
+                    predicted_final_status,
+                    run_attempt,
+                    &events_so_far,
+                    &validation,
+                    &twin,
+                    &agent_executions,
+                    &run_dir,
+                )
+            }
         } else {
             HiddenScenarioSummary {
                 passed: true,
