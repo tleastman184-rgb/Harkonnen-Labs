@@ -11,7 +11,7 @@ stale_when: [implementation behavior, oracle semantics, or runtime assumptions c
 observed_paths: [src/llm.rs, src/capacity.rs]
 code_under_test_paths: [src/llm.rs, src/capacity.rs]
 status: challenged
-challenged_by: [lesson-exploration-hidden_scenarios-89581934-1986-44c0-9c5d-1e48d67a4020, lesson-dead-end-2d9c4c73-bb52-414f-bc88-044d0e408e25-hidden-scenarios-sable-sable-pack-is-workin-thas]
+challenged_by: [lesson-exploration-hidden_scenarios-89581934-1986-44c0-9c5d-1e48d67a4020, lesson-dead-end-2d9c4c73-bb52-414f-bc88-044d0e408e25-hidden-scenarios-sable-sable-pack-is-workin-thas, lesson-hidden_scenarios-a0ef19d7-49bd-4550-9d75-7bc4292b8811, lesson-exploration-hidden_scenarios-a0ef19d7-49bd-4550-9d75-7bc4292b8811, lesson-dead-end-a8d2f5c2-9b1a-4465-a539-b8e94e7315fa-hidden-scenarios-sable-sable-pack-is-workin-thas]
 ---
 
 Strategy: sable - pack is workin

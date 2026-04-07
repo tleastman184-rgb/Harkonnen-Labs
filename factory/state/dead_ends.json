@@ -181,6 +181,19 @@
       "surviving_structure": "none",
       "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
       "created_at": "2026-04-07T15:41:41.305347736+00:00"
+    },
+    {
+      "registry_id": "a8d2f5c2-9b1a-4465-a539-b8e94e7315fa:hidden_scenarios-a0ef19d7-49bd-4550-9d75-7bc4292b8811",
+      "run_id": "a8d2f5c2-9b1a-4465-a539-b8e94e7315fa",
+      "spec_id": "wire-fallback-for",
+      "product": "Harkonnen-Labs",
+      "phase": "hidden_scenarios",
+      "agent": "sable",
+      "strategy": "sable - pack is workin\nthasrealnotgrate\nEvaluating hidden scenarios",
+      "failure_constraint": "thasnotgrate\nthasrealnotgrate\nHidden scenario evaluation finished: 1 scenario(s)",
+      "surviving_structure": "none",
+      "reformulation": "hidden_scenarios phase failed; preserve surviving structure and change strategy on retry",
+      "created_at": "2026-04-07T15:52:05.279671962+00:00"
     }
   ]
 }
