@@ -1,6 +1,8 @@
 id: belt-buckle-phase1
 title: Belt Buckle Phase 1 — Position Open and Close
 purpose: Implement and validate the ability to open and close a single Orca SOL/USDC concentrated liquidity position with correct tick calculation, position mint persistence, and SOL reserve protection.
+parent_spec: belt-buckle
+phase: 1
 scope:
   - open one Orca position at a specified price range
   - persist position mint address to disk before returning
@@ -10,6 +12,8 @@ constraints:
   - single pool only — Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
   - private key never logged
   - position mint written to disk before any further action
+  - no rebalancing logic in this phase
+  - no multi-layer deployment in this phase
 inputs:
   - wallet private key from .env
   - RPC URL from .env
@@ -36,6 +40,7 @@ performance_expectations:
   - position open completes within 30 seconds
 security_expectations:
   - private key never logged or transmitted
+  - all transactions signed locally
 hidden_scenarios:
   - id: insufficient_sol_reserve
     description: Attempt to open position with only 0.5 SOL liquid — must be rejected
