@@ -211,24 +211,181 @@ Sources:
 - [SWE-bench Pro paper page](https://labs.scale.com/papers/swe_bench_pro)
 - [OpenAI note on why Verified alone is no longer enough](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/)
 
+### FRAMES
+
+Use for Coobie memory quality against Mem0 and other vector-store memory systems.
+FRAMES specifically tests multi-hop factual recall — questions that require chaining
+two or more retrieved facts. Single-pass vector similarity cannot resolve these;
+Coobie's multi-hop retrieval chain (Phase 4) is the required feature.
+Run in paired mode: Coobie vs raw-LLM baseline, same provider.
+
+Sources:
+
+- [Paper](https://arxiv.org/abs/2409.12941)
+- [Dataset (HuggingFace)](https://huggingface.co/datasets/google/frames-benchmark)
+
+### StreamingQA
+
+Use for Coobie belief-update accuracy. StreamingQA streams fact changes over time and
+tests whether the system correctly updates its beliefs — not just whether it recalls
+stored facts. No competitor publishes StreamingQA scores because no other memory system
+has explicit fact-invalidation tracking. Requires the memory invalidation feature
+(Phase 4) to produce meaningful results.
+
+Sources:
+
+- [Paper](https://arxiv.org/abs/2205.11388)
+
+### HELMET
+
+Use for Coobie retrieval precision/recall on long-context tasks. HELMET separates
+"retrieved the right passage" from "retrieved too much noise." Run after Phase 4 to
+validate whether the Palace patrol compound scent reduces retrieval noise versus
+flat vector similarity.
+
+Sources:
+
+- [Official repo](https://github.com/princeton-nlp/HELMET)
+- [Paper](https://arxiv.org/abs/2410.02669)
+
+### LiveCodeBench
+
+Use for Mason/Piper against OpenCode and other single-agent coding tools.
+Problems are pulled from recent competitive programming contests and postdate
+training cutoffs, making contamination unlikely. Run Mason's iterative fix loop
+plus online-judge feedback parsing against the same problems as competitors.
+
+Sources:
+
+- [Official repo](https://github.com/LiveCodeBench/LiveCodeBench)
+- [Leaderboard](https://livecodebench.github.io/leaderboard.html)
+
+### Aider Polyglot
+
+Use for Mason/Piper as a direct open-source coding agent comparison.
+Aider publishes its own benchmark and leaderboard, making it the most reproducible
+apples-to-apples comparison against a credible open-source competitor.
+The adapter is a thin script — no structural changes to Harkonnen required.
+
+Sources:
+
+- [Benchmark page](https://aider.chat/docs/leaderboards/)
+
+### DevBench
+
+Use for Scout/Mason/Piper/Bramble/Flint as the full software development lifecycle
+claim. DevBench scores design, implementation, testing, and documentation separately —
+each maps to a Labrador phase. This is the structural argument against single-agent
+tools that only measure the implementation phase.
+Requires Flint documentation artifacts (Phase 3).
+
+Sources:
+
+- [Official repo](https://github.com/open-compass/DevBench)
+- [Paper](https://arxiv.org/abs/2403.08604)
+
+### CLADDER
+
+Use for Coobie's causal memory layer (Layer D). CLADDER tests Pearl's causal
+hierarchy: associational, interventional, and counterfactual questions scored
+separately. This maps directly to Coobie's `diagnose` output structure after
+Phase 4 adds Pearl hierarchy labeling. No memory or agent competitor publishes
+CLADDER scores — this is a unique differentiating claim.
+Run in paired mode: Coobie diagnose vs raw-LLM direct answer.
+
+Sources:
+
+- [Official repo](https://github.com/causalNLP/cladder)
+- [Paper](https://arxiv.org/abs/2312.04350)
+
+### E-CARE
+
+Use for Coobie's `diagnose` output quality after Phase 5 consolidation is live.
+E-CARE scores whether causal explanations are natural-language coherent, not just
+structurally correct. Run after consolidation so that approved lessons can inform
+subsequent diagnose output and improvement over time is measurable.
+
+Sources:
+
+- [Official repo](https://github.com/Waste-Wood/E-CARE)
+- [Paper](https://arxiv.org/abs/2205.07364)
+
+### GAIA
+
+Use for the full factory chain (Scout → Mason → Piper → Sable) as a multi-step
+delegation claim. Level 3 tasks are the target — single-agent tools fail here
+because they cannot delegate sub-tasks. Run after Phase 6 when TypeDB is live so
+Coobie can answer cross-run context questions mid-task.
+
+Sources:
+
+- [Official repo](https://huggingface.co/datasets/gaia-benchmark/GAIA)
+- [Paper](https://arxiv.org/abs/2311.12983)
+
+### AgentBench
+
+Use for Labrador role separation against single-generalist agent frameworks.
+Target the OS, database, and web environments first — these map most cleanly to
+Mason/Piper (OS), Ash (DB), and Flint (web). Run after Phase 6.
+
+Sources:
+
+- [Official repo](https://github.com/THUDM/AgentBench)
+- [Paper](https://arxiv.org/abs/2308.03688)
+
+### Harkonnen-Native Benchmarks
+
+**Spec Adherence Rate** — no external repo. Build the grader in
+`factory/benchmarks/spec-adherence/`. Uses an LLM-as-judge prompt that extracts
+requirements from the spec and scores the implementation output on completeness and
+precision. Run two variants: with Scout formalization and without (raw spec → Mason).
+
+**Hidden Scenario Delta** — no external repo. Tracked automatically from run data
+once Bramble real test execution (Phase 2) and Sable hidden scenario results are
+both stored in comparable format. Report surfaces the gap per spec type and
+aggregates across the corpus.
+
+**Causal Attribution Accuracy** — seeded failure corpus lives in
+`factory/benchmarks/causal-attribution/`. Each entry has a spec, a seeded failure,
+a ground-truth cause label, and the Coobie diagnose output from that run.
+Score top-1 and top-3 accuracy. Build the corpus incrementally — 10 entries is
+enough for a first baseline; 30–50 is reportable.
+
 ## Results Table Template
 
 Use this template in the README or release notes once scores are available:
 
-| Benchmark | Subsystem | Metric | Harkonnen | Baseline | Source | Date |
-| --- | --- | --- | ---: | ---: | --- | --- |
-| LongMemEval-S | Coobie | Accuracy | pending | pending | reproduced baseline | pending |
-| LoCoMo QA | Coobie | Proxy QA score | pending | pending | reproduced baseline | pending |
-| tau2-bench | PackChat | Pass^1 | pending | pending | official or reproduced | pending |
-| SWE-bench Verified | Code loop | % Resolved | pending | pending | official leaderboard | pending |
-| SWE-bench Pro | Code loop | % Resolved | pending | pending | official leaderboard or paper | pending |
+| Benchmark | Subsystem | Metric | Harkonnen | Baseline | Comparison target | Source | Date |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| LongMemEval-S | Coobie | Accuracy | pending | pending | Mem0 / raw LLM | reproduced baseline | pending |
+| FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | reproduced baseline | pending |
+| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | reproduced baseline | pending |
+| LoCoMo QA | Coobie | Proxy QA score | pending | pending | raw LLM | reproduced baseline | pending |
+| CLADDER | Coobie | Causal accuracy by level | pending | pending | raw LLM | reproduced baseline | pending |
+| E-CARE | Coobie | Coherence score | pending | pending | raw LLM | reproduced baseline | pending |
+| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | official leaderboard | pending |
+| Aider Polyglot | Mason / Piper | % Correct | pending | pending | Aider | official leaderboard | pending |
+| DevBench | Full factory | Lifecycle score | pending | pending | Single-agent tools | reproduced baseline | pending |
+| SWE-bench Verified | Code loop | % Resolved | pending | pending | SWE-agent / OpenCode | official leaderboard | pending |
+| SWE-bench Pro | Code loop | % Resolved | pending | pending | SWE-agent | official leaderboard | pending |
+| tau2-bench | PackChat | Pass^1 | pending | pending | raw LLM | official or reproduced | pending |
+| GAIA Level 3 | Full factory | Task completion | pending | pending | General agents | official leaderboard | pending |
+| AgentBench (OS/DB/web) | Labrador roles | Env pass rate | pending | pending | Single-agent frameworks | reproduced baseline | pending |
+| Spec Adherence Rate | Scout / Mason | Completeness / Precision | pending | pending | No Scout baseline | internal | pending |
+| Hidden Scenario Delta | Bramble / Sable | Pass rate gap | pending | pending | Visible tests only | internal | pending |
+| Causal Attribution Accuracy | Coobie diagnose | Top-1 / Top-3 | pending | pending | Semantic recall only | internal | pending |
 
 ## Near-Term Follow-up
 
-The current toolchain is intentionally adapter-friendly. The next high-value follow-ups are:
+The current toolchain is intentionally adapter-friendly. Priority order for the next adapter work:
 
-- publish side-by-side LongMemEval PackChat versus raw-LLM results in the README
-- publish side-by-side LoCoMo PackChat versus raw-LLM results in the README
-- wire tau2-bench trajectories into PackChat artifacts
-- add a first-class SWE-bench submission/export path for both Verified and Pro
-- add a repo-native hidden-scenario and twin-fidelity benchmark suite for Sable and Ash
+1. Publish side-by-side LongMemEval PackChat versus raw-LLM results in the README
+2. Wire FRAMES adapter — the Mem0 comparison line, highest competitive value
+3. Wire CLADDER adapter — unique claim, no competitor can respond to it
+4. Wire LiveCodeBench adapter — the OpenCode/Aider comparison line
+5. Wire Aider Polyglot adapter — direct open-source leaderboard comparison
+6. Add a first-class SWE-bench submission/export path for both Verified and Pro
+7. Wire DevBench adapter after Flint doc phase ships (Phase 3)
+8. Add StreamingQA adapter after memory invalidation feature ships (Phase 4)
+9. Begin building causal attribution seeded failure corpus (can start now, incrementally)
+10. Wire GAIA and AgentBench after Phase 6

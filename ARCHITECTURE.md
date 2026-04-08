@@ -189,6 +189,7 @@ Responsibilities:
 - generate code
 - modify code
 - implement multi-file changes
+- iterate on build failures — up to 3 fix-loop iterations, each feeding structured failure context (compiler errors, wrong-answer output, test failures) back for targeted correction
 
 ##### Piper
 
@@ -247,10 +248,13 @@ Role: memory retriever.
 
 Responsibilities:
 
-- retrieve prior specs
-- retrieve patterns
-- retrieve failures
-- store new knowledge
+- retrieve prior specs, patterns, and failures
+- store new knowledge from each run
+- run preflight guidance before each phase using spec-scoped cause history
+- patrol the Palace (five named dens) and compute compound scent before each run
+- score episodes causally and detect cross-run failure streaks and patterns
+- manage the team blackboard (four named slices: Mission, Action, Evidence, Memory)
+- coordinate consolidation — what gets promoted into durable memory and what gets pruned
 
 ##### Keeper
 
@@ -282,29 +286,48 @@ What it should store:
 
 #### Coobie Memory Layers
 
-Coobie should manage three distinct layers instead of one undifferentiated note pile:
+Coobie manages six distinct layers — not one undifferentiated note pile:
 
-- short-term memory: current run state, recent tool outputs, current plan, and active team context
-- long-term memory: durable notes, imported assets, run reflections, and reusable patterns
-- team memory: shared pack state, handoffs, claims, blockers, and run board status
+| Layer | Purpose | Current status |
+| --- | --- | --- |
+| Working Memory | Current run state, active hypotheses, blockers — token-budgeted and ephemeral | Live |
+| Episodic Memory | Ordered execution traces (state → action → result) with phase attribution | Live |
+| Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | Live |
+| Causal Memory | Intervention-aware cause/effect with streak detection and cross-run patterns | Live |
+| Team Blackboard | Four named slices (Mission, Action, Evidence, Memory) for pack coordination | Live |
+| Consolidation | Operator-reviewed promotion, pruning, and abstraction of high-value episodes | Phase 5 |
 
-Recommended local stack:
+#### Coobie Palace
 
-- filesystem is the source of truth for durable memory
-- SQLite holds structured run state and early team memory
-- repo-local `.harkonnen/` state carries project-specific continuity when Harkonnen works on an external codebase
-- Qdrant is the optional semantic index for long-term memory
-- Redis is optional hot memory for shared coordination, not the canonical record
-- AnythingLLM remains an optional local retrieval accelerator
+The Palace is a compound recall layer built on top of causal memory. Related failure
+cause IDs are grouped into named **Dens**. Before each run, Coobie **Patrols** all dens
+and computes a **Scent** — a context bundle that elevates den-level streak weight beyond
+individual cause streaks. The result ("the whole den smells, not just one corner") injects
+into the preflight briefing's `required_checks`, `guardrails`, and `open_questions`.
+
+The five dens: Spec Den, Test Den, Twin Den, Pack Den, Memory Den.
 
 Current repo mapping:
 
-- [src/memory.rs](./src/memory.rs)
-- [src/orchestrator.rs](./src/orchestrator.rs)
+- [src/coobie.rs](./src/coobie.rs) — causal reasoning, episode scoring, preflight guidance
+- [src/coobie_palace.rs](./src/coobie_palace.rs) — Palace, dens, patrol, scent computation
+- [src/memory.rs](./src/memory.rs) — file-backed memory store
+- [src/embeddings.rs](./src/embeddings.rs) — hybrid vector + keyword retrieval
+- [src/orchestrator.rs](./src/orchestrator.rs) — episode recording and phase attribution
 - [factory/agents/profiles/coobie.yaml](./factory/agents/profiles/coobie.yaml)
-- [COOBIE.md](./COOBIE.md)
-- [factory/memory](./factory/memory)
+- [COOBIE.md](./COOBIE.md) — memory strategy
+- [COOBIE_SPEC.md](./COOBIE_SPEC.md) — implementation architecture
+- [factory/memory](./factory/memory) — durable memory store
 - project-local `<repo>/.harkonnen/project-memory/` on external codebases
+
+Persistence stack:
+
+- filesystem is the source of truth for durable memory
+- SQLite holds structured run state, episode records, causal links, and chat threads
+- fastembed or OpenAI-compatible embeddings + SQLite vector store for semantic retrieval
+- repo-local `.harkonnen/` carries project-specific continuity when Harkonnen works on an external codebase
+- TypeDB 3.x (Phase 6) — durable semantic graph for typed causal queries, not the hot-path store
+- AnythingLLM remains an optional local retrieval accelerator for home-linux
 
 ### 5. Hidden Scenario System
 
@@ -636,27 +659,29 @@ Think control room for an AI machine shop, not pet-adoption website with logs.
 
 ## MVP Spine in This Repository
 
-The current scaffold already establishes the factory spine:
+The current scaffold is no longer just a spine — Phase 1 is fully shipped:
 
-- spec loading and validation
+- spec loading and validation (Scout layer)
 - run creation and persistence in SQLite
-- per-run workspace creation
-- artifact packaging
-- PackChat backend thread/message persistence plus directed agent replies
-- checkpoint reply and unblock control-plane routes
-- causal memory and project/core memory ingestion
-- policy boundary enforcement and Keeper coordination
-- agent profile definitions
-- CLI entry points
-- Pack Board web UI
+- per-run workspace creation and artifact packaging
+- Piper real build execution with live stdout/stderr streaming
+- Mason fix loop — up to 3 build-failure iterations with structured feedback
+- PackChat conversational control plane — chat threads, `@mention` routing, checkpoint/unblock flow
+- Coobie layered memory — episodic capture, causal reasoning, hybrid semantic retrieval
+- Coobie Palace — den-based compound recall, patrol, and scent computation
+- Coobie causal streaks, cross-run pattern detection, Phase 3 preflight guidance
+- Causal feedback loop — Sable rationale written back to project memory
+- Keeper coordination API with claims, heartbeats, conflict detection, and release
+- Pack Board React UI — PackChat panel, Attribution Board, Factory Floor, Memory Board
+- First-class benchmark toolchain — LongMemEval and LoCoMo native adapters, CI workflow
 
 The next practical layers to build are:
 
-1. Bramble real test execution
-2. Ash live twin provisioning
-3. episodic layer enrichment and causal-link persistence
-4. operator-reviewed consolidation workbench
-5. TypeDB 3.x semantic layer
+1. Phase 2 — Bramble real test execution; Mason online-judge feedback loop
+2. Phase 3 — Ash live twin provisioning; Flint documentation phase
+3. Phase 4 — Episodic layer enrichment; multi-hop retrieval; memory invalidation; Pearl hierarchy in diagnose
+4. Phase 5 — Operator-reviewed consolidation Workbench
+5. Phase 6 — TypeDB 3.x semantic graph layer
 
 ## Final Definition
 

@@ -47,71 +47,89 @@ This loop converts **execution traces into reusable knowledge**.
 
 ### 1. Agent Pack (Execution Layer)
 
-Harkonnen decomposes execution into specialized agents:
+Harkonnen decomposes execution into nine specialist agents:
 
-* **Scout** → specification parsing and ambiguity detection
-* **Mason** → code generation and modification
-* **Bramble** → test generation and evaluation
-* **Sable** → hidden scenario execution (ground truth validation)
-* **Flint** → artifact packaging and output structuring
-* **Keeper** → policy enforcement and boundary control
-* **Coobie** → memory, consolidation, and causal reasoning
+| Agent | Role | What it does |
+| --- | --- | --- |
+| **Scout** | Spec retriever | Parses specs, flags ambiguity, produces normalized intent packages |
+| **Mason** | Build retriever | Generates and modifies code; iterates up to 3 times on build failure with structured fix-loop reasoning |
+| **Piper** | Tool retriever | Runs build tools, fetches docs, executes helpers with live stdout/stderr streaming |
+| **Bramble** | Test retriever | Generates visible tests, runs lint and build, feeds pass/fail into Coobie scoring |
+| **Sable** | Scenario retriever | Executes hidden behavioral scenarios; its results are the ground truth, not Bramble's |
+| **Ash** | Twin retriever | Provisions digital twin manifests and dependency stubs for safe external-system simulation |
+| **Flint** | Artifact retriever | Collects outputs, packages artifact bundles for inspection and evidence |
+| **Coobie** | Memory retriever | Manages layered memory — episodic capture, causal reasoning, Palace patrol, and consolidation |
+| **Keeper** | Boundary retriever | Enforces policy, guards role boundaries, owns file-claim coordination |
 
 This is not a monolithic agent — it is a **role-constrained system with explicit handoffs**.
+Scout, Sable, and Keeper are pinned to Claude. All others route per setup configuration.
 
 ---
 
 ### 2. Coobie (Layered Memory System)
 
-Coobie implements a **multi-layer memory architecture**:
+Coobie implements a **multi-layer memory architecture** that goes beyond a flat note store:
 
-| Layer           | Purpose                                            |
-| --------------- | -------------------------------------------------- |
-| Working Memory  | Current run state (compressed, ephemeral)          |
-| Episodic Memory | Ordered execution traces (state → action → result) |
-| Semantic Memory | Stable facts, patterns, invariants                 |
-| Causal Memory   | Intervention-aware cause/effect relationships      |
-| Team Blackboard | Shared agent coordination state                    |
-| Consolidation   | Promotion, pruning, and abstraction                |
+| Layer | Purpose | Status |
+| --- | --- | --- |
+| Working Memory | Current run state (compressed, ephemeral, token-budgeted) | Live |
+| Episodic Memory | Ordered execution traces (state → action → result) with phase attribution | Live |
+| Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | Live |
+| Causal Memory | Intervention-aware cause/effect relationships scored per run | Live |
+| Team Blackboard | Shared agent coordination state across four named slices | Live |
+| Consolidation | Promotion, pruning, and abstraction (operator-reviewed in Phase 5) | Partial |
+
+#### Coobie Palace
+
+The Palace is a **spatially-organized compound recall layer** built on top of Coobie's causal memory. Related failure causes are grouped into named **Dens** that Coobie patrols before every run:
+
+| Den | Residents | What it covers |
+| --- | --- | --- |
+| Spec Den | `SPEC_AMBIGUITY`, `BROAD_SCOPE` | Failures from unclear or over-scoped specs |
+| Test Den | `TEST_BLIND_SPOT` | Visible tests passed but hidden scenarios caught failures |
+| Twin Den | `TWIN_GAP` | Simulated environment didn't match production |
+| Pack Den | `PACK_BREAKDOWN` | Degraded or incomplete Labrador phase execution |
+| Memory Den | `NO_PRIOR_MEMORY` | Factory ran cold with no relevant prior context |
+
+A **Patrol** walks each den before a run, computing a compound **Scent** — when multiple causes from the same den have fired together, the whole den is elevated, not just the individual signal. Results inject directly into the preflight briefing's `required_checks`, `guardrails`, and `open_questions`. The principle: *the whole den smells, not just one corner*.
+
+#### Causal Reasoning
+
+Coobie tracks three levels of the causal hierarchy:
+
+* **Association** — co-occurrence patterns across runs
+* **Intervention** — outcome changes due to explicit actions, recorded in the causal link table
+* **Counterfactuals** — inferred alternative outcomes
+
+Live features:
+
+* Causal streaks — a cause that fires repeatedly across runs is escalated in the preflight briefing
+* Cross-run pattern detection — identifies causes that cluster on specific spec types or phases
+* Phase 3 preflight guidance — spec-scoped cause history drives `required_checks` before each run
+* Palace compound recall — den-level streak weight elevates compound failures beyond individual cause scores
+* Causal feedback loop — Sable's scenario rationale is written back to project memory as evidence
 
 ---
 
-### 3. Causal Memory (Key Differentiator)
+### 3. PackChat — Conversational Control Plane
 
-Most systems rely on **semantic similarity**:
+PackChat shifts the factory from pure autonomous orchestration to **supervised autonomy** — you stay in the loop through the same conversation surface while the pack works.
 
-> “This looks like something that worked before”
-
-Harkonnen builds toward **causal inference**:
-
-> “When we changed X under context Y, Z occurred”
-
-Coobie tracks:
-
-* **Association** — co-occurrence patterns
-* **Intervention** — outcome changes due to explicit actions
-* **Counterfactuals** — inferred alternative outcomes
-
-Causal knowledge is represented as:
-
-* structured **episodes**
-* promoted **semantic facts**
-* **causal claims** with:
-
-  * supporting evidence
-  * contradiction tracking
-  * scoped applicability
-  * confidence over time
+* **Chat threads** scoped to a run or spec, persisted in SQLite
+* **`@mention` routing** — `@coobie what did we learn?`, `@mason explain the fix` — dispatches to the right Labrador with its full system role loaded
+* **Blocking checkpoint flow** — when an agent needs an answer before proceeding, it surfaces a structured reply card in the thread; you answer there, the run continues
+* **Unblock flow** — `POST /api/agents/:id/unblock` releases a stalled run after you reply
+* **Default to Coobie** for unaddressed messages — memory and context retrieval without `@mention`
 
 ---
 
 ### 4. Persistence Model
 
-* **SQLite** → episodic memory and run state
-* **Filesystem** → specs, artifacts, evidence
+* **SQLite** → episodic memory, run state, chat threads, phase attributions, causal links
+* **Filesystem** → specs, artifacts, evidence, Coobie memory (`factory/memory/*.md`)
+* **fastembed / OpenAI-compatible embeddings + SQLite vector store** → hybrid semantic + keyword retrieval (live)
 * **(Planned / Optional) TypeDB 3.x service** → durable semantic graph + typed relational queries, not the hot-path store
-* **(Optional) Vector store** → retrieval acceleration
-* **(Future) Causal graph / causaloids** → executable reasoning
+* **(Future) Causal graph / causaloids** → executable causal reasoning via DeepCausality
 
 ---
 
@@ -132,6 +150,60 @@ cargo run -- benchmark run --all
 The machine-readable suite manifest lives at `factory/benchmarks/suites.yaml`, benchmark strategy and reporting guidance live in `BENCHMARKS.md`, and reports are written to `factory/artifacts/benchmarks/`. The default suite is a local regression gate, LongMemEval and LoCoMo now both run in native Harkonnen and raw-LLM baseline modes, and the remaining external adapters are prepared for tau2-bench and SWE-bench Verified/Pro. The execution roadmap in `ROADMAP.md` now treats benchmark gates as phase-level exit criteria rather than optional follow-up work.
 
 The OpenAI/Codex provider path also supports optional OpenAI-compatible BYO endpoints through a setup `base_url`, so benchmark runs can target local or third-party compatible backends without changing Rust code.
+
+### Benchmark Results
+
+Status legend: **wired** = adapter integrated and runnable; **planned** = adapter not yet built; **internal** = Harkonnen-native, no external suite.
+
+All scores are pending first runs. The comparison targets listed are the systems each benchmark is designed to compare against.
+
+#### Memory and retrieval — vs Mem0 / MindPalace / Zep
+
+| Benchmark | Subsystem | Metric | Harkonnen | Raw LLM baseline | Comparison target | Status | Phase |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| LongMemEval-S | Coobie | Accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 1 done |
+| FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | planned | Phase 4 |
+| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | planned | Phase 4 |
+| LoCoMo QA | Coobie | QA score | pending | pending | raw LLM | wired | Phase 1 done |
+| HELMET | Coobie | Retrieval precision / recall | pending | pending | raw LLM | planned | Phase 4 |
+
+#### Causal reasoning — unique to Harkonnen
+
+| Benchmark | Subsystem | Metric | Harkonnen | Raw LLM baseline | Notes | Status | Phase |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| CLADDER | Coobie / causal layer | Accuracy by causal level | pending | pending | No competitor publishes this | planned | Phase 4 |
+| E-CARE | Coobie / diagnose | Explanation coherence | pending | pending | Tests diagnose output quality | planned | Phase 5 |
+
+#### Coding loop — vs OpenCode / Aider / SWE-agent
+
+| Benchmark | Subsystem | Metric | Harkonnen | Competitor baseline | Comparison target | Status | Phase |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| SWE-bench Verified | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent / OpenCode | planned | Phase 2 |
+| SWE-bench Pro | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent | planned | Phase 2 |
+| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | planned | Phase 2 |
+| Aider Polyglot | Mason / Piper | % Correct | pending | pending | Aider (published leaderboard) | planned | Phase 2 |
+| DevBench | Full factory pipeline | Lifecycle score | pending | pending | Single-agent tools | planned | Phase 3 |
+
+#### Multi-turn and tool-use — vs general agent frameworks
+
+| Benchmark | Subsystem | Metric | Harkonnen | Competitor baseline | Comparison target | Status | Phase |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| tau2-bench | PackChat | Pass^1 / Pass^4 | pending | pending | raw LLM | planned | Phase 1+ |
+| GAIA Level 3 | Full factory (Scout → Sable) | Task completion | pending | pending | General agent frameworks | planned | Phase 6 |
+| AgentBench (OS / DB / web) | Labrador roles | Env pass rate | pending | pending | Single-generalist frameworks | planned | Phase 6 |
+
+#### Harkonnen-native — no competitor can run these
+
+| Benchmark | Subsystem | Metric | Result | Notes | Status | Phase |
+| --- | --- | --- | ---: | --- | --- | --- |
+| Spec Adherence Rate | Scout / Mason | Completeness % / Precision % | pending | Measures spec-first contribution — run with and without Scout | internal | Phase 3 |
+| Hidden Scenario Delta | Bramble / Sable | Pass rate gap (hidden − visible) | pending | Proves Sable catches what Bramble misses | internal | Phase 3 |
+| Causal Attribution Accuracy | Coobie diagnose | Top-1 / Top-3 accuracy | pending | Seeded failure corpus; measures causal memory vs semantic recall | internal | Phase 5 |
+| Local Regression Gate | Whole factory | pass / fail | passing | Hard merge gate, runs on every change | wired | Phase 1 done |
+
+Full benchmark strategy, adapter environment variables, and reporting guidance: [BENCHMARKS.md](BENCHMARKS.md)
+
+---
 
 ### 6. Execution Semantics
 
@@ -369,33 +441,50 @@ Spec → Agents → Validation → Artifacts → Memory → Consolidation → Be
 
 ## ⚠️ Status
 
-Harkonnen Labs is an **active development system**.
+Harkonnen Labs is an **active development system** — Phase 1 backend is shipped.
 
-* Core pipeline: working
-* Memory system: functional, evolving
-* Causal reasoning: emerging
-* APIs / CLI: stabilizing
+| Area | Status |
+| --- | --- |
+| Core factory pipeline (Scout → Mason → Piper → Bramble → Sable → Ash → Flint) | Working |
+| Mason fix loop (up to 3 iterations on build failure) | Live |
+| PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow |
+| Coobie layered memory (episodic, semantic, causal) | Live |
+| Coobie Palace (den-based compound recall, patrol, scent) | Live |
+| Coobie causal streaks and cross-run pattern detection | Live |
+| Coobie preflight guidance (Phase 3 spec-scoped cause history) | Live |
+| Hybrid semantic + keyword retrieval (fastembed / OpenAI-compatible) | Live |
+| Pack Board React UI (PackChat, Attribution Board, Factory Floor, Memory Board) | Live |
+| Keeper coordination API (claims, heartbeats, conflict detection) | Live |
+| Benchmark toolchain (manifest-driven, LongMemEval + LoCoMo native adapters) | Live |
+| Bramble real test execution | Phase 2 — next |
+| Ash live twin provisioning (Docker stubs) | Phase 3 |
+| Episodic layer enrichment + causal link graph | Phase 4 |
+| Operator consolidation Workbench | Phase 5 |
+| TypeDB 3.x semantic graph layer | Phase 6 |
 
-Expect rapid iteration.
+See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase build order.
 
 ---
 
 ## 🚀 Direction
 
-Near-term:
+Near-term (Phase 2–3):
 
-* stronger causal claim system
-* intervention-aware execution
-* policy integration
+* Bramble real test execution — make `validation_passed` meaningful
+* Ash live twin provisioning — ground Sable's scenario evaluation in running stubs
+* Flint documentation phase — enable DevBench lifecycle scoring
+* FRAMES and CLADDER benchmark adapters — the Mem0 and causal reasoning comparison lines
 
-Mid-term:
+Mid-term (Phase 4–5):
 
-* executable causal units (causaloids)
-* automated causal discovery
-* cross-project knowledge reuse
+* Episodic layer enrichment — causal link table, Pearl hierarchy in `diagnose`
+* Multi-hop retrieval chain — beat single-pass vector stores on FRAMES
+* Memory invalidation tracking — belief-update accuracy (StreamingQA)
+* Operator consolidation Workbench — nothing enters durable memory without approval
 
-Long-term:
+Long-term (Phase 6+):
 
-* **self-improving software factory**
+* TypeDB 3.x semantic graph — typed causal queries that vector similarity cannot answer
+* **Self-improving software factory** — each run makes the next run better
 
 

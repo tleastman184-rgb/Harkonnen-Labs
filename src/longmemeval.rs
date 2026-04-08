@@ -331,7 +331,9 @@ pub async fn run(paths: &Paths, config: &LongMemEvalRunConfig) -> Result<LongMem
         let hypothesis = match config.mode {
             LongMemEvalMode::Harkonnen => {
                 let prompt = build_question_prompt(question);
-                chat::complete_agent_reply(&config.agent, &prompt, &history, None, paths)
+                let packchat_history =
+                    history_with_prompt(&history, &question.question_id, &config.agent, &prompt);
+                chat::complete_agent_reply(&config.agent, &prompt, &packchat_history, None, paths)
                     .await
                     .with_context(|| {
                         format!(
@@ -493,6 +495,25 @@ pub fn status_for_output(output: &LongMemEvalRunOutput) -> BenchmarkStatus {
 
 pub fn reason_for_output(output: &LongMemEvalRunOutput) -> Option<String> {
     output.threshold_failure.clone()
+}
+
+fn history_with_prompt(
+    history: &[ChatMessage],
+    thread_id: &str,
+    agent: &str,
+    prompt: &str,
+) -> Vec<ChatMessage> {
+    let mut augmented = history.to_vec();
+    augmented.push(ChatMessage {
+        message_id: format!("{}-prompt", thread_id),
+        thread_id: thread_id.to_string(),
+        role: "operator".to_string(),
+        agent: Some(agent.to_string()),
+        content: prompt.to_string(),
+        checkpoint_id: None,
+        created_at: Utc::now(),
+    });
+    augmented
 }
 
 fn build_history(question: &LongMemEvalQuestion, agent: &str) -> Vec<ChatMessage> {

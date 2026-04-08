@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::time::Duration;
 
 use crate::capacity::CapacityState;
@@ -128,9 +129,17 @@ pub fn build_provider_with_capacity(
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(http_timeout_secs()))
         .build()
         .expect("failed to build HTTP client")
+}
+
+fn http_timeout_secs() -> u64 {
+    env::var("HARKONNEN_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120)
 }
 
 fn openai_chat_completions_url(base_url: Option<&str>) -> String {

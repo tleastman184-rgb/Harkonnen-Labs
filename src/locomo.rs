@@ -140,8 +140,11 @@ struct LoCoMoSample {
 #[derive(Debug, Deserialize, Clone)]
 struct LoCoMoQa {
     question: String,
-    answer: Value,
+    #[serde(default)]
+    answer: Option<Value>,
     category: i64,
+    #[serde(default)]
+    adversarial_answer: Option<String>,
     #[serde(default, rename = "evidence")]
     _evidence: Vec<String>,
 }
@@ -254,14 +257,27 @@ pub async fn run(paths: &Paths, config: &LoCoMoRunConfig) -> Result<LoCoMoRunOut
             let raw_hypothesis = match config.mode {
                 LoCoMoMode::Harkonnen => {
                     let prompt = build_question_prompt(qa);
-                    chat::complete_agent_reply(&config.agent, &prompt, &history, None, paths)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "answering LoCoMo sample {} qa {} via PackChat",
-                                sample.sample_id, qa_index
-                            )
-                        })?
+                    let packchat_history = history_with_prompt(
+                        &history,
+                        &sample.sample_id,
+                        qa_index,
+                        &config.agent,
+                        &prompt,
+                    );
+                    chat::complete_agent_reply(
+                        &config.agent,
+                        &prompt,
+                        &packchat_history,
+                        None,
+                        paths,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "answering LoCoMo sample {} qa {} via PackChat",
+                            sample.sample_id, qa_index
+                        )
+                    })?
                 }
                 LoCoMoMode::Direct => complete_direct_reply(paths, config, sample, qa, &history)
                     .await
@@ -404,6 +420,26 @@ fn resolve_dataset_path(paths: &Paths, overrides: &BTreeMap<String, String>) -> 
         PathBuf::from("/tmp/locomo/data/locomo10.json"),
     ];
     candidates.into_iter().find(|path| path.exists())
+}
+
+fn history_with_prompt(
+    history: &[ChatMessage],
+    sample_id: &str,
+    qa_index: usize,
+    agent: &str,
+    prompt: &str,
+) -> Vec<ChatMessage> {
+    let mut augmented = history.to_vec();
+    augmented.push(ChatMessage {
+        message_id: format!("{}-qa-{}-prompt", sample_id, qa_index),
+        thread_id: sample_id.to_string(),
+        role: "operator".to_string(),
+        agent: Some(agent.to_string()),
+        content: prompt.to_string(),
+        checkpoint_id: None,
+        created_at: Utc::now(),
+    });
+    augmented
 }
 
 fn build_history(sample: &LoCoMoSample, agent: &str) -> Result<Vec<ChatMessage>> {
@@ -563,21 +599,22 @@ fn evaluate_question(
 }
 
 fn answer_text(qa: &LoCoMoQa) -> String {
-    match &qa.answer {
-        Value::String(text) => {
+    match qa.answer.as_ref() {
+        Some(Value::String(text)) => {
             if qa.category == 3 {
                 text.split(';').next().unwrap_or(text).trim().to_string()
             } else {
                 text.trim().to_string()
             }
         }
-        Value::Array(values) => values
+        Some(Value::Array(values)) => values
             .iter()
             .filter_map(Value::as_str)
             .map(str::trim)
             .collect::<Vec<_>>()
             .join(", "),
-        other => other.to_string(),
+        Some(other) => other.to_string(),
+        None => qa.adversarial_answer.clone().unwrap_or_default(),
     }
 }
 

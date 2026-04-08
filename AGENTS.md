@@ -28,18 +28,29 @@ src/                    Rust CLI (cargo run -- <command>)
   main.rs               Entry point and command dispatch
   cli.rs                All subcommands and handlers
   api.rs                Axum API routes and handlers
+  agents.rs             Agent profile loading and prompt bundle resolution
   benchmark.rs          Benchmark manifests, execution, and report generation
+  capacity.rs           Token budget and working-memory capacity management
   chat.rs               PackChat thread/message persistence and agent dispatch
+  claude_pack.rs        Claude-specific pack setup and agent routing helpers
   config.rs             Path discovery + SetupConfig loading
-  setup.rs              SetupConfig structs, provider resolution, routing
-  orchestrator.rs       AppContext, run lifecycle
+  coobie.rs             Coobie causal reasoning, episode scoring, preflight guidance
+  coobie_palace.rs      Palace: den definitions, patrol, compound scent, PatchPatrol
+  db.rs                 SQLite init and schema migrations
+  embeddings.rs         fastembed + OpenAI-compatible vector store, hybrid retrieval
+  llm.rs                LLM request/response types and provider routing
+  longmemeval.rs        LongMemEval native adapter (Harkonnen vs raw-LLM paired mode)
   memory.rs             File-backed memory store, init, reindex, retrieve
-  spec.rs               YAML spec loader
-  models.rs             Shared data types (Spec, RunRecord, IntentPackage)
+  models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
+  orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
+  pidgin.rs             Inter-agent message format and handoff protocol
   policy.rs             Path boundary enforcement
-  workspace.rs          Per-run workspace creation
-  db.rs                 SQLite init
   reporting.rs          Run report generation
+  scenarios.rs          Hidden scenario loading and evaluation (Sable)
+  setup.rs              SetupConfig structs, provider resolution, routing
+  spec.rs               YAML spec loader and validation
+  tesseract.rs          Workspace isolation and file-write permission model
+  workspace.rs          Per-run workspace creation
 
 factory/
   agents/profiles/      Nine agent YAML profiles (one per agent)
@@ -416,25 +427,32 @@ Consolidation Workbench → TypeDB Semantic Layer.
 - Phase-level attribution recording — captures prompt bundle, pinned skills, memory hits, lessons, required checks, and outcome per Labrador phase into SQLite and `phase_attributions.json`
 - Provider-aware LLM routing for Claude, Gemini, and OpenAI/Codex
 - Scout, Mason, Piper, Bramble, and Ash LLM calls with rule-based or procedural fallback
+- **Mason fix loop** — up to 3 iterations on build failure; each iteration feeds structured failure context back to Mason for targeted correction before giving up
 - Opt-in Mason LLM-authored file writes inside the staged workspace
-- PackChat backend in Rust: chat thread/message persistence, direct agent chat,
-  multi-turn agent replies, and thread history retrieval
+- Piper real build execution with live stdout/stderr streaming on the `LiveEvent` broadcast channel
+- **PackChat conversational control plane** — chat threads scoped to run or spec; `@mention` routing to named agents; blocking checkpoint materialization and reply flow; agent unblock route; multi-turn conversation history
 - Checkpoint reply and agent unblock routes wired into the conversational control plane
 - Hidden scenario evaluation through protected scenario files (Sable)
 - Digital twin manifests with dependency stubs and optional narrative (Ash)
-- Coobie causal reasoning phase 1 with causal report output
+- **Coobie causal reasoning** — heuristic rules, episode scoring per run, causal report output
+- **Coobie causal streaks** — causes that fire repeatedly across runs are escalated in briefings
+- **Coobie cross-run pattern detection** — identifies causes that cluster on specific spec types or phases
+- **Coobie Phase 3 preflight guidance** — spec-scoped cause history drives `required_checks` before each run
+- **Coobie Palace** (`src/coobie_palace.rs`) — den-based compound recall layer; patrol walks five dens (Spec, Test, Twin, Pack, Memory) before each run; compound scent elevates den-level streaks over individual cause scores; feeds directly into preflight briefing
+- **Causal feedback loop** — Sable scenario rationale written back to project memory as evidence after each run
+- **Semantic memory** — fastembed or OpenAI-compatible embeddings + SQLite vector store; hybrid vector + keyword retrieval
+- **Native LongMemEval adapter** — paired Harkonnen vs raw-LLM comparison mode; `longmemeval_s_cleaned.json` support
+- **Native LoCoMo adapter** — paired Harkonnen vs raw-LLM comparison mode
+- **First-class benchmark toolchain** — `benchmark list/run/report`; manifest-driven suites in `factory/benchmarks/suites.yaml`; CI workflow; LM Studio local routing
 - Keeper coordination API with claims, heartbeats, conflict detection, and release flow
 - Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, and Memory Board
 - Bootstrap scripts for home-linux and work-windows
 
 ### Planned (next build layer)
 
-- Bramble real test execution from spec-driven test commands
-- Ash live twin provisioning against running stubs instead of manifests-only evaluation
-- Coobie reading phase attribution records during causal scoring and lesson promotion
-- Post-run consolidation surface in the Workbench — review phase attributions, promote or discard lessons, trigger consolidation pass
-- Richer black-box hidden scenarios beyond event/artifact evaluation
-- Richer digital twins for external-system simulation
-- Richer memory indexing (Qdrant semantic, not just keyword)
-- TypeDB 3.x semantic graph layer (COOBIE_SPEC.md Layer C) as a later durable semantic store, not the hot-path run database
-- DeepCausality phase 2 integration
+- **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
+- **Phase 3** — Ash live twin provisioning against running Docker stubs; Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter
+- **Phase 4** — Episodic layer enrichment (causal link table, `state_before`/`state_after`); Coobie multi-hop retrieval chain; memory invalidation/fact-update tracking; Pearl hierarchy in `diagnose`; FRAMES, StreamingQA, HELMET, CLADDER adapters
+- **Phase 5** — Post-run consolidation Workbench (operator review before durable memory write); E-CARE adapter; causal attribution accuracy seeded failure corpus
+- **Phase 6** — TypeDB 3.x semantic graph layer (COOBIE_SPEC.md Layer C); GAIA Level 3 and AgentBench adapters
+- DeepCausality phase 2 integration (real causaloids from the causal link table)
