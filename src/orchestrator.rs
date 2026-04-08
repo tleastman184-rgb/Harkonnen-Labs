@@ -41,6 +41,9 @@ pub struct AppContext {
     pub memory_store: MemoryStore,
     pub blackboard: Arc<RwLock<BlackboardState>>,
     pub coobie: crate::coobie::SqliteCoobie,
+    /// Semantic memory — None if fastembed failed to initialise (e.g. first run
+    /// with no internet, or ONNX runtime unavailable). Falls back to keyword.
+    pub embedding_store: Option<crate::embeddings::EmbeddingStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +129,20 @@ struct MemoryContextBundle {
 struct CollectedMemoryHits {
     hits: Vec<String>,
     ids: Vec<String>,
+}
+
+/// A causal cause that has fired on prior runs of a specific spec.
+/// Used to drive concrete preflight guidance in Coobie's briefing.
+#[derive(Debug, Clone)]
+struct SpecCauseSignal {
+    cause_id: String,
+    #[allow(dead_code)]
+    description: String,
+    occurrences: usize,
+    scenario_pass_rate: f32,
+    streak_len: usize,
+    /// True when streak_len >= 3 — escalation is recommended.
+    escalate: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -470,6 +487,8 @@ struct MasonEditApplicationArtifact {
     summary: String,
     proposal_generated: bool,
     changed_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,12 +600,26 @@ impl AppContext {
         let pool = db::init_db(&paths).await?;
         let memory_store = MemoryStore::new(paths.memory.clone());
         let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
+        let embedding_store = match crate::embeddings::EmbeddingStore::new(pool.clone()).await {
+            Ok(es) => {
+                tracing::info!("semantic memory (fastembed BGESmallENV15) ready");
+                Some(es)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "semantic memory unavailable ({}); Coobie will use keyword search",
+                    e
+                );
+                None
+            }
+        };
         Ok(Self {
             paths,
             pool,
             memory_store,
             blackboard: Arc::new(RwLock::new(BlackboardState::default())),
             coobie,
+            embedding_store,
         })
     }
 
@@ -2642,16 +2675,75 @@ next_actions={}",
         let hidden_definitions =
             scenarios::load_hidden_scenarios(&self.paths.scenarios, &spec_obj.id)?;
         let mut hidden_scenarios = if req.run_hidden_scenarios {
-            scenarios::evaluate_hidden_scenarios(
-                &hidden_definitions,
-                predicted_final_status,
-                run_attempt,
-                &events_so_far,
-                &validation,
-                &twin,
-                &agent_executions,
-                &run_dir,
-            )
+            if hidden_definitions.is_empty() {
+                // No predefined scenarios — ask Sable to generate them from the run context.
+                tracing::info!("No predefined hidden scenarios for spec '{}' — invoking Sable to generate", spec_obj.id);
+                match scenarios::sable_generate_and_evaluate(
+                    &spec_obj,
+                    &self.paths.setup,
+                    predicted_final_status,
+                    run_attempt,
+                    &events_so_far,
+                    &validation,
+                    &twin,
+                    &agent_executions,
+                    &run_dir,
+                )
+                .await
+                {
+                    Some((summary, rationale)) => {
+                        // Save Sable's generation rationale as an artifact.
+                        let _ = tokio::fs::write(
+                            run_dir.join("sable_scenario_rationale.md"),
+                            format!("# Sable Generated Scenario Rationale\n\n{rationale}"),
+                        )
+                        .await;
+
+                        // ── Feed Sable's reasoning into project memory ────────
+                        if let Ok(proj_store) = self.project_memory_store(&target_source).await {
+                            let (id, tags, mem_summary, content, prov) =
+                                sable_rationale_to_memory_entry(
+                                    &rationale,
+                                    &spec_obj.id,
+                                    &spec_obj.title,
+                                    run_id,
+                                    summary.passed,
+                                );
+                            if let Err(e) = proj_store
+                                .store_with_metadata(&id, tags, &mem_summary, &content, prov)
+                                .await
+                            {
+                                tracing::warn!("Sable rationale memory write failed: {e}");
+                            } else {
+                                tracing::info!("Sable rationale written to project memory: {id}");
+                            }
+                        }
+
+                        summary
+                    }
+                    None => HiddenScenarioSummary {
+                        passed: false,
+                        results: vec![HiddenScenarioEvaluation {
+                            scenario_id: "sable_generation_failed".to_string(),
+                            title: "Sable scenario generation unavailable".to_string(),
+                            passed: false,
+                            details: "Sable could not generate hidden scenarios (provider unavailable or LLM error).".to_string(),
+                            checks: vec![],
+                        }],
+                    },
+                }
+            } else {
+                scenarios::evaluate_hidden_scenarios(
+                    &hidden_definitions,
+                    predicted_final_status,
+                    run_attempt,
+                    &events_so_far,
+                    &validation,
+                    &twin,
+                    &agent_executions,
+                    &run_dir,
+                )
+            }
         } else {
             HiddenScenarioSummary {
                 passed: true,
@@ -2989,7 +3081,7 @@ Top memory hits:
         if let Err(err) = self.coobie.ingest_episode(&factory_episode).await {
             tracing::warn!("Coobie ingest failed: {err}");
         } else {
-            match self.coobie.emit_report(run_id).await {
+            match self.coobie.emit_report(run_id, &spec_obj.id).await {
                 Ok(report) => {
                     let report_response = crate::coobie::render_coobie_report_response(&report);
                     let _ = self
@@ -3006,6 +3098,22 @@ Top memory hits:
                     push_unique(&mut blackboard.artifact_refs, "coobie_report_response.md");
                     push_unique(&mut blackboard.artifact_refs, "causal_summary.md");
                     let _ = self.sync_blackboard(&blackboard, Some(&run_dir)).await;
+
+                    // ── Feed causal insight back into project memory ──────────
+                    // This closes the loop: next run's Coobie preflight will
+                    // semantically retrieve this entry and adjust its guidance.
+                    if let Ok(proj_store) = self.project_memory_store(&target_source).await {
+                        let (id, tags, summary, content, prov) =
+                            causal_report_to_memory_entry(&report, &spec_obj.id, &spec_obj.title);
+                        if let Err(e) = proj_store
+                            .store_with_metadata(&id, tags, &summary, &content, prov)
+                            .await
+                        {
+                            tracing::warn!("causal memory write failed: {e}");
+                        } else {
+                            tracing::info!("causal insight written to project memory: {id}");
+                        }
+                    }
                 }
                 Err(err) => tracing::warn!("Coobie emit_report failed: {err}"),
             }
@@ -3121,21 +3229,41 @@ Top memory hits:
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
 
-        for term in query_terms {
-            if term.trim().is_empty() {
+        // Build a single semantic query from the first 15 non-empty terms.
+        let semantic_query = query_terms
+            .iter()
+            .filter(|t| !t.trim().is_empty())
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let raw_hits: Vec<String> = if semantic_query.is_empty() {
+            vec![]
+        } else if let Some(es) = self.embedding_store.as_ref() {
+            // Semantic path: one cosine search over the full memory index.
+            store.retrieve_context_hybrid(&semantic_query, es).await?
+        } else {
+            // Keyword fallback: iterate terms as before.
+            let mut kw = Vec::new();
+            for term in query_terms {
+                if !term.trim().is_empty() {
+                    kw.extend(store.retrieve_context(term).await?);
+                }
+            }
+            kw
+        };
+
+        for hit in raw_hits {
+            if hit.contains("No memories found") || hit.contains("Memory not initialized") {
                 continue;
             }
-            for hit in store.retrieve_context(term).await? {
-                if hit.contains("No memories found") || hit.contains("Memory not initialized") {
-                    continue;
-                }
-                if let Some(id) = extract_memory_entry_id(&hit) {
-                    ids.push(id);
-                }
-                let labeled_hit = format!("[{source_label}] {hit}");
-                if seen.insert(labeled_hit.clone()) {
-                    hits.push(labeled_hit);
-                }
+            if let Some(id) = extract_memory_entry_id(&hit) {
+                ids.push(id);
+            }
+            let labeled_hit = format!("[{source_label}] {hit}");
+            if seen.insert(labeled_hit.clone()) {
+                hits.push(labeled_hit);
             }
         }
 
@@ -3807,6 +3935,105 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 .cmp(&left.occurrences)
                 .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
         });
+        signals.truncate(limit);
+        Ok(signals)
+    }
+
+    /// Spec-scoped cause summary — returns causes that fired on *this spec's* runs,
+    /// newest first, with per-cause consecutive streak length attached.
+    /// Falls back gracefully to an empty list (the global summary is still used
+    /// alongside this one in the briefing builder).
+    async fn summarize_prior_causes_for_spec(
+        &self,
+        spec_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SpecCauseSignal>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT h.cause_id, h.description, h.created_at, s.scenario_passed
+            FROM causal_hypotheses h
+            JOIN runs r ON r.run_id = h.run_id
+            LEFT JOIN coobie_episode_scores s ON s.run_id = h.run_id
+            WHERE r.spec_id = ?1
+            ORDER BY h.created_at DESC
+            "#,
+        )
+        .bind(spec_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Aggregate per cause_id: total occurrences, scenario successes, streak.
+        // Key: cause_id → (description, occurrences, scenario_successes, streak_len)
+        let mut map: HashMap<String, (String, usize, usize, usize)> = HashMap::new();
+        // Process rows newest-first to build streaks correctly.
+        let cause_order: Vec<String> = indexmap_ordered_keys(&rows, "cause_id");
+        for row in &rows {
+            let cause_id = row.get::<String, _>("cause_id");
+            let description = row.get::<String, _>("description");
+            let scenario_passed = row.get::<Option<i64>, _>("scenario_passed").unwrap_or(0) != 0;
+            let entry = map.entry(cause_id.clone()).or_insert_with(|| (description, 0, 0, 0));
+            entry.1 += 1;
+            if scenario_passed {
+                entry.2 += 1;
+            }
+        }
+
+        // Compute streak per cause using per-spec run order (at most 6 causes, 10 runs).
+        let run_rows = sqlx::query(
+            r#"
+            SELECT DISTINCT r.run_id, r.created_at
+            FROM runs r
+            WHERE r.spec_id = ?1
+            ORDER BY r.created_at DESC
+            LIMIT 10
+            "#,
+        )
+        .bind(spec_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for (cause_id, entry) in map.iter_mut() {
+            let mut streak = 0usize;
+            for run_row in &run_rows {
+                let run_id: String = run_row.get("run_id");
+                let fired: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM causal_hypotheses WHERE run_id = ?1 AND cause_id = ?2",
+                )
+                .bind(&run_id)
+                .bind(cause_id.as_str())
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+                if fired > 0 {
+                    streak += 1;
+                } else {
+                    break;
+                }
+            }
+            entry.3 = streak;
+        }
+
+        let mut signals: Vec<SpecCauseSignal> = cause_order
+            .iter()
+            .filter_map(|cause_id| {
+                let (description, occurrences, scenario_successes, streak_len) = map.get(cause_id)?;
+                Some(SpecCauseSignal {
+                    cause_id: cause_id.clone(),
+                    description: description.clone(),
+                    occurrences: *occurrences,
+                    scenario_pass_rate: if *occurrences > 0 {
+                        *scenario_successes as f32 / *occurrences as f32
+                    } else {
+                        0.0
+                    },
+                    streak_len: *streak_len,
+                    escalate: *streak_len >= 3,
+                })
+            })
+            .collect();
+
+        signals.sort_by(|a, b| b.streak_len.cmp(&a.streak_len).then(b.occurrences.cmp(&a.occurrences)));
         signals.truncate(limit);
         Ok(signals)
     }
@@ -5025,6 +5252,22 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             &mut open_questions,
         );
 
+        // ── Phase 3: causal priors influence preflight ────────────────────────
+        // Query this spec's causal history and inject concrete, cause-specific
+        // checks and guardrails — not generic heuristics.
+        let spec_causes = self
+            .summarize_prior_causes_for_spec(&spec_obj.id, 6)
+            .await
+            .unwrap_or_default();
+        if !spec_causes.is_empty() {
+            apply_causal_preflight_guidance(
+                &spec_causes,
+                &mut required_checks,
+                &mut recommended_guardrails,
+                &mut open_questions,
+            );
+        }
+
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
             product: target_source.label.clone(),
@@ -5457,11 +5700,9 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
             build_implementation_plan(spec_obj, intent, briefing, staged_product, target_source);
 
         if let Some(provider) = llm::build_provider("mason", "default", &self.paths.setup) {
-            let memory_section = format_memory_context(&briefing.memory_hits);
             let spec_yaml =
                 serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
-            let intent_json = serde_json::to_string_pretty(intent).unwrap_or_default();
-            let briefing_json = serde_json::to_string_pretty(briefing).unwrap_or_default();
+            let constraints = mason_slim_briefing(briefing);
             let prompt_support = self.agent_prompt_support("mason", spec_obj, target_source);
             let system_instruction = prompt_support
                 .as_ref()
@@ -5469,10 +5710,10 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     "{}
 
 Task contract:
-You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec, a Scout intent package, and prior memory context. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Intent Summary, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks, ## Prior Context. Be specific and avoid filler.",
+You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec and operating constraints. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks. Be specific and avoid filler.",
                     support.system_instruction
                 ))
-                .unwrap_or_else(|| "You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec, a Scout intent package, and prior memory context. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Intent Summary, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks, ## Prior Context. Be specific and avoid filler.".to_string());
+                .unwrap_or_else(|| "You are Mason, an implementation planning specialist for a software factory. You receive a YAML spec and operating constraints. Produce a clear, actionable implementation plan in Markdown with sections: ## Target, ## Scope, ## Acceptance Criteria, ## Recommended Steps, ## Risks. Be specific and avoid filler.".to_string());
             let repo_context_block = prompt_support
                 .as_ref()
                 .map(|support| support.repo_context_block.as_str())
@@ -5492,30 +5733,16 @@ REPO-LOCAL SKILL BUNDLES:
 {spec_yaml}
 ```
 
-INTENT:
-```json
-{intent_json}
-```
-
 TARGET: {} ({})
 
-PRIOR MEMORY:
-{memory_section}
-
-COOBIE BRIEFING:
-```json
-{briefing_json}
-```
-
-COOBIE RESPONSE:
-{response}
+CONSTRAINTS:
+{constraints}
 
 {repo_context_block}
 
-Produce the implementation plan markdown and treat Coobie guardrails, required checks, repo-local constraints, and skill bundles as real operating constraints.",
+Produce the implementation plan markdown. Treat guardrails and required checks as hard constraints.",
                     target_source.label,
                     target_source.source_path,
-                    response = briefing.coobie_response,
                     repo_context_block = repo_context_block,
                 ),
             );
@@ -5563,9 +5790,9 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
         &self,
         run_id: &str,
         spec_obj: &Spec,
-        intent: &IntentPackage,
+        _intent: &IntentPackage,
         briefing: &CoobieBriefing,
-        implementation_plan: &str,
+        _implementation_plan: &str,
         target_source: &TargetSourceMetadata,
         staged_product: &Path,
         run_dir: &Path,
@@ -5584,6 +5811,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because the spec did not resolve any code-under-test paths inside the staged workspace.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5601,6 +5829,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because no bounded text file context could be loaded for the editable paths.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5617,6 +5846,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
                 summary: "Mason edit lane skipped because no live LLM provider is configured for Mason in the active setup.".to_string(),
                 proposal_generated: false,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5625,8 +5855,7 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
 
         let spec_yaml =
             serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
-        let intent_json = serde_json::to_string_pretty(intent).unwrap_or_default();
-        let briefing_json = serde_json::to_string_pretty(briefing).unwrap_or_default();
+        let constraints = mason_slim_briefing(briefing);
         let context_paths = context_files
             .iter()
             .map(|file| file.path.clone())
@@ -5635,22 +5864,14 @@ Produce the implementation plan markdown and treat Coobie guardrails, required c
             .iter()
             .map(|file| {
                 format!(
-                    "FILE: {}
-TRUNCATED: {}
-```text
-{}
-```",
+                    "FILE: {}{}\n```text\n{}\n```",
                     file.path,
-                    if file.truncated { "true" } else { "false" },
+                    if file.truncated { " [truncated]" } else { "" },
                     file.content
                 )
             })
             .collect::<Vec<_>>()
-            .join(
-                "
-
-",
-            );
+            .join("\n\n");
 
         let prompt_support = self.agent_prompt_support("mason", spec_obj, target_source);
         let system_instruction = prompt_support
@@ -5662,7 +5883,7 @@ Task contract:
 You are Mason, an implementation specialist for a software factory. Produce valid JSON only. Return an object with keys summary (string), rationale (array of strings), and edits (array). Each edit must contain path (relative path inside the staged workspace), action (must be 'write'), summary (string), and content (the full file contents after your edit). Only edit files within the provided editable paths. Do not emit markdown. Do not explain outside the JSON object.",
                 support.system_instruction
             ))
-            .unwrap_or_else(|| "You are Mason, an implementation specialist for a software factory. Produce valid JSON only. Return an object with keys summary (string), rationale (array of strings), and edits (array). Each edit must contain path (relative path inside the staged workspace), action (must be 'write'), summary (string), and content (the full file contents after your edit). Only edit files within the provided editable paths. Do not emit markdown. Do not explain outside the JSON object.".to_string());
+            .unwrap_or_else(|| "You are Mason, an implementation specialist for a software factory. You must respond with a single raw JSON object and nothing else — no prose before it, no explanation after it, no markdown fences. The object must have exactly these keys: \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). Each edit must have: \"path\" (relative path in staged workspace), \"action\" (must be the string \"write\"), \"summary\" (string), \"content\" (full file contents after edit). Only edit files listed in EDITABLE PATHS. If no edit is needed, return edits as an empty array.".to_string());
         let repo_context_block = prompt_support
             .as_ref()
             .map(|support| support.repo_context_block.as_str())
@@ -5683,32 +5904,20 @@ REPO-LOCAL SKILL BUNDLES:
 {spec_yaml}
 ```
 
-INTENT:
-```json
-{intent_json}
-```
-
-COOBIE BRIEFING:
-```json
-{briefing_json}
-```
-
-IMPLEMENTATION PLAN:
-```markdown
-{implementation_plan}
-```
-
 TARGET: {} ({})
 
 EDITABLE PATHS:
 {}
 
-CURRENT FILE CONTEXT:
-{}
+CONSTRAINTS:
+{constraints}
 
 {repo_context_block}
 
-Generate the smallest safe set of file writes needed to move the staged workspace toward the spec's requested behavior. Respect the declared skill bundles and repo-local guidance. If no safe edit is justified from this context, return edits as an empty array and explain why in rationale.",
+CURRENT FILE CONTEXT:
+{}
+
+Respond with a single JSON object only — no prose, no markdown, no explanation outside the object. If no edit is needed, return edits as an empty array. Do not write any text outside this JSON object.",
                     target_source.label,
                     staged_product.display(),
                     render_list(&editable_paths, "No editable paths were resolved."),
@@ -5716,7 +5925,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     repo_context_block = repo_context_block,
                 )),
             ],
-            max_tokens: 12000,
+            max_tokens: 8000,
             temperature: 0.1,
         };
 
@@ -5732,6 +5941,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     summary: format!("Mason edit lane failed before applying edits: {}", error),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5739,9 +5949,14 @@ Generate the smallest safe set of file writes needed to move the staged workspac
             }
         };
 
+        // Write raw response to disk before parsing so failures are diagnosable.
+        let raw_response_path = run_dir.join("mason_raw_response.txt");
+        let _ = tokio::fs::write(&raw_response_path, &response.content).await;
+
         let proposal = match parse_mason_edit_proposal(&response.content) {
             Ok(proposal) => proposal,
             Err(error) => {
+                let preview: String = response.content.chars().take(500).collect();
                 let application = MasonEditApplicationArtifact {
                     run_id: run_id.to_string(),
                     spec_id: spec_obj.id.clone(),
@@ -5749,11 +5964,12 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     generated_at: Utc::now().to_rfc3339(),
                     status: "invalid_llm_edit_response".to_string(),
                     summary: format!(
-                        "Mason edit lane produced an invalid JSON edit proposal: {}",
-                        error
+                        "Mason edit lane produced an invalid JSON edit proposal: {}\nRaw response preview: {}",
+                        error, preview
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5774,6 +5990,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                         .to_string(),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5792,6 +6009,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5810,6 +6028,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                     ),
                     proposal_generated: false,
                     changed_files: Vec::new(),
+                    git_branch: None,
                 };
                 self.write_mason_edit_application(run_dir, &application)
                     .await?;
@@ -5847,6 +6066,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                 },
                 proposal_generated: true,
                 changed_files: Vec::new(),
+                git_branch: None,
             };
             self.write_mason_edit_application(run_dir, &application)
                 .await?;
@@ -5879,6 +6099,42 @@ Generate the smallest safe set of file writes needed to move the staged workspac
                 target_source.label
             )
         };
+
+        // If git_branch is requested and there are real changes, commit them to a
+        // new branch in the source repo so a proper diff is always available.
+        let git_branch = if spec_obj
+            .worker_harness
+            .as_ref()
+            .map(|h| h.git_branch)
+            .unwrap_or(false)
+            && !changed_files.is_empty()
+        {
+            let source_root = PathBuf::from(&target_source.source_path);
+            let short_run = &run_id[..8];
+            let branch_name = format!("mason/{}-{}", spec_obj.id, short_run);
+            match mason_commit_branch(
+                &source_root,
+                &staged_product,
+                &changed_files,
+                &branch_name,
+                &spec_obj.title,
+                run_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("Mason committed edits to branch {}", branch_name);
+                    Some(branch_name)
+                }
+                Err(e) => {
+                    tracing::warn!("Mason git branch commit failed ({}), continuing", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let application = MasonEditApplicationArtifact {
             run_id: run_id.to_string(),
             spec_id: spec_obj.id.clone(),
@@ -5888,6 +6144,7 @@ Generate the smallest safe set of file writes needed to move the staged workspac
             summary,
             proposal_generated: true,
             changed_files,
+            git_branch,
         };
         self.write_mason_edit_application(run_dir, &application)
             .await?;
@@ -15184,7 +15441,7 @@ fn read_mason_context_file(
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&bytes).to_string();
-    let max_chars = 4000usize;
+    let max_chars = 12000usize;
     let mut content = text.chars().take(max_chars).collect::<String>();
     let truncated = text.chars().count() > max_chars;
     if truncated {
@@ -15259,12 +15516,170 @@ fn join_workspace_relative_path(base: &Path, relative: &str) -> Result<PathBuf> 
     Ok(joined)
 }
 
+/// Compact constraint block sent to Mason — only what it needs to act.
+/// Strips all citation chains, reasoning histories, and memory blobs.
+fn mason_slim_briefing(briefing: &CoobieBriefing) -> String {
+    let mut out = String::new();
+
+    if !briefing.required_checks.is_empty() {
+        out.push_str("REQUIRED CHECKS:\n");
+        for c in &briefing.required_checks {
+            out.push_str(&format!("- {c}\n"));
+        }
+        out.push('\n');
+    }
+
+    if !briefing.recommended_guardrails.is_empty() {
+        out.push_str("GUARDRAILS:\n");
+        for g in &briefing.recommended_guardrails {
+            out.push_str(&format!("- {g}\n"));
+        }
+        out.push('\n');
+    }
+
+    if !briefing.application_risks.is_empty() {
+        out.push_str("RISKS:\n");
+        for r in &briefing.application_risks {
+            out.push_str(&format!("- {r}\n"));
+        }
+        out.push('\n');
+    }
+
+    // Coobie's distilled verdict — capped so it can't explode
+    let response = briefing.coobie_response.trim();
+    if !response.is_empty() {
+        let capped: String = response.chars().take(600).collect();
+        out.push_str("COOBIE SUMMARY:\n");
+        out.push_str(&capped);
+        if response.chars().count() > 600 {
+            out.push_str("...");
+        }
+        out.push('\n');
+    }
+
+    if out.is_empty() {
+        "No constraints loaded.".to_string()
+    } else {
+        out.trim_end().to_string()
+    }
+}
+
 fn path_allowed_for_edit(path: &str, editable_paths: &[String]) -> bool {
     let path = normalize_project_path(path);
     editable_paths.iter().any(|root| {
         let root = normalize_project_path(root);
         root == "." || path == root || path.starts_with(&format!("{root}/"))
     })
+}
+
+/// Create a git branch in `source_root`, copy the changed files from the
+/// staged workspace, commit them, and restore the original branch.
+///
+/// The branch is named `mason/<spec-id>-<short-run-id>` and is created from
+/// whatever branch is currently checked out (typically main/master). This gives
+/// reviewers a proper `git diff main...mason/<branch>` without touching live
+/// working-tree files outside a controlled commit.
+async fn mason_commit_branch(
+    source_root: &Path,
+    staged_product: &Path,
+    changed_files: &[String],
+    branch_name: &str,
+    spec_title: &str,
+    run_id: &str,
+) -> Result<()> {
+    // Capture the current branch so we can restore it.
+    let current_branch = {
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(source_root)
+            .output()
+            .await
+            .context("git rev-parse HEAD")?;
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Create and switch to the new branch.
+    let checkout = Command::new("git")
+        .args(["checkout", "-b", branch_name])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git checkout -b")?;
+    if !checkout.status.success() {
+        anyhow::bail!(
+            "git checkout -b {} failed: {}",
+            branch_name,
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+
+    // Copy each changed file from the staged workspace into the real repo.
+    for rel_path in changed_files {
+        let src = staged_product.join(rel_path);
+        let dst = source_root.join(rel_path);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::copy(&src, &dst)
+            .await
+            .with_context(|| format!("copying {} to branch workspace", rel_path))?;
+    }
+
+    // Stage changed files.
+    let mut add_args = vec!["add", "--"];
+    let file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+    add_args.extend(file_refs.iter());
+    let add = Command::new("git")
+        .args(&add_args)
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git add")?;
+    if !add.status.success() {
+        // Restore branch before bailing.
+        let _ = Command::new("git")
+            .args(["checkout", &current_branch])
+            .current_dir(source_root)
+            .output()
+            .await;
+        anyhow::bail!("git add failed: {}", String::from_utf8_lossy(&add.stderr));
+    }
+
+    // Commit.
+    let message = format!(
+        "mason: {} [run:{}]\n\nAutomated edit by Mason agent.\nSpec: {}\nRun: {}",
+        spec_title,
+        &run_id[..8],
+        spec_title,
+        run_id,
+    );
+    let commit = Command::new("git")
+        .args(["commit", "-m", &message])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git commit")?;
+    if !commit.status.success() {
+        let _ = Command::new("git")
+            .args(["checkout", &current_branch])
+            .current_dir(source_root)
+            .output()
+            .await;
+        anyhow::bail!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    // Restore original branch.
+    Command::new("git")
+        .args(["checkout", &current_branch])
+        .current_dir(source_root)
+        .output()
+        .await
+        .context("git checkout restore")?;
+
+    Ok(())
 }
 
 fn parse_mason_edit_proposal(raw: &str) -> Result<MasonEditProposal> {
@@ -15561,4 +15976,331 @@ fn render_agent_response_log(agent_executions: &[AgentExecution]) -> String {
         );
     }
     out
+}
+
+// ── Causal preflight guidance ─────────────────────────────────────────────────
+
+/// Extract ordered unique values of `col` from a slice of sqlx rows, preserving
+/// first-seen order (used to maintain newest-first cause ordering).
+fn indexmap_ordered_keys(rows: &[sqlx::sqlite::SqliteRow], col: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        let val = row.get::<String, _>(col);
+        if set.insert(val.clone()) {
+            seen.push(val);
+        }
+    }
+    seen
+}
+
+/// Translate spec-scoped causal history into concrete preflight checks,
+/// guardrails, and open questions that Mason and the other agents will see
+/// before touching any code.
+///
+/// This is the core of Phase 1 intelligence: instead of generic heuristics,
+/// Coobie's briefing says exactly what failed last time and what to do about it.
+fn apply_causal_preflight_guidance(
+    spec_causes: &[SpecCauseSignal],
+    required_checks: &mut Vec<String>,
+    recommended_guardrails: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    for cause in spec_causes {
+        let streak_prefix = if cause.streak_len >= 2 {
+            format!("[{} consecutive runs] ", cause.streak_len)
+        } else {
+            String::new()
+        };
+
+        match cause.cause_id.as_str() {
+            "SPEC_AMBIGUITY" => {
+                required_checks.push(format!(
+                    "{}SPEC_AMBIGUITY fired on {} prior run(s) of this spec — before implementation, \
+                     confirm that every acceptance criterion has an explicit pass/fail condition and \
+                     at least one failure-mode example.",
+                    streak_prefix, cause.occurrences,
+                ));
+                if cause.scenario_pass_rate < 0.5 {
+                    recommended_guardrails.push(
+                        "Spec clarity is historically low for this spec — require Scout to validate \
+                         acceptance criteria completeness before Mason begins.".to_string(),
+                    );
+                }
+                if cause.escalate {
+                    open_questions.push(format!(
+                        "SPEC_AMBIGUITY has fired {} consecutive times — does this spec need \
+                         structural rework rather than incremental clarification?",
+                        cause.streak_len,
+                    ));
+                }
+            }
+            "TEST_BLIND_SPOT" => {
+                required_checks.push(format!(
+                    "{}TEST_BLIND_SPOT fired on {} prior run(s) — include at least one explicit \
+                     failure-path test (expired credential, invalid input, permission boundary, \
+                     or timeout) in the acceptance criteria before this run proceeds.",
+                    streak_prefix, cause.occurrences,
+                ));
+                recommended_guardrails.push(
+                    "Visible tests have previously passed while hidden scenarios failed on this spec — \
+                     do not treat a green test suite as a proxy for scenario readiness.".to_string(),
+                );
+                if cause.escalate {
+                    open_questions.push(format!(
+                        "TEST_BLIND_SPOT has fired {} times on this spec — are the acceptance \
+                         criteria systematically missing failure-mode coverage, or is the test \
+                         strategy itself misaligned with Sable's adversarial lens?",
+                        cause.streak_len,
+                    ));
+                }
+            }
+            "TWIN_GAP" => {
+                required_checks.push(format!(
+                    "{}TWIN_GAP fired on {} prior run(s) — enumerate which production conditions \
+                     (auth expiry, third-party errors, network partitions) are NOT simulated in \
+                     the twin before Mason writes code that depends on them.",
+                    streak_prefix, cause.occurrences,
+                ));
+                recommended_guardrails.push(
+                    "Twin fidelity has been a recurring gap on this spec — treat every external \
+                     dependency as a stub risk and call it out explicitly in the twin narrative.".to_string(),
+                );
+            }
+            "NO_PRIOR_MEMORY" => {
+                recommended_guardrails.push(format!(
+                    "{}Memory retrieval was insufficient on {} prior run(s) of this spec — \
+                     seed Coobie memory with domain context before re-attempting if the \
+                     semantic retrieval hit count is still low.",
+                    streak_prefix, cause.occurrences,
+                ));
+            }
+            "BROAD_SCOPE" => {
+                required_checks.push(format!(
+                    "{}BROAD_SCOPE fired on {} prior run(s) — confirm this run's deliverable \
+                     is the minimum scope that satisfies the acceptance criteria; flag any \
+                     out-of-scope agent activity for Mason to avoid.",
+                    streak_prefix, cause.occurrences,
+                ));
+                if cause.escalate {
+                    open_questions.push(format!(
+                        "BROAD_SCOPE has escalated after {} consecutive runs — should this spec \
+                         be split into smaller deliverables before the next attempt?",
+                        cause.streak_len,
+                    ));
+                }
+            }
+            "PACK_BREAKDOWN" => {
+                required_checks.push(format!(
+                    "{}PACK_BREAKDOWN fired on {} prior run(s) — identify which Labrador phase \
+                     degraded last time and verify its prompt bundle and provider route before \
+                     starting this run.",
+                    streak_prefix, cause.occurrences,
+                ));
+                if cause.escalate {
+                    open_questions.push(format!(
+                        "PACK_BREAKDOWN has recurred {} consecutive times — is the pack's phase \
+                         sequencing or agent routing structurally misaligned with this spec type?",
+                        cause.streak_len,
+                    ));
+                }
+            }
+            _ => {
+                // Unknown cause ID — surface it generically so it's not silently dropped.
+                recommended_guardrails.push(format!(
+                    "{}Causal pattern '{}' fired on {} prior run(s) of this spec — \
+                     review the causal_report.json from the last run before proceeding.",
+                    streak_prefix, cause.cause_id, cause.occurrences,
+                ));
+            }
+        }
+    }
+}
+
+// ── Causal feedback loop ──────────────────────────────────────────────────────
+//
+// After every run, Coobie's causal report and Sable's scenario rationale are
+// written back into the project memory store as structured entries. On the next
+// run the semantic retrieval layer finds them, so Coobie's pre-run guidance
+// improves automatically without any manual curation.
+
+/// Build a structured memory entry from a completed CausalReport.
+/// Stored in project memory, tagged so semantic search can surface it.
+fn causal_report_to_memory_entry(
+    report: &crate::coobie::CausalReport,
+    spec_id: &str,
+    spec_title: &str,
+) -> (String, Vec<String>, String, String, crate::memory::MemoryProvenance) {
+    let id = format!("causal-{}-{}", spec_id, &report.run_id[..report.run_id.len().min(8)]);
+
+    let mut tags = vec![
+        "causal".to_string(),
+        format!("spec:{}", spec_id),
+        format!("run:{}", &report.run_id[..report.run_id.len().min(8)]),
+    ];
+    if let Some(ref cause) = report.primary_cause {
+        // e.g. "SPEC_AMBIGUITY" → tag "cause:spec_ambiguity"
+        tags.push(format!("cause:{}", cause.split_whitespace().next().unwrap_or("unknown").to_lowercase()));
+    }
+    if report.episode_scores.scenario_passed {
+        tags.push("outcome:scenario_passed".to_string());
+    } else {
+        tags.push("outcome:scenario_failed".to_string());
+    }
+    if report.episode_scores.validation_passed {
+        tags.push("outcome:validation_passed".to_string());
+    }
+    for streak in &report.streaks {
+        tags.push(format!("streak:{}", streak.cause_id.to_lowercase()));
+        if streak.escalate {
+            tags.push("escalation-required".to_string());
+        }
+    }
+
+    let pass_label = if report.episode_scores.scenario_passed && report.episode_scores.validation_passed {
+        "passed"
+    } else if report.episode_scores.validation_passed {
+        "validation-only"
+    } else {
+        "failed"
+    };
+
+    let summary = format!(
+        "Causal analysis for spec '{}' run {} — {} (primary: {:.0}% confidence)",
+        spec_title,
+        &report.run_id[..report.run_id.len().min(8)],
+        pass_label,
+        report.primary_confidence * 100.0,
+    );
+
+    let mut content = String::new();
+
+    // Primary cause
+    content.push_str(&format!("## Outcome: {}\n\n", pass_label));
+    if let Some(ref cause) = report.primary_cause {
+        content.push_str(&format!(
+            "**Primary cause** ({:.0}% confidence): {}\n\n",
+            report.primary_confidence * 100.0,
+            cause,
+        ));
+    } else {
+        content.push_str("No dominant cause identified.\n\n");
+    }
+
+    // Contributing causes
+    if !report.contributing_causes.is_empty() {
+        content.push_str("**Contributing causes:**\n");
+        for c in &report.contributing_causes {
+            content.push_str(&format!("- {}\n", c));
+        }
+        content.push('\n');
+    }
+
+    // Episode scores
+    let s = &report.episode_scores;
+    content.push_str("**Episode scores:**\n");
+    content.push_str(&format!("- spec_clarity: {:.2}\n", s.spec_clarity_score));
+    content.push_str(&format!("- change_scope: {:.2}\n", s.change_scope_score));
+    content.push_str(&format!("- twin_fidelity: {:.2}\n", s.twin_fidelity_score));
+    content.push_str(&format!("- test_coverage: {:.2}\n", s.test_coverage_score));
+    content.push_str(&format!("- memory_retrieval: {:.2}\n", s.memory_retrieval_score));
+    content.push_str(&format!("- phase_success: {:.2}\n\n", s.phase_success_score));
+
+    // Streak warnings — most important signal for future preflight
+    if !report.streaks.is_empty() {
+        content.push_str("**Recurring cause streaks:**\n");
+        for streak in &report.streaks {
+            content.push_str(&format!(
+                "- {} × {} runs{}\n",
+                streak.cause_id,
+                streak.streak_len,
+                if streak.escalate { " ⚠ ESCALATE to Scout" } else { "" },
+            ));
+        }
+        content.push('\n');
+    }
+
+    // Active deep signals
+    if let Some(ref deep) = report.deep_causality {
+        if !deep.active_signals.is_empty() {
+            content.push_str("**Active causal signals:**\n");
+            for sig in &deep.active_signals {
+                content.push_str(&format!(
+                    "- {} (strength {:.0}%): {}\n",
+                    sig.cause_id,
+                    sig.activation_strength * 100.0,
+                    sig.question,
+                ));
+            }
+            content.push('\n');
+        }
+    }
+
+    // Recommended interventions
+    if !report.recommended_interventions.is_empty() {
+        content.push_str("**Recommended interventions:**\n");
+        for plan in &report.recommended_interventions {
+            content.push_str(&format!("- [{}] {}\n", plan.target, plan.action));
+        }
+        content.push('\n');
+    }
+
+    let provenance = crate::memory::MemoryProvenance {
+        source_label: Some(format!("causal_report:{}", report.run_id)),
+        source_kind: Some("causal_report".to_string()),
+        source_run_id: Some(report.run_id.clone()),
+        source_spec_id: Some(spec_id.to_string()),
+        stale_when: vec![
+            "spec acceptance criteria change significantly".to_string(),
+            "twin environment is redesigned".to_string(),
+        ],
+        ..crate::memory::MemoryProvenance::default()
+    };
+
+    (id, tags, summary, content, provenance)
+}
+
+/// Build a structured memory entry from Sable's scenario generation rationale.
+fn sable_rationale_to_memory_entry(
+    rationale: &str,
+    spec_id: &str,
+    spec_title: &str,
+    run_id: &str,
+    scenarios_passed: bool,
+) -> (String, Vec<String>, String, String, crate::memory::MemoryProvenance) {
+    let id = format!("sable-rationale-{}-{}", spec_id, &run_id[..run_id.len().min(8)]);
+
+    let tags = vec![
+        "sable".to_string(),
+        "scenario-rationale".to_string(),
+        format!("spec:{}", spec_id),
+        format!("run:{}", &run_id[..run_id.len().min(8)]),
+        if scenarios_passed { "outcome:scenario_passed".to_string() } else { "outcome:scenario_failed".to_string() },
+    ];
+
+    let summary = format!(
+        "Sable scenario rationale for spec '{}' run {} — {}",
+        spec_title,
+        &run_id[..run_id.len().min(8)],
+        if scenarios_passed { "scenarios passed" } else { "scenarios failed" },
+    );
+
+    let content = format!(
+        "## Sable's Scenario Design Rationale\n\nSpec: {}\nRun: {}\nOutcome: {}\n\n{}",
+        spec_title,
+        run_id,
+        if scenarios_passed { "scenarios passed" } else { "scenarios failed" },
+        rationale.trim(),
+    );
+
+    let provenance = crate::memory::MemoryProvenance {
+        source_label: Some(format!("sable_rationale:{}", run_id)),
+        source_kind: Some("sable_rationale".to_string()),
+        source_run_id: Some(run_id.to_string()),
+        source_spec_id: Some(spec_id.to_string()),
+        stale_when: vec!["spec scope or acceptance criteria change significantly".to_string()],
+        ..crate::memory::MemoryProvenance::default()
+    };
+
+    (id, tags, summary, content, provenance)
 }

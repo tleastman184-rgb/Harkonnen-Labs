@@ -2,7 +2,7 @@ name: ash
 display_name: Ash
 role: twin_retriever
 # Uses setup default — environment provisioning is procedural, not reasoning-heavy
-provider: default
+provider: claude-haiku
 model_override: ~
 responsibilities:
   - provision_twins

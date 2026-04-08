@@ -242,6 +242,88 @@ impl MemoryStore {
         }
     }
 
+    /// Hybrid retrieval: semantic cosine search (primary) blended with historical
+    /// success/failure scores. Falls back to `retrieve_context` on any error so
+    /// the pipeline never stalls because of an embedding failure.
+    pub async fn retrieve_context_hybrid(
+        &self,
+        query: &str,
+        embedding_store: &crate::embeddings::EmbeddingStore,
+    ) -> Result<Vec<String>> {
+        self.ensure_fresh_index().await?;
+
+        let index_path = self.root.join("index.json");
+        if !index_path.exists() {
+            return Ok(vec![
+                "Memory not initialized. Run: harkonnen memory init".to_string()
+            ]);
+        }
+
+        let index = read_memory_index(&index_path).await?;
+        if index.entries.is_empty() {
+            return Ok(vec![format!("No memories found for: {query}")]);
+        }
+
+        let memory_root = self.root.display().to_string();
+
+        // Ensure all entries have stored embeddings (incremental — skips existing).
+        if let Err(e) = embedding_store
+            .ensure_embedded(&index.entries, &memory_root)
+            .await
+        {
+            tracing::warn!("embed failed, falling back to keyword search: {e}");
+            return self.retrieve_context(query).await;
+        }
+
+        // Cosine search — top 20 candidates.
+        let semantic_hits = match embedding_store
+            .query_semantic(query, &memory_root, 20)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("semantic query failed, falling back to keyword search: {e}");
+                return self.retrieve_context(query).await;
+            }
+        };
+
+        // Build a lookup map from entry id → entry.
+        let entry_map: std::collections::HashMap<&str, &MemoryEntry> =
+            index.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+
+        let q = query.to_lowercase();
+
+        // Blend semantic score (dominant) with historical signal and keyword bonus.
+        let mut results: Vec<(f32, &MemoryEntry)> = semantic_hits
+            .into_iter()
+            .filter_map(|(sem_score, id)| {
+                let entry = entry_map.get(id.as_str()).copied()?;
+                let historical = (entry.contributed_to_success_count * 10
+                    - entry.contributed_to_failure_count * 4
+                    + entry.recall_count.min(20)) as f32;
+                let kw_bonus = if memory_matches(entry, &q) { 10.0 } else { 0.0 };
+                let blended = sem_score * 100.0 + historical + kw_bonus;
+                Some((blended, entry))
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let rendered = results
+            .into_iter()
+            .map(|(_, entry)| {
+                let snippet = &entry.content[..entry.content.len().min(400)];
+                format!("[{}] {}\n{}", entry.id, entry.summary, snippet)
+            })
+            .collect::<Vec<_>>();
+
+        if rendered.is_empty() {
+            Ok(vec![format!("No memories found for: {query}")])
+        } else {
+            Ok(rendered)
+        }
+    }
+
     /// Write a new memory entry as a markdown file and reindex.
     pub async fn store(
         &self,

@@ -419,6 +419,25 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
         }
         MemoryCommands::Init => {
             app.memory_store.init(&app.paths.setup).await?;
+
+            // Pre-embed all memory entries so semantic search is ready immediately
+            // on the next run. The model downloads once (~33MB) on first call.
+            match &app.embedding_store {
+                Some(es) => {
+                    let entries = app.memory_store.list_entries().await?;
+                    let root = app.memory_store.root.display().to_string();
+                    let count = entries.len();
+                    print!("Embedding {count} memory entries for semantic search...");
+                    match es.ensure_embedded(&entries, &root).await {
+                        Ok(()) => println!(" done."),
+                        Err(e) => println!("\nEmbedding failed (will retry on next run): {e}"),
+                    }
+                }
+                None => {
+                    println!("Semantic embedding unavailable — memory init complete without embeddings.");
+                    println!("Embeddings will be generated automatically on the next `cargo run`.");
+                }
+            }
         }
         MemoryCommands::Search(args) => {
             let hits = app.memory_store.retrieve_context(&args.query).await?;
@@ -648,6 +667,11 @@ fn handle_setup_check(paths: &Paths) -> Result<()> {
     print_provider_status("claude", s.providers.claude.as_ref());
     print_provider_status("gemini", s.providers.gemini.as_ref());
     print_provider_status("codex", s.providers.codex.as_ref());
+    let mut extra_names: Vec<&String> = s.providers.extras.keys().collect();
+    extra_names.sort();
+    for name in extra_names {
+        print_provider_status(name, s.providers.extras.get(name));
+    }
 
     print_agent_routing(paths, s)?;
 

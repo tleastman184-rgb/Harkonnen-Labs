@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::path::Path;
 
+use crate::llm::{self, LlmRequest, Message};
 use crate::models::{
     AgentExecution, HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary,
     RunEvent, TwinEnvironment, ValidationSummary,
 };
+use crate::setup::SetupConfig;
+use crate::models::Spec;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttemptThreshold {
@@ -488,4 +491,197 @@ fn read_json_artifact(path: &Path) -> std::result::Result<JsonValue, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("could not parse {}: {e}", path.display()))
+}
+
+// ── Sable LLM-generated scenarios ────────────────────────────────────────────
+
+/// Serde shape for what Sable returns from her LLM call.
+#[derive(Debug, Deserialize, Serialize)]
+struct SableGeneratedCheck {
+    kind: String,
+    // optional fields used by different check kinds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contains_all: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    equals: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SableGeneratedScenario {
+    id: String,
+    title: String,
+    description: String,
+    checks: Vec<SableGeneratedCheck>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SableGeneratedPayload {
+    scenarios: Vec<SableGeneratedScenario>,
+    rationale: String,
+}
+
+/// Convert Sable's generated checks into the typed `HiddenScenarioCheck` enum.
+fn parse_sable_check(check: &SableGeneratedCheck) -> Option<HiddenScenarioCheck> {
+    match check.kind.as_str() {
+        "validation_passed" => Some(HiddenScenarioCheck::ValidationPassed),
+        "exploration_log_exists" => Some(HiddenScenarioCheck::ExplorationLogExists),
+        "artifact_exists" => check.path.as_ref().map(|p| HiddenScenarioCheck::ArtifactExists {
+            path: p.clone(),
+        }),
+        "agent_executed" => check.agent.as_ref().map(|a| HiddenScenarioCheck::AgentExecuted {
+            agent: a.clone(),
+        }),
+        "event_present" => match (&check.phase, &check.agent) {
+            (Some(phase), Some(agent)) => Some(HiddenScenarioCheck::EventPresent {
+                phase: phase.clone(),
+                agent: agent.clone(),
+            }),
+            _ => None,
+        },
+        "artifact_contains_all" => match (&check.path, &check.contains_all) {
+            (Some(path), Some(needles)) if !needles.is_empty() => {
+                Some(HiddenScenarioCheck::ArtifactContainsAll {
+                    path: path.clone(),
+                    contains_all: needles.clone(),
+                })
+            }
+            _ => None,
+        },
+        _ => {
+            tracing::warn!("Sable generated unknown check kind '{}' — skipping", check.kind);
+            None
+        }
+    }
+}
+
+/// Ask Sable (claude-opus) to generate hidden scenarios for this run, then
+/// evaluate them using the standard deterministic evaluator.
+///
+/// Returns `None` if Sable is not configured or the LLM call fails — the
+/// caller should treat that as "no scenarios available."
+pub async fn sable_generate_and_evaluate(
+    spec: &Spec,
+    setup: &SetupConfig,
+    run_status: &str,
+    run_attempt: usize,
+    events: &[RunEvent],
+    validation: &ValidationSummary,
+    twin: &TwinEnvironment,
+    agent_executions: &[AgentExecution],
+    run_dir: &Path,
+) -> Option<(HiddenScenarioSummary, String)> {
+    let provider = llm::build_provider("sable", "claude-opus", setup)?;
+
+    // Collect available artifacts so Sable knows what she can check against.
+    let artifacts: Vec<String> = std::fs::read_dir(run_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    let agents_ran: Vec<&str> = agent_executions.iter().map(|a| a.agent_name.as_str()).collect();
+    let spec_yaml = serde_yaml::to_string(spec).unwrap_or_default();
+    let validation_summary = serde_json::to_string_pretty(validation).unwrap_or_default();
+
+    let system = "You are Sable, a hidden scenario evaluator for a software factory. \
+Your job is to generate adversarial but fair hidden scenarios that verify a run did what the spec actually asked — \
+not just that it didn't crash. \
+Respond with a single raw JSON object only. No prose, no markdown fences. \
+Schema: {\"scenarios\": [{\"id\": \"string\", \"title\": \"string\", \"description\": \"string\", \
+\"checks\": [{\"kind\": \"string\", ...}]}], \"rationale\": \"string\"}. \
+Available check kinds and their required fields: \
+validation_passed (no extra fields); \
+artifact_exists {path: \"filename\"}; \
+agent_executed {agent: \"name\"}; \
+event_present {phase: \"name\", agent: \"name\"}; \
+artifact_contains_all {path: \"filename\", contains_all: [\"snippet1\", \"snippet2\"]}; \
+exploration_log_exists (no extra fields). \
+Generate 2-4 scenarios. Each scenario should have 1-3 checks. \
+Only reference artifacts that are listed in AVAILABLE ARTIFACTS. \
+Only reference agents listed in AGENTS THAT RAN. \
+Be adversarial: check that the spec's core acceptance criteria are actually met, not just that the pipeline ran.";
+
+    let user = format!(
+        "SPEC:\n```yaml\n{spec_yaml}```\n\n\
+RUN STATUS: {run_status}\n\
+RUN ATTEMPT: {run_attempt}\n\n\
+VISIBLE VALIDATION:\n```json\n{validation_summary}```\n\n\
+AGENTS THAT RAN: {agents_list}\n\n\
+AVAILABLE ARTIFACTS:\n{artifact_list}\n\n\
+Generate hidden scenarios that verify the spec's acceptance criteria were genuinely met. \
+Focus on what could pass visible validation but still fail the spec's intent.",
+        agents_list = agents_ran.join(", "),
+        artifact_list = artifacts
+            .iter()
+            .map(|a| format!("- {a}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let req = LlmRequest {
+        messages: vec![Message::system(system), Message::user(user)],
+        max_tokens: 2000,
+        temperature: 0.3,
+    };
+
+    let raw = match provider.complete(req).await {
+        Ok(resp) => resp.content,
+        Err(e) => {
+            tracing::warn!("Sable LLM call failed: {e}");
+            return None;
+        }
+    };
+
+    // Parse Sable's response.
+    let stripped = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let payload: SableGeneratedPayload = match serde_json::from_str(stripped) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Sable returned invalid JSON ({}): {}", e, &raw[..raw.len().min(300)]);
+            return None;
+        }
+    };
+
+    // Convert Sable's generated scenarios into typed HiddenScenarioFile entries.
+    let definitions: Vec<HiddenScenarioFile> = payload
+        .scenarios
+        .iter()
+        .map(|s| HiddenScenarioFile {
+            id: s.id.clone(),
+            spec_id: spec.id.clone(),
+            title: s.title.clone(),
+            description: s.description.clone(),
+            checks: s
+                .checks
+                .iter()
+                .filter_map(parse_sable_check)
+                .collect(),
+        })
+        .collect();
+
+    let summary = evaluate_hidden_scenarios(
+        &definitions,
+        run_status,
+        run_attempt,
+        events,
+        validation,
+        twin,
+        agent_executions,
+        run_dir,
+    );
+
+    Some((summary, payload.rationale))
 }

@@ -18,11 +18,24 @@ pub async fn stage_target_workspace(source: &Path, workspace_root: &Path) -> Res
 
     let destination = workspace_root.join("product");
     tokio::fs::create_dir_all(&destination).await?;
-    copy_dir_all(source, &destination)?;
+
+    // Canonicalize both paths so we can detect if destination is inside source
+    // and exclude that subtree from the copy to prevent recursive explosion.
+    let source_canon = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let dest_canon = destination
+        .canonicalize()
+        .unwrap_or_else(|_| destination.to_path_buf());
+
+    copy_dir_all(source, &destination, &source_canon, &dest_canon)?;
     Ok(destination)
 }
 
-fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
+fn copy_dir_all(
+    source: &Path,
+    destination: &Path,
+    source_canon: &Path,
+    dest_canon: &Path,
+) -> Result<()> {
     for entry in fs::read_dir(source)
         .with_context(|| format!("reading source directory {}", source.display()))?
     {
@@ -37,6 +50,17 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
 
+        // Skip if this source path is a prefix of or equal to the destination
+        // (prevents copying the workspace into itself when product path == repo root).
+        if file_type.is_dir() {
+            let entry_canon = source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source_path.clone());
+            if dest_canon.starts_with(&entry_canon) || entry_canon.starts_with(dest_canon) {
+                continue;
+            }
+        }
+
         if file_type.is_dir() {
             fs::create_dir_all(&destination_path).with_context(|| {
                 format!(
@@ -44,7 +68,7 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
                     destination_path.display()
                 )
             })?;
-            copy_dir_all(&source_path, &destination_path)?;
+            copy_dir_all(&source_path, &destination_path, source_canon, dest_canon)?;
         } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path).with_context(|| {
                 format!(

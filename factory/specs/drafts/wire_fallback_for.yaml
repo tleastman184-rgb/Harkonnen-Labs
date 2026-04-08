@@ -1,0 +1,88 @@
+id: wire-fallback-for
+title: Wire CapacityState::fallback_for into build_provider_with_capacity
+purpose: >
+  The fallback_for method on CapacityState is defined but never called.
+  build_provider_with_capacity manually walks the fallback_chain instead of
+  using it. This spec asks Mason to refactor build_provider_with_capacity so it
+  uses fallback_for to resolve the next available provider, eliminating the
+  dead code warning and keeping the two implementations in sync.
+scope:
+  - refactor build_provider_with_capacity in src/llm.rs to call fallback_for
+  - remove the manual fallback_chain walk that duplicates fallback_for logic
+  - keep all existing provider-selection behavior intact
+  - eliminate the dead_code warning on CapacityState::fallback_for
+constraints:
+  - only modify src/llm.rs and src/capacity.rs
+  - do not change the public API of build_provider or build_provider_with_capacity
+  - do not change provider selection order or fallback behavior
+  - all existing callers must continue to compile
+inputs:
+  - src/llm.rs — build_provider_with_capacity implementation
+  - src/capacity.rs — CapacityState and fallback_for definition
+outputs:
+  - src/llm.rs with refactored build_provider_with_capacity
+  - no compiler warnings about unused fallback_for
+acceptance_criteria:
+  - cargo check passes with no errors
+  - fallback_for is called from build_provider_with_capacity
+  - the dead_code warning on fallback_for is gone
+  - provider selection behavior is unchanged
+forbidden_behaviors:
+  - changing the function signatures of build_provider or build_provider_with_capacity
+  - removing fallback_for from CapacityState
+  - modifying files outside src/llm.rs and src/capacity.rs
+rollback_requirements:
+  - staged workspace only — do not modify the live source files directly
+dependencies:
+  - rust
+  - cargo
+performance_expectations:
+  - cargo check should complete in under 60 seconds
+security_expectations:
+  - no secrets or credentials introduced
+project_components:
+  - name: llm_provider_builder
+    role: code_under_test
+    kind: source_file
+    path: src/llm.rs
+    notes:
+      - build_provider_with_capacity is the target function
+      - currently walks fallback_chain manually instead of using fallback_for
+  - name: capacity_state
+    role: code_under_test
+    kind: source_file
+    path: src/capacity.rs
+    notes:
+      - fallback_for is defined but never called (dead_code warning)
+      - should be the single source of truth for fallback resolution
+test_commands:
+  - cargo check --quiet
+worker_harness:
+  adapter: rust
+  profile: standard
+  llm_edits: true
+  git_branch: true
+  allowed_components:
+    - llm_provider_builder
+    - capacity_state
+  denied_paths:
+    - factory/
+    - .harkonnen/
+    - target/
+  visible_success_conditions:
+    - cargo check passes
+    - fallback_for is referenced in llm.rs
+  return_artifacts:
+    - src/llm.rs
+    - src/capacity.rs
+scenario_blueprint:
+  pattern: refactor_dead_code
+  objective: wire fallback_for into build_provider_with_capacity and verify cargo check passes
+  code_under_test:
+    - src/llm.rs
+    - src/capacity.rs
+  coobie_memory_topics:
+    - capacity
+    - fallback
+    - provider
+    - llm

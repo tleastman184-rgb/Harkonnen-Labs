@@ -25,9 +25,22 @@ openclaw    = true
 # ignore the default provider but can still be overridden deliberately.
 
 [providers]
-default = "claude"
+default = "claude-sonnet"
 
-[providers.claude]
+# ── Claude tiers ──────────────────────────────────────────────────────────────
+# Three named providers, one per capability tier.
+# Agents are routed to the tier that matches their role — not just one model
+# for everything. This keeps costs sensible and reserves Opus for judgment work.
+
+[providers.claude-opus]
+type         = "anthropic"
+model        = "claude-opus-4-6"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+[providers.claude-sonnet]
 type         = "anthropic"
 model        = "claude-sonnet-4-6"
 api_key_env  = "ANTHROPIC_API_KEY"
@@ -35,8 +48,15 @@ enabled      = true
 usage_rights = "standard"
 surface      = "claude-code"
 
-# Gemini remains configured for later reuse, but default routing is temporarily moved off it while the local quota window is exhausted.
-# Gemini quota is constrained on this machine until the reset window passes.
+[providers.claude-haiku]
+type         = "anthropic"
+model        = "claude-haiku-4-5-20251001"
+api_key_env  = "ANTHROPIC_API_KEY"
+enabled      = true
+usage_rights = "standard"
+surface      = "claude-code"
+
+# ── Other providers ───────────────────────────────────────────────────────────
 
 [providers.gemini]
 type         = "google"
@@ -55,15 +75,22 @@ usage_rights = "targeted"
 surface      = "vscode"
 
 # ── Agent Routing ─────────────────────────────────────────────────────────────
-# This is the clean place to decide which Labrador agent uses which engine on a
-# given machine. Keep generic agent profiles stable and let per-machine setup
-# files control routing.
+# Each agent is matched to the model tier that fits its role.
+#
+# Opus  — trusted judgment: spec interpretation (Scout), hidden scenario eval (Sable)
+# Sonnet — core reasoning: memory/causal (Coobie), code gen (Mason), test interp (Bramble), policy (Keeper)
+# Haiku  — mechanical/high-volume: tool execution (Piper), env provisioning (Ash), packaging (Flint)
 
 [routing.agents]
-# Spec interpretation, implementation, and policy stay on Claude for now.
-coobie = "claude"
-mason  = "claude"
-# scout, sable, keeper, bramble, piper, ash, and flint all resolve to Claude in this setup
+scout  = "claude-opus"
+sable  = "claude-opus"
+coobie = "claude-sonnet"
+mason  = "claude-sonnet"
+bramble = "claude-sonnet"
+keeper = "claude-sonnet"
+piper  = "claude-haiku"
+ash    = "claude-haiku"
+flint  = "claude-haiku"
 
 # ── MCP Servers ───────────────────────────────────────────────────────────────
 # Each entry maps a named MCP server into the agent tool boundary.

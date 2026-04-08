@@ -1,9 +1,23 @@
 target/
 .env
+
+# SQLite state — regenerated at runtime
 *.db
 *.db-shm
 *.db-wal
+
+# Generated indexes and caches — rebuilt by `harkonnen memory init`
+factory/memory/index.json
+**/project-memory/index.json
+
+# Factory runtime directories — not source
 factory/logs/
 factory/artifacts/
 factory/workspaces/
 products/
+
+# fastembed model cache — downloaded on first run, never committed
+.fastembed_cache/
+
+# Hugging Face model cache — lives at ~/.cache/huggingface/hub/ outside the repo
+# Listed here as documentation; not tracked by git.

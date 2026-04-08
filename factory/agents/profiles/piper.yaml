@@ -2,7 +2,7 @@ name: piper
 display_name: Piper
 role: tool_retriever
 # Uses setup default — mostly mechanical tool execution, not judgment-heavy
-provider: default
+provider: claude-haiku
 model_override: ~
 responsibilities:
   - run_tools

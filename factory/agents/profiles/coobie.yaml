@@ -3,7 +3,7 @@ display_name: Coobie
 role: memory_retriever
 # Uses setup default — on work-windows this routes to mcp:memory (server-memory);
 # on home-linux it can also use AnythingLLM for richer document RAG
-provider: default
+provider: claude-sonnet
 model_override: ~
 responsibilities:
   - retrieve_prior_specs
