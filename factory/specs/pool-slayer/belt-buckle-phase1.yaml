@@ -43,3 +43,12 @@ hidden_scenarios:
     description: RPC times out during position open — must roll back cleanly
   - id: mint_persistence_failure
     description: Disk write fails after position opens — must detect and alert
+
+exit_strategy:
+  trigger_sol_drop_1h_pct: -15
+  action: close_all_positions_then_swap_all_sol_to_usdc
+  swap_slippage_bps: 100
+  sol_reserve_post_swap: 0.25
+  retry_swap_attempts: 10
+  telegram_confirm_required: true
+  cannot_be_cancelled_once_triggered: true
