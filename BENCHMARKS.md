@@ -111,7 +111,7 @@ The first automation pass uses small wrapper scripts so each external benchmark 
 | --- | --- |
 | LongMemEval | `LONGMEMEVAL_DATASET`, optional `LONGMEMEVAL_MODE`, `LONGMEMEVAL_DIRECT_PROVIDER`, `LONGMEMEVAL_LIMIT`, `LONGMEMEVAL_OUTPUT_DIR`, `LONGMEMEVAL_OFFICIAL_EVAL_COMMAND`, `LONGMEMEVAL_OFFICIAL_EVAL_ROOT`, `LONGMEMEVAL_MIN_PROXY_EXACT`, `LONGMEMEVAL_MIN_PROXY_F1` |
 | LoCoMo | `LOCOMO_DATASET`, optional `LOCOMO_MODE`, `LOCOMO_ROOT`, `LOCOMO_LIMIT`, `LOCOMO_OUTPUT_DIR`, `LOCOMO_DIRECT_PROVIDER`, `LOCOMO_MIN_PROXY_SCORE` |
-| tau2-bench | `TAU2_BENCH_COMMAND`, optional `TAU2_BENCH_ROOT` |
+| tau2-bench | `TAU2_BENCH_COMMAND`, optional `TAU2_BENCH_ROOT`, `TAU2_BENCH_AUTOSTART_HARKONNEN`, `TAU2_BENCH_API_PORT`, `TAU2_BENCH_WAIT_SECS`, `TAU2_BENCH_HEALTH_PATH`, `TAU2_BENCH_SERVER_LOG` |
 | SWE-bench Verified | `SWEBENCH_COMMAND`, optional `SWEBENCH_ROOT` |
 | SWE-bench Pro | `SWEBENCH_PRO_COMMAND`, optional `SWEBENCH_PRO_ROOT` |
 | FRAMES | `FRAMES_DATASET`, optional `FRAMES_MODE`, `FRAMES_LIMIT`, `FRAMES_OUTPUT_DIR`, `FRAMES_DIRECT_PROVIDER`, `FRAMES_MIN_ACCURACY` |
@@ -193,6 +193,8 @@ Sources:
 
 Use for PackChat when Harkonnen is acting as a tool-using conversational agent under domain rules and policies.
 When reporting publicly, include trajectories or other run artifacts whenever possible.
+
+The repo wrapper at `scripts/benchmark-tau2.sh` now supports autostarting Harkonnen's API server and exporting a stable PackChat base URL into the external tau2 command. Set `TAU2_BENCH_AUTOSTART_HARKONNEN=1` to launch `cargo run -- serve`, then read `TAU2_BENCH_HARKONNEN_BASE_URL` or `HARKONNEN_BENCH_BASE_URL` inside your tau2 adapter command.
 
 Sources:
 

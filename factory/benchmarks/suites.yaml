@@ -167,7 +167,9 @@ suites:
       - "TAU2_BENCH_COMMAND"
     setup_notes:
       - "Clone tau2-bench locally and point TAU2_BENCH_ROOT at that checkout if desired."
-      - "Set TAU2_BENCH_COMMAND to the exact command that runs the Harkonnen agent adapter."
+      - "Set TAU2_BENCH_COMMAND to the exact command that runs the Harkonnen agent adapter. The wrapper exports TAU2_BENCH_HARKONNEN_BASE_URL and HARKONNEN_BENCH_BASE_URL for that command."
+      - "Optionally set TAU2_BENCH_AUTOSTART_HARKONNEN=1 to launch `cargo run -- serve --port <port>` automatically before the benchmark."
+      - "Optionally set TAU2_BENCH_API_PORT, TAU2_BENCH_WAIT_SECS, TAU2_BENCH_HEALTH_PATH, and TAU2_BENCH_SERVER_LOG to control local PackChat startup behavior."
       - "Publish the benchmark domain mix used for the score: retail, airline, and telecom."
     tags:
       - "external"

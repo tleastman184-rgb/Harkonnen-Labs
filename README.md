@@ -188,7 +188,7 @@ All scores are pending first runs. The comparison targets listed are the systems
 
 | Benchmark | Subsystem | Metric | Harkonnen | Competitor baseline | Comparison target | Status | Phase |
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
-| tau2-bench | PackChat | Pass^1 / Pass^4 | pending | pending | raw LLM | planned | Phase 1+ |
+| tau2-bench | PackChat | Pass^1 / Pass^4 | pending | pending | raw LLM | launcher wired | Phase 1+ |
 | GAIA Level 3 | Full factory (Scout → Sable) | Task completion | pending | pending | General agent frameworks | planned | Phase 6 |
 | AgentBench (OS / DB / web) | Labrador roles | Env pass rate | pending | pending | Single-generalist frameworks | planned | Phase 6 |
 
