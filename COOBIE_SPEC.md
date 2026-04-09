@@ -9,14 +9,53 @@ It sits one layer below [COOBIE.md](./COOBIE.md):
 
 ## Current implementation notes
 
-The repo now implements an important subset of this design already:
+The repo implements a substantial and growing subset of this design. Phase 1 is complete.
 
-- file-backed durable memory with indexed Markdown notes
-- extracted ingest from files and URLs into either core memory or repo-local project memory
-- repo-local causal evidence bundles and annotation validation for teaching Coobie pattern examples and cause/effect windows
+**Memory foundations (live):**
+
+- file-backed durable memory with indexed Markdown notes (`factory/memory/`)
+- extracted ingest from files and URLs into core or repo-local project memory
+- repo-local causal evidence bundles and annotation validation under `.harkonnen/evidence/`
 - project continuity artifacts under `.harkonnen/` for external repos
 - exploration logs, dead-end registry, stale-memory mitigation history, and retriever-forge evidence that Coobie can cite during preflight
-- self-tuning manifest signals such as recall counts, load counts, and contribution counts
+- self-tuning manifest signals — recall counts, load counts, and contribution counts
+- hybrid vector + keyword retrieval via fastembed or OpenAI-compatible embeddings with SQLite vector store (`src/embeddings.rs`)
+
+**Causal reasoning (live):**
+
+- causal reasoning Phase 1 — heuristic rules, episode scoring, causal report output (`src/coobie.rs`)
+- causal streaks — causes that fire repeatedly across runs are escalated in the preflight briefing
+- cross-run pattern detection — identifies causes that cluster on specific spec types or phases
+- Phase 3 preflight guidance — spec-scoped cause history drives `required_checks`, `guardrails`, and `open_questions` before each run
+- causal feedback loop — Sable's scenario rationale is written back to project memory as evidence after each run
+
+**Coobie Palace (live — `src/coobie_palace.rs`):**
+
+The Palace is a compound recall projection layer over causal memory — not a second memory
+store, but a read-only grouping of existing causal signals into **Dens** that Coobie
+**Patrols** before every run. A **Scent** is computed per den (a context bundle from
+related cause signals); the **PatchPatrol** result is a compound weight across all dens
+that elevates den-level streak weight beyond individual cause streaks.
+
+The five dens and their residents:
+
+| Den | Residents | Description |
+| --- | --- | --- |
+| Spec Den | `SPEC_AMBIGUITY`, `BROAD_SCOPE` | Failures from unclear or over-scoped specs |
+| Test Den | `TEST_BLIND_SPOT` | Visible tests passed but hidden scenarios found failures |
+| Twin Den | `TWIN_GAP` | Simulated environment did not match production |
+| Pack Den | `PACK_BREAKDOWN` | Degraded or incomplete Labrador phase execution |
+| Memory Den | `NO_PRIOR_MEMORY` | Factory ran cold with no relevant prior context |
+
+Palace output injects into the same briefing points as flat causal preflight guidance —
+`required_checks`, `guardrails`, `open_questions` — so the Pack Board and preflight prompts
+see compound den-level context, not just individual cause scores.
+
+**Planned next (by phase):**
+
+- Phase 4 — causal link table in SQLite (`from_event_id`, `to_event_id`, `relation`, `confidence`); `state_before`/`state_after` in episode records; Pearl hierarchy labeling in `diagnose` output; multi-hop retrieval chain; memory invalidation/fact-update tracking
+- Phase 5 — operator-reviewed consolidation Workbench; causal attribution accuracy seeded failure corpus
+- Phase 6 — TypeDB 3.x semantic layer (Layer C); real causaloids from the causal link table (DeepCausality Phase 2)
 
 The sections below still describe the target architecture, but they should be read as a layered build plan on top of a non-trivial current implementation, not a greenfield spec.
 
@@ -172,7 +211,7 @@ Recommended local backing:
 Purpose:
 
 - store stable facts, abstractions, invariants, and learned procedures
-- support typed queries and rule-based inference
+- support typed queries and function-backed semantic reasoning
 - hold what should still matter next week
 
 This is the best place for TypeDB.
@@ -195,10 +234,12 @@ Role of TypeDB:
 - typed schema
 - subtyping and polymorphism
 - explicit typed relations
-- rule-based inference
+- function-backed semantic reasoning in TypeDB 3.x
 - query-time reasoning over a knowledge graph instead of brittle app-side joins
 
-TypeDB should not be the hot path buffer. It is the durable semantic layer.
+TypeDB 3.x is now a much better fit for a Rust-first stack than older JVM-era
+assumptions implied, but it is still an external database service with real ops
+cost. TypeDB should not be the hot path buffer. It is the durable semantic layer.
 
 ### Layer D: Causal Graph
 
@@ -342,8 +383,14 @@ Role:
 Role:
 
 - durable semantic graph
-- typed relations and rule engine
+- typed relations and TypeDB 3.x function-backed reasoning
 - inferred higher-order lessons
+
+Integration note:
+
+- prefer the official TypeDB 3.x Rust-facing driver surface behind a local adapter
+- keep SQLite as the fast local run/episode store
+- do not assume TypeDB is embedded into the Rust process just because the core is now Rust
 
 ### Qdrant
 
@@ -402,7 +449,7 @@ Suggested responsibilities:
 - `blackboard.rs`: role-scoped team memory surfaces
 - `retrieval.rs`: hybrid retrieval orchestration
 - `extraction.rs`: PDF/OCR/document text extraction
-- `td.rs`: TypeDB adapter and query helpers
+- `td.rs`: TypeDB 3.x adapter and query helpers
 - `qdrant.rs`: Qdrant indexing and semantic lookup
 - `redis.rs`: optional hot-state backend
 
@@ -492,9 +539,9 @@ pub enum CausalLinkKind {
 }
 ```
 
-## TypeDB Schema Sketch
+## TypeDB 3 Schema Sketch
 
-TypeDB should hold the durable semantic graph and rule layer.
+TypeDB should hold the durable semantic graph and function-backed reasoning layer.
 
 The following is an implementation sketch, not a final locked schema.
 
@@ -665,7 +712,7 @@ Recommended approach:
 3. add micro- and run-level consolidation
 4. add local extraction pipeline
 5. add Qdrant integration for semantic acceleration
-6. add TypeDB semantic graph layer
+6. add TypeDB 3.x semantic graph layer
 7. add Redis only if hot shared-state pressure justifies it
 
 ## Strongest Implementation Rule

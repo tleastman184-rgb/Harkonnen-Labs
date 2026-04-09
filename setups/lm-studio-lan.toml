@@ -1,0 +1,55 @@
+# LM Studio LAN setup
+# Points at an LM Studio instance on another machine on the local network.
+#
+# On the LM Studio machine:
+#   1. Local Server tab → Host: change 127.0.0.1 to 0.0.0.0
+#   2. Start Server (default port 1234)
+#   3. Allow inbound TCP 1234 through the firewall if needed
+#
+# On this machine:
+#   export LM_STUDIO_API_KEY=lm-studio
+#   export LM_STUDIO_LAN_HOST=192.168.1.50   # replace with actual LAN IP
+#   export HARKONNEN_SETUP=lm-studio-lan
+#   cargo run -- setup check
+#
+# The base_url below uses a placeholder — replace 192.168.1.50 with the
+# actual LAN IP of the machine running LM Studio, or set an env var and
+# reference it here once Harkonnen supports env interpolation in TOML.
+
+[setup]
+name        = "lm-studio-lan"
+platform    = "linux"
+anythingllm = false
+openclaw    = false
+
+[providers]
+default = "codex"
+
+[providers.codex]
+type         = "openai"
+model        = "crow-9b-opus-4.6-distill-heretic_qwen3.5"
+api_key_env  = "LM_STUDIO_API_KEY"
+enabled      = true
+usage_rights = "local"
+surface      = "lm-studio"
+base_url     = "http://192.168.1.50:1234"   # <-- update to actual LAN IP
+
+[providers.embedding]
+type         = "openai"
+model        = "text-embedding-nomic-embed-text-v1.5"
+api_key_env  = "LM_STUDIO_API_KEY"
+enabled      = true
+usage_rights = "local"
+surface      = "lm-studio"
+base_url     = "http://192.168.1.50:1234"   # <-- update to actual LAN IP
+
+[routing.agents]
+scout   = "codex"
+sable   = "codex"
+keeper  = "codex"
+coobie  = "codex"
+mason   = "codex"
+bramble = "codex"
+piper   = "codex"
+ash     = "codex"
+flint   = "codex"

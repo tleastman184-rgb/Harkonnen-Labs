@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::time::Duration;
 
 use crate::capacity::CapacityState;
@@ -116,6 +117,7 @@ pub fn build_provider_with_capacity(
             "openai" | "codex" => Box::new(OpenAiClient {
                 api_key,
                 model: provider_cfg.model.clone(),
+                base_url: openai_chat_completions_url(provider_cfg.base_url.as_deref()),
                 http: build_http_client(),
             }),
             _ => continue,
@@ -127,9 +129,32 @@ pub fn build_provider_with_capacity(
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(http_timeout_secs()))
         .build()
         .expect("failed to build HTTP client")
+}
+
+fn http_timeout_secs() -> u64 {
+    env::var("HARKONNEN_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120)
+}
+
+fn openai_chat_completions_url(base_url: Option<&str>) -> String {
+    let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "https://api.openai.com/v1/chat/completions".to_string();
+    };
+
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
+    }
 }
 
 // ── Anthropic ─────────────────────────────────────────────────────────────────
@@ -384,6 +409,7 @@ impl LlmProvider for GeminiClient {
 struct OpenAiClient {
     api_key: String,
     model: String,
+    base_url: String,
     http: reqwest::Client,
 }
 
@@ -437,7 +463,7 @@ impl LlmProvider for OpenAiClient {
 
         let resp = self
             .http
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(&self.base_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
             .json(&body)
@@ -461,5 +487,42 @@ impl LlmProvider for OpenAiClient {
             .join("");
 
         Ok(LlmResponse { content })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openai_chat_completions_url;
+
+    #[test]
+    fn openai_base_url_defaults_to_public_api() {
+        assert_eq!(
+            openai_chat_completions_url(None),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_base_url_appends_v1_chat_completions() {
+        assert_eq!(
+            openai_chat_completions_url(Some("http://localhost:11434")),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_base_url_respects_existing_v1_suffix() {
+        assert_eq!(
+            openai_chat_completions_url(Some("https://openrouter.ai/api/v1")),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_base_url_accepts_full_endpoint() {
+        assert_eq!(
+            openai_chat_completions_url(Some("http://localhost:1234/v1/chat/completions")),
+            "http://localhost:1234/v1/chat/completions"
+        );
     }
 }

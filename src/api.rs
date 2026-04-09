@@ -1,7 +1,10 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -11,10 +14,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as _;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::{
+    chat::{dispatch_message, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
     models::{
         AgentExecution, BlackboardState, CoobieBriefing, EvidenceAnnotation,
@@ -538,6 +544,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))
         .route("/api/runs/:id/events", get(get_run_events))
+        .route("/api/runs/:id/events/stream", get(get_run_events_stream))
         .route("/api/runs/:id/blackboard", get(get_run_blackboard))
         .route(
             "/api/runs/:id/blackboard/:role",
@@ -559,6 +566,15 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/coobie/query", post(post_coobie_query))
         .route("/api/agents/:id/chat", post(post_agent_chat))
         .route("/api/agents/:id/unblock", post(post_agent_unblock))
+        .route(
+            "/api/chat/threads",
+            get(list_chat_threads).post(post_open_thread),
+        )
+        .route("/api/chat/threads/:id", get(get_chat_thread))
+        .route(
+            "/api/chat/threads/:id/messages",
+            get(list_chat_messages).post(post_chat_message),
+        )
         .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
@@ -709,6 +725,42 @@ async fn get_run_events(
         Ok(events) => (StatusCode::OK, Json(events)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+/// SSE endpoint — streams `LiveEvent` values as they happen for a given run.
+///
+/// Each SSE `data` field is a JSON-encoded `LiveEvent`.  The stream stays open
+/// until the client disconnects; a 15-second keepalive comment is sent to
+/// prevent proxy timeouts.
+async fn get_run_events_stream(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = app.event_tx.subscribe();
+    let run_id = id.clone();
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        let run_id = run_id.clone();
+        match msg {
+            Ok(live_event) => {
+                // Only forward events that belong to this run.
+                let matches = match &live_event {
+                    crate::models::LiveEvent::RunEvent(e) => e.run_id == run_id,
+                    crate::models::LiveEvent::BuildOutput { run_id: rid, .. } => *rid == run_id,
+                };
+                if matches {
+                    match serde_json::to_string(&live_event) {
+                        Ok(json) => Some(Ok(Event::default().data(json))),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            // Lagged receiver — skip the missed entries and continue.
+            Err(_) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn get_run_blackboard(
@@ -3543,5 +3595,76 @@ async fn get_run_artifact(
                 .into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "artifact not found").into_response(),
+    }
+}
+
+// ── PackChat handlers ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ListThreadsQuery {
+    run_id: Option<String>,
+    #[serde(default = "default_thread_limit")]
+    limit: usize,
+}
+
+fn default_thread_limit() -> usize {
+    50
+}
+
+async fn list_chat_threads(
+    Query(q): Query<ListThreadsQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.chat.list_threads(q.run_id.as_deref(), q.limit).await {
+        Ok(threads) => (StatusCode::OK, Json(threads)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn post_open_thread(
+    State(app): State<AppContext>,
+    Json(req): Json<OpenThreadRequest>,
+) -> impl IntoResponse {
+    match app.chat.open_thread(&req).await {
+        Ok(thread) => (StatusCode::CREATED, Json(thread)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_chat_thread(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.chat.get_thread(&id).await {
+        Ok(Some(thread)) => (StatusCode::OK, Json(thread)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "thread not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn list_chat_messages(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.chat.list_messages(&id).await {
+        Ok(messages) => (StatusCode::OK, Json(messages)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn post_chat_message(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+    Json(req): Json<PostMessageRequest>,
+) -> impl IntoResponse {
+    let thread = match app.chat.get_thread(&id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return (StatusCode::NOT_FOUND, "thread not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    match dispatch_message(&app.chat, &app.paths, &thread, &req).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

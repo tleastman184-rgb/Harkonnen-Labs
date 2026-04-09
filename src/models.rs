@@ -346,6 +346,25 @@ pub struct RunEvent {
 
 pub type FactoryEvent = RunEvent;
 
+/// Broadcast over the in-process event channel so the SSE endpoint and any
+/// other subscriber can observe factory activity in real time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LiveEvent {
+    /// A normal run lifecycle event (phase transitions, agent status).
+    RunEvent(RunEvent),
+    /// A single line of stdout or stderr from a Piper build subprocess.
+    BuildOutput {
+        run_id: String,
+        phase: String,
+        agent: String,
+        line: String,
+        /// `"stdout"` or `"stderr"`
+        stream: String,
+        created_at: DateTime<Utc>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointAnswerRecord {
     pub answer_id: String,
@@ -670,6 +689,10 @@ pub struct ScenarioResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationSummary {
     pub passed: bool,
+    #[serde(default)]
+    pub scored_checks: usize,
+    #[serde(default)]
+    pub passed_scored_checks: usize,
     pub results: Vec<ScenarioResult>,
 }
 
