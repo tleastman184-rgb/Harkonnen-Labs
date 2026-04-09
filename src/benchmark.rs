@@ -404,7 +404,11 @@ fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Str
         }
     }
 
-    lines.push(format!("- Correct answers: {}/{}", correct.len(), questions.len()));
+    lines.push(format!(
+        "- Correct answers: {}/{}",
+        correct.len(),
+        questions.len()
+    ));
     if correct.is_empty() {
         lines.push("- None recorded in this run.".to_string());
     } else {
