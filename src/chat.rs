@@ -24,6 +24,7 @@
 //! Routable agents (Mason, Piper, Bramble, Ash, Flint, Coobie) use the setup default.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
@@ -92,6 +93,13 @@ pub struct PostMessageResponse {
     pub operator_message: ChatMessage,
     pub agent_reply: Option<ChatMessage>,
 }
+
+const PACKCHAT_RECENT_MESSAGE_COUNT: usize = 6;
+const PACKCHAT_RELEVANT_MESSAGE_LIMIT: usize = 10;
+const PACKCHAT_CONTEXT_NEIGHBOR_WINDOW: usize = 1;
+const PACKCHAT_HISTORY_CHAR_BUDGET: usize = 18_000;
+const PACKCHAT_MESSAGE_EXCERPT_CHARS: usize = 1_200;
+const PACKCHAT_ASSISTANT_CONTEXT_CHARS: usize = 2_400;
 
 // ── Chat store ────────────────────────────────────────────────────────────────
 
@@ -518,21 +526,95 @@ pub async fn complete_agent_reply(
         )
     })?;
 
-    let system = agent_system_prompt(agent, run_id);
-    let mut messages = vec![Message::system(system)];
+    let prior_history = history
+        .iter()
+        .take(history.len().saturating_sub(1))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_history = select_relevant_history(&prior_history, user_content);
+    let query_terms = retrieval_terms(user_content);
 
-    for msg in history.iter().take(history.len().saturating_sub(1)) {
+    let mut system = agent_system_prompt(agent, run_id);
+    system.push_str(
+        "\n\nPrefer explicit user-stated facts, previously confirmed preferences, and concrete operator details over generic assistant prose.",
+    );
+    if !prior_history.is_empty() && selected_history.len() < prior_history.len() {
+        system.push_str(
+            "\n\nThe conversation thread is longer than the context shown below. The supplied history has been trimmed to the most relevant and most recent slices for the current question.",
+        );
+    }
+
+    let mut prior_messages: Vec<Message> = Vec::new();
+    let mut leading_assistant_context = Vec::new();
+
+    for msg in selected_history {
         let role = if msg.role == "operator" {
             "user"
         } else {
             "assistant"
         };
-        messages.push(Message {
+        let content = compact_history_message(
+            &msg.content,
+            &query_terms,
+            PACKCHAT_MESSAGE_EXCERPT_CHARS,
+        );
+
+        // Some benchmark datasets begin with assistant turns. Local prompt templates
+        // are often stricter than hosted APIs, so keep that leading context out of the
+        // message list and fold it into the system prompt instead.
+        if prior_messages.is_empty() && role == "assistant" {
+            leading_assistant_context.push(content);
+            continue;
+        }
+
+        if let Some(last) = prior_messages.last_mut() {
+            if last.role == role {
+                if !last.content.is_empty() {
+                    last.content.push_str("\n\n");
+                }
+                last.content.push_str(&content);
+                continue;
+            }
+        }
+
+        prior_messages.push(Message {
             role: role.to_string(),
-            content: msg.content.clone(),
+            content,
         });
     }
-    messages.push(Message::user(user_content));
+
+    if !leading_assistant_context.is_empty() {
+        let assistant_context = compact_history_message(
+            &leading_assistant_context.join("\n\n"),
+            &query_terms,
+            PACKCHAT_ASSISTANT_CONTEXT_CHARS,
+        );
+        system.push_str("\n\nConversation context from earlier assistant turns:\n");
+        system.push_str(&assistant_context);
+    }
+
+    let mut messages = vec![Message::system(system)];
+    messages.extend(prior_messages);
+
+    let trimmed_user_content = user_content.trim();
+    let user_message = if trimmed_user_content.is_empty() {
+        "Please respond to the latest operator message using the available conversation context."
+    } else {
+        trimmed_user_content
+    };
+
+    if let Some(last) = messages.last_mut() {
+        if last.role == "user" {
+            if !last.content.is_empty() {
+                last.content.push_str("\n\n");
+            }
+            last.content.push_str(user_message);
+        } else {
+            messages.push(Message::user(user_message));
+        }
+    } else {
+        messages.push(Message::user(user_message));
+    }
 
     let req = LlmRequest {
         messages,
@@ -563,10 +645,322 @@ async fn generate_agent_reply(
     }
 }
 
+fn select_relevant_history(history: &[ChatMessage], user_content: &str) -> Vec<ChatMessage> {
+    if history.len() <= PACKCHAT_RECENT_MESSAGE_COUNT + 2 {
+        return history.to_vec();
+    }
+
+    let query_terms = retrieval_terms(user_content);
+    let recent_start = history.len().saturating_sub(PACKCHAT_RECENT_MESSAGE_COUNT);
+    let mut selected = BTreeSet::new();
+
+    for idx in recent_start..history.len() {
+        selected.insert(idx);
+    }
+
+    let mut scored = history
+        .iter()
+        .enumerate()
+        .map(|(idx, msg)| (score_history_message(msg, user_content, &query_terms), idx))
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_score, left_idx), (right_score, right_idx)| {
+        right_score.cmp(left_score).then(right_idx.cmp(left_idx))
+    });
+
+    for (_, idx) in scored
+        .into_iter()
+        .filter(|(score, _)| *score > 0)
+        .take(PACKCHAT_RELEVANT_MESSAGE_LIMIT)
+    {
+        let start = idx.saturating_sub(PACKCHAT_CONTEXT_NEIGHBOR_WINDOW);
+        let end = (idx + PACKCHAT_CONTEXT_NEIGHBOR_WINDOW).min(history.len().saturating_sub(1));
+        for neighbor in start..=end {
+            selected.insert(neighbor);
+        }
+    }
+
+    trim_selected_history_to_budget(
+        history,
+        &selected.into_iter().collect::<Vec<_>>(),
+        user_content,
+        &query_terms,
+    )
+}
+
+fn trim_selected_history_to_budget(
+    history: &[ChatMessage],
+    selected_indices: &[usize],
+    user_content: &str,
+    query_terms: &[String],
+) -> Vec<ChatMessage> {
+    let recent_start = history.len().saturating_sub(PACKCHAT_RECENT_MESSAGE_COUNT);
+    let mut candidates = selected_indices
+        .iter()
+        .copied()
+        .map(|idx| {
+            let excerpt = compact_history_message(
+                &history[idx].content,
+                query_terms,
+                PACKCHAT_MESSAGE_EXCERPT_CHARS,
+            );
+            let excerpt_chars = excerpt.chars().count();
+            let mut priority = score_history_message(&history[idx], user_content, query_terms);
+            if idx >= recent_start {
+                priority += 1_000;
+            }
+            if history[idx].role == "operator" {
+                priority += 25;
+            }
+            (priority, idx, excerpt_chars)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_priority, left_idx, _), (right_priority, right_idx, _)| {
+        right_priority
+            .cmp(left_priority)
+            .then(right_idx.cmp(left_idx))
+    });
+
+    let mut kept = BTreeSet::new();
+    let mut used_chars = 0usize;
+    for (_, idx, excerpt_chars) in candidates {
+        let message_cost = excerpt_chars + 24;
+        if kept.is_empty() || used_chars + message_cost <= PACKCHAT_HISTORY_CHAR_BUDGET {
+            kept.insert(idx);
+            used_chars += message_cost;
+        }
+    }
+
+    if kept.is_empty() && !history.is_empty() {
+        kept.insert(history.len() - 1);
+    }
+
+    kept.into_iter().map(|idx| history[idx].clone()).collect()
+}
+
+fn score_history_message(msg: &ChatMessage, user_content: &str, query_terms: &[String]) -> i64 {
+    let normalized_query = normalize_retrieval_text(user_content);
+    let normalized_content = normalize_retrieval_text(&msg.content);
+    if normalized_content.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0i64;
+    if !normalized_query.is_empty() && normalized_content.contains(&normalized_query) {
+        score += 80;
+    }
+
+    let overlap = query_terms
+        .iter()
+        .filter(|term| normalized_content.contains(term.as_str()))
+        .count() as i64;
+    score += overlap * 18;
+
+    if msg.role == "operator" {
+        score += 6;
+    }
+    if looks_like_user_fact(msg) {
+        score += 14;
+    }
+    if normalized_content.contains("remember") {
+        score += 4;
+    }
+
+    score
+}
+
+fn looks_like_user_fact(msg: &ChatMessage) -> bool {
+    if msg.role != "operator" {
+        return false;
+    }
+
+    let normalized = normalize_retrieval_text(&msg.content);
+    [
+        "i am",
+        "im",
+        "i was",
+        "i have",
+        "i had",
+        "i graduated",
+        "i work",
+        "i live",
+        "i like",
+        "i love",
+        "i prefer",
+        "i booked",
+        "my favorite",
+        "my name",
+        "my degree",
+        "my job",
+        "my birthday",
+        "i finally",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+}
+
+fn retrieval_terms(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "at", "be", "did", "do", "does", "for", "from",
+        "had", "have", "how", "i", "if", "in", "is", "it", "my", "of", "on",
+        "or", "that", "the", "to", "was", "what", "when", "where", "which", "who",
+        "why", "with", "would", "you", "your",
+    ];
+
+    let mut terms = Vec::new();
+    for token in normalize_retrieval_text(query).split_whitespace() {
+        if token.len() < 3 || STOPWORDS.contains(&token) {
+            continue;
+        }
+        if !terms.iter().any(|existing| existing == token) {
+            terms.push(token.to_string());
+        }
+    }
+    terms
+}
+
+fn normalize_retrieval_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_space = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(mapped);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn compact_history_message(content: &str, query_terms: &[String], max_chars: usize) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mut best_match = None;
+    for term in query_terms {
+        if let Some(idx) = lower.find(term) {
+            best_match = match best_match {
+                Some(current) if current <= idx => Some(current),
+                _ => Some(idx),
+            };
+        }
+    }
+
+    if let Some(byte_idx) = best_match {
+        let char_idx = trimmed[..byte_idx].chars().count();
+        let half_window = max_chars / 2;
+        let start = char_idx.saturating_sub(half_window / 2);
+        let end = (start + max_chars).min(trimmed.chars().count());
+        let excerpt = slice_chars(trimmed, start, end).trim().to_string();
+        let mut output = String::new();
+        if start > 0 {
+            output.push_str("...");
+        }
+        output.push_str(&excerpt);
+        if end < trimmed.chars().count() {
+            output.push_str("...");
+        }
+        return output;
+    }
+
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars.saturating_sub(head_chars + 3);
+    format!(
+        "{}...{}",
+        take_first_chars(trimmed, head_chars).trim_end(),
+        take_last_chars(trimmed, tail_chars).trim_start()
+    )
+}
+
+fn take_first_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn take_last_chars(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(total - max_chars).collect()
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_dt(s: String) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(id: &str, role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: id.to_string(),
+            thread_id: "thread-1".to_string(),
+            role: role.to_string(),
+            agent: Some("coobie".to_string()),
+            content: content.to_string(),
+            checkpoint_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn relevant_history_prefers_fact_bearing_user_turns() {
+        let history = vec![
+            msg("1", "agent", "Welcome to the thread."),
+            msg("2", "operator", "Can you help me with organizing kitchen cabinets?"),
+            msg("3", "agent", "Use bins and labels for your pantry."),
+            msg("4", "operator", "I graduated with a degree in Business Administration."),
+            msg("5", "agent", "That sounds like a strong foundation for work."),
+            msg("6", "operator", "What apps help with errands?"),
+            msg("7", "agent", "Todoist and Trello are common picks."),
+            msg("8", "operator", "Please remember my pantry question too."),
+            msg("9", "agent", "I will remember that."),
+            msg("10", "operator", "Also, I booked a train for Saturday."),
+            msg("11", "agent", "Nice, have a safe trip."),
+        ];
+
+        let selected = select_relevant_history(&history, "What degree did I graduate with?");
+        assert!(selected
+            .iter()
+            .any(|message| message.content.contains("Business Administration")));
+    }
+
+    #[test]
+    fn compact_history_message_centers_relevant_excerpt() {
+        let content = format!(
+            "{} Business Administration {}",
+            "intro ".repeat(300),
+            "tail ".repeat(300)
+        );
+        let excerpt = compact_history_message(
+            &content,
+            &["business".to_string(), "administration".to_string()],
+            160,
+        );
+        assert!(excerpt.contains("Business Administration"));
+        assert!(excerpt.starts_with("...") || excerpt.ends_with("..."));
+    }
 }

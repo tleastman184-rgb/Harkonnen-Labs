@@ -47,8 +47,13 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 BUILD_CMD=("${DOCKER_CMD[@]}" build -f docker/benchmark-runner.Dockerfile -t "$IMAGE_TAG" "$REPO_ROOT")
+TTY_FLAGS=()
+if [[ -t 0 && -t 1 ]]; then
+  TTY_FLAGS=(-it)
+fi
+
 RUN_CMD=(
-  "${DOCKER_CMD[@]}" run --rm -it
+  "${DOCKER_CMD[@]}" run --rm "${TTY_FLAGS[@]}"
   --add-host host.docker.internal:host-gateway
   -v "$REPO_ROOT:/workdir"
   -v harkonnen-cargo-registry:/cargo/registry
