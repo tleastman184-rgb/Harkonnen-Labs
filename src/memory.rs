@@ -74,6 +74,26 @@ pub struct MemoryIndex {
     pub entries: Vec<MemoryEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRetrievalHit {
+    pub id: String,
+    pub summary: String,
+    pub snippet: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub score: f32,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub challenged_by: Vec<String>,
+    #[serde(default)]
+    pub invalidation_reasons: Vec<String>,
+    #[serde(default)]
+    pub surfaced_via: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoryIngestOptions {
     pub id: Option<String>,
@@ -130,6 +150,14 @@ struct MemoryEntryStats {
     loaded_for_run_count: i64,
     contributed_to_success_count: i64,
     contributed_to_failure_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryRetrievalCandidate<'a> {
+    score: f32,
+    entry: &'a MemoryEntry,
+    invalidation_reasons: Vec<String>,
+    surfaced_via: Vec<String>,
 }
 
 impl MemoryStore {
@@ -195,51 +223,10 @@ impl MemoryStore {
 
         Ok(())
     }
-
     /// Keyword search across the index. Returns formatted snippets.
     pub async fn retrieve_context(&self, query: &str) -> Result<Vec<String>> {
-        self.ensure_fresh_index().await?;
-
-        let index_path = self.root.join("index.json");
-        if !index_path.exists() {
-            return Ok(vec![
-                "Memory not initialized. Run: harkonnen memory init".to_string()
-            ]);
-        }
-
-        let index = read_memory_index(&index_path).await?;
-        let q = query.to_lowercase();
-        let mut hits = index
-            .entries
-            .iter()
-            .filter(|entry| memory_matches(entry, &q))
-            .map(|entry| (memory_match_score(entry, &q), entry))
-            .collect::<Vec<_>>();
-
-        hits.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.id.cmp(&right.1.id))
-        });
-
-        let rendered = hits
-            .into_iter()
-            .map(|(_, entry)| {
-                let snippet = &entry.content[..entry.content.len().min(400)];
-                format!(
-                    "[{}] {}
-{}",
-                    entry.id, entry.summary, snippet
-                )
-            })
-            .collect::<Vec<_>>();
-
-        if rendered.is_empty() {
-            Ok(vec![format!("No memories found for: {query}")])
-        } else {
-            Ok(rendered)
-        }
+        let hits = self.retrieve_ranked_entries(query, None, 20).await?;
+        Ok(render_memory_hits(query, &hits))
     }
 
     /// Hybrid retrieval: semantic cosine search (primary) blended with historical
@@ -250,78 +237,140 @@ impl MemoryStore {
         query: &str,
         embedding_store: &crate::embeddings::EmbeddingStore,
     ) -> Result<Vec<String>> {
+        let hits = self
+            .retrieve_ranked_entries(query, Some(embedding_store), 20)
+            .await?;
+        Ok(render_memory_hits(query, &hits))
+    }
+
+    /// Structured retrieval for query-time chaining and source tracing.
+    pub async fn retrieve_ranked_entries(
+        &self,
+        query: &str,
+        embedding_store: Option<&crate::embeddings::EmbeddingStore>,
+        limit: usize,
+    ) -> Result<Vec<MemoryRetrievalHit>> {
         self.ensure_fresh_index().await?;
 
         let index_path = self.root.join("index.json");
         if !index_path.exists() {
-            return Ok(vec![
-                "Memory not initialized. Run: harkonnen memory init".to_string()
-            ]);
+            return Ok(Vec::new());
         }
 
         let index = read_memory_index(&index_path).await?;
         if index.entries.is_empty() {
-            return Ok(vec![format!("No memories found for: {query}")]);
+            return Ok(Vec::new());
         }
-
-        let memory_root = self.root.display().to_string();
-
-        // Ensure all entries have stored embeddings (incremental — skips existing).
-        if let Err(e) = embedding_store
-            .ensure_embedded(&index.entries, &memory_root)
-            .await
-        {
-            tracing::warn!("embed failed, falling back to keyword search: {e}");
-            return self.retrieve_context(query).await;
-        }
-
-        // Cosine search — top 20 candidates.
-        let semantic_hits = match embedding_store
-            .query_semantic(query, &memory_root, 20)
-            .await
-        {
-            Ok(hits) => hits,
-            Err(e) => {
-                tracing::warn!("semantic query failed, falling back to keyword search: {e}");
-                return self.retrieve_context(query).await;
-            }
-        };
-
-        // Build a lookup map from entry id → entry.
-        let entry_map: std::collections::HashMap<&str, &MemoryEntry> =
-            index.entries.iter().map(|e| (e.id.as_str(), e)).collect();
 
         let q = query.to_lowercase();
-
-        // Blend semantic score (dominant) with historical signal and keyword bonus.
-        let mut results: Vec<(f32, &MemoryEntry)> = semantic_hits
-            .into_iter()
-            .filter_map(|(sem_score, id)| {
-                let entry = entry_map.get(id.as_str()).copied()?;
-                let historical = (entry.contributed_to_success_count * 10
-                    - entry.contributed_to_failure_count * 4
-                    + entry.recall_count.min(20)) as f32;
-                let kw_bonus = if memory_matches(entry, &q) { 10.0 } else { 0.0 };
-                let blended = sem_score * 100.0 + historical + kw_bonus;
-                Some((blended, entry))
-            })
+        let limit = limit.max(1);
+        let entry_map: HashMap<&str, &MemoryEntry> = index
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
             .collect();
 
-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let rendered = results
-            .into_iter()
-            .map(|(_, entry)| {
-                let snippet = &entry.content[..entry.content.len().min(400)];
-                format!("[{}] {}\n{}", entry.id, entry.summary, snippet)
-            })
-            .collect::<Vec<_>>();
-
-        if rendered.is_empty() {
-            Ok(vec![format!("No memories found for: {query}")])
+        let results: Vec<(f32, &MemoryEntry)> = if let Some(embedding_store) = embedding_store {
+            let memory_root = self.root.display().to_string();
+            if let Err(e) = embedding_store
+                .ensure_embedded(&index.entries, &memory_root)
+                .await
+            {
+                tracing::warn!("embed failed, falling back to keyword search: {e}");
+                keyword_ranked_entries(&index.entries, &q)
+            } else {
+                match embedding_store
+                    .query_semantic(query, &memory_root, limit.max(20))
+                    .await
+                {
+                    Ok(semantic_hits) => {
+                        let mut blended = semantic_hits
+                            .into_iter()
+                            .filter_map(|(sem_score, id)| {
+                                let entry = entry_map.get(id.as_str()).copied()?;
+                                let historical = (entry.contributed_to_success_count * 10
+                                    - entry.contributed_to_failure_count * 4
+                                    + entry.recall_count.min(20))
+                                    as f32;
+                                let kw_bonus = if memory_matches(entry, &q) { 10.0 } else { 0.0 };
+                                Some((sem_score * 100.0 + historical + kw_bonus, entry))
+                            })
+                            .collect::<Vec<_>>();
+                        if blended.is_empty() {
+                            blended = keyword_ranked_entries(&index.entries, &q);
+                        }
+                        blended
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "semantic query failed, falling back to keyword search: {e}"
+                        );
+                        keyword_ranked_entries(&index.entries, &q)
+                    }
+                }
+            }
         } else {
-            Ok(rendered)
+            keyword_ranked_entries(&index.entries, &q)
+        };
+
+        let mut candidates: HashMap<String, MemoryRetrievalCandidate<'_>> = HashMap::new();
+        for (base_score, entry) in results {
+            let invalidation_reasons = memory_invalidation_reasons(entry, &entry_map);
+            let adjusted_score = adjust_retrieval_score_for_provenance(base_score, entry);
+            upsert_memory_candidate(
+                &mut candidates,
+                entry,
+                adjusted_score,
+                invalidation_reasons,
+                Vec::new(),
+            );
+
+            if let Some(successor_id) = entry.provenance.superseded_by.as_deref() {
+                if let Some(successor) = entry_map.get(successor_id).copied() {
+                    let mut surfaced_via = vec![format!("superseded fact {}", entry.id)];
+                    if !entry.summary.trim().is_empty() {
+                        surfaced_via.push(format!(
+                            "query matched older lesson {}",
+                            entry.summary.trim()
+                        ));
+                    }
+                    upsert_memory_candidate(
+                        &mut candidates,
+                        successor,
+                        (base_score + 20.0).max(adjusted_score + 25.0),
+                        memory_invalidation_reasons(successor, &entry_map),
+                        surfaced_via,
+                    );
+                }
+            }
         }
+
+        let mut ranked = candidates.into_values().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.entry.id.cmp(&right.entry.id))
+        });
+
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|candidate| MemoryRetrievalHit {
+                id: candidate.entry.id.clone(),
+                summary: candidate.entry.summary.clone(),
+                snippet: candidate.entry.content[..candidate.entry.content.len().min(400)]
+                    .to_string(),
+                tags: candidate.entry.tags.clone(),
+                score: candidate.score,
+                status: candidate.entry.provenance.status.clone(),
+                superseded_by: candidate.entry.provenance.superseded_by.clone(),
+                challenged_by: candidate.entry.provenance.challenged_by.clone(),
+                invalidation_reasons: candidate.invalidation_reasons,
+                surfaced_via: candidate.surfaced_via,
+            })
+            .collect())
     }
 
     /// Write a new memory entry as a markdown file and reindex.
@@ -1200,7 +1249,6 @@ fn memory_entry_stats_map(index: Option<&MemoryIndex>) -> HashMap<String, Memory
         })
         .unwrap_or_default()
 }
-
 fn apply_memory_entry_stats(entry: &mut MemoryEntry, stats: Option<&MemoryEntryStats>) {
     let Some(stats) = stats else {
         return;
@@ -1210,6 +1258,60 @@ fn apply_memory_entry_stats(entry: &mut MemoryEntry, stats: Option<&MemoryEntryS
     entry.loaded_for_run_count = stats.loaded_for_run_count;
     entry.contributed_to_success_count = stats.contributed_to_success_count;
     entry.contributed_to_failure_count = stats.contributed_to_failure_count;
+}
+
+fn render_memory_hits(query: &str, hits: &[MemoryRetrievalHit]) -> Vec<String> {
+    if hits.is_empty() {
+        vec![format!("No memories found for: {query}")]
+    } else {
+        hits.iter()
+            .map(|hit| {
+                let note = format_memory_hit_note(hit);
+                if note.is_empty() {
+                    format!(
+                        "[{}] {}
+{}",
+                        hit.id, hit.summary, hit.snippet
+                    )
+                } else {
+                    format!(
+                        "[{}] {}
+{}
+{}",
+                        hit.id, hit.summary, note, hit.snippet
+                    )
+                }
+            })
+            .collect()
+    }
+}
+
+fn format_memory_hit_note(hit: &MemoryRetrievalHit) -> String {
+    let mut parts = Vec::new();
+    if let Some(status) = hit.status.as_deref() {
+        if !status.trim().is_empty() {
+            parts.push(format!("status={}", status.trim()));
+        }
+    }
+    if let Some(superseded_by) = hit.superseded_by.as_deref() {
+        if !superseded_by.trim().is_empty() {
+            parts.push(format!("superseded_by={}", superseded_by.trim()));
+        }
+    }
+    if !hit.challenged_by.is_empty() {
+        parts.push(format!("challenged_by={}", hit.challenged_by.join(", ")));
+    }
+    if !hit.surfaced_via.is_empty() {
+        parts.push(format!("via {}", hit.surfaced_via.join("; ")));
+    }
+    if !hit.invalidation_reasons.is_empty() {
+        parts.push(hit.invalidation_reasons.join("; "));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("note: {}", parts.join(" | "))
+    }
 }
 
 fn memory_matches(entry: &MemoryEntry, query: &str) -> bool {
@@ -1242,6 +1344,101 @@ fn memory_match_score(entry: &MemoryEntry, query: &str) -> i64 {
     score -= entry.contributed_to_failure_count * 4;
     score += entry.recall_count.min(20);
     score
+}
+
+fn adjust_retrieval_score_for_provenance(base_score: f32, entry: &MemoryEntry) -> f32 {
+    let mut multiplier = 1.0_f32;
+    if let Some(status) = entry.provenance.status.as_deref() {
+        match status.trim().to_ascii_lowercase().as_str() {
+            "superseded" => multiplier = multiplier.min(0.08),
+            "challenged" => multiplier = multiplier.min(0.55),
+            "stale" | "deprecated" => multiplier = multiplier.min(0.7),
+            _ => {}
+        }
+    }
+    if entry.provenance.superseded_by.is_some() {
+        multiplier = multiplier.min(0.08);
+    }
+    if !entry.provenance.challenged_by.is_empty() {
+        multiplier = multiplier.min(0.55);
+    }
+    base_score * multiplier
+}
+
+fn memory_invalidation_reasons(
+    entry: &MemoryEntry,
+    entry_map: &HashMap<&str, &MemoryEntry>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if let Some(status) = entry.provenance.status.as_deref() {
+        let status = status.trim();
+        if !status.is_empty() {
+            reasons.push(format!("status={}", status));
+        }
+    }
+    if let Some(superseded_by) = entry.provenance.superseded_by.as_deref() {
+        let superseded_by = superseded_by.trim();
+        if !superseded_by.is_empty() {
+            if let Some(successor) = entry_map.get(superseded_by).copied() {
+                reasons.push(format!(
+                    "superseded by {} ({})",
+                    successor.id, successor.summary
+                ));
+            } else {
+                reasons.push(format!("superseded by {}", superseded_by));
+            }
+        }
+    }
+    if !entry.provenance.challenged_by.is_empty() {
+        reasons.push(format!(
+            "challenged by {}",
+            entry.provenance.challenged_by.join(", ")
+        ));
+    }
+    reasons
+}
+
+fn upsert_memory_candidate<'a>(
+    candidates: &mut HashMap<String, MemoryRetrievalCandidate<'a>>,
+    entry: &'a MemoryEntry,
+    score: f32,
+    invalidation_reasons: Vec<String>,
+    surfaced_via: Vec<String>,
+) {
+    if let Some(existing) = candidates.get_mut(&entry.id) {
+        existing.score = existing.score.max(score);
+        extend_unique_strings(&mut existing.invalidation_reasons, invalidation_reasons);
+        extend_unique_strings(&mut existing.surfaced_via, surfaced_via);
+    } else {
+        candidates.insert(
+            entry.id.clone(),
+            MemoryRetrievalCandidate {
+                score,
+                entry,
+                invalidation_reasons,
+                surfaced_via,
+            },
+        );
+    }
+}
+
+fn extend_unique_strings(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn keyword_ranked_entries<'a>(
+    entries: &'a [MemoryEntry],
+    query: &str,
+) -> Vec<(f32, &'a MemoryEntry)> {
+    entries
+        .iter()
+        .filter(|entry| memory_matches(entry, query))
+        .map(|entry| (memory_match_score(entry, query) as f32, entry))
+        .collect()
 }
 
 fn collect_entries(root: &Path, current: &Path, entries: &mut Vec<MemoryEntry>) -> Result<()> {

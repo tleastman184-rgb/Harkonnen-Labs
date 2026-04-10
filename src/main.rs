@@ -10,6 +10,7 @@ mod coobie;
 mod coobie_palace;
 mod db;
 mod embeddings;
+mod frames;
 mod llm;
 mod locomo;
 mod longmemeval;
@@ -22,6 +23,7 @@ mod reporting;
 mod scenarios;
 mod setup;
 mod spec;
+mod streamingqa;
 mod tesseract;
 mod workspace;
 

@@ -24,10 +24,10 @@
 //! Routable agents (Mason, Piper, Bramble, Ash, Flint, Coobie) use the setup default.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::{
@@ -547,12 +547,8 @@ pub async fn complete_agent_reply(
     let mut assistant_budget = PACKCHAT_ASSISTANT_CONTEXT_CHARS;
 
     loop {
-        let selected_history = select_relevant_history(
-            &prior_history,
-            user_content,
-            history_budget,
-            excerpt_budget,
-        );
+        let selected_history =
+            select_relevant_history(&prior_history, user_content, history_budget, excerpt_budget);
 
         let mut system = agent_system_prompt(agent, run_id);
         system.push_str(
@@ -631,7 +627,8 @@ pub async fn complete_agent_reply(
         match provider.complete(req).await {
             Ok(resp) => return Ok(resp.content),
             Err(err) if is_context_window_error(&err) => {
-                let next_history_budget = (history_budget / 2).max(PACKCHAT_MIN_HISTORY_CHAR_BUDGET);
+                let next_history_budget =
+                    (history_budget / 2).max(PACKCHAT_MIN_HISTORY_CHAR_BUDGET);
                 let next_excerpt_budget =
                     (excerpt_budget / 2).max(PACKCHAT_MIN_MESSAGE_EXCERPT_CHARS);
                 let next_assistant_budget =
@@ -743,11 +740,8 @@ fn trim_selected_history_to_budget(
         .iter()
         .copied()
         .map(|idx| {
-            let excerpt = compact_history_message(
-                &history[idx].content,
-                query_terms,
-                excerpt_budget,
-            );
+            let excerpt =
+                compact_history_message(&history[idx].content, query_terms, excerpt_budget);
             let excerpt_chars = excerpt.chars().count();
             let mut priority = score_history_message(&history[idx], user_content, query_terms);
             if idx >= recent_start {
@@ -759,11 +753,13 @@ fn trim_selected_history_to_budget(
             (priority, idx, excerpt_chars)
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|(left_priority, left_idx, _), (right_priority, right_idx, _)| {
-        right_priority
-            .cmp(left_priority)
-            .then(right_idx.cmp(left_idx))
-    });
+    candidates.sort_by(
+        |(left_priority, left_idx, _), (right_priority, right_idx, _)| {
+            right_priority
+                .cmp(left_priority)
+                .then(right_idx.cmp(left_idx))
+        },
+    );
 
     let mut kept = BTreeSet::new();
     let mut used_chars = 0usize;
@@ -845,10 +841,9 @@ fn looks_like_user_fact(msg: &ChatMessage) -> bool {
 
 fn retrieval_terms(query: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
-        "a", "an", "and", "are", "at", "be", "did", "do", "does", "for", "from",
-        "had", "have", "how", "i", "if", "in", "is", "it", "my", "of", "on",
-        "or", "that", "the", "to", "was", "what", "when", "where", "which", "who",
-        "why", "with", "would", "you", "your",
+        "a", "an", "and", "are", "at", "be", "did", "do", "does", "for", "from", "had", "have",
+        "how", "i", "if", "in", "is", "it", "my", "of", "on", "or", "that", "the", "to", "was",
+        "what", "when", "where", "which", "who", "why", "with", "would", "you", "your",
     ];
 
     let mut terms = Vec::new();
@@ -947,7 +942,6 @@ fn slice_chars(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-
 fn is_context_window_error(err: &anyhow::Error) -> bool {
     let text = err.to_string().to_ascii_lowercase();
     text.contains("context length")
@@ -987,10 +981,22 @@ mod tests {
     fn relevant_history_prefers_fact_bearing_user_turns() {
         let history = vec![
             msg("1", "agent", "Welcome to the thread."),
-            msg("2", "operator", "Can you help me with organizing kitchen cabinets?"),
+            msg(
+                "2",
+                "operator",
+                "Can you help me with organizing kitchen cabinets?",
+            ),
             msg("3", "agent", "Use bins and labels for your pantry."),
-            msg("4", "operator", "I graduated with a degree in Business Administration."),
-            msg("5", "agent", "That sounds like a strong foundation for work."),
+            msg(
+                "4",
+                "operator",
+                "I graduated with a degree in Business Administration.",
+            ),
+            msg(
+                "5",
+                "agent",
+                "That sounds like a strong foundation for work.",
+            ),
             msg("6", "operator", "What apps help with errands?"),
             msg("7", "agent", "Todoist and Trello are common picks."),
             msg("8", "operator", "Please remember my pantry question too."),

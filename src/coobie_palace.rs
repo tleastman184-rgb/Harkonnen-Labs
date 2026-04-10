@@ -286,7 +286,11 @@ fn match_lessons_to_den(den: &Den, lessons: &[LessonRecord]) -> Vec<DenLesson> {
         .collect();
 
     // Strongest lessons first so the most reliable signal surfaces in the briefing.
-    matched.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal));
+    matched.sort_by(|a, b| {
+        b.strength
+            .partial_cmp(&a.strength)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     matched.truncate(3);
     matched
 }

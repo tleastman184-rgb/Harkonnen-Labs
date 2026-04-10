@@ -410,17 +410,12 @@ fn build_deep_signal(spec: &DeepSignalSpec, scores: &EpisodeScores) -> DeepCausa
     let explanation = if activated {
         format!(
             "{} activated: observation {:.3} exceeded threshold {:.3} (strength {:.2})",
-            spec.cause_id,
-            observation_value,
-            spec.threshold,
-            activation_strength,
+            spec.cause_id, observation_value, spec.threshold, activation_strength,
         )
     } else {
         format!(
             "{} inactive: observation {:.3} below threshold {:.3}",
-            spec.cause_id,
-            observation_value,
-            spec.threshold,
+            spec.cause_id, observation_value, spec.threshold,
         )
     };
 
@@ -480,9 +475,7 @@ fn hierarchy_level_key(level: &PearlHierarchyLevel) -> &'static str {
 
 fn pearl_hierarchy_for_relation(relation: &str) -> PearlHierarchyLevel {
     match relation.trim().to_ascii_lowercase().as_str() {
-        "caused" | "contributed_to" | "failure_triggered" => {
-            PearlHierarchyLevel::Interventional
-        }
+        "caused" | "contributed_to" | "failure_triggered" => PearlHierarchyLevel::Interventional,
         "prevented" | "invalidated" => PearlHierarchyLevel::Counterfactual,
         _ => PearlHierarchyLevel::Associational,
     }
@@ -1686,7 +1679,10 @@ impl CoobieReasoner for SqliteCoobie {
             .chain(deep_analysis.inactive_signals.iter())
             .map(|signal| (signal.cause_id.as_str(), signal))
             .collect();
-        let causal_edges = self.load_causal_edges_for_run(run_id).await.unwrap_or_default();
+        let causal_edges = self
+            .load_causal_edges_for_run(run_id)
+            .await
+            .unwrap_or_default();
 
         let mut hypotheses: Vec<CausalHypothesis> = Vec::new();
 

@@ -20,9 +20,9 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode,
-        CheckpointAnswerRecord, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState,
-        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode, CheckpointAnswerRecord,
+        CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord,
+        EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
         EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
         EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, HiddenScenarioCheckResult,
         HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent,
@@ -302,6 +302,21 @@ struct StaleMemoryMitigationStatusArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct StaleMemoryMitigationHistory {
     records: Vec<StaleMemoryMitigationStatusArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectMemoryUpdateEntry {
+    relation: String,
+    stale_memory_id: String,
+    stale_summary: String,
+    fresh_memory_id: String,
+    fresh_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProjectMemoryUpdateArtifact {
+    generated_at: String,
+    entries: Vec<ProjectMemoryUpdateEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2123,10 +2138,7 @@ impl AppContext {
                     .await?;
                 push_unique(&mut blackboard.artifact_refs, "coobie_critique.json");
                 if !critique.passed {
-                    push_unique(
-                        &mut blackboard.open_blockers,
-                        "coobie_plan_critique_failed",
-                    );
+                    push_unique(&mut blackboard.open_blockers, "coobie_plan_critique_failed");
                     tracing::warn!(
                         blocking = critique.blocking_concerns.len(),
                         dead_ends = critique.dead_end_matches.len(),
@@ -8273,8 +8285,7 @@ Produce the validation analysis and note any checks Coobie asked for that are st
         let registry_path = self.paths.factory.join("state").join("dead_ends.json");
         if registry_path.exists() {
             if let Ok(raw) = tokio::fs::read_to_string(&registry_path).await {
-                let registry =
-                    serde_json::from_str::<DeadEndRegistry>(&raw).unwrap_or_default();
+                let registry = serde_json::from_str::<DeadEndRegistry>(&raw).unwrap_or_default();
                 for entry in &registry.entries {
                     if entry.spec_id != spec_obj.id {
                         continue;
@@ -8392,9 +8403,7 @@ Produce the validation analysis and note any checks Coobie asked for that are st
                         addressed_guardrails: Vec<String>,
                     }
                     let stripped = strip_json_fences(&resp.content);
-                    if let Ok(llm) =
-                        serde_json::from_str::<LlmCritique>(stripped.trim())
-                    {
+                    if let Ok(llm) = serde_json::from_str::<LlmCritique>(stripped.trim()) {
                         // Merge LLM findings with rule-based — deduplicate.
                         for c in llm.blocking_concerns {
                             if !blocking_concerns.contains(&c) {
@@ -8415,7 +8424,10 @@ Produce the validation analysis and note any checks Coobie asked for that are st
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Coobie plan critique LLM call failed ({}), using rule-based only", e);
+                    tracing::warn!(
+                        "Coobie plan critique LLM call failed ({}), using rule-based only",
+                        e
+                    );
                 }
             }
         }
@@ -8972,13 +8984,11 @@ Write the twin environment narrative and identify any simulation gaps against Co
         snapshot: &WorkspaceStateSnapshot,
     ) -> Result<()> {
         let json = serde_json::to_string(snapshot)?;
-        sqlx::query(
-            "UPDATE episodes SET state_before = ?2 WHERE episode_id = ?1",
-        )
-        .bind(episode_id)
-        .bind(json)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE episodes SET state_before = ?2 WHERE episode_id = ?1")
+            .bind(episode_id)
+            .bind(json)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -8988,13 +8998,11 @@ Write the twin environment narrative and identify any simulation gaps against Co
         snapshot: &WorkspaceStateSnapshot,
     ) -> Result<()> {
         let json = serde_json::to_string(snapshot)?;
-        sqlx::query(
-            "UPDATE episodes SET state_after = ?2 WHERE episode_id = ?1",
-        )
-        .bind(episode_id)
-        .bind(json)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE episodes SET state_after = ?2 WHERE episode_id = ?1")
+            .bind(episode_id)
+            .bind(json)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -11055,10 +11063,7 @@ Observed pattern: {}",
             };
 
             // Insert — ignore if the link already exists (same from/to/type).
-            let link_id = format!(
-                "cross-{}-{}",
-                pred_last.event_id, succ_first.event_id
-            );
+            let link_id = format!("cross-{}-{}", pred_last.event_id, succ_first.event_id);
             sqlx::query(
                 r#"
                 INSERT OR IGNORE INTO causal_links
@@ -11423,6 +11428,10 @@ Query terms: {}",
         store: &MemoryStore,
     ) -> Result<()> {
         let entries = store.list_entries().await?;
+        let updates = ProjectMemoryUpdateArtifact {
+            generated_at: Utc::now().to_rfc3339(),
+            entries: build_project_memory_update_entries(&entries),
+        };
         let relevant = entries
             .into_iter()
             .filter(|entry| {
@@ -11438,6 +11447,13 @@ Query terms: {}",
         tokio::fs::write(
             harkonnen_dir.join("memory-status.md"),
             render_project_memory_status_markdown(&relevant),
+        )
+        .await?;
+        self.write_json_file(&harkonnen_dir.join("memory-updates.json"), &updates)
+            .await?;
+        tokio::fs::write(
+            harkonnen_dir.join("memory-updates.md"),
+            render_project_memory_updates_markdown(&updates.entries),
         )
         .await?;
         Ok(())
@@ -15648,7 +15664,11 @@ fn render_project_strategy_register_markdown(
 
 fn render_project_memory_status_markdown(entries: &[MemoryEntry]) -> String {
     if entries.is_empty() {
-        return "# Memory Status\n\n- No project-memory contradictions or supersessions have been recorded yet.\n".to_string();
+        return "# Memory Status
+
+- No project-memory contradictions or supersessions have been recorded yet.
+"
+        .to_string();
     }
 
     let lines = entries
@@ -15675,9 +15695,112 @@ fn render_project_memory_status_markdown(entries: &[MemoryEntry]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(
+            "
+",
+        );
 
-    format!("# Memory Status\n\n{}\n", lines)
+    format!(
+        "# Memory Status
+
+{}
+",
+        lines
+    )
+}
+
+fn build_project_memory_update_entries(entries: &[MemoryEntry]) -> Vec<ProjectMemoryUpdateEntry> {
+    let summary_by_id = entries
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.summary.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut updates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in entries {
+        if !entry.tags.iter().any(|tag| tag == "lesson") {
+            continue;
+        }
+
+        if let Some(fresh_memory_id) = entry.provenance.superseded_by.as_deref() {
+            let key = format!("superseded:{}:{}", entry.id, fresh_memory_id);
+            if seen.insert(key) {
+                updates.push(ProjectMemoryUpdateEntry {
+                    relation: "superseded".to_string(),
+                    stale_memory_id: entry.id.clone(),
+                    stale_summary: entry.summary.clone(),
+                    fresh_memory_id: fresh_memory_id.to_string(),
+                    fresh_summary: summary_by_id
+                        .get(fresh_memory_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        for fresh_memory_id in &entry.provenance.challenged_by {
+            let key = format!("challenged:{}:{}", entry.id, fresh_memory_id);
+            if seen.insert(key) {
+                updates.push(ProjectMemoryUpdateEntry {
+                    relation: "challenged".to_string(),
+                    stale_memory_id: entry.id.clone(),
+                    stale_summary: entry.summary.clone(),
+                    fresh_memory_id: fresh_memory_id.clone(),
+                    fresh_summary: summary_by_id
+                        .get(fresh_memory_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
+        }
+    }
+
+    updates.sort_by(|left, right| {
+        left.relation
+            .cmp(&right.relation)
+            .then_with(|| left.fresh_memory_id.cmp(&right.fresh_memory_id))
+            .then_with(|| left.stale_memory_id.cmp(&right.stale_memory_id))
+    });
+    updates
+}
+
+fn render_project_memory_updates_markdown(entries: &[ProjectMemoryUpdateEntry]) -> String {
+    if entries.is_empty() {
+        return "# Memory Updates
+
+- No fact updates or contradictions have been recorded yet.
+"
+        .to_string();
+    }
+
+    let lines = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "- {}: {} -> {} ({})",
+                entry.relation,
+                entry.stale_memory_id,
+                entry.fresh_memory_id,
+                if entry.fresh_summary.trim().is_empty() {
+                    entry.stale_summary.clone()
+                } else {
+                    entry.fresh_summary.clone()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+
+    format!(
+        "# Memory Updates
+
+{}
+",
+        lines
+    )
 }
 
 fn derive_stale_memory_mitigation_status(
@@ -16613,9 +16736,9 @@ fn detect_package_scripts(package_json: &Path) -> Result<Vec<String>> {
 
 /// Words excluded from the guardrail keyword match in `coobie_critique_plan`.
 const STOP_WORDS: &[&str] = &[
-    "the", "this", "that", "with", "from", "have", "been", "before", "after",
-    "should", "would", "could", "which", "their", "there", "where", "when",
-    "every", "other", "about", "these", "those", "will", "must", "into",
+    "the", "this", "that", "with", "from", "have", "been", "before", "after", "should", "would",
+    "could", "which", "their", "there", "where", "when", "every", "other", "about", "these",
+    "those", "will", "must", "into",
 ];
 
 /// Returns true when the (lowercased) plan text has significant word overlap
@@ -16648,12 +16771,7 @@ fn has_real_test_failure(validation: &ValidationSummary) -> bool {
         !r.passed
             && (matches!(
                 r.scenario_id.as_str(),
-                "cargo_test"
-                    | "npm_test"
-                    | "pnpm_test"
-                    | "yarn_test"
-                    | "go_test"
-                    | "python_tests"
+                "cargo_test" | "npm_test" | "pnpm_test" | "yarn_test" | "go_test" | "python_tests"
             ) || r.scenario_id.starts_with("test_command_"))
     })
 }
@@ -17442,7 +17560,10 @@ fn summarize_episode_state_diff(
     removed_files.sort();
     modified_files.sort();
 
-    let shared_files = before_files.keys().filter(|path| after_files.contains_key(**path)).count();
+    let shared_files = before_files
+        .keys()
+        .filter(|path| after_files.contains_key(**path))
+        .count();
     let unchanged_files = shared_files.saturating_sub(modified_files.len());
     let summary = format!(
         "{} added, {} modified, {} removed, {} unchanged",
@@ -17465,9 +17586,7 @@ fn summarize_episode_state_diff(
 
 fn pearl_hierarchy_for_causal_link(link_type: &str) -> PearlHierarchyLevel {
     match link_type.trim().to_ascii_lowercase().as_str() {
-        "caused" | "contributed_to" | "failure_triggered" => {
-            PearlHierarchyLevel::Interventional
-        }
+        "caused" | "contributed_to" | "failure_triggered" => PearlHierarchyLevel::Interventional,
         "prevented" | "invalidated" => PearlHierarchyLevel::Counterfactual,
         _ => PearlHierarchyLevel::Associational,
     }

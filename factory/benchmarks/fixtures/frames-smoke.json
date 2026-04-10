@@ -1,0 +1,44 @@
+[
+  {
+    "question_id": "frames-smoke-ada-babbage",
+    "prompt": "Ada Lovelace worked with a mathematician who designed the Difference Engine. What was that mathematician's last name?",
+    "answer": "Babbage",
+    "reasoning_types": [
+      "multi_hop",
+      "entity_linking"
+    ],
+    "contexts": [
+      {
+        "title": "Ada Lovelace",
+        "source_url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+        "text": "Ada Lovelace was an English mathematician and writer, chiefly known for her work on Charles Babbage's proposed mechanical general-purpose computer, the Analytical Engine."
+      },
+      {
+        "title": "Charles Babbage",
+        "source_url": "https://en.wikipedia.org/wiki/Charles_Babbage",
+        "text": "Charles Babbage was an English mathematician, philosopher, inventor, and mechanical engineer. He originated the concept of a digital programmable computer and designed the Difference Engine."
+      }
+    ]
+  },
+  {
+    "question_id": "frames-smoke-mercury-messenger",
+    "prompt": "The spacecraft MESSENGER orbited which planet, the one closest to the Sun?",
+    "answer": "Mercury",
+    "reasoning_types": [
+      "multi_hop",
+      "world_knowledge"
+    ],
+    "contexts": [
+      {
+        "title": "MESSENGER",
+        "source_url": "https://en.wikipedia.org/wiki/MESSENGER",
+        "text": "MESSENGER was a NASA robotic space probe that orbited the planet Mercury between 2011 and 2015 to study its chemical composition, geology, and magnetic field."
+      },
+      {
+        "title": "Mercury (planet)",
+        "source_url": "https://en.wikipedia.org/wiki/Mercury_(planet)",
+        "text": "Mercury is the smallest planet in the Solar System and the closest to the Sun."
+      }
+    ]
+  }
+]

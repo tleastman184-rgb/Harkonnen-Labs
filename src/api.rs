@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -22,12 +22,13 @@ use tracing::info;
 use crate::{
     chat::{dispatch_message, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
+    memory::{MemoryRetrievalHit, MemoryStore},
     models::{
         AgentExecution, BlackboardState, CoobieBriefing, EvidenceAnnotation,
         EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchReport,
         EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
-        PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent,
-        RunRecord, Spec, ValidationSummary,
+        PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec,
+        ValidationSummary,
     },
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
@@ -71,6 +72,7 @@ struct MemoryBoardResponse {
     project_memory_root: Option<String>,
     stale_risk_summary: MemoryBoardRiskSummary,
     stale_memory_entries: Vec<MemoryBoardRiskView>,
+    memory_updates: Vec<MemoryBoardUpdateView>,
     consolidate_available: bool,
 }
 
@@ -161,6 +163,15 @@ struct MemoryBoardRiskView {
     risk_reduced_from_previous: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+struct MemoryBoardUpdateView {
+    relation: String,
+    stale_memory_id: String,
+    stale_summary: String,
+    fresh_memory_id: String,
+    fresh_summary: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct MemoryBoardStaleStatusArtifact {
     #[serde(default)]
@@ -186,6 +197,26 @@ struct MemoryBoardStaleStatusEntry {
     previous_severity_score: Option<i32>,
     #[serde(default)]
     risk_reduced_from_previous: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryBoardUpdateArtifact {
+    #[serde(default)]
+    entries: Vec<MemoryBoardUpdateEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MemoryBoardUpdateEntry {
+    #[serde(default)]
+    relation: String,
+    #[serde(default)]
+    stale_memory_id: String,
+    #[serde(default)]
+    stale_summary: String,
+    #[serde(default)]
+    fresh_memory_id: String,
+    #[serde(default)]
+    fresh_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -370,6 +401,8 @@ struct CoobieQueryRequest {
     message: String,
     #[serde(default)]
     run_id: Option<String>,
+    #[serde(default)]
+    retrieval_depth: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +410,8 @@ struct AgentChatRequest {
     message: String,
     #[serde(default)]
     run_id: Option<String>,
+    #[serde(default)]
+    retrieval_depth: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +433,33 @@ struct CoobieQuerySource {
     phase: Option<String>,
     #[serde(default)]
     artifact: Option<String>,
+    #[serde(default)]
+    hop: Option<u8>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    score: Option<f64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    challenged_by: Vec<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryTargetSourceMetadata {
+    source_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedMemoryHit {
+    scope: String,
+    hop: u8,
+    query: String,
+    hit: MemoryRetrievalHit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,7 +997,14 @@ async fn post_chat(
     State(app): State<AppContext>,
     Json(request): Json<CoobieQueryRequest>,
 ) -> impl IntoResponse {
-    match execute_coobie_query(&app, request.run_id.as_deref(), &request.message).await {
+    match execute_coobie_query(
+        &app,
+        request.run_id.as_deref(),
+        &request.message,
+        normalize_retrieval_depth(request.retrieval_depth),
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -945,7 +1014,14 @@ async fn post_coobie_query(
     State(app): State<AppContext>,
     Json(request): Json<CoobieQueryRequest>,
 ) -> impl IntoResponse {
-    match execute_coobie_query(&app, request.run_id.as_deref(), &request.message).await {
+    match execute_coobie_query(
+        &app,
+        request.run_id.as_deref(),
+        &request.message,
+        normalize_retrieval_depth(request.retrieval_depth),
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -957,7 +1033,14 @@ async fn post_agent_chat(
     Json(request): Json<AgentChatRequest>,
 ) -> impl IntoResponse {
     if agent.eq_ignore_ascii_case("coobie") {
-        match execute_coobie_query(&app, request.run_id.as_deref(), &request.message).await {
+        match execute_coobie_query(
+            &app,
+            request.run_id.as_deref(),
+            &request.message,
+            normalize_retrieval_depth(request.retrieval_depth),
+        )
+        .await
+        {
             Ok(response) => (StatusCode::OK, Json(response)).into_response(),
             Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
         }
@@ -1439,6 +1522,7 @@ async fn execute_coobie_query(
     app: &AppContext,
     requested_run_id: Option<&str>,
     message: &str,
+    retrieval_depth: usize,
 ) -> anyhow::Result<CoobieQueryResponse> {
     let query = message.trim();
     if query.is_empty() {
@@ -1472,7 +1556,7 @@ async fn execute_coobie_query(
         return answer_memory_status_query(app, target_run.as_deref(), query).await;
     }
 
-    answer_general_coobie_query(app, target_run.as_deref(), query).await
+    answer_general_coobie_query(app, target_run.as_deref(), query, retrieval_depth).await
 }
 
 async fn resolve_query_run(
@@ -1495,13 +1579,243 @@ async fn resolve_query_run(
         .map(|run| run.run_id))
 }
 
+fn normalize_retrieval_depth(depth: Option<u8>) -> usize {
+    depth.unwrap_or(1).clamp(1, 2) as usize
+}
+
+async fn load_query_memory_stores(
+    app: &AppContext,
+    run_id: Option<&str>,
+) -> anyhow::Result<Vec<(String, MemoryStore)>> {
+    let mut stores = vec![("core_memory".to_string(), app.memory_store.clone())];
+
+    let Some(run_id) = run_id else {
+        return Ok(stores);
+    };
+
+    let target_source_path = app
+        .paths
+        .workspaces
+        .join(run_id)
+        .join("run")
+        .join("target_source.json");
+    if !target_source_path.exists() {
+        return Ok(stores);
+    }
+
+    let raw = tokio::fs::read_to_string(&target_source_path).await?;
+    let target_source: QueryTargetSourceMetadata = serde_json::from_str(&raw)?;
+    let project_memory_root = PathBuf::from(target_source.source_path)
+        .join(".harkonnen")
+        .join("project-memory");
+    tokio::fs::create_dir_all(project_memory_root.join("imports")).await?;
+    let project_store = MemoryStore::new(project_memory_root);
+    project_store.reindex().await?;
+    stores.insert(0, ("project_memory".to_string(), project_store));
+    Ok(stores)
+}
+
+fn memory_source_ref(
+    scope: &str,
+    run_id: Option<&str>,
+    hit: &ScopedMemoryHit,
+) -> CoobieQuerySource {
+    let note = if !hit.hit.surfaced_via.is_empty() {
+        Some(format!("via {}", hit.hit.surfaced_via.join("; ")))
+    } else if !hit.hit.invalidation_reasons.is_empty() {
+        Some(hit.hit.invalidation_reasons.join("; "))
+    } else {
+        None
+    };
+
+    CoobieQuerySource {
+        kind: scope.to_string(),
+        label: hit.hit.summary.clone(),
+        run_id: run_id.map(|value| value.to_string()),
+        phase: None,
+        artifact: Some(hit.hit.id.clone()),
+        hop: Some(hit.hop),
+        query: Some(hit.query.clone()),
+        score: Some(hit.hit.score as f64),
+        status: hit.hit.status.clone(),
+        superseded_by: hit.hit.superseded_by.clone(),
+        challenged_by: hit.hit.challenged_by.clone(),
+        note,
+    }
+}
+
+fn follow_up_query_from_hits(original_query: &str, hits: &[ScopedMemoryHit]) -> Option<String> {
+    let top_hit = hits.first()?;
+    let original_tokens = original_query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    let mut parts = vec![top_hit.hit.summary.clone()];
+    for tag in top_hit.hit.tags.iter().take(3) {
+        if !tag.trim().is_empty() {
+            parts.push(tag.trim().to_string());
+        }
+    }
+
+    let snippet_terms = top_hit
+        .hit
+        .snippet
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 5)
+        .map(|token| token.to_ascii_lowercase())
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "which"
+                    | "their"
+                    | "there"
+                    | "would"
+                    | "about"
+                    | "because"
+                    | "after"
+                    | "before"
+                    | "under"
+                    | "while"
+                    | "where"
+                    | "using"
+                    | "these"
+                    | "those"
+                    | "query"
+                    | "memory"
+            ) && !original_tokens.contains(token)
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+    if !snippet_terms.is_empty() {
+        parts.push(snippet_terms.join(" "));
+    }
+
+    let derived = parts.join(" ").trim().to_string();
+    if derived.is_empty() || derived.eq_ignore_ascii_case(original_query) {
+        None
+    } else {
+        Some(derived)
+    }
+}
+
+async fn retrieve_multi_hop_memory_hits(
+    app: &AppContext,
+    run_id: Option<&str>,
+    query: &str,
+    retrieval_depth: usize,
+) -> anyhow::Result<(Vec<String>, Vec<ScopedMemoryHit>)> {
+    let stores = load_query_memory_stores(app, run_id).await?;
+    let mut retrieval_path = Vec::new();
+    let mut all_hits = Vec::new();
+    let mut seen = HashSet::new();
+    let mut active_query = query.trim().to_string();
+
+    for hop in 1..=retrieval_depth.max(1) {
+        if active_query.is_empty() {
+            break;
+        }
+
+        let mut hop_hits = Vec::new();
+        for (scope, store) in &stores {
+            let ranked = store
+                .retrieve_ranked_entries(
+                    &active_query,
+                    app.embedding_store.as_ref(),
+                    if hop == 1 { 4 } else { 3 },
+                )
+                .await?;
+            for hit in ranked {
+                let dedupe_key = format!("{}::{}", scope, hit.id);
+                if seen.insert(dedupe_key) {
+                    hop_hits.push(ScopedMemoryHit {
+                        scope: scope.clone(),
+                        hop: hop as u8,
+                        query: active_query.clone(),
+                        hit,
+                    });
+                }
+            }
+        }
+
+        hop_hits.sort_by(|left, right| {
+            right
+                .hit
+                .score
+                .partial_cmp(&left.hit.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if hop_hits.is_empty() {
+            if hop == 1 {
+                retrieval_path.push("memory_chain:hop_1_empty".to_string());
+            }
+            break;
+        }
+
+        retrieval_path.push(format!("memory_chain:hop_{}", hop));
+        for hit in &hop_hits {
+            let scope_segment = format!("{}:hop_{}", hit.scope, hop);
+            if !retrieval_path
+                .iter()
+                .any(|existing| existing == &scope_segment)
+            {
+                retrieval_path.push(scope_segment);
+            }
+        }
+        all_hits.extend(hop_hits.clone());
+
+        if hop >= retrieval_depth {
+            break;
+        }
+        let Some(next_query) = follow_up_query_from_hits(query, &hop_hits) else {
+            break;
+        };
+        if next_query.eq_ignore_ascii_case(&active_query) {
+            break;
+        }
+        active_query = next_query;
+    }
+
+    Ok((retrieval_path, all_hits))
+}
+
+fn format_memory_chain_summary(hits: &[ScopedMemoryHit]) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+
+    let hop_count = hits.iter().map(|hit| hit.hop).max().unwrap_or(1);
+    let top = hits
+        .iter()
+        .take(4)
+        .map(|hit| format!("hop {} {} [{}]", hit.hop, hit.hit.summary, hit.scope))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "memory chain surfaced {} hit(s) across {} hop(s): {}",
+        hits.len(),
+        hop_count,
+        top,
+    ))
+}
+
 async fn answer_general_coobie_query(
     app: &AppContext,
     run_id: Option<&str>,
     query: &str,
+    retrieval_depth: usize,
 ) -> anyhow::Result<CoobieQueryResponse> {
     let mut retrieval_path = Vec::new();
     let mut sources = Vec::new();
+    let (memory_retrieval_path, memory_hits) =
+        retrieve_multi_hop_memory_hits(app, run_id, query, retrieval_depth).await?;
+    retrieval_path.extend(memory_retrieval_path);
+    for hit in memory_hits.iter().take(6) {
+        sources.push(memory_source_ref(&hit.scope, run_id, hit));
+    }
+
     if let Some(run_id) = run_id {
         retrieval_path.push("working_memory".to_string());
         retrieval_path.push("blackboard".to_string());
@@ -1555,26 +1869,44 @@ async fn answer_general_coobie_query(
             ));
         }
 
-        let response = format_general_query_response(
+        let mut response = format_general_query_response(
             query,
             mission.as_ref(),
             action.as_ref(),
             evidence.as_ref(),
             memory.as_ref(),
         );
+        if let Some(summary) = format_memory_chain_summary(&memory_hits) {
+            response.push(' ');
+            response.push_str(&summary);
+            response.push('.');
+        }
         return Ok(CoobieQueryResponse {
             agent: "coobie".to_string(),
             response,
             retrieval_path,
-            confidence: 0.72,
+            confidence: if memory_hits.is_empty() { 0.72 } else { 0.82 },
+            sources,
+        });
+    }
+
+    if let Some(summary) = format_memory_chain_summary(&memory_hits) {
+        return Ok(CoobieQueryResponse {
+            agent: "coobie".to_string(),
+            response: format!(
+                "I do not have a run in working memory yet, but {}.",
+                summary
+            ),
+            retrieval_path,
+            confidence: 0.61,
             sources,
         });
     }
 
     Ok(CoobieQueryResponse {
         agent: "coobie".to_string(),
-        response: "I do not have a run in working memory yet. Commission a run or pass a run_id and I can answer from the blackboard, lessons, and causal history.".to_string(),
-        retrieval_path: vec!["working_memory".to_string()],
+        response: "I do not have a run in working memory yet. Commission a run or pass a run_id and I can answer from the blackboard, lessons, causal history, and memory chain retrieval.".to_string(),
+        retrieval_path: vec!["working_memory".to_string(), "memory_chain:hop_1_empty".to_string()],
         confidence: 0.42,
         sources,
     })
@@ -1631,6 +1963,17 @@ async fn answer_memory_status_query(
             )
         })
         .collect::<Vec<_>>();
+    let updates = board
+        .memory_updates
+        .iter()
+        .take(3)
+        .map(|entry| {
+            format!(
+                "{}:{}->{}",
+                entry.relation, entry.stale_memory_id, entry.fresh_memory_id
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mut response = format!(
         "Memory Board for run {}: {} active recalled lessons, {} stale-risk entries, active risk score {}.",
@@ -1644,6 +1987,9 @@ async fn answer_memory_status_query(
     }
     if !stale.is_empty() {
         response.push_str(&format!(" Top stale memory entries: {}.", stale.join("; ")));
+    }
+    if !updates.is_empty() {
+        response.push_str(&format!(" Recorded fact updates: {}.", updates.join("; ")));
     }
 
     Ok(CoobieQueryResponse {
@@ -1669,6 +2015,13 @@ async fn answer_memory_status_query(
                 Some(run_id),
                 Some("memory"),
                 Some("stale_memory_mitigation_status.json"),
+            ),
+            source_ref(
+                "memory_board",
+                "memory-updates",
+                Some(run_id),
+                Some("memory"),
+                Some("memory-updates.json"),
             ),
         ],
     })
@@ -1941,6 +2294,13 @@ fn source_ref(
         run_id: run_id.map(|value| value.to_string()),
         phase: phase.map(|value| value.to_string()),
         artifact: artifact.map(|value| value.to_string()),
+        hop: None,
+        query: None,
+        score: None,
+        status: None,
+        superseded_by: None,
+        challenged_by: Vec::new(),
+        note: None,
     }
 }
 
@@ -2138,6 +2498,7 @@ async fn build_memory_board(
     let mut causal_precedents = Vec::new();
     let mut project_memory_root = None;
     let mut stale_entries = Vec::new();
+    let mut memory_updates = Vec::new();
 
     if let Some(briefing) = coobie_briefing.as_ref() {
         for reminder in &briefing.recommended_guardrails {
@@ -2153,6 +2514,30 @@ async fn build_memory_board(
         }
         causal_precedents = briefing.prior_causes.clone();
         project_memory_root = briefing.project_memory_root.clone();
+        if let Some(project_memory_root_value) = project_memory_root.as_ref() {
+            if let Some(harkonnen_dir) = PathBuf::from(project_memory_root_value)
+                .parent()
+                .map(|path| path.to_path_buf())
+            {
+                if let Some(update_artifact) = read_optional_json::<MemoryBoardUpdateArtifact>(
+                    &harkonnen_dir.join("memory-updates.json"),
+                )
+                .await?
+                {
+                    memory_updates = update_artifact
+                        .entries
+                        .into_iter()
+                        .map(|entry| MemoryBoardUpdateView {
+                            relation: entry.relation,
+                            stale_memory_id: entry.stale_memory_id,
+                            stale_summary: entry.stale_summary,
+                            fresh_memory_id: entry.fresh_memory_id,
+                            fresh_summary: entry.fresh_summary,
+                        })
+                        .collect();
+                }
+            }
+        }
 
         for lesson in &briefing.relevant_lessons {
             let mut used_in_phases = Vec::new();
@@ -2305,6 +2690,7 @@ async fn build_memory_board(
             active_risk_score,
         },
         stale_memory_entries: stale_entries,
+        memory_updates,
         consolidate_available: true,
     }))
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::process::Command;
 
-use crate::{config::Paths, locomo, longmemeval};
+use crate::{config::Paths, frames, locomo, longmemeval, streamingqa};
 
 const SKIP_EXIT_CODE: i32 = 10;
 const OUTPUT_LIMIT: usize = 8_000;
@@ -404,7 +404,11 @@ fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Str
         }
     }
 
-    lines.push(format!("- Correct answers: {}/{}", correct.len(), questions.len()));
+    lines.push(format!(
+        "- Correct answers: {}/{}",
+        correct.len(),
+        questions.len()
+    ));
     if correct.is_empty() {
         lines.push("- None recorded in this run.".to_string());
     } else {
@@ -720,6 +724,42 @@ async fn run_builtin_step(
                 )
             }
             locomo::LoCoMoSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "frames" => match frames::run_with_overrides(paths, &step.env).await? {
+            frames::FramesSuiteOutcome::Completed(output) => {
+                let status = frames::status_for_output(&output);
+                let reason = frames::reason_for_output(&output);
+                (
+                    status,
+                    frames::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            frames::FramesSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "streamingqa" => match streamingqa::run_with_overrides(paths, &step.env).await? {
+            streamingqa::StreamingQaSuiteOutcome::Completed(output) => {
+                let status = streamingqa::status_for_output(&output);
+                let reason = streamingqa::reason_for_output(&output);
+                (
+                    status,
+                    streamingqa::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            streamingqa::StreamingQaSuiteOutcome::Skipped(reason) => (
                 BenchmarkStatus::Skipped,
                 String::new(),
                 String::new(),
