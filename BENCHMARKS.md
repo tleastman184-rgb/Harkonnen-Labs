@@ -105,7 +105,7 @@ when their datasets or adapter commands are not configured yet.
 
 ## External Adapter Environment
 
-The first automation pass uses small wrapper scripts so each external benchmark can be attached without changing Rust code.
+The benchmark toolchain now mixes native Rust adapters and thin wrappers. LongMemEval, LoCoMo, and FRAMES run natively; the remaining external suites still use wrapper scripts until their adapters land.
 
 | Benchmark | Required env to make it runnable |
 | --- | --- |
@@ -115,7 +115,7 @@ The first automation pass uses small wrapper scripts so each external benchmark 
 | SWE-bench Verified | `SWEBENCH_COMMAND`, optional `SWEBENCH_ROOT` |
 | SWE-bench Pro | `SWEBENCH_PRO_COMMAND`, optional `SWEBENCH_PRO_ROOT` |
 | FRAMES | `FRAMES_DATASET`, optional `FRAMES_MODE`, `FRAMES_LIMIT`, `FRAMES_OUTPUT_DIR`, `FRAMES_DIRECT_PROVIDER`, `FRAMES_MIN_ACCURACY` |
-| StreamingQA | `STREAMINGQA_DATASET`, optional `STREAMINGQA_LIMIT`, `STREAMINGQA_OUTPUT_DIR`, `STREAMINGQA_DIRECT_PROVIDER` |
+| StreamingQA | `STREAMINGQA_DATASET`, optional `STREAMINGQA_DOCS`, `STREAMINGQA_MODE`, `STREAMINGQA_LIMIT`, `STREAMINGQA_OUTPUT_DIR`, `STREAMINGQA_DIRECT_PROVIDER`, `STREAMINGQA_MIN_ACCURACY` |
 | HELMET | `HELMET_COMMAND`, optional `HELMET_ROOT`, `HELMET_SPLIT` |
 | LiveCodeBench | `LIVECODEBENCH_COMMAND`, optional `LIVECODEBENCH_ROOT`, `LIVECODEBENCH_LIMIT` |
 | Aider Polyglot | `AIDER_POLYGLOT_COMMAND`, optional `AIDER_POLYGLOT_ROOT` |
@@ -228,7 +228,10 @@ Use for Coobie memory quality against Mem0 and other vector-store memory systems
 FRAMES specifically tests multi-hop factual recall — questions that require chaining
 two or more retrieved facts. Single-pass vector similarity cannot resolve these;
 Coobie's multi-hop retrieval chain (Phase 4) is the required feature.
-Run in paired mode: Coobie vs raw-LLM baseline, same provider.
+
+Native adapter status: implemented. The built-in runner supports paired Coobie versus
+raw-LLM mode, local JSON smoke fixtures with inline contexts, and official TSV/CSV
+rows that resolve Wikipedia extracts into a local benchmark cache.
 
 Sources:
 
@@ -242,6 +245,10 @@ tests whether the system correctly updates its beliefs — not just whether it r
 stored facts. No competitor publishes StreamingQA scores because no other memory system
 has explicit fact-invalidation tracking. Requires the memory invalidation feature
 (Phase 4) to produce meaningful results.
+
+Native adapter status: implemented. The built-in runner supports inline smoke fixtures
+with explicit document supersession, plus official question JSONL paired with a local
+JSON/JSONL WMT document export keyed by `evidence_id`/`sorting_key`.
 
 Sources:
 
@@ -390,13 +397,12 @@ Use this template in the README or release notes once scores are available:
 
 The current toolchain is intentionally adapter-friendly. Priority order for the next adapter work:
 
-1. Publish side-by-side LongMemEval PackChat versus raw-LLM results in the README
-2. Wire FRAMES adapter — the Mem0 comparison line, highest competitive value
+1. Publish side-by-side LongMemEval, LoCoMo, and FRAMES PackChat versus raw-LLM results in the README
+2. Publish side-by-side StreamingQA PackChat versus raw-LLM results in the README
 3. Wire CLADDER adapter — unique claim, no competitor can respond to it
 4. Wire LiveCodeBench adapter — the OpenCode/Aider comparison line
 5. Wire Aider Polyglot adapter — direct open-source leaderboard comparison
 6. Add a first-class SWE-bench submission/export path for both Verified and Pro
 7. Wire DevBench adapter after Flint doc phase ships (Phase 3)
-8. Add StreamingQA adapter after memory invalidation feature ships (Phase 4)
-9. Begin building causal attribution seeded failure corpus (can start now, incrementally)
-10. Wire GAIA and AgentBench after Phase 6
+8. Begin building causal attribution seeded failure corpus (can start now, incrementally)
+9. Wire GAIA and AgentBench after Phase 6

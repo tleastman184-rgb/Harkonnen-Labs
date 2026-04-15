@@ -1,0 +1,63 @@
+{
+  "documents": [
+    {
+      "id": "oakview-mayor-2024-01",
+      "title": "Oakview elects Alice Hart",
+      "publication_ts": 1704067200,
+      "text": "On January 1, 2024, Oakview elected Alice Hart as mayor after a close city race."
+    },
+    {
+      "id": "oakview-mayor-2024-04",
+      "title": "Ben Moss becomes Oakview mayor",
+      "publication_ts": 1711929600,
+      "supersedes": [
+        "oakview-mayor-2024-01"
+      ],
+      "text": "On April 1, 2024, Ben Moss became mayor of Oakview, replacing Alice Hart after a special election."
+    },
+    {
+      "id": "harbor-power-2024-02",
+      "title": "Harbor Power chief executive update",
+      "publication_ts": 1707523200,
+      "text": "In February 2024, Harbor Power appointed Dana Ibarra as chief executive officer."
+    }
+  ],
+  "questions": [
+    {
+      "qa_id": "streamingqa-smoke-1",
+      "question": "Who was the mayor of Oakview in February 2024?",
+      "answers": [
+        "Alice Hart"
+      ],
+      "question_ts": 1708041600,
+      "evidence_ts": 1704067200,
+      "evidence_id": "oakview-mayor-2024-01",
+      "recent_or_past": "past",
+      "written_or_generated": "written"
+    },
+    {
+      "qa_id": "streamingqa-smoke-2",
+      "question": "Who was the mayor of Oakview in April 2024 after the special election?",
+      "answers": [
+        "Ben Moss"
+      ],
+      "question_ts": 1712534400,
+      "evidence_ts": 1711929600,
+      "evidence_id": "oakview-mayor-2024-04",
+      "recent_or_past": "recent",
+      "written_or_generated": "written"
+    },
+    {
+      "qa_id": "streamingqa-smoke-3",
+      "question": "Who became chief executive officer of Harbor Power in February 2024?",
+      "answers": [
+        "Dana Ibarra"
+      ],
+      "question_ts": 1708387200,
+      "evidence_ts": 1707523200,
+      "evidence_id": "harbor-power-2024-02",
+      "recent_or_past": "recent",
+      "written_or_generated": "generated"
+    }
+  ]
+}

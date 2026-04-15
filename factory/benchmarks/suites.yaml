@@ -150,6 +150,131 @@ suites:
         env:
           LOCOMO_MODE: "direct"
 
+
+
+  - id: "coobie_frames"
+    title: "Coobie on FRAMES"
+    subsystem: "coobie"
+    category: "multi_hop_memory"
+    tier: "target"
+    description: >-
+      External multi-hop factual recall benchmark that measures whether Coobie can
+      chain retrieved evidence across multiple documents instead of relying on a
+      single memory hit.
+    benchmark_url: "https://huggingface.co/datasets/google/frames-benchmark"
+    baseline_reference: >-
+      Compare against reproduced raw-model or memory-system baselines, and report
+      the exact dataset split plus proxy metric used for the local run.
+    required_env:
+      - "FRAMES_DATASET"
+    setup_notes:
+      - "Set FRAMES_DATASET to a local FRAMES JSON, TSV, or CSV file. The bundled smoke fixture lives at factory/benchmarks/fixtures/frames-smoke.json."
+      - "Official FRAMES TSV rows can omit inline context; the adapter will fetch and cache Wikipedia extracts into the benchmark output dir."
+      - "Optionally set FRAMES_LIMIT for smoke runs, FRAMES_OUTPUT_DIR for custom artifact paths, and FRAMES_MIN_ACCURACY to fail the suite under a local threshold."
+    tags:
+      - "external"
+      - "memory"
+      - "coobie"
+      - "multi-hop"
+    steps:
+      - id: "frames_adapter"
+        label: "FRAMES adapter"
+        builtin: "frames"
+
+  - id: "frames_raw_llm"
+    title: "Raw LLM Baseline on FRAMES"
+    subsystem: "baseline"
+    category: "multi_hop_memory"
+    tier: "target"
+    description: >-
+      Direct model-only FRAMES baseline using the active provider without PackChat
+      prompts or Coobie orchestration.
+    benchmark_url: "https://huggingface.co/datasets/google/frames-benchmark"
+    baseline_reference: >-
+      Use this as the local raw-model baseline so reporting can show what Coobie's
+      retrieval chain adds over the same underlying provider.
+    required_env:
+      - "FRAMES_DATASET"
+    setup_notes:
+      - "Set FRAMES_DATASET to a local FRAMES JSON, TSV, or CSV file. The bundled smoke fixture lives at factory/benchmarks/fixtures/frames-smoke.json."
+      - "This suite sets FRAMES_MODE=direct and uses the active setup provider directly."
+      - "Optionally set FRAMES_DIRECT_PROVIDER to target a named setup provider such as codex."
+    tags:
+      - "external"
+      - "baseline"
+      - "memory"
+      - "llm"
+      - "multi-hop"
+    steps:
+      - id: "frames_direct_adapter"
+        label: "FRAMES raw-model adapter"
+        builtin: "frames"
+        env:
+          FRAMES_MODE: "direct"
+
+
+
+  - id: "coobie_streamingqa"
+    title: "Coobie on StreamingQA"
+    subsystem: "coobie"
+    category: "belief_updates"
+    tier: "target"
+    description: >-
+      External temporal QA benchmark for belief updates over changing news facts.
+      The native adapter streams documents in publication order and answers each
+      question using only context available before that question timestamp.
+    benchmark_url: "https://github.com/google-deepmind/streamingqa"
+    baseline_reference: >-
+      Compare against a raw-model baseline on the same retrieved context to show
+      what Coobie gains from temporal memory handling and invalidation-aware recall.
+    required_env:
+      - "STREAMINGQA_DATASET"
+    setup_notes:
+      - "Set STREAMINGQA_DATASET to a local StreamingQA fixture JSON or official question JSONL. The bundled smoke fixture lives at factory/benchmarks/fixtures/streamingqa-smoke.json."
+      - "If STREAMINGQA_DATASET is the official question JSONL, also set STREAMINGQA_DOCS to a JSON or JSONL export of WMT documents with id/sorting_key, publication_ts, and text fields."
+      - "Optional envs: STREAMINGQA_MODE, STREAMINGQA_LIMIT, STREAMINGQA_OUTPUT_DIR, STREAMINGQA_DIRECT_PROVIDER, and STREAMINGQA_MIN_ACCURACY."
+    tags:
+      - "external"
+      - "memory"
+      - "coobie"
+      - "temporal"
+      - "belief-updates"
+    steps:
+      - id: "streamingqa_adapter"
+        label: "StreamingQA adapter"
+        builtin: "streamingqa"
+
+  - id: "streamingqa_raw_llm"
+    title: "Raw LLM Baseline on StreamingQA"
+    subsystem: "baseline"
+    category: "belief_updates"
+    tier: "target"
+    description: >-
+      Direct model-only StreamingQA baseline using the active provider against the
+      same temporally filtered retrieved context, without PackChat orchestration.
+    benchmark_url: "https://github.com/google-deepmind/streamingqa"
+    baseline_reference: >-
+      Use this as the local raw-model baseline so reporting can separate Coobie's
+      temporal memory behavior from the base provider's parametric knowledge.
+    required_env:
+      - "STREAMINGQA_DATASET"
+    setup_notes:
+      - "Set STREAMINGQA_DATASET to a local StreamingQA fixture JSON or official question JSONL. The bundled smoke fixture lives at factory/benchmarks/fixtures/streamingqa-smoke.json."
+      - "If STREAMINGQA_DATASET is the official question JSONL, also set STREAMINGQA_DOCS to a JSON or JSONL export of WMT documents with id/sorting_key, publication_ts, and text fields."
+      - "This suite sets STREAMINGQA_MODE=direct. Optionally set STREAMINGQA_DIRECT_PROVIDER to target a named setup provider such as codex."
+    tags:
+      - "external"
+      - "baseline"
+      - "memory"
+      - "llm"
+      - "temporal"
+    steps:
+      - id: "streamingqa_direct_adapter"
+        label: "StreamingQA raw-model adapter"
+        builtin: "streamingqa"
+        env:
+          STREAMINGQA_MODE: "direct"
+
   - id: "packchat_tau2"
     title: "PackChat on tau2-bench"
     subsystem: "packchat"
