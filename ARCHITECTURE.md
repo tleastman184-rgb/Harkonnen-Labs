@@ -659,7 +659,7 @@ Think control room for an AI machine shop, not pet-adoption website with logs.
 
 ## MVP Spine in This Repository
 
-The current scaffold is no longer just a spine — Phase 1 is fully shipped:
+The current scaffold is no longer just a spine — Phases 1, 4, 4b, and 5 are now shipped:
 
 - spec loading and validation (Scout layer)
 - run creation and persistence in SQLite
@@ -669,19 +669,24 @@ The current scaffold is no longer just a spine — Phase 1 is fully shipped:
 - PackChat conversational control plane — chat threads, `@mention` routing, checkpoint/unblock flow
 - Coobie layered memory — episodic capture, causal reasoning, hybrid semantic retrieval
 - Coobie Palace — den-based compound recall, patrol, and scent computation
-- Coobie causal streaks, cross-run pattern detection, Phase 3 preflight guidance
+- Coobie causal streaks, cross-run pattern detection, and Phase 3 preflight guidance
+- episodic `state_before` / `state_after` snapshots and cross-phase causal links
+- Pearl hierarchy labels in Coobie hypotheses and causal graph edges
+- multi-hop retrieval and memory invalidation / fact-update tracking
+- Consolidation Workbench — operator-reviewed keep/discard/edit flow before durable promotion
 - Causal feedback loop — Sable rationale written back to project memory
 - Keeper coordination API with claims, heartbeats, conflict detection, and release
-- Pack Board React UI — PackChat panel, Attribution Board, Factory Floor, Memory Board
-- First-class benchmark toolchain — LongMemEval and LoCoMo native adapters, CI workflow
+- Pack Board React UI — PackChat panel, Attribution Board, Factory Floor, Memory Board, Workbench
+- First-class benchmark toolchain — LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER native adapters, plus CI workflow
 
 The next practical layers to build are:
 
 1. Phase 2 — Bramble real test execution; Mason online-judge feedback loop
 2. Phase 3 — Ash live twin provisioning; Flint documentation phase
-3. Phase 4 — Episodic layer enrichment; multi-hop retrieval; memory invalidation; Pearl hierarchy in diagnose
-4. Phase 5 — Operator-reviewed consolidation Workbench
-5. Phase 6 — TypeDB 3.x semantic graph layer
+3. Parallel Product Track — Operator Model Activation in PackChat and the Pack Board
+4. Phase 5b — Qdrant semantic memory, OCR ingest, and memory-module refactor
+5. Phase 6 — TypeDB 3.x semantic graph layer and real graph-backed causal queries
+6. Phase 7 — E-CARE, causal attribution corpus, and stronger causal benchmark claims
 
 ## Final Definition
 

@@ -105,7 +105,7 @@ when their datasets or adapter commands are not configured yet.
 
 ## External Adapter Environment
 
-The benchmark toolchain now mixes native Rust adapters and thin wrappers. LongMemEval, LoCoMo, and FRAMES run natively; the remaining external suites still use wrapper scripts until their adapters land.
+The benchmark toolchain now mixes native Rust adapters and thin wrappers. LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER run natively; the remaining external suites still use wrapper scripts until their adapters land.
 
 | Benchmark | Required env to make it runnable |
 | --- | --- |
@@ -125,7 +125,7 @@ The benchmark toolchain now mixes native Rust adapters and thin wrappers. LongMe
 | GAIA | `GAIA_COMMAND`, optional `GAIA_ROOT`, `GAIA_LEVEL` |
 | AgentBench | `AGENTBENCH_COMMAND`, optional `AGENTBENCH_ROOT`, `AGENTBENCH_ENVS` |
 
-LongMemEval and LoCoMo now both have native Harkonnen adapters and raw-model direct baselines inside the Rust benchmark runner. Point `LONGMEMEVAL_DATASET` or `LOCOMO_DATASET` at local dataset files to run either mode and emit local prediction and summary artifacts. The remaining suites still use external wrapper commands.
+LongMemEval and LoCoMo have native Harkonnen adapters and raw-model direct baselines inside the Rust benchmark runner, and FRAMES, StreamingQA, HELMET, and CLADDER now also run natively through the same benchmark command surface. Point the corresponding dataset or adapter env vars at local inputs to emit local prediction and summary artifacts. The remaining suites still use external wrapper commands.
 
 For a quick native LongMemEval comparison run, use:
 
@@ -395,14 +395,13 @@ Use this template in the README or release notes once scores are available:
 
 ## Near-Term Follow-up
 
-The current toolchain is intentionally adapter-friendly. Priority order for the next adapter work:
+The current toolchain is intentionally adapter-friendly. Priority order for the next benchmark work:
 
-1. Publish side-by-side LongMemEval, LoCoMo, and FRAMES PackChat versus raw-LLM results in the README
-2. Publish side-by-side StreamingQA PackChat versus raw-LLM results in the README
-3. Wire CLADDER adapter — unique claim, no competitor can respond to it
-4. Wire LiveCodeBench adapter — the OpenCode/Aider comparison line
-5. Wire Aider Polyglot adapter — direct open-source leaderboard comparison
-6. Add a first-class SWE-bench submission/export path for both Verified and Pro
-7. Wire DevBench adapter after Flint doc phase ships (Phase 3)
-8. Begin building causal attribution seeded failure corpus (can start now, incrementally)
-9. Wire GAIA and AgentBench after Phase 6
+1. Publish side-by-side LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER Harkonnen versus baseline results in the README
+2. Wire LiveCodeBench adapter — the OpenCode/Aider comparison line
+3. Wire Aider Polyglot adapter — direct open-source leaderboard comparison
+4. Add a first-class SWE-bench submission/export path for both Verified and Pro
+5. Wire DevBench adapter after Flint doc phase ships (Phase 3)
+6. Begin building the causal attribution seeded failure corpus (can start now, incrementally)
+7. Wire GAIA and AgentBench after Phase 6
+8. Add E-CARE after the Phase 7 causal-attribution track is live

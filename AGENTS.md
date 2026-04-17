@@ -406,9 +406,12 @@ security_expectations: [auth, secrets, isolation]
 
 **[ROADMAP.md](ROADMAP.md) is the canonical phase-by-phase build order.**
 All agents and contributors must check it before starting new work.
-Phase 1 PackChat backend is already shipped.
-The next phases in order are: Bramble Tests → Ash Twins → Episodic Layer →
-Consolidation Workbench → TypeDB Semantic Layer.
+Phases 1, 4, 4b, and 5 are already shipped.
+The active numbered build phases are Phase 2 (Bramble real test execution) and
+Phase 3 (Ash live twin provisioning), with Operator Model Activation running as a
+parallel product/control-plane track. Long-term roadmap work remains Phase 5b
+(memory infrastructure), Phase 6 (TypeDB semantic layer), and Phase 7
+(causal attribution corpus + E-CARE).
 
 ---
 
@@ -441,18 +444,26 @@ Consolidation Workbench → TypeDB Semantic Layer.
 - **Coobie Palace** (`src/coobie_palace.rs`) — den-based compound recall layer; patrol walks five dens (Spec, Test, Twin, Pack, Memory) before each run; compound scent elevates den-level streaks over individual cause scores; feeds directly into preflight briefing
 - **Causal feedback loop** — Sable scenario rationale written back to project memory as evidence after each run
 - **Semantic memory** — fastembed or OpenAI-compatible embeddings + SQLite vector store; hybrid vector + keyword retrieval
+- **Episodic state snapshots** — `state_before` / `state_after` workspace snapshots recorded for implementation and build episodes
+- **Cross-phase causal graph** — phase-sequence and failure-triggered links populate `causal_links`, surfaced through the causal events API
+- **Pearl hierarchy labeling** — Coobie hypotheses and causal graph edges carry associational / interventional / counterfactual levels
+- **Coobie multi-hop retrieval** — configurable retrieval depth with hop-by-hop source tracing in query responses
+- **Memory invalidation / fact-update tracking** — stale facts are marked superseded or challenged rather than silently overwritten
+- **Consolidation Workbench** — operator-reviewed keep/discard/edit flow before durable lesson promotion
 - **Native LongMemEval adapter** — paired Harkonnen vs raw-LLM comparison mode; `longmemeval_s_cleaned.json` support
 - **Native LoCoMo adapter** — paired Harkonnen vs raw-LLM comparison mode
+- **Native FRAMES, StreamingQA, HELMET, and CLADDER adapters** — benchmarked retrieval and causal-reasoning surfaces wired into the Rust runner
 - **First-class benchmark toolchain** — `benchmark list/run/report`; manifest-driven suites in `factory/benchmarks/suites.yaml`; CI workflow; LM Studio local routing
 - Keeper coordination API with claims, heartbeats, conflict detection, and release flow
-- Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, and Memory Board
+- Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, Memory Board, and Consolidation Workbench
 - Bootstrap scripts for home-linux and work-windows
 
 ### Planned (next build layer)
 
 - **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
 - **Phase 3** — Ash live twin provisioning against running Docker stubs; Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter
-- **Phase 4** — Episodic layer enrichment (causal link table, `state_before`/`state_after`); Coobie multi-hop retrieval chain; memory invalidation/fact-update tracking; Pearl hierarchy in `diagnose`; FRAMES, StreamingQA, HELMET, CLADDER adapters
-- **Phase 5** — Post-run consolidation Workbench (operator review before durable memory write); E-CARE adapter; causal attribution accuracy seeded failure corpus
+- **Parallel Product Track** — Operator Model Activation: PackChat-based elicitation workflow, approved operator-model storage, artifact export/import, and Scout/Coobie/Keeper integration
+- **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` split into the COOBIE_SPEC module tree
 - **Phase 6** — TypeDB 3.x semantic graph layer (COOBIE_SPEC.md Layer C); GAIA Level 3 and AgentBench adapters
-- DeepCausality phase 2 integration (real causaloids from the causal link table)
+- **Phase 7** — causal attribution corpus, E-CARE adapter, and publishable causal benchmark baselines
+- **DeepCausality Phase 2** — real causaloids from the causal link table after the TypeDB layer is live

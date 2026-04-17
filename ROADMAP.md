@@ -1,14 +1,14 @@
 # Harkonnen Labs — Execution Roadmap
 
 **This is the canonical build order from 2026-04-17 forward.**
-Phases 1, 4, and 5 are shipped. Phases 2 and 3 are the active next targets.
-New implementation work starts at Phase 2 unless an explicit doc-sync or polish task says otherwise.
+Phases 1, 4, 4b, and 5 are shipped. Phases 2 and 3 remain the active numbered build targets.
+New implementation work starts at Phase 2 unless an explicit doc-sync, operator-model slice, or polish task says otherwise.
 
 ---
 
 ## Why this order
 
-The factory has a complete foundation: core pipeline, PackChat control plane, layered Coobie memory, causal graph, Pearl hierarchy labeling, multi-hop retrieval, operator-reviewed consolidation Workbench, and a manifest-driven benchmark toolchain with several native adapters. The remaining gaps are concrete: Bramble's validation score is still a stub, Sable's twin is a manifest not a running system, memory invalidation tracking was spec'd but not built, and TypeDB is still ahead. Every phase below unblocks something downstream.
+The factory has a complete foundation: core pipeline, PackChat control plane, layered Coobie memory, causal graph, Pearl hierarchy labeling, multi-hop retrieval, memory invalidation, operator-reviewed consolidation Workbench, and a manifest-driven benchmark toolchain with several native adapters. The remaining gaps are concrete: Bramble's validation score is still a stub, Sable's twin is a manifest not a running system, long-term memory infrastructure is still SQLite-first, and TypeDB plus real causaloids are still ahead. Every phase below unblocks something downstream.
 
 Benchmarking remains a parallel track. Each phase ships with at least one measurable gate.
 
@@ -70,7 +70,7 @@ Right now Sable judges against a twin that is a JSON manifest, not running infra
 
 ---
 
-## Phase 4b — Memory Invalidation and Fact-Update Tracking
+## Phase 4b — Memory Invalidation and Fact-Update Tracking (Shipped)
 
 **Unlocks:** StreamingQA, and the structural claim that Coobie correctly *updates* beliefs rather than just *recalls* them. This work was spec'd in the Phase 4 episodic enrichment design but was not implemented during that phase. It needs its own slot.
 
@@ -158,6 +158,31 @@ TypeDB 3.x changes the implementation assumptions: the old JVM burden objection 
 **Done when:** The corpus has at least 30 labeled entries, the causal attribution accuracy benchmark has a published run, and E-CARE has a published score.
 
 ---
+
+## Parallel Product Track — Operator Model Activation
+
+**Unlocks:** Better commissioning, fewer mid-run clarification failures, and a reusable operator context layer that Scout, Coobie, and Keeper can all consume.
+
+This is not a replacement for Phase 2 or Phase 3. It is a control-plane/product track that fills the upstream gap between "I installed the factory" and "I can describe my work clearly enough to commission it."
+
+**What to build:**
+
+- Native PackChat-based elicitation workflow with five fixed layers: operating rhythms, recurring decisions, dependencies, institutional knowledge, friction
+- Approval checkpoints after each layer, reusing the existing checkpoint and unblock flow
+- Structured SQLite store for operator-model profiles, sessions, approved layer checkpoints, canonical entries, exports, and update candidates
+- Artifact generation for `operating-model.json`, `USER.md`, `SOUL.md`, `HEARTBEAT.md`, `schedule-recommendations.json`, plus a Harkonnen-specific `commissioning-brief.json`
+- Scout draft integration so spec generation can use an approved operator model as first-class context
+- Coobie preflight integration so operator-model assumptions contribute to `required_checks`, guardrails, and escalation rules
+- Review loop after runs: consolidation can propose operator-model updates, which the operator can keep/discard/edit before promotion
+- Import/export compatibility with OB1-style operating artifacts, but no direct code dependency on OB1
+
+**Benchmark / product gate:**
+
+- reduced operator clarification burden during commissioning and run execution
+- measurable drop in open checkpoints per run for projects using an approved operator model
+- spec draft quality and spec adherence compared with and without the operator model
+
+**Done when:** A user can choose `Interview Me First` in the current commissioning flow, complete the five-layer interview with approvals, generate operating artifacts, and see those artifacts materially influence Scout draft quality and Coobie preflight behavior.
 
 ## Benchmark Track (cross-phase)
 
@@ -254,7 +279,7 @@ Every reportable benchmark claim should include:
 - Native LongMemEval adapter + paired raw-LLM vs Harkonnen comparison mode
 - Native LoCoMo QA adapter + paired raw-LLM vs Harkonnen comparison mode
 - Native FRAMES adapter + paired raw-LLM vs Harkonnen comparison mode
-- Native StreamingQA adapter (static recall; belief-update tracking is Phase 4b)
+- Native StreamingQA adapter + memory invalidation / fact-update tracking for superseded beliefs
 - LM Studio / OpenAI-compatible benchmark routing for chat and embedding backends
 
 **Phase 4 — Episodic Layer Enrichment + Causal Graph + Benchmarks:**

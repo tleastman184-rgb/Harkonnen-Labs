@@ -77,7 +77,7 @@ Coobie implements a **multi-layer memory architecture** that goes beyond a flat 
 | Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | Live |
 | Causal Memory | Intervention-aware cause/effect relationships scored per run | Live |
 | Team Blackboard | Shared agent coordination state across four named slices | Live |
-| Consolidation | Promotion, pruning, and abstraction (operator-reviewed in Phase 5) | Partial |
+| Consolidation | Promotion, pruning, and abstraction with operator-reviewed keep/discard/edit flow | Live |
 
 #### Coobie Palace
 
@@ -107,6 +107,10 @@ Live features:
 * Cross-run pattern detection — identifies causes that cluster on specific spec types or phases
 * Phase 3 preflight guidance — spec-scoped cause history drives `required_checks` before each run
 * Palace compound recall — den-level streak weight elevates compound failures beyond individual cause scores
+* Cross-phase causal graph — episode-to-episode links record `phase_sequence` and `failure_triggered` relationships
+* Pearl hierarchy labels — Coobie hypotheses and causal graph edges are tagged associational, interventional, or counterfactual
+* Multi-hop retrieval chain — query responses now trace hop-by-hop memory retrieval depth and supporting evidence
+* Memory invalidation / fact-update tracking — superseded facts are surfaced as stale rather than silently overwritten
 * Causal feedback loop — Sable's scenario rationale is written back to project memory as evidence
 
 ---
@@ -147,7 +151,7 @@ cargo run -- benchmark run --all
 ./scripts/run-benchmarks.sh
 ```
 
-The machine-readable suite manifest lives at `factory/benchmarks/suites.yaml`, benchmark strategy and reporting guidance live in `BENCHMARKS.md`, and reports are written to `factory/artifacts/benchmarks/`. The default suite is a local regression gate, LongMemEval and LoCoMo now both run in native Harkonnen and raw-LLM baseline modes, and the remaining external adapters are prepared for tau2-bench and SWE-bench Verified/Pro. The execution roadmap in `ROADMAP.md` now treats benchmark gates as phase-level exit criteria rather than optional follow-up work.
+The machine-readable suite manifest lives at `factory/benchmarks/suites.yaml`, benchmark strategy and reporting guidance live in `BENCHMARKS.md`, and reports are written to `factory/artifacts/benchmarks/`. The default suite is a local regression gate, and LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER now run through native Harkonnen adapters alongside raw-LLM or direct baselines where supported. The execution roadmap in `ROADMAP.md` treats benchmark gates as phase-level exit criteria rather than optional follow-up work.
 
 The OpenAI/Codex provider path also supports optional OpenAI-compatible BYO endpoints through a setup `base_url`, so benchmark runs can target local or third-party compatible backends without changing Rust code.
 
@@ -162,17 +166,17 @@ All scores are pending first runs. The comparison targets listed are the systems
 | Benchmark | Subsystem | Metric | Harkonnen | Raw LLM baseline | Comparison target | Status | Phase |
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | LongMemEval-S | Coobie | Accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 1 done |
-| FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | planned | Phase 4 |
-| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | planned | Phase 4 |
+| FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 4 done |
+| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | wired | Phase 4b done |
 | LoCoMo QA | Coobie | QA score | pending | pending | raw LLM | wired | Phase 1 done |
-| HELMET | Coobie | Retrieval precision / recall | pending | pending | raw LLM | planned | Phase 4 |
+| HELMET | Coobie | Retrieval precision / recall | pending | pending | raw LLM | wired | Phase 4 done |
 
 #### Causal reasoning — unique to Harkonnen
 
 | Benchmark | Subsystem | Metric | Harkonnen | Raw LLM baseline | Notes | Status | Phase |
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
-| CLADDER | Coobie / causal layer | Accuracy by causal level | pending | pending | No competitor publishes this | planned | Phase 4 |
-| E-CARE | Coobie / diagnose | Explanation coherence | pending | pending | Tests diagnose output quality | planned | Phase 5 |
+| CLADDER | Coobie / causal layer | Accuracy by causal level | pending | pending | No competitor publishes this | wired | Phase 4 done |
+| E-CARE | Coobie / diagnose | Explanation coherence | pending | pending | Tests diagnose output quality | planned | Phase 7 |
 
 #### Coding loop — vs OpenCode / Aider / SWE-agent
 
@@ -227,140 +231,126 @@ Over time:
 ```bash
 git clone https://github.com/durinwinter/Harkonnen-Labs.git
 cd Harkonnen-Labs
-
 cargo build
 ```
 
----
-
-### 2. Start the Factory
+### 2. Check Your Setup
 
 ```bash
-cargo run
+cargo run -- setup check
 ```
 
-You should see:
+### 3. Create And Validate A YAML Spec
 
-* agent initialization
-* memory system startup
-* factory ready state
-
----
-
-### 3. Create a Spec
+```yaml
+# factory/specs/hello_api.yaml
+id: hello_api
+title: Hello API
+purpose: Create a simple Rust API that returns JSON from GET /hello.
+scope:
+  - Build an Axum server
+  - Expose GET /hello
+constraints:
+  - Keep the implementation local-first
+inputs:
+  - No external inputs
+outputs:
+  - Rust service source code
+  - Run report
+acceptance_criteria:
+  - GET /hello returns JSON
+  - The project compiles successfully
+forbidden_behaviors:
+  - No hardcoded secrets
+rollback_requirements:
+  - Leave the source tree recoverable after a failed run
+dependencies:
+  - axum
+performance_expectations:
+  - Local startup under 2 seconds
+security_expectations:
+  - No secrets committed to source control
+```
 
 ```bash
-mkdir -p specs
+cargo run -- spec validate factory/specs/hello_api.yaml
 ```
 
-```json
-// specs/hello_api.json
-{
-  "name": "hello-api",
-  "description": "Create a simple REST API",
-  "language": "rust",
-  "requirements": [
-    "axum server",
-    "GET /hello endpoint",
-    "returns JSON"
-  ]
-}
-```
-
----
-
-### 4. Run the Spec
+### 4. Start A Run
 
 ```bash
-cargo run -- run specs/hello_api.json
+cargo run -- run start factory/specs/hello_api.yaml --product hello-api
 ```
 
----
-
-### 5. Inspect Outputs
-
-Artifacts:
+### 5. Inspect The Run
 
 ```bash
-artifacts/
+cargo run -- run status <run-id>
+cargo run -- run report <run-id>
+cargo run -- artifact package <run-id>
 ```
 
-Runs:
+### 6. Use The Pack Board
 
 ```bash
-runs/<run_id>/
+cargo run -- serve
 ```
-
-Memory:
-
-```bash
-factory/memory/
-```
-
----
 
 ## 🛠 Core Commands
 
-### Run a spec
+### Validate a spec
 
 ```bash
-cargo run -- run <spec.json>
+cargo run -- spec validate factory/specs/example.yaml
 ```
 
----
-
-### Run with memory influence
+### Start a run
 
 ```bash
-cargo run -- run <spec.json> --with-memory
+cargo run -- run start factory/specs/example.yaml --product sample-app
 ```
 
----
-
-### List runs
+### Check run status and report
 
 ```bash
-cargo run -- runs list
+cargo run -- run status <run-id>
+cargo run -- run report <run-id>
 ```
 
----
-
-### Inspect a run
+### Package artifacts
 
 ```bash
-cargo run -- runs inspect <run_id>
+cargo run -- artifact package <run-id>
 ```
 
----
-
-### Inspect memory
+### Search and ingest memory
 
 ```bash
-cargo run -- memory list
+cargo run -- memory search "jwt auth"
+cargo run -- memory ingest ./docs/architecture.md
+cargo run -- memory ingest https://example.com/reference --scope project --project-root .
 ```
+
+### Evidence workflows
 
 ```bash
-cargo run -- memory inspect <memory_id>
+cargo run -- evidence init --project-root .
+cargo run -- evidence validate .harkonnen/evidence/example-bundle.json
+cargo run -- evidence promote .harkonnen/evidence/example-bundle.json --scope project --project-root .
 ```
 
----
-
-### Ingest knowledge
+### Benchmark and setup checks
 
 ```bash
-cargo run -- memory ingest ./docs/
+cargo run -- benchmark list
+cargo run -- benchmark run --suite local_regression --strict
+cargo run -- setup check
 ```
-
-```bash
-cargo run -- memory ingest https://example.com
-```
-
----
 
 ### Debug mode
 
 ```bash
-RUST_LOG=debug cargo run -- run specs/hello_api.json
+RUST_LOG=debug cargo run -- run start factory/specs/hello_api.yaml --product hello-api
 ```
 
 ---
@@ -441,7 +431,7 @@ Spec → Agents → Validation → Artifacts → Memory → Consolidation → Be
 
 ## ⚠️ Status
 
-Harkonnen Labs is an **active development system** — Phase 1 backend is shipped.
+Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, and 5 are shipped; Phase 2 and Phase 3 are the active numbered build targets.
 
 | Area | Status |
 | --- | --- |
@@ -452,15 +442,21 @@ Harkonnen Labs is an **active development system** — Phase 1 backend is shippe
 | Coobie Palace (den-based compound recall, patrol, scent) | Live |
 | Coobie causal streaks and cross-run pattern detection | Live |
 | Coobie preflight guidance (Phase 3 spec-scoped cause history) | Live |
+| Episodic state snapshots + cross-phase causal graph | Live |
+| Pearl hierarchy labeling in hypotheses and causal links | Live |
+| Multi-hop retrieval + retrieval-depth tracing | Live |
+| Memory invalidation / fact-update tracking | Live |
+| Consolidation Workbench | Live |
 | Hybrid semantic + keyword retrieval (fastembed / OpenAI-compatible) | Live |
-| Pack Board React UI (PackChat, Attribution Board, Factory Floor, Memory Board) | Live |
+| Pack Board React UI (PackChat, Attribution Board, Factory Floor, Memory Board, Workbench) | Live |
 | Keeper coordination API (claims, heartbeats, conflict detection) | Live |
-| Benchmark toolchain (manifest-driven, LongMemEval + LoCoMo native adapters) | Live |
-| Bramble real test execution | Phase 2 — next |
-| Ash live twin provisioning (Docker stubs) | Phase 3 |
-| Episodic layer enrichment + causal link graph | Phase 4 |
-| Operator consolidation Workbench | Phase 5 |
+| Benchmark toolchain (LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, CLADDER native adapters) | Live |
+| Bramble real test execution | Phase 2 — next numbered phase |
+| Ash live twin provisioning (Docker stubs) | Phase 3 — next numbered phase |
+| Operator Model Activation | Parallel product track — planned |
+| Qdrant + OCR memory infrastructure | Phase 5b |
 | TypeDB 3.x semantic graph layer | Phase 6 |
+| E-CARE + causal attribution corpus | Phase 7 |
 
 See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase build order.
 
@@ -468,23 +464,21 @@ See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase build order.
 
 ## 🚀 Direction
 
-Near-term (Phase 2–3):
+Near-term (active now):
 
-* Bramble real test execution — make `validation_passed` meaningful
-* Ash live twin provisioning — ground Sable's scenario evaluation in running stubs
-* Flint documentation phase — enable DevBench lifecycle scoring
-* FRAMES and CLADDER benchmark adapters — the Mem0 and causal reasoning comparison lines
+* Phase 2 — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
+* Phase 3 — Ash live twin provisioning plus Flint documentation artifacts for richer hidden-scenario and DevBench evaluation
+* Parallel product track — Operator Model Activation so PackChat can interview the operator before commissioning and feed Scout/Coobie/Keeper structured context
 
-Mid-term (Phase 4–5):
+Mid-term (after the active numbered phases):
 
-* Episodic layer enrichment — causal link table, Pearl hierarchy in `diagnose`
-* Multi-hop retrieval chain — beat single-pass vector stores on FRAMES
-* Memory invalidation tracking — belief-update accuracy (StreamingQA)
-* Operator consolidation Workbench — nothing enters durable memory without approval
+* Phase 5b — Qdrant-backed long-term semantic memory, OCR ingest, and memory-module refactor
+* Phase 6 — TypeDB 3.x semantic graph for typed causal queries, GAIA Level 3, and AgentBench
+* DeepCausality Phase 2 — real causaloids derived from the causal link table once the semantic layer is live
 
-Long-term (Phase 6+):
+Long-term:
 
-* TypeDB 3.x semantic graph — typed causal queries that vector similarity cannot answer
-* **Self-improving software factory** — each run makes the next run better
+* Phase 7 — E-CARE, causal attribution corpus, and stronger publishable causal benchmark claims
+* **Self-improving software factory** — each run makes the next run better, and operator models become part of the commissioning loop
 
 
