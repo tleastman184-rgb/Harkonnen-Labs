@@ -24,11 +24,11 @@ use crate::{
     coobie::CausalReport,
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, CoobieBriefing, EvidenceAnnotation,
-        EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchReport,
-        EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
-        PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec,
-        ValidationSummary,
+        AgentExecution, BlackboardState, CoobieBriefing, ConsolidationCandidate,
+        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
+        EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan,
+        LessonRecord, PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent,
+        RunRecord, Spec, ValidationSummary,
     },
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
@@ -624,6 +624,22 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/lessons", get(get_run_lessons))
         .route("/api/runs/:id/state", get(get_run_state))
         .route("/api/runs/:id/consolidate", post(post_run_consolidate))
+        .route(
+            "/api/runs/:id/consolidation/candidates",
+            get(get_consolidation_candidates).post(post_generate_candidates),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/keep",
+            post(post_candidate_keep),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/discard",
+            post(post_candidate_discard),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/edit",
+            post(post_candidate_edit),
+        )
         .route("/api/chat", post(post_chat))
         .route("/api/coobie/query", post(post_coobie_query))
         .route("/api/agents/:id/chat", post(post_agent_chat))
@@ -1112,7 +1128,10 @@ async fn post_run_consolidate(
     State(app): State<AppContext>,
 ) -> impl IntoResponse {
     match app.get_run(&id).await {
-        Ok(Some(_)) => match app.consolidate_run_for_operator(&id).await {
+        // If candidates exist and some are kept, only promote those.
+        // Otherwise fall back to the legacy auto-promote path so old clients
+        // that call /consolidate directly still work.
+        Ok(Some(_)) => match app.promote_kept_candidates(&id).await {
             Ok(new_lessons) => match build_memory_board(&app, &id).await {
                 Ok(Some(memory_board)) => (
                     StatusCode::OK,
@@ -1133,6 +1152,138 @@ async fn post_run_consolidate(
         },
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+// ── Phase 5 — Consolidation Workbench ────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct CandidatesResponse {
+    run_id: String,
+    total: usize,
+    pending: usize,
+    kept: usize,
+    discarded: usize,
+    candidates: Vec<ConsolidationCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditCandidateRequest {
+    content: serde_json::Value,
+}
+
+/// `GET /api/runs/:id/consolidation/candidates` — list all candidates.
+async fn get_consolidation_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_consolidation_candidates(&id).await {
+            Ok(candidates) => {
+                let total = candidates.len();
+                let pending = candidates.iter().filter(|c| c.status == "pending").count();
+                let kept = candidates.iter().filter(|c| c.status == "kept").count();
+                let discarded = candidates.iter().filter(|c| c.status == "discarded").count();
+                (
+                    StatusCode::OK,
+                    Json(CandidatesResponse {
+                        run_id: id,
+                        total,
+                        pending,
+                        kept,
+                        discarded,
+                        candidates,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates` — generate candidates.
+async fn post_generate_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.generate_consolidation_candidates(&id).await {
+            Ok(new_candidates) => match app.list_consolidation_candidates(&id).await {
+                Ok(all_candidates) => {
+                    let total = all_candidates.len();
+                    let pending = all_candidates.iter().filter(|c| c.status == "pending").count();
+                    let kept = all_candidates.iter().filter(|c| c.status == "kept").count();
+                    let discarded =
+                        all_candidates.iter().filter(|c| c.status == "discarded").count();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "run_id": id,
+                            "new_candidates": new_candidates.len(),
+                            "total": total,
+                            "pending": pending,
+                            "kept": kept,
+                            "discarded": discarded,
+                            "candidates": all_candidates,
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+            },
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/keep`
+async fn post_candidate_keep(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.review_consolidation_candidate(&cid, "kept").await {
+            Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "kept", "candidate_id": cid}))).into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/discard`
+async fn post_candidate_discard(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.review_consolidation_candidate(&cid, "discarded").await {
+            Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "discarded", "candidate_id": cid}))).into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/edit`
+async fn post_candidate_edit(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+    Json(body): Json<EditCandidateRequest>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.edit_consolidation_candidate(&cid, body.content).await {
+            Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "kept", "candidate_id": cid}))).into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 

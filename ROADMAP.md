@@ -1,147 +1,18 @@
 # Harkonnen Labs — Execution Roadmap
 
-**This is the canonical build order from 2026-04-08 forward.**
-Phase 1 backend is shipped. New implementation work starts at Phase 2 unless an
-explicit doc-sync or polish task says otherwise.
+**This is the canonical build order from 2026-04-17 forward.**
+Phases 1, 4, and 5 are shipped. Phases 2 and 3 are the active next targets.
+New implementation work starts at Phase 2 unless an explicit doc-sync or polish task says otherwise.
 
 ---
 
 ## Why this order
 
-The factory has excellent bones and real memory/causal intelligence. The first
-conversational control-plane backend is now in. The remaining gap is that several
-downstream phases still depend on stubbed validation, stubbed twins, and
-under-modeled episodic/semantic memory. Every phase below unblocks something
-downstream — skip one and the next phase is hollow.
+The factory has a complete foundation: core pipeline, PackChat control plane, layered Coobie memory, causal graph, Pearl hierarchy labeling, multi-hop retrieval, operator-reviewed consolidation Workbench, and a manifest-driven benchmark toolchain with several native adapters. The remaining gaps are concrete: Bramble's validation score is still a stub, Sable's twin is a manifest not a running system, memory invalidation tracking was spec'd but not built, and TypeDB is still ahead. Every phase below unblocks something downstream.
 
-Benchmarking is now a parallel execution track, not a postscript. Each roadmap
-phase should land with at least one measurable benchmark or regression gate so we
-can separate architectural progress from benchmark regressions and publish what
-Harkonnen adds over the raw provider.
+Benchmarking remains a parallel track. Each phase ships with at least one measurable gate.
 
 ---
-
-## Benchmark Track
-
-These benchmarks should be wired in alongside the build phases rather than after
-Phase 6. The point is to make each phase measurable as it ships.
-
-### Immediate benchmark baseline work
-
-- `Local Regression Gate` runs on every substantial change and remains the hard
-  merge gate for the repo.
-- `LongMemEval` should be run in paired mode: raw LLM baseline versus Harkonnen
-  PackChat/Coobie on the same provider routing and dataset slice.
-- The first publishable benchmark target is `longmemeval_s_cleaned.json` with a
-  fixed sampled slice for iteration and the full split for reportable runs.
-
-### Phase-aligned benchmark milestones
-
-- `Phase 2` maps to `SWE-bench Verified` readiness for Mason/Piper/Bramble plus
-  stronger local regression on build and visible test execution. Also the entry
-  point for `LiveCodeBench` and `Aider Polyglot` as contamination-free coding comparisons.
-- `Phase 3` maps to repo-native `twin fidelity`, `hidden scenario integrity`, and
-  `spec adherence rate` benchmarks because off-the-shelf suites do not measure
-  stub realism, scenario black-box integrity, or spec fidelity at all.
-  Also the entry point for `DevBench` once Flint produces documentation artifacts.
-- `Phase 4` maps to `LongMemEval` and then `LoCoMo QA`, because richer episodic
-  memory should improve PackChat/Coobie over the direct baseline.
-  Also the entry point for `FRAMES` (vs Mem0), `StreamingQA` (fact-update tracking),
-  `HELMET` (retrieval precision), and `CLADDER` (causal hierarchy) — each of which
-  requires the enriched episodic layer to be meaningful.
-- `Phase 5` maps to promotion-quality and memory-review benchmarks: how often the
-  Workbench keeps, edits, or rejects candidates and whether approved lessons help
-  future runs. Also the entry point for `E-CARE` (causal explanation quality)
-  and the `causal attribution accuracy` internal benchmark.
-- `Phase 6` maps to cross-run causal query benchmarks and graph-backed recall,
-  plus more ambitious public comparisons once TypeDB-backed semantic recall ships.
-  Also the entry point for `GAIA Level 3` and `AgentBench` as multi-agent
-  coordination claims.
-- `PackChat overall` should be measured on `tau2-bench` once the chat/backend and
-  unblock/control-plane flows are stable enough to expose tool trajectories.
-
-### Competitive positioning benchmarks
-
-These benchmarks support direct comparison claims against specific alternatives.
-
-#### vs Mem0 / MindPalace / Zep — memory systems
-
-- `FRAMES` (Google DeepMind) — multi-hop factual recall across long documents. Mem0
-  publishes scores here. Coobie's hybrid retrieval needs to beat single-pass vector
-  recall, and the multi-hop cases are where the causal + semantic layer combination
-  should win. Requires the multi-hop retrieval chain feature (see Phase 4).
-- `StreamingQA` — tests whether a memory system correctly *updates* beliefs when
-  facts change over time, not just whether it recalls them. Coobie's stale-memory
-  model is a structural advantage; no vector-only competitor has explicit
-  fact-update tracking. Requires the memory invalidation feature (see Phase 4).
-- `HELMET` — holistic precision/recall on long-context retrieval tasks. Validates
-  whether Coobie's compound Palace patrol reduces retrieval noise compared to flat
-  vector similarity. Runnable after Phase 4.
-
-#### vs OpenCode / Aider / single-agent coding tools
-
-- `LiveCodeBench` — recent competitive programming problems from Codeforces,
-  LeetCode, and AtCoder that postdate training cutoffs. Fairer than HumanEval
-  because problems are genuinely new. Mason's iterative fix loop plus Piper's real
-  build execution should outperform single-pass code generation.
-  Requires Mason online-judge feedback loop (see Phase 2).
-- `Aider Polyglot` — Aider's own multi-language benchmark with a public leaderboard.
-  Running Mason/Piper through the same harness gives a clean apples-to-apples
-  comparison against one of the most credible open-source coding agents.
-  Runnable after Phase 2.
-- `DevBench` — full software development lifecycle: requirements → design →
-  implementation → testing → documentation. SWE-bench measures one phase; DevBench
-  measures the whole pipeline. This is the structural argument against single-agent
-  tools. Requires Flint documentation artifacts (see Phase 3).
-
-#### vs general agent frameworks
-
-- `GAIA Level 3` — multi-step tool use and planning where single-agent tools fail
-  because they cannot delegate. Expensive to run but independently verifiable.
-  The hardest Level 3 tasks map to Harkonnen's Scout → Mason → Piper → Sable chain.
-  Runnable after Phase 6.
-- `AgentBench` — eight environments (OS, DB, web, etc.) testing specialist
-  coordination versus a single generalist. Maps directly to the Labrador role
-  separation claim. Runnable after Phase 6.
-
-#### Causal reasoning — unique claim, no competitor benchmarks this
-
-- `CLADDER` — Pearl's causal hierarchy: associational ("what correlates"),
-  interventional ("what happens if we do X"), and counterfactual ("what would have
-  happened"). Maps directly to Coobie's Layer D design. This is the benchmark no
-  memory or agent competitor runs. Requires Pearl hierarchy structuring in
-  Coobie's `diagnose` output (see Phase 4).
-- `E-CARE` (Explainable Causal Reasoning) — tests whether causal explanations are
-  natural-language coherent, not just structurally correct. Validates the quality
-  of Coobie's `diagnose` output as human-readable rationale. Runnable after Phase 5.
-
-### Harkonnen-native internal benchmarks
-
-These do not exist as off-the-shelf suites because no other system is built this way.
-They are the most differentiating publishable claims because competitors cannot run them.
-
-- `Spec Adherence Rate` — given a spec: completeness (did it implement all stated
-  requirements?) and precision (did it add things *not* in the spec?). Compare
-  Harkonnen with and without Scout's formalization step to isolate the spec-first
-  contribution. Target: Phase 3.
-- `Hidden Scenario Delta` — the gap between visible test pass rate and hidden
-  scenario pass rate across a corpus of runs. A large delta proves Sable catches
-  failures that Bramble's tests miss. Requires real test execution from Phase 2.
-  Target: Phase 3.
-- `Causal Attribution Accuracy` — a labeled corpus of seeded failures; scores whether
-  Coobie's `diagnose` correctly ranks the true cause in top-1 or top-3. The most
-  direct test of whether causal memory adds value over semantic recall alone.
-  Target: Phase 5.
-
-### Reporting standard
-
-Every reportable benchmark claim should include:
-
-- the raw-LLM baseline on the same provider when that baseline is meaningful
-- the Harkonnen setup name and routing
-- the benchmark split or slice used
-- the commit hash and benchmark artifact path
-- latency and cost where available, not just accuracy
 
 ## Phase 2 — Bramble Real Test Execution
 
@@ -150,38 +21,23 @@ Every reportable benchmark claim should include:
 
 **What to build:**
 
-- `bramble_run_tests` method in orchestrator — reads `spec.test_commands` (same
-  detection logic as Piper's build phase) and executes them in the staged workspace
-- Stdout/stderr streamed as `LiveEvent::BuildOutput` on the broadcast channel
-  (already exists — Bramble just needs to use it)
-- `ValidationSummary` populated from real exit codes and parsed test output,
-  not from scenario results or stubs
+- `bramble_run_tests` in orchestrator — reads `spec.test_commands` (same detection logic as Piper) and executes them in the staged workspace
+- Stdout/stderr streamed as `LiveEvent::BuildOutput` on the broadcast channel (already exists — Bramble just needs to use it)
+- `ValidationSummary` populated from real exit codes and parsed test output, not from scenario results or stubs
 - Bramble's phase attribution records `validation_passed: true/false` from actual runs
 - Feed result back as `test_coverage_score` into the Coobie episode at ingest time
-- **Mason online-judge feedback loop** — parse stdout diff output from competitive
-  programming judges (expected vs actual output) as a first-class failure signal
-  distinct from compiler errors. Required for LiveCodeBench and Aider Polyglot.
-  Feeds into Mason's fix loop as a new `FailureKind::WrongAnswer` variant so
-  Mason generates output-correction attempts rather than build-fix attempts.
-- **LiveCodeBench adapter** — wrapper command that pulls recent problems, runs
-  Mason/Piper against them, and emits pass/fail per problem into the benchmark runner.
-  Problems should be fetched fresh to avoid contamination from cached datasets.
-- **Aider Polyglot adapter** — runs Mason/Piper through Aider's published multi-language
-  benchmark harness. Requires no structural changes; the adapter is a thin shell
-  script that maps Aider's input format to Harkonnen specs.
+- **Mason online-judge feedback loop** — parse stdout diff output from competitive programming judges (expected vs actual output) as a first-class failure signal distinct from compiler errors. Feeds into Mason's fix loop as a new `FailureKind::WrongAnswer` variant.
+- **LiveCodeBench adapter** — wrapper command that pulls recent problems, runs Mason/Piper, and emits pass/fail per problem into the benchmark runner.
+- **Aider Polyglot adapter** — maps Aider's multi-language benchmark format to Harkonnen specs; no structural changes needed.
 
-**Benchmark gate for this phase:**
+**Benchmark gate:**
 
-- `local_regression` must stay green on every merge
-- the code loop should be runnable through the emerging `SWE-bench Verified`
-  adapter, even if early scores are still unpublished
-- `LiveCodeBench` adapter wired and producing artifacts, even if scores are unpublished
+- `local_regression` stays green on every merge
+- the code loop should be runnable through the emerging `SWE-bench Verified` adapter, even if scores are unpublished
+- `LiveCodeBench` adapter wired and producing artifacts
 - `Aider Polyglot` adapter wired for a direct open-source comparison line
-- benchmark artifacts should record build/test latency, not just pass/fail
 
-**Done when:** A spec with `test_commands` shows real pass/fail in the run report,
-Coobie's episode scores reflect actual test execution, and Mason's fix loop handles
-wrong-answer failures from online-judge-style tests.
+**Done when:** A spec with `test_commands` shows real pass/fail in the run report, Coobie's episode scores reflect actual test execution, and Mason's fix loop handles wrong-answer failures.
 
 ---
 
@@ -192,238 +48,193 @@ Right now Sable judges against a twin that is a JSON manifest, not running infra
 
 **What to build:**
 
-- Ash generates a `docker-compose.yml` (or equivalent) in the run workspace from the
-  twin manifest — one service stub per declared external dependency
+- Ash generates a `docker-compose.yml` in the run workspace from the twin manifest — one service stub per declared external dependency
 - `ash_provision_twin` spawns the compose stack before Sable runs, tears it down after
-- Network address and port bindings written to `twin_env.json` so Mason/Piper can
-  reference them in build/test commands
-- `twin_fidelity_score` in Coobie's episode scoring derived from which declared
-  dependencies actually had running stubs (not just declared in manifest)
-- Failure injection: Ash can set environment variables on stubs to simulate
-  auth expiry, rate limits, or connection refusal per scenario config
-- **Flint documentation phase** — Flint produces a documentation artifact (README,
-  API reference, or inline doc comments) as a first-class phase output, not an
-  afterthought. Required for DevBench, which scores the full lifecycle including docs.
-  Flint reads the spec and Mason's implementation artifacts, then generates docs in
-  the run workspace under `artifacts/docs/`.
-- **DevBench adapter** — maps Harkonnen's full run (Scout → Mason → Piper → Bramble
-  → Flint) to DevBench's evaluation format. DevBench scores design, implementation,
-  testing, and documentation separately; each maps to a Labrador phase.
-- **Spec Adherence Rate benchmark** — LLM-as-judge grader that extracts requirements
-  from the spec and scores the output on completeness (all requirements implemented?)
-  and precision (nothing added beyond the spec?). Run with and without Scout's
-  formalization step to isolate the spec-first contribution.
-- **Hidden Scenario Delta benchmark** — tracks `visible_test_pass_rate` versus
-  `hidden_scenario_pass_rate` across a corpus of runs and surfaces the gap. Requires
-  Bramble real test results (Phase 2) to be stored alongside Sable results in a
-  comparable format. The delta is the proof that Sable catches what Bramble misses.
+- Network address and port bindings written to `twin_env.json` so Mason/Piper can reference them
+- `twin_fidelity_score` derived from which declared dependencies actually had running stubs
+- Failure injection: Ash can set env vars on stubs to simulate auth expiry, rate limits, or connection refusal per scenario config
+- **Flint documentation phase** — Flint produces a documentation artifact (README, API reference, or inline doc comments) as a first-class phase output. Required for DevBench. Flint reads the spec and Mason's implementation artifacts, then generates docs under `artifacts/docs/`.
+- **DevBench adapter** — maps Harkonnen's full run to DevBench's evaluation format. Each Labrador phase maps to a DevBench lifecycle stage.
+- **Spec Adherence Rate benchmark** — LLM-as-judge grader that extracts requirements from the spec and scores completeness and precision. Run with and without Scout's formalization step.
+- **Hidden Scenario Delta benchmark** — tracks `visible_test_pass_rate` versus `hidden_scenario_pass_rate` across a corpus and surfaces the gap. Requires Phase 2 real test results.
 
-**Benchmark gate for this phase:**
+**Benchmark gate:**
 
-- repo-native `twin fidelity` benchmark suite scoring whether declared dependencies
-  become reachable running stubs
-- repo-native `hidden scenario integrity` benchmark measuring whether scenarios
-  remain truly black-box relative to Mason/Bramble
-- `hidden scenario delta` first run published — visible vs hidden pass rate gap
-- `spec adherence rate` first run published — completeness and precision scores
+- repo-native `twin fidelity` benchmark suite
+- repo-native `hidden scenario integrity` benchmark
+- `hidden scenario delta` first run published
+- `spec adherence rate` first run published
 - `DevBench` adapter wired, even if early scores are unpublished
 
-**Done when:** A spec with a twin declaration actually starts Docker containers,
-Sable's hidden scenarios run against live stubs, Flint produces a doc artifact,
-and the spec adherence and hidden scenario delta benchmarks have baseline runs.
+**Done when:** A spec with a twin declaration actually starts Docker containers, Sable's hidden scenarios run against live stubs, Flint produces a doc artifact, and the spec adherence and hidden scenario delta benchmarks have baseline runs.
 
 ---
 
-## Phase 4 — Episodic Layer Enrichment
+## Phase 4b — Memory Invalidation and Fact-Update Tracking
 
-**Unlocks:** Layer D (causal graph) can be a real graph, not a flat hypothesis list.
-The current episode record is missing the fields needed for causal link candidates.
-This phase also unlocks the FRAMES, StreamingQA, HELMET, and CLADDER benchmarks,
-which each require the enriched episodic layer to produce meaningful results.
+**Unlocks:** StreamingQA, and the structural claim that Coobie correctly *updates* beliefs rather than just *recalls* them. This work was spec'd in the Phase 4 episodic enrichment design but was not implemented during that phase. It needs its own slot.
 
 **What to build:**
 
-- Add to `EpisodeRecord` / `run_events` schema:
-  - `state_before: Option<serde_json::Value>` — snapshot of relevant state before action
-  - `state_after: Option<serde_json::Value>` — snapshot after
-  - `candidate_causal_links: Vec<String>` — event IDs that may have caused this one
-- Populate `candidate_causal_links` during `record_event` using temporal proximity
-  and phase co-occurrence (simple heuristic first, graph traversal later)
-- Add `causal_link` table to SQLite:
-  `(from_event_id, to_event_id, relation, confidence, created_at)`
-  Relations: `caused`, `contributed_to`, `prevented`, `preceded`, `invalidated`,
-  `depended_on`, `corrected`, `escalated` (per COOBIE_SPEC Layer D spec)
-- Coobie's `diagnose` reads the causal link table in addition to episode scores
-- DeepCausality Phase 2: use real causaloids built from the link table, not just
-  per-run scoring signals
-- **Coobie multi-hop retrieval chain** — current hybrid retrieval is single-pass
-  (vector similarity + keyword). Add a chaining step where a retrieved fact can
-  trigger a second retrieval using its content as the query. Required for FRAMES,
-  where the benchmark specifically tests multi-hop factual recall that flat vector
-  search cannot resolve. Implement as a configurable `retrieval_depth` param
-  (default 1 = current behavior, 2 = one chain step).
-- **Memory invalidation / fact-update tracking** — add an `invalidated_by` field to
-  memory records and a `memory_updates` table tracking when a stored fact is
-  superseded. When Coobie ingests new information that contradicts an existing
-  memory, the old record is marked invalidated rather than silently overwritten.
-  Required for StreamingQA, which directly tests whether belief updates are correct.
-- **Coobie `diagnose` Pearl hierarchy structuring** — restructure `diagnose` output
-  to classify each causal hypothesis by Pearl's hierarchy level:
-  `associational` (correlation observed), `interventional` (action taken and result
-  recorded), or `counterfactual` (what would have happened). Required for CLADDER.
-  The classification uses the `causal_link.relation` field — `caused` /
-  `contributed_to` map to interventional; `preceded` maps to associational;
-  `prevented` / `invalidated` map to counterfactual.
-- **FRAMES adapter** — wrapper that loads FRAMES evaluation sets, routes questions
-  through Coobie's retrieval chain (including multi-hop), and scores factual accuracy.
-  Run in paired mode: Coobie vs raw-LLM baseline, same provider.
-- **StreamingQA adapter** — streams fact-update events to Coobie's memory, then
-  queries whether the updated belief is correctly recalled. Scores belief-update
-  accuracy as a separate metric from static recall.
-- **HELMET adapter** — runs Coobie retrieval against HELMET's long-context tasks
-  and measures precision/recall on retrieved passages.
-- **CLADDER adapter** — maps CLADDER's causal questions to Coobie's Pearl-structured
-  diagnose output and scores associational, interventional, and counterfactual
-  accuracy separately.
+- `invalidated_by` field on memory records — when new information contradicts an existing fact, the old record is marked invalidated rather than silently overwritten
+- `memory_updates` table in SQLite: `(update_id, old_memory_id, new_memory_id, reason, created_at)` — tracks when a stored fact is superseded
+- Coobie ingest pipeline updated: before writing a new memory entry, check for semantic near-duplicates with conflicting claims; if found, write the supersession record and flag the old entry
+- `GET /api/memory/updates` — surfaces invalidation history to the Pack Board
+- Memory Board UI panel: show invalidated entries distinctly from current entries; allow operator to confirm or reject a supersession
+- **StreamingQA native adapter** — streams fact-update events to Coobie's memory, then queries whether the updated belief is correctly recalled. Scores belief-update accuracy separately from static recall. This is the primary benchmark for this phase.
 
-**Benchmark gate for this phase:**
+**Benchmark gate:**
 
-- paired `LongMemEval` runs repeated here to verify richer episodes improve Coobie
-  over the direct baseline
-- `LoCoMo QA` adapter wired — longer-horizon memory should start outperforming raw
-  transcript prompting at this layer
-- `FRAMES` first run published — multi-hop retrieval accuracy vs Mem0 comparison
-- `StreamingQA` first run published — belief-update accuracy, no competitor has this
-- `CLADDER` first run published — Pearl hierarchy accuracy, unique claim
-- `HELMET` adapter wired and producing retrieval precision/recall artifacts
+- `StreamingQA` first run published — belief-update accuracy, no competitor publishes this
+- re-run `LongMemEval` to confirm invalidation tracking does not regress static recall
 
-**Done when:** After a run you can query `GET /api/runs/:id/causal-events` and see
-a graph of what caused what; Coobie's diagnose output labels each hypothesis by
-Pearl hierarchy level; and FRAMES, StreamingQA, and CLADDER have baseline scores.
+**Done when:** Ingesting a new fact that contradicts an older one marks the old fact as invalidated, the operator can review the supersession, and StreamingQA has a baseline score.
 
 ---
 
-## Phase 5 — Post-Run Consolidation Workbench
+## Phase 5b — Memory Infrastructure (Qdrant + OCR)
 
-**Unlocks:** Intentional memory. Right now Coobie auto-promotes everything;
-the operator review loop the architecture describes does not exist.
+**Unlocks:** Semantic recall at scale and document ingest completeness. These are COOBIE.md Phase C and Phase B gaps that have been deferred because the SQLite vector store is sufficient for current run volume, but they become the bottleneck as the memory corpus grows.
 
 **What to build:**
 
-- `GET /api/runs/:id/consolidation/candidates` — surface what Coobie proposes to
-  promote: new lessons, causal links, pattern extractions, with confidence scores
-- `POST /api/runs/:id/consolidation/candidates/:id/keep` — operator approves
-- `POST /api/runs/:id/consolidation/candidates/:id/discard` — operator rejects
-- `POST /api/runs/:id/consolidation/candidates/:id/edit` — operator edits before
-  promoting (changes the memory content inline)
-- `POST /api/runs/:id/consolidate` — runs only after review; promotes approved
-  candidates into `factory/memory/` and re-indexes
-- Pack Board Workbench panel: card per candidate with approve/discard/edit controls
-- **E-CARE adapter** — maps Coobie's `diagnose` output to E-CARE's evaluation format
-  and scores whether the generated causal explanations are judged coherent by the
-  official evaluator. Run after consolidation so promoted lessons can inform
-  subsequent diagnose output and the improvement is measurable.
-- **Causal attribution accuracy corpus** — a curated set of 30–50 labeled runs with
-  intentionally seeded failures (wrong API version, missing env var, breaking schema
-  change, etc.). Each failure has a ground-truth cause label. Scores whether
-  Coobie's `diagnose` top-1 and top-3 match the ground truth. Build and maintain
-  this corpus in `factory/benchmarks/causal-attribution/`. This is the most direct
-  test of whether causal memory adds value over semantic recall alone, and cannot
-  be reproduced by any competitor.
+- **Qdrant integration** — add `src/coobie/qdrant.rs` implementing the semantic index over extracted text and memory summaries. Payload metadata: `org`, `role`, `product`, `spec_id`, `run_id`, `agent`, `memory_type`, `tags`, `created_at`. Qdrant replaces the SQLite vector store for long-term semantic memory (keep SQLite as the short-term and episodic store). Bootstrap script at `scripts/bootstrap-coobie-memory-stack.sh` already exists.
+- **OCR pipeline** — add Tesseract-backed OCR for scanned PDFs and images. Current extractors handle text-forward formats but cannot read scanned documents. Wire through the existing `memory ingest` path: detect image-only PDFs, invoke `tesseract`, write extracted text sidecar alongside the imported asset.
+- **Memory module refactor** — split the growing `src/memory.rs` into the module tree described in COOBIE_SPEC: `src/memory/mod.rs`, `working.rs`, `episodic.rs`, `semantic.rs`, `causal.rs`, `consolidation.rs`, `blackboard.rs`, `retrieval.rs`, `extraction.rs`. No behavior change; this is a maintainability gate before the codebase grows further.
 
-**Benchmark gate for this phase:**
+**Benchmark gate:**
 
-- consolidation-quality benchmark tracking keep/edit/discard decisions and whether
-  approved lessons later improve run outcomes
-- `E-CARE` first run published — causal explanation coherence score
-- `causal attribution accuracy` first run published against seeded failure corpus —
-  top-1 and top-3 accuracy; compare pre- and post-Phase 4 causal graph
-- publish before/after comparisons for memory promotion quality, not just UI status
+- re-run `FRAMES` after Qdrant lands to confirm multi-hop recall improves over the SQLite vector baseline
+- `LongMemEval` and `LoCoMo` re-run to confirm semantic recall quality does not regress
 
-**Done when:** After a run, you sit in the Workbench, review what Coobie wants to
-remember, make changes, and commit. Nothing enters durable memory without your
-approval. The causal attribution corpus has baseline scores, and E-CARE has a
-published run.
+**Done when:** Qdrant is serving semantic queries for long-term memory, OCR-scanned PDFs can be ingested, and `src/memory.rs` is split into the COOBIE_SPEC module tree.
 
 ---
 
 ## Phase 6 — TypeDB Semantic Layer (Layer C)
 
-**Unlocks:** Typed causal queries that vector similarity cannot answer.
-"Find all runs where TWIN_GAP caused a failure that was fixed by an intervention
-that held for ≥ 3 runs" — this requires a graph, not a similarity score.
+**Unlocks:** Typed causal queries that vector similarity cannot answer. "Find all runs where TWIN_GAP caused a failure that was fixed by an intervention that held for ≥ 3 runs" requires a graph, not a similarity score.
 
-TypeDB 3.x changes the implementation assumptions here: the old "JVM burden"
-objection is no longer a reason to avoid the layer, because TypeDB's core moved
-to Rust. It is still an external database service with real operational cost, so
-it stays later in the sequence and should not replace SQLite as the hot path.
+TypeDB 3.x changes the implementation assumptions: the old JVM burden objection is gone because TypeDB's core is now Rust. It is still an external service with real operational cost, so it stays later in the sequence and should not replace SQLite as the hot path.
 
 **What to build:**
 
-- TypeDB 3.x instance/service configured in the home-linux setup TOML
+- TypeDB 3.x instance configured in the home-linux setup TOML
 - `src/coobie/semantic.rs` implementing the `SemanticMemory` trait from COOBIE_SPEC
-- Rust-facing TypeDB adapter using the official TypeDB 3.x driver surface behind
-  the `SemanticMemory` abstraction
-- TypeDB schema from COOBIE_SPEC: entities (agent, goal, episode, observation, action,
-  outcome, artifact, lesson, failure-mode, causal-link), relations as specified
-- TypeDB 3.x function-backed semantic reasoning where inference is needed; do not
-  design this layer around legacy "rules engine" assumptions
-- Write-back: after Phase 5 consolidation approval, promoted lessons and causal links
-  are written to TypeDB as well as the file store
-- Query surface: `POST /api/coobie/query` routes natural-language causal questions
-  through Coobie's retrieval chain: working → blackboard → typed lessons → semantic
-  recall → causal lookup
-- Coobie's briefing builder can call TypeDB for cross-run pattern queries before
-  preflight, replacing the current SQL aggregate approach for complex patterns
+- Rust-facing TypeDB adapter using the official TypeDB 3.x driver behind the `SemanticMemory` abstraction
+- TypeDB schema from COOBIE_SPEC: entities (agent, goal, episode, observation, action, outcome, artifact, lesson, failure-mode, causal-link), relations as specified
+- TypeDB 3.x function-backed semantic reasoning; do not design around legacy rules-engine assumptions
+- Write-back: after Phase 5 consolidation approval, promoted lessons and causal links written to TypeDB as well as the file store
+- Query surface: `POST /api/coobie/query` routes natural-language causal questions through Coobie's retrieval chain
+- Coobie's briefing builder calls TypeDB for cross-run pattern queries before preflight
+- **GAIA Level 3 adapter** — maps GAIA's multi-step tool-use tasks to Harkonnen's factory run format; routes sub-tasks to the appropriate Labrador rather than a single generalist. Requires the TypeDB query surface to be live.
+- **AgentBench adapters** — OS, database, and web environments, each mapped to a Labrador role.
 
-**What to also build for competitive benchmark readiness:**
+**Benchmark gate:**
 
-- **GAIA Level 3 adapter** — maps GAIA's multi-step tool-use tasks to Harkonnen's
-  factory run format. The hardest Level 3 tasks require delegation that single-agent
-  tools cannot do; the adapter routes sub-tasks to the appropriate Labrador rather
-  than a single generalist. Requires the TypeDB query surface to be live so Coobie
-  can answer cross-run context questions mid-task.
-- **AgentBench adapters** — environment adapters for AgentBench's OS, database, and
-  web environments. Each environment maps to a Labrador role (OS → Mason/Piper,
-  DB → Ash, web → Flint). Adapters translate AgentBench's action/observation loop
-  into Harkonnen's phase event stream.
+- cross-run causal-query benchmarks comparing SQL aggregate recall versus TypeDB-backed semantic recall
+- `GAIA Level 3` first run published
+- `AgentBench` first runs across OS, DB, and web environments
 
-**Benchmark gate for this phase:**
+**Done when:** You can ask Coobie "what caused the last three failures on this spec" and get an answer from a typed graph; GAIA Level 3 and AgentBench adapters wired and producing artifacts.
 
-- cross-run causal-query benchmarks comparing SQL aggregate recall versus TypeDB-backed
-  semantic recall on the same questions
-- `GAIA Level 3` first run published — multi-step delegation accuracy
-- `AgentBench` first runs published across OS, DB, and web environments
-- only make stronger public memory/causal claims once this layer beats the raw and
-  pre-TypeDB baselines on fixed evaluation prompts
+---
 
-**Done when:** You can ask Coobie "what caused the last three failures on this spec"
-and get an answer sourced from a typed graph; GAIA Level 3 and AgentBench adapters
-are wired and producing artifacts.
+## Phase 7 — Causal Attribution Corpus and E-CARE
+
+**Unlocks:** The strongest publishable internal benchmark claims. The causal attribution corpus and E-CARE adapter are both spec'd in Phase 5 but can be built incrementally and do not depend on TypeDB.
+
+**What to build:**
+
+- **Causal attribution accuracy corpus** — 30–50 labeled runs with seeded failures (wrong API version, missing env var, breaking schema change, etc.). Each entry has a spec, a seeded failure, a ground-truth cause label, and the Coobie `diagnose` output. Score top-1 and top-3 accuracy. Start with 10 entries for a first baseline. Lives in `factory/benchmarks/causal-attribution/`.
+- **E-CARE native adapter** — maps Coobie's `diagnose` output to E-CARE's evaluation format and scores whether generated causal explanations are judged natural-language coherent. Run after consolidation so promoted lessons can inform subsequent diagnose output.
+- Publish before/after comparisons for causal attribution accuracy: pre-Phase 4 (pure semantic recall) versus post-Phase 4 (causal graph-augmented).
+
+**Benchmark gate:**
+
+- `E-CARE` first run published — causal explanation coherence score
+- `causal attribution accuracy` first run published — top-1 / top-3 vs semantic-only baseline
+
+**Done when:** The corpus has at least 30 labeled entries, the causal attribution accuracy benchmark has a published run, and E-CARE has a published score.
+
+---
+
+## Benchmark Track (cross-phase)
+
+Benchmarks should advance in lockstep with implementation phases. When a phase ships, at least one benchmark gate tied to it should ship too.
+
+### Phase-aligned milestones summary
+
+| Phase | Key benchmarks unlocked |
+| --- | --- |
+| Phase 2 | SWE-bench Verified readiness, LiveCodeBench, Aider Polyglot |
+| Phase 3 | twin fidelity, hidden scenario delta, spec adherence rate, DevBench |
+| Phase 4b | StreamingQA belief-update accuracy |
+| Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
+| Phase 6 | GAIA Level 3, AgentBench |
+| Phase 7 | E-CARE, causal attribution accuracy |
+
+### Always-on benchmarks
+
+- `Local Regression Gate` — hard merge gate, runs on every substantial change
+- `LongMemEval` paired mode (Coobie vs raw LLM) — run on every memory-relevant change
+- `LoCoMo QA` paired mode — longer-horizon memory regression check
+
+### Competitive positioning benchmarks
+
+#### vs Mem0 / MindPalace / Zep
+
+- `FRAMES` — multi-hop factual recall; Mem0 publishes here. Native adapter live. Requires Phase 5b Qdrant for best results.
+- `StreamingQA` — belief-update accuracy; no competitor tracks this. Phase 4b.
+- `HELMET` — retrieval precision/recall. Native adapter live.
+- `LongMemEval` — long-term assistant memory. Native adapter live.
+- `LoCoMo QA` — long-horizon dialogue memory. Native adapter live.
+
+#### vs OpenCode / Aider / single-agent coding tools
+
+- `LiveCodeBench` — recent competitive programming problems; contamination-resistant. Phase 2.
+- `Aider Polyglot` — Aider's own multi-language leaderboard. Phase 2.
+- `DevBench` — full software lifecycle; structural argument against single-phase tools. Phase 3.
+- `SWE-bench Verified` / `SWE-bench Pro` — industry-standard code loop benchmarks. Phase 2.
+
+#### vs general agent frameworks
+
+- `GAIA Level 3` — multi-step delegation; single-agent tools fail here. Phase 6.
+- `AgentBench` — eight environments; tests Labrador role separation. Phase 6.
+
+#### Causal reasoning — unique claim, no competitor benchmarks this
+
+- `CLADDER` — Pearl hierarchy accuracy. Native adapter live.
+- `E-CARE` — causal explanation coherence. Phase 7.
+
+#### Harkonnen-native — cannot be run by any competitor
+
+- `Spec Adherence Rate` — completeness and precision vs spec. Phase 3.
+- `Hidden Scenario Delta` — visible vs hidden pass rate gap. Phase 3.
+- `Causal Attribution Accuracy` — seeded failure corpus, top-1 / top-3. Phase 7.
+
+### Reporting standard
+
+Every reportable benchmark claim should include:
+
+- the raw-LLM baseline on the same provider when meaningful
+- the Harkonnen setup name and routing
+- the benchmark split or slice used
+- the commit hash and benchmark artifact path
+- latency and cost where available, not just accuracy
 
 ---
 
 ## What is already done (do not redo)
 
-- PackChat backend persistence in SQLite: `chat_threads` and `chat_messages`
-- `src/chat.rs` ChatStore plus multi-turn `dispatch_message` routing using
-  conversation history, `@mentions`, and Coobie default fallback
-- PackChat API routes:
-  `GET/POST /api/chat/threads`,
-  `GET /api/chat/threads/:id`,
-  `GET/POST /api/chat/threads/:id/messages`,
-  `POST /api/agents/:id/chat`
-- Existing checkpoint/reply/unblock routes now documented as part of the
-  PackChat control-plane backend:
-  `GET /api/runs/:id/checkpoints`,
-  `POST /api/runs/:id/checkpoints/:checkpoint_id/reply`,
-  `POST /api/agents/:id/unblock`
+**Phase 1 — Core Factory + PackChat + Coobie Memory + Benchmark Toolchain:**
+
 - Spec loading, validation, run lifecycle, SQLite persistence
 - Phase-level attribution recording
-- LLM routing for Claude, Gemini, OpenAI
+- LLM routing for Claude, Gemini, OpenAI, and OpenAI-compatible local endpoints
 - Scout, Mason, Piper, Sable, Ash, Flint LLM calls
 - Mason opt-in file writes with staged workspace isolation
-- Piper real build execution with stdout/stderr streaming (Phase 1 execution layer)
+- Piper real build execution with stdout/stderr streaming
 - Mason fix loop (up to 3 iterations on build failure)
 - Live event broadcast (`LiveEvent`) + SSE endpoint `/api/runs/:id/events/stream`
 - Coobie causal reasoning Phase 1 (heuristic rules, episode scoring)
@@ -434,27 +245,48 @@ are wired and producing artifacts.
 - Causal feedback loop (causal reports + Sable rationale written back to project memory)
 - Keeper coordination API (claims, heartbeats, conflict detection, release)
 - Pack Board React UI (PackChat panel, Attribution Board, Factory Floor, Memory Board)
+- PackChat backend: `chat_threads`, `chat_messages`, multi-turn `dispatch_message`, `@mention` routing, Coobie default fallback
+- PackChat API routes: `GET/POST /api/chat/threads`, `GET /api/chat/threads/:id`, `GET/POST /api/chat/threads/:id/messages`, `POST /api/agents/:id/chat`
+- Checkpoint/reply/unblock routes as PackChat control-plane backend
 - Evidence bootstrap, annotation bundle validation, evidence promotion
 - `harkonnen memory init` with pre-embedding on fresh clone
 - First-class benchmark toolchain (`benchmark list/run/report`, manifest-driven suites, CI workflow)
-- Native LongMemEval adapter plus paired raw-LLM versus Harkonnen comparison mode
-- Native LoCoMo QA adapter plus paired raw-LLM versus Harkonnen comparison mode
-- LM Studio/OpenAI-compatible benchmark routing for both chat and embedding backends
+- Native LongMemEval adapter + paired raw-LLM vs Harkonnen comparison mode
+- Native LoCoMo QA adapter + paired raw-LLM vs Harkonnen comparison mode
+- Native FRAMES adapter + paired raw-LLM vs Harkonnen comparison mode
+- Native StreamingQA adapter (static recall; belief-update tracking is Phase 4b)
+- LM Studio / OpenAI-compatible benchmark routing for chat and embedding backends
+
+**Phase 4 — Episodic Layer Enrichment + Causal Graph + Benchmarks:**
+
+- `state_before` / `state_after` on `EpisodeRecord` and episodes table (workspace state snapshots via FNV-64 hash walk)
+- `causal_links` table: `(link_id, run_id, from_event_id, to_event_id, relation, confidence, hierarchy_level, key, created_at)`
+- `PearlHierarchyLevel` enum (Associational / Interventional / Counterfactual) on causal links
+- `populate_cross_phase_causal_links` — auto-emits phase_sequence and failure_triggered links across run episodes
+- `get_run_causal_graph` — returns event graph with Pearl-labeled edges; surfaced via `GET /api/runs/:id/causal-events`
+- Coobie multi-hop retrieval: `retrieve_context_multihop(query, embedding_store, depth)` — configurable chain depth (1–3)
+- Native CLADDER adapter — Pearl hierarchy causal benchmark, paired Harkonnen vs raw-LLM mode
+- Native HELMET adapter — retrieval precision/recall benchmark
+
+**Phase 5 — Consolidation Workbench:**
+
+- `consolidation_candidates` table: `(candidate_id, run_id, kind, status, content_json, edited_json, confidence, label, created_at, reviewed_at)`
+- `generate_consolidation_candidates`, `list_consolidation_candidates`, `review_consolidation_candidate`, `edit_consolidation_candidate`, `promote_kept_candidates`
+- INSERT OR IGNORE idempotency on candidate generation
+- API routes: `GET /api/runs/:id/consolidation/candidates`, `POST .../candidates` (generate), `POST .../candidates/:id/keep`, `.../discard`, `.../edit`, `POST /api/runs/:id/consolidate` (promote)
+- Pack Board Consolidation Workbench panel: candidate cards with keep/discard/edit controls, confidence bars, expandable JSON, filter bar, promote footer
+- `RunDetailDrawer` updated with workbench tab
 
 ---
 
 ## Tracking
 
-Each active implementation phase gets its own git branch:
-`phase/2-bramble-tests`, `phase/3-ash-twins`, etc.
+Each active implementation phase gets its own git branch: `phase/2-bramble-tests`, `phase/3-ash-twins`, etc.
 A phase is merged to `main` when its "Done when" condition is verifiably met.
-This file is updated when a phase ships — move it from the numbered list above
-into the "already done" section.
+This file is updated when a phase ships — move it from the numbered list above into the "already done" section.
 
 Benchmark wiring should advance in lockstep with implementation:
 
 - when a phase ships, add or tighten at least one benchmark gate tied to it
-- when a public benchmark is still adapter-only, capture that explicitly here
-  rather than implying it is already fully integrated
-- benchmark artifacts belong in `factory/artifacts/benchmarks/` and should be
-  linked from release notes or README once they support a public claim
+- when a public benchmark is still adapter-only, capture that explicitly here rather than implying it is fully integrated
+- benchmark artifacts belong in `factory/artifacts/benchmarks/` and should be linked from release notes once they support a public claim

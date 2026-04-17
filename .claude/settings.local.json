@@ -41,7 +41,8 @@
       "WebFetch(domain:api.github.com)",
       "WebFetch(domain:openspec.dev)",
       "Bash(ls \"/media/earthling/Caleb's Files1/Harkonnen-Labs/src/\"*.rs)",
-      "Bash(xargs -I{} basename {})"
+      "Bash(xargs -I{} basename {})",
+      "Bash(ls \"/media/earthling/Caleb's Files1/Harkonnen-Labs\"/*.md)"
     ],
     "additionalDirectories": [
       "/media/earthling/Caleb''''s Files/Harkonnen-Labs/factory",

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import CausalReportPanel from './CausalReportPanel';
+import ConsolidationWorkbench from './ConsolidationWorkbench';
 import ValidationPanel from './ValidationPanel';
 import CoobieSignalPanel from './CoobieSignalPanel';
 
@@ -126,7 +127,7 @@ export default function RunDetailDrawer({ runId, onClose }) {
 
   const hasExploreLog = blackboard?.artifact_refs?.includes('exploration_log.md');
   const hasCorpusResults = blackboard?.artifact_refs?.includes('corpus_results.json');
-  const TABS = ['overview', 'timeline', 'agents', 'causal', 'lessons', 'explore', 'corpus'];
+  const TABS = ['overview', 'timeline', 'agents', 'causal', 'lessons', 'workbench', 'explore', 'corpus'];
 
   return (
     <div className="drawer-overlay">
@@ -354,6 +355,10 @@ export default function RunDetailDrawer({ runId, onClose }) {
                 ))
               )}
             </div>
+          )}
+
+          {tab === 'workbench' && (
+            <ConsolidationWorkbench runId={runId} />
           )}
         </div>
       </div>

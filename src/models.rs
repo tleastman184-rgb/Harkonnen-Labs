@@ -807,6 +807,29 @@ pub struct CounterfactualOutcome {
     pub confidence_gain: f32,
 }
 
+/// A candidate item surfaced by Coobie at end-of-run for operator review.
+/// Nothing is written to durable memory until the operator approves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationCandidate {
+    pub candidate_id: String,
+    pub run_id: String,
+    /// `"lesson"` | `"causal_link"` | `"pattern"`
+    pub kind: String,
+    /// `"pending"` | `"kept"` | `"discarded"`
+    pub status: String,
+    /// The raw proposed content (lesson record, causal link, etc.)
+    pub content_json: serde_json::Value,
+    /// If the operator edited the content, this holds the edited version.
+    #[serde(default)]
+    pub edited_json: Option<serde_json::Value>,
+    pub confidence: f64,
+    /// Human-readable one-liner shown in the Workbench card.
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub reviewed_at: Option<DateTime<Utc>>,
+}
+
 /// A causal pattern that has fired on consecutive runs of the same spec.
 /// Streak length ≥ 3 triggers escalation — the standard intervention alone
 /// is not breaking the cycle.

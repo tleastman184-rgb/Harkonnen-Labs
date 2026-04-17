@@ -21,8 +21,8 @@ use crate::{
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
         AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode, CheckpointAnswerRecord,
-        CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord,
-        EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        CoobieBriefing, CoobieEvidenceCitation, ConsolidationCandidate, EpisodeCausalState,
+        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
         EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
         EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, HiddenScenarioCheckResult,
         HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent,
@@ -10464,6 +10464,384 @@ Write the twin environment narrative and identify any simulation gaps against Co
         self.attach_lessons_to_blackboard(&run_dir, &lessons)
             .await?;
         Ok(lessons)
+    }
+
+    // ── Phase 5 — Consolidation Workbench ─────────────────────────────────────
+
+    /// Generate `ConsolidationCandidate` rows for a run without promoting
+    /// anything.  Safe to call multiple times — existing pending candidates
+    /// are not duplicated (keyed on candidate_id derived from lesson_id).
+    pub async fn generate_consolidation_candidates(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ConsolidationCandidate>> {
+        let run_dir = self.run_dir(run_id);
+        let spec_path = run_dir.join("spec.yaml");
+        if !spec_path.exists() {
+            bail!("run {run_id} is missing spec.yaml; cannot generate candidates");
+        }
+        let spec_obj = spec::load_spec(&spec_path.to_string_lossy())?;
+
+        let episodes = self.list_run_episodes(run_id).await?;
+        let prior_lessons = self.list_lessons().await?;
+        let target_source = self.target_source_for_run(run_id).await?;
+        let mut known_lesson_ids = prior_lessons
+            .iter()
+            .map(|l| l.lesson_id.clone())
+            .collect::<HashSet<_>>();
+
+        let mut candidates: Vec<ConsolidationCandidate> = Vec::new();
+
+        // ── Episode-pattern lessons ──
+        for episode in &episodes {
+            let outcome = episode.outcome.as_deref().unwrap_or("unknown");
+            if outcome != "failure" && outcome != "blocked" {
+                continue;
+            }
+            let events = self.list_events_for_episode(&episode.episode_id).await?;
+            if events.is_empty() {
+                continue;
+            }
+            let pattern = build_episode_pattern(&episode.phase, &events);
+            let prior_count = self
+                .count_prior_matching_failed_episodes(run_id, &episode.phase, &pattern)
+                .await?;
+            if prior_count < 3 {
+                continue;
+            }
+            let lesson_id = format!("lesson-{}", episode.episode_id);
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let lesson = LessonRecord {
+                lesson_id: lesson_id.clone(),
+                source_episode: Some(episode.episode_id.clone()),
+                pattern: format!("Repeated failure pattern in {}: {}", episode.phase, pattern),
+                intervention: infer_intervention(&events),
+                tags: vec![
+                    "lesson".to_string(),
+                    "causal".to_string(),
+                    "project-memory".to_string(),
+                    episode.phase.clone(),
+                    events.last().map(|e| e.agent.clone()).unwrap_or_default(),
+                ],
+                strength: 1.0,
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let candidate_id = format!("cand-{}", lesson_id);
+            // Skip if already exists.
+            if self.candidate_exists(&candidate_id).await? {
+                continue;
+            }
+            let label = format!(
+                "[lesson] {} — {}",
+                episode.phase,
+                lesson
+                    .intervention
+                    .as_deref()
+                    .unwrap_or("no intervention yet")
+            );
+            let candidate = ConsolidationCandidate {
+                candidate_id: candidate_id.clone(),
+                run_id: run_id.to_string(),
+                kind: "lesson".to_string(),
+                status: "pending".to_string(),
+                content_json: serde_json::to_value(&lesson).unwrap_or_default(),
+                edited_json: None,
+                confidence: 0.8,
+                label,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            };
+            self.insert_consolidation_candidate(&candidate).await?;
+            known_lesson_ids.insert(lesson_id);
+            candidates.push(candidate);
+        }
+
+        // ── Phase-attribution lessons ──
+        let attributions = self.list_phase_attributions_for_run(run_id).await?;
+        for attr in &attributions {
+            if attr.outcome == "success" {
+                continue;
+            }
+            let lesson_id = format!("lesson-attr-{}", attr.attribution_id);
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+            let candidate_id = format!("cand-{}", lesson_id);
+            if self.candidate_exists(&candidate_id).await? {
+                continue;
+            }
+            let pattern = format!(
+                "Attribution failure in {} by {}: outcome={}",
+                attr.phase, attr.agent_name, attr.outcome
+            );
+            let lesson = LessonRecord {
+                lesson_id: lesson_id.clone(),
+                source_episode: Some(attr.episode_id.clone()),
+                pattern: pattern.clone(),
+                intervention: None,
+                tags: vec![
+                    "lesson".to_string(),
+                    "attribution".to_string(),
+                    attr.phase.clone(),
+                    attr.agent_name.clone(),
+                ],
+                strength: attr.confidence.unwrap_or(0.5),
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let label = format!("[attribution] {} {} failed", attr.phase, attr.agent_name);
+            let candidate = ConsolidationCandidate {
+                candidate_id,
+                run_id: run_id.to_string(),
+                kind: "lesson".to_string(),
+                status: "pending".to_string(),
+                content_json: serde_json::to_value(&lesson).unwrap_or_default(),
+                edited_json: None,
+                confidence: attr.confidence.unwrap_or(0.5),
+                label,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            };
+            self.insert_consolidation_candidate(&candidate).await?;
+            known_lesson_ids.insert(lesson_id);
+            candidates.push(candidate);
+        }
+
+        // ── Causal hypotheses from diagnose ──
+        let hypotheses = self.coobie.diagnose(run_id).await.unwrap_or_default();
+        for hypothesis in &hypotheses {
+            if hypothesis.confidence < 0.4 {
+                continue;
+            }
+            let candidate_id = format!("cand-hyp-{}-{}", run_id, hypothesis.cause_id);
+            if self.candidate_exists(&candidate_id).await? {
+                continue;
+            }
+            let label = format!(
+                "[causal] {} ({:.0}% confidence)",
+                hypothesis.cause_id,
+                hypothesis.confidence * 100.0
+            );
+            let candidate = ConsolidationCandidate {
+                candidate_id,
+                run_id: run_id.to_string(),
+                kind: "pattern".to_string(),
+                status: "pending".to_string(),
+                content_json: serde_json::to_value(hypothesis).unwrap_or_default(),
+                edited_json: None,
+                confidence: hypothesis.confidence as f64,
+                label,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            };
+            self.insert_consolidation_candidate(&candidate).await?;
+            candidates.push(candidate);
+        }
+
+        let _ = target_source;
+        let _ = spec_obj;
+        Ok(candidates)
+    }
+
+    /// Return all candidates for a run, ordered by confidence descending.
+    pub async fn list_consolidation_candidates(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ConsolidationCandidate>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT candidate_id, run_id, kind, status, content_json, edited_json,
+                   confidence, label, created_at, reviewed_at
+            FROM consolidation_candidates
+            WHERE run_id = ?1
+            ORDER BY confidence DESC, created_at ASC
+            "#,
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(ConsolidationCandidate {
+                candidate_id: row.get::<String, _>("candidate_id"),
+                run_id: row.get::<String, _>("run_id"),
+                kind: row.get::<String, _>("kind"),
+                status: row.get::<String, _>("status"),
+                content_json: row
+                    .get::<Option<String>, _>("content_json")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                edited_json: row
+                    .get::<Option<String>, _>("edited_json")
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                confidence: row.get::<f64, _>("confidence"),
+                label: row.get::<String, _>("label"),
+                created_at: chrono::DateTime::parse_from_rfc3339(
+                    row.get::<String, _>("created_at").as_str(),
+                )?
+                .with_timezone(&Utc),
+                reviewed_at: row
+                    .get::<Option<String>, _>("reviewed_at")
+                    .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                    .transpose()?
+                    .map(|dt| dt.with_timezone(&Utc)),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Set a candidate's status to `"kept"` or `"discarded"`.
+    pub async fn review_consolidation_candidate(
+        &self,
+        candidate_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        if status != "kept" && status != "discarded" {
+            bail!("invalid consolidation status: {status}; must be 'kept' or 'discarded'");
+        }
+        sqlx::query(
+            "UPDATE consolidation_candidates SET status = ?2, reviewed_at = ?3 WHERE candidate_id = ?1",
+        )
+        .bind(candidate_id)
+        .bind(status)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Store operator-edited content for a candidate (and mark it kept).
+    pub async fn edit_consolidation_candidate(
+        &self,
+        candidate_id: &str,
+        edited_json: serde_json::Value,
+    ) -> Result<()> {
+        let json_str = serde_json::to_string(&edited_json)?;
+        sqlx::query(
+            r#"UPDATE consolidation_candidates
+               SET edited_json = ?2, status = 'kept', reviewed_at = ?3
+               WHERE candidate_id = ?1"#,
+        )
+        .bind(candidate_id)
+        .bind(json_str)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Promote only `"kept"` candidates into durable memory.
+    /// This replaces the auto-promote path — nothing enters memory without
+    /// operator approval after this point.
+    pub async fn promote_kept_candidates(&self, run_id: &str) -> Result<Vec<LessonRecord>> {
+        let run_dir = self.run_dir(run_id);
+        let spec_path = run_dir.join("spec.yaml");
+        if !spec_path.exists() {
+            bail!("run {run_id} is missing spec.yaml; cannot promote candidates");
+        }
+        let spec_obj = spec::load_spec(&spec_path.to_string_lossy())?;
+        let target_source = self.target_source_for_run(run_id).await?;
+
+        let candidates = self.list_consolidation_candidates(run_id).await?;
+        let prior_lessons = self.list_lessons().await?;
+        let mut known_lesson_ids = prior_lessons
+            .iter()
+            .map(|l| l.lesson_id.clone())
+            .collect::<HashSet<_>>();
+        let mut promoted: Vec<LessonRecord> = Vec::new();
+
+        for candidate in candidates {
+            if candidate.status != "kept" {
+                continue;
+            }
+            if candidate.kind != "lesson" {
+                // causal_link / pattern candidates are stored in their own
+                // tables (causal_hypotheses) — not lesson memory.
+                continue;
+            }
+
+            // Use edited content if available, otherwise fall back to original.
+            let content = candidate
+                .edited_json
+                .as_ref()
+                .unwrap_or(&candidate.content_json);
+
+            let Ok(lesson) = serde_json::from_value::<LessonRecord>(content.clone()) else {
+                continue;
+            };
+
+            let lesson_body = format!(
+                "Source episode: {}\nPhase: {}\nIntervention: {}\nPattern: {}",
+                lesson.source_episode.as_deref().unwrap_or("unknown"),
+                lesson.tags.get(3).map(|s| s.as_str()).unwrap_or("unknown"),
+                lesson.intervention.as_deref().unwrap_or("none"),
+                lesson.pattern,
+            );
+
+            self.persist_lesson(
+                lesson.clone(),
+                lesson_body,
+                target_source.as_ref(),
+                Some(&spec_obj),
+                &mut known_lesson_ids,
+                &mut promoted,
+            )
+            .await?;
+        }
+
+        // Cross-phase links + blackboard update.
+        let _ = self.populate_cross_phase_causal_links(run_id).await;
+        self.attach_lessons_to_blackboard(&run_dir, &promoted).await?;
+
+        Ok(promoted)
+    }
+
+    async fn candidate_exists(&self, candidate_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM consolidation_candidates WHERE candidate_id = ?1 LIMIT 1",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn insert_consolidation_candidate(
+        &self,
+        candidate: &ConsolidationCandidate,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO consolidation_candidates
+               (candidate_id, run_id, kind, status, content_json, edited_json,
+                confidence, label, created_at, reviewed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        )
+        .bind(&candidate.candidate_id)
+        .bind(&candidate.run_id)
+        .bind(&candidate.kind)
+        .bind(&candidate.status)
+        .bind(serde_json::to_string(&candidate.content_json)?)
+        .bind(
+            candidate
+                .edited_json
+                .as_ref()
+                .map(|v| serde_json::to_string(v))
+                .transpose()?,
+        )
+        .bind(candidate.confidence)
+        .bind(&candidate.label)
+        .bind(candidate.created_at.to_rfc3339())
+        .bind(candidate.reviewed_at.map(|dt| dt.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn materialize_run_checkpoints(&self, run_id: &str) -> Result<()> {
