@@ -20,15 +20,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::{
-    chat::{dispatch_message, OpenThreadRequest, PostMessageRequest},
+    chat::{dispatch_message, ChatThread, ChatThreadKind, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
         AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing,
         EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
         EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
-        PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec,
-        ValidationSummary,
+        OperatorModelProfile, OperatorModelScope, OperatorModelSession, PhaseAttributionRecord,
+        PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec, ValidationSummary,
     },
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
@@ -170,6 +170,43 @@ struct MemoryBoardUpdateView {
     stale_summary: String,
     fresh_memory_id: String,
     fresh_summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OperatorModelSessionResponse {
+    profile: OperatorModelProfile,
+    session: OperatorModelSession,
+    thread: ChatThread,
+    export_root: String,
+    reused_existing_session: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OperatorModelProfileResponse {
+    profile: OperatorModelProfile,
+    export_root: String,
+    active_session: Option<OperatorModelSession>,
+    active_thread: Option<ChatThread>,
+    light_global_topics: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartOperatorModelSessionRequest {
+    project_root: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    started_by: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default = "default_resume_if_exists")]
+    resume_if_exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListOperatorModelProfilesQuery {
+    #[serde(default)]
+    scope: Option<OperatorModelScope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -652,6 +689,22 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route(
             "/api/chat/threads/:id/messages",
             get(list_chat_messages).post(post_chat_message),
+        )
+        .route(
+            "/api/operator-model/sessions",
+            post(post_start_operator_model_session),
+        )
+        .route(
+            "/api/operator-model/profiles",
+            get(list_operator_model_profiles),
+        )
+        .route(
+            "/api/operator-model/profiles/:id",
+            get(get_operator_model_profile),
+        )
+        .route(
+            "/api/operator-model/sessions/:id",
+            get(get_operator_model_session),
         )
         .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
@@ -4175,6 +4228,8 @@ async fn get_run_artifact(
 #[derive(Deserialize)]
 struct ListThreadsQuery {
     run_id: Option<String>,
+    #[serde(default)]
+    thread_kind: Option<ChatThreadKind>,
     #[serde(default = "default_thread_limit")]
     limit: usize,
 }
@@ -4187,7 +4242,11 @@ async fn list_chat_threads(
     Query(q): Query<ListThreadsQuery>,
     State(app): State<AppContext>,
 ) -> impl IntoResponse {
-    match app.chat.list_threads(q.run_id.as_deref(), q.limit).await {
+    match app
+        .chat
+        .list_threads(q.run_id.as_deref(), q.thread_kind.as_ref(), q.limit)
+        .await
+    {
         Ok(threads) => (StatusCode::OK, Json(threads)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -4239,4 +4298,353 @@ async fn post_chat_message(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+fn default_resume_if_exists() -> bool {
+    true
+}
+
+fn normalize_project_root(app: &AppContext, raw: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(raw.trim());
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        app.paths.root.join(candidate)
+    };
+    let canonical = absolute.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project_root is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn default_project_profile_name(project_root: &FsPath) -> String {
+    project_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{} operator model", value))
+        .unwrap_or_else(|| "project operator model".to_string())
+}
+
+async fn operator_model_profile_response(
+    app: &AppContext,
+    profile: OperatorModelProfile,
+) -> Result<OperatorModelProfileResponse, String> {
+    let active_session = app
+        .operator_models
+        .find_active_session_for_profile(&profile.profile_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let active_thread = match active_session
+        .as_ref()
+        .and_then(|session| session.thread_id.as_deref())
+    {
+        Some(thread_id) => app
+            .chat
+            .get_thread(thread_id)
+            .await
+            .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    Ok(OperatorModelProfileResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        light_global_topics: crate::operator_model::LIGHT_GLOBAL_PROFILE_TOPICS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        profile,
+        active_session,
+        active_thread,
+    })
+}
+
+async fn list_operator_model_profiles(
+    Query(q): Query<ListOperatorModelProfilesQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let profiles = match q.scope {
+        Some(scope) => app.operator_models.list_profiles_by_scope(scope).await,
+        None => app.operator_models.list_profiles().await,
+    };
+
+    match profiles {
+        Ok(profiles) => {
+            let mut responses = Vec::with_capacity(profiles.len());
+            for profile in profiles {
+                match operator_model_profile_response(&app, profile).await {
+                    Ok(response) => responses.push(response),
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                    }
+                }
+            }
+            (StatusCode::OK, Json(responses)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_operator_model_profile(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.operator_models.get_profile(&id).await {
+        Ok(Some(profile)) => match operator_model_profile_response(&app, profile).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "operator-model profile not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_operator_model_session(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let session = match app.operator_models.get_session(&id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "operator-model session not found").into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let profile = match app.operator_models.get_profile(&session.profile_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "operator-model profile not found").into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let thread = match session.thread_id.as_deref() {
+        Some(thread_id) => match app.chat.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, "operator-model thread not found").into_response()
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "operator-model session has no thread",
+            )
+                .into_response()
+        }
+    };
+
+    let response = OperatorModelSessionResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        profile,
+        session,
+        thread,
+        reused_existing_session: true,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn post_start_operator_model_session(
+    State(app): State<AppContext>,
+    Json(req): Json<StartOperatorModelSessionRequest>,
+) -> impl IntoResponse {
+    let project_root = match normalize_project_root(&app, &req.project_root) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let display_name = req
+        .display_name
+        .clone()
+        .unwrap_or_else(|| default_project_profile_name(&project_root));
+
+    let profile = match app
+        .operator_models
+        .ensure_project_profile(&project_root, &display_name)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let existing_session = if req.resume_if_exists {
+        match app
+            .operator_models
+            .find_active_session_for_profile(&profile.profile_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    } else {
+        None
+    };
+
+    let project_root_text = match project_root.to_str() {
+        Some(value) => value.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "project_root is not valid UTF-8: {}",
+                    project_root.display()
+                ),
+            )
+                .into_response()
+        }
+    };
+
+    let thread_title = req
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Operator model: {}", display_name));
+
+    let mut reused_existing_session = false;
+    let session = if let Some(session) = existing_session {
+        reused_existing_session = true;
+        session
+    } else {
+        let thread = match app
+            .chat
+            .open_thread(&OpenThreadRequest {
+                run_id: None,
+                spec_id: None,
+                title: Some(thread_title.clone()),
+                thread_kind: ChatThreadKind::OperatorModel,
+                metadata_json: Some(serde_json::json!({
+                    "scope": "project",
+                    "profile_id": profile.profile_id,
+                    "project_root": project_root_text,
+                    "pending_layer": crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER,
+                })),
+            })
+            .await
+        {
+            Ok(thread) => thread,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        match app
+            .operator_models
+            .create_session(
+                &profile.profile_id,
+                Some(&thread.thread_id),
+                Some(crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER),
+                req.started_by.as_deref(),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    };
+
+    let thread = match session.thread_id.as_deref() {
+        Some(thread_id) => match app.chat.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) => {
+                let thread = match app
+                    .chat
+                    .open_thread(&OpenThreadRequest {
+                        run_id: None,
+                        spec_id: None,
+                        title: Some(thread_title),
+                        thread_kind: ChatThreadKind::OperatorModel,
+                        metadata_json: Some(serde_json::json!({
+                            "scope": "project",
+                            "profile_id": profile.profile_id,
+                            "project_root": project_root_text,
+                            "session_id": session.session_id,
+                            "pending_layer": session.pending_layer.clone().unwrap_or_else(|| crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER.to_string()),
+                        })),
+                    })
+                    .await
+                {
+                    Ok(thread) => thread,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    }
+                };
+                if let Err(e) = app
+                    .operator_models
+                    .update_session_thread(&session.session_id, &thread.thread_id)
+                    .await
+                {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+                thread
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        None => {
+            let thread = match app
+                .chat
+                .open_thread(&OpenThreadRequest {
+                    run_id: None,
+                    spec_id: None,
+                    title: Some(thread_title),
+                    thread_kind: ChatThreadKind::OperatorModel,
+                    metadata_json: Some(serde_json::json!({
+                        "scope": "project",
+                        "profile_id": profile.profile_id,
+                        "project_root": project_root_text,
+                        "session_id": session.session_id,
+                        "pending_layer": session.pending_layer.clone().unwrap_or_else(|| crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER.to_string()),
+                    })),
+                })
+                .await
+            {
+                Ok(thread) => thread,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            };
+            if let Err(e) = app
+                .operator_models
+                .update_session_thread(&session.session_id, &thread.thread_id)
+                .await
+            {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+            thread
+        }
+    };
+
+    if !reused_existing_session {
+        let kickoff = format!(
+            "I'm ready to build the operator model for `{}`. We'll treat this as a project-scoped profile and stamp the repo under `.harkonnen/operator-model/`. Let's start with operating rhythms: what recurring work, triggers, or timing patterns shape how work actually moves in this repo?",
+            project_root_text
+        );
+        if let Err(e) = app
+            .chat
+            .append_message(&thread.thread_id, "agent", Some("coobie"), &kickoff, None)
+            .await
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+
+    let response = OperatorModelSessionResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        profile,
+        session,
+        thread,
+        reused_existing_session,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
 }

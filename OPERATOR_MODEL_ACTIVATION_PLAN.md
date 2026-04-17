@@ -32,6 +32,28 @@ Do not copy:
 
 ## Product Shape
 
+## Product Defaults
+
+The product should be explicitly **project-first**.
+
+Default behavior:
+
+- start or resume a `project` profile tied to the commissioned repo
+- export artifacts into that repo's `.harkonnen/operator-model/` directory
+- feed the stamped project profile into Scout, Coobie, and Keeper for that repo
+
+Global behavior should stay intentionally light and optional:
+
+- only create a `global` profile when the operator asks for a reusable baseline
+- keep it focused on broad preferences: communication style, approval boundaries, escalation style, and working rhythm
+- never let the global profile replace repo-specific workflows, dependencies, institutional knowledge, or friction
+
+Resolution order for commissioning and preflight:
+
+1. matching `project` profile for the target repo
+2. otherwise a light `global` profile if one exists
+3. otherwise no operator model yet
+
 ### Entry points
 
 1. `New Run` flow gets a new first choice:
@@ -55,7 +77,7 @@ Each layer produces:
 
 - free-text checkpoint summary for operator approval
 - canonical structured entries
-- one summary memory write to repo-local project memory or core memory depending on scope
+- one summary memory write to repo-local project memory by default, or core memory only for the rare light global profile
 
 ### Outputs
 
@@ -68,6 +90,9 @@ At successful completion, generate and persist:
 - `schedule-recommendations.json`
 - `commissioning-brief.json` (Harkonnen-specific)
 
+For `project` scope these should land in the target repo under `.harkonnen/operator-model/`.
+For the optional light `global` scope they can live under Harkonnen's own factory state.
+
 `commissioning-brief.json` should be the bridge artifact Scout and Coobie use before spec drafting.
 
 ## Proposed Data Model
@@ -78,7 +103,7 @@ Add a native operator-model store in SQLite.
 
 #### `operator_model_profiles`
 
-One logical profile per human or per repo-scoped operator context.
+One logical profile per human or per repo-scoped operator context. In practice, `project` should be the default and `global` should stay small.
 
 Fields:
 
@@ -277,16 +302,16 @@ Add a dedicated operator-model API namespace.
 
 When `Interview Me First` is used:
 
-1. start operator-model session
+1. start or resume the `project` operator-model session for the target repo
 2. finish or resume interview
-3. generate `commissioning-brief.json`
+3. generate `commissioning-brief.json` in that repo's `.harkonnen/operator-model/` directory
 4. pass the brief into Scout draft generation
 
 Scout should treat the operator model as a hard context source, not just loose memory.
 
 ### Before run preflight
 
-Coobie should read the latest approved operator model alongside repo-local project memory and causal priors.
+Coobie should read the latest approved `project` operator model alongside repo-local project memory and causal priors, falling back to the light global baseline only when no project profile exists yet.
 
 Use it to shape:
 
@@ -316,7 +341,7 @@ Coobie consolidation should emit `operator_model_update_candidates` when a run r
 Use both structured tables and memory writes.
 
 - structured tables are the canonical source for querying and export generation
-- project/core memory stores summary lessons for Coobie retrieval
+- project memory stores summary lessons for the default repo-scoped profile; core memory is only for the optional light global baseline
 
 ### Write strategy
 
@@ -347,7 +372,7 @@ This should explicitly reuse the stale-memory/supersession behavior already pres
 Add step `0a` before `Describe`:
 
 - toggle or card choice: `Draft Spec Now` vs `Interview Me First`
-- if interview chosen, launch operator-model session and route into a conversational modal
+- if interview chosen, launch the repo-scoped operator-model session and route into a conversational modal
 
 ### New component: `ui/src/components/OperatorModelFlow.jsx`
 

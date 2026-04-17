@@ -405,17 +405,35 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS chat_threads (
-            thread_id   TEXT PRIMARY KEY,
-            run_id      TEXT,
-            spec_id     TEXT,
-            title       TEXT NOT NULL DEFAULT '',
-            status      TEXT NOT NULL DEFAULT 'open',
-            created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            thread_id      TEXT PRIMARY KEY,
+            run_id         TEXT,
+            spec_id        TEXT,
+            title          TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'open',
+            thread_kind    TEXT NOT NULL DEFAULT 'general',
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "chat_threads",
+        "thread_kind",
+        "ALTER TABLE chat_threads ADD COLUMN thread_kind TEXT NOT NULL DEFAULT 'general'",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "chat_threads",
+        "metadata_json",
+        "ALTER TABLE chat_threads ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+    )
     .await?;
 
     sqlx::query(

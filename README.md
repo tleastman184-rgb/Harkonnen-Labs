@@ -453,7 +453,7 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, and 5 are s
 | Benchmark toolchain (LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, CLADDER native adapters) | Live |
 | Bramble real test execution | Phase 2 — next numbered phase |
 | Ash live twin provisioning (Docker stubs) | Phase 3 — next numbered phase |
-| Operator Model Activation | Parallel product track — planned |
+| Operator Model Activation | Parallel product track — planned, project-scoped by default |
 | Qdrant + OCR memory infrastructure | Phase 5b |
 | TypeDB 3.x semantic graph layer | Phase 6 |
 | E-CARE + causal attribution corpus | Phase 7 |
@@ -468,7 +468,7 @@ Near-term (active now):
 
 * Phase 2 — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
 * Phase 3 — Ash live twin provisioning plus Flint documentation artifacts for richer hidden-scenario and DevBench evaluation
-* Parallel product track — Operator Model Activation so PackChat can interview the operator before commissioning and feed Scout/Coobie/Keeper structured context
+* Parallel product track — Operator Model Activation so PackChat can interview the operator before commissioning, stamp the target repo, and feed Scout/Coobie/Keeper structured project context
 
 Mid-term (after the active numbered phases):
 

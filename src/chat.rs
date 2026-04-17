@@ -26,6 +26,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -38,6 +39,27 @@ use crate::{
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatThreadKind {
+    #[default]
+    General,
+    Run,
+    Spec,
+    OperatorModel,
+}
+
+impl ChatThreadKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Run => "run",
+            Self::Spec => "spec",
+            Self::OperatorModel => "operator_model",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatThread {
     pub thread_id: String,
@@ -45,6 +67,10 @@ pub struct ChatThread {
     pub spec_id: Option<String>,
     pub title: String,
     pub status: String, // "open" | "closed"
+    #[serde(default)]
+    pub thread_kind: ChatThreadKind,
+    #[serde(default = "default_thread_metadata")]
+    pub metadata_json: Value,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
 }
@@ -69,6 +95,10 @@ pub struct OpenThreadRequest {
     pub run_id: Option<String>,
     pub spec_id: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub thread_kind: ChatThreadKind,
+    #[serde(default)]
+    pub metadata_json: Option<Value>,
 }
 
 /// Request body for posting a message.
@@ -126,17 +156,23 @@ impl ChatStore {
             .title
             .clone()
             .unwrap_or_else(|| "New conversation".to_string());
+        let metadata_json = req
+            .metadata_json
+            .clone()
+            .unwrap_or_else(default_thread_metadata);
 
         sqlx::query(
             r#"
-            INSERT INTO chat_threads (thread_id, run_id, spec_id, title, status, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)
+            INSERT INTO chat_threads (thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8)
             "#,
         )
         .bind(&thread_id)
         .bind(&req.run_id)
         .bind(&req.spec_id)
         .bind(&title)
+        .bind(req.thread_kind.as_str())
+        .bind(serde_json::to_string(&metadata_json)?)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&self.pool)
@@ -149,6 +185,8 @@ impl ChatStore {
             spec_id: req.spec_id.clone(),
             title,
             status: "open".to_string(),
+            thread_kind: req.thread_kind.clone(),
+            metadata_json,
             created_at: now,
             updated_at: now,
         })
@@ -156,61 +194,69 @@ impl ChatStore {
 
     pub async fn get_thread(&self, thread_id: &str) -> Result<Option<ChatThread>> {
         let row = sqlx::query(
-            "SELECT thread_id, run_id, spec_id, title, status, created_at, updated_at
+            "SELECT thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at
              FROM chat_threads WHERE thread_id = ?1",
         )
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| ChatThread {
-            thread_id: r.get("thread_id"),
-            run_id: r.get("run_id"),
-            spec_id: r.get("spec_id"),
-            title: r.get("title"),
-            status: r.get("status"),
-            created_at: parse_dt(r.get("created_at")),
-            updated_at: parse_dt(r.get("updated_at")),
-        }))
+        row.map(parse_chat_thread).transpose()
     }
 
     pub async fn list_threads(
         &self,
         run_id: Option<&str>,
+        thread_kind: Option<&ChatThreadKind>,
         limit: usize,
     ) -> Result<Vec<ChatThread>> {
-        let rows = if let Some(rid) = run_id {
-            sqlx::query(
-                "SELECT thread_id, run_id, spec_id, title, status, created_at, updated_at
-                 FROM chat_threads WHERE run_id = ?1
-                 ORDER BY created_at DESC LIMIT ?2",
-            )
-            .bind(rid)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT thread_id, run_id, spec_id, title, status, created_at, updated_at
-                 FROM chat_threads ORDER BY created_at DESC LIMIT ?1",
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?
+        let rows = match (run_id, thread_kind) {
+            (Some(rid), Some(kind)) => {
+                sqlx::query(
+                    "SELECT thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at
+                     FROM chat_threads WHERE run_id = ?1 AND thread_kind = ?2
+                     ORDER BY created_at DESC LIMIT ?3",
+                )
+                .bind(rid)
+                .bind(kind.as_str())
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(rid), None) => {
+                sqlx::query(
+                    "SELECT thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at
+                     FROM chat_threads WHERE run_id = ?1
+                     ORDER BY created_at DESC LIMIT ?2",
+                )
+                .bind(rid)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(kind)) => {
+                sqlx::query(
+                    "SELECT thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at
+                     FROM chat_threads WHERE thread_kind = ?1
+                     ORDER BY created_at DESC LIMIT ?2",
+                )
+                .bind(kind.as_str())
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query(
+                    "SELECT thread_id, run_id, spec_id, title, status, thread_kind, metadata_json, created_at, updated_at
+                     FROM chat_threads ORDER BY created_at DESC LIMIT ?1",
+                )
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ChatThread {
-                thread_id: r.get("thread_id"),
-                run_id: r.get("run_id"),
-                spec_id: r.get("spec_id"),
-                title: r.get("title"),
-                status: r.get("status"),
-                created_at: parse_dt(r.get("created_at")),
-                updated_at: parse_dt(r.get("updated_at")),
-            })
-            .collect())
+        rows.into_iter().map(parse_chat_thread).collect()
     }
 
     // ── Messages ──────────────────────────────────────────────────────────────
@@ -420,29 +466,86 @@ pub fn route_message(content: &str) -> &'static str {
 }
 
 /// Build a system prompt for a named agent responding in PackChat context.
-fn agent_system_prompt(agent: &str, run_id: Option<&str>) -> String {
-    let run_ctx = run_id
+fn agent_system_prompt(agent: &str, thread: &ChatThread) -> String {
+    let run_ctx = thread
+        .run_id
+        .as_deref()
         .map(|id| format!(" You are currently assisting with run `{}`.", id))
         .unwrap_or_default();
 
     let role = match agent {
-        "scout"  => "spec intake specialist — you parse specs, identify ambiguity, and produce intent packages",
-        "mason"  => "implementation specialist — you generate and modify code inside the staged workspace",
-        "piper"  => "tool and MCP routing specialist — you run build tools and fetch documentation",
-        "bramble"=> "test specialist — you generate tests, run lint/build/visible tests, and report results",
-        "sable"  => "scenario evaluation specialist — you execute hidden behavioral scenarios and produce eval reports",
-        "ash"    => "digital twin specialist — you provision simulated environments and mock external dependencies",
-        "flint"  => "artifact specialist — you collect outputs and package artifact bundles",
-        "keeper" => "boundary enforcement specialist — you guard policy, protect secrets, and manage file-claim coordination",
-        _        => "memory and reasoning specialist — you retrieve prior patterns, causal history, and lessons learned",
+        "scout" => {
+            "spec intake specialist — you parse specs, identify ambiguity, and produce intent packages"
+        }
+        "mason" => {
+            "implementation specialist — you generate and modify code inside the staged workspace"
+        }
+        "piper" => {
+            "tool and MCP routing specialist — you run build tools and fetch documentation"
+        }
+        "bramble" => {
+            "test specialist — you generate tests, run lint/build/visible tests, and report results"
+        }
+        "sable" => {
+            "scenario evaluation specialist — you execute hidden behavioral scenarios and produce eval reports"
+        }
+        "ash" => {
+            "digital twin specialist — you provision simulated environments and mock external dependencies"
+        }
+        "flint" => "artifact specialist — you collect outputs and package artifact bundles",
+        "keeper" => {
+            "boundary enforcement specialist — you guard policy, protect secrets, and manage file-claim coordination"
+        }
+        _ => "memory and reasoning specialist — you retrieve prior patterns, causal history, and lessons learned",
     };
 
-    format!(
-        "You are {}, a {}, working inside Harkonnen Labs — a local-first, spec-driven AI software factory.{} \
-         You share the Labrador Retriever personality: loyal, honest, persistent, never bluff. \
-         Keep answers concise and grounded in what you know. If you're uncertain, say so clearly.",
+    let mut prompt = format!(
+        "You are {}, a {}, working inside Harkonnen Labs — a local-first, spec-driven AI software factory.{} You share the Labrador Retriever personality: loyal, honest, persistent, never bluff. Keep answers concise and grounded in what you know. If you're uncertain, say so clearly.",
         agent_display(agent), role, run_ctx
-    )
+    );
+
+    if thread.thread_kind == ChatThreadKind::OperatorModel {
+        let scope = thread
+            .metadata_json
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("project");
+        let pending_layer = thread
+            .metadata_json
+            .get("pending_layer")
+            .and_then(Value::as_str)
+            .unwrap_or("operating_rhythms");
+        let project_root = thread
+            .metadata_json
+            .get("project_root")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        prompt.push_str("
+
+This thread is an operator-model activation interview. Your job is to elicit concrete, reusable operating detail that Harkonnen can stamp into the commissioned repo as structured operator-model artifacts.");
+        prompt.push_str("
+Ask 1-3 focused questions at a time. Prefer recurring triggers, decision rules, dependencies, approval boundaries, and real examples over generic biography.");
+        prompt.push_str("
+Treat the operator as the source of truth. Do not say a layer is approved, complete, or persisted unless the operator clearly confirms it.");
+        prompt.push_str("
+Summarize what you learned before moving on, and call out any ambiguity or missing operational detail explicitly.");
+        prompt.push_str(&format!(
+            "
+Current scope: `{}`. Current layer: `{}`.",
+            scope, pending_layer
+        ));
+        if !project_root.is_empty() {
+            prompt.push_str(&format!("
+Target project root: `{}`.", project_root));
+        }
+        if scope == "project" {
+            prompt.push_str("
+Bias toward repo-specific workflows and decision logic. Use only light, stable global defaults when the operator explicitly frames something as cross-project.");
+        }
+    }
+
+    prompt
 }
 
 fn agent_display(agent: &str) -> &'static str {
@@ -488,10 +591,8 @@ pub async fn dispatch_message(
 
     // Build conversation history for multi-turn context.
     let history = store.list_messages(&thread.thread_id).await?;
-    let run_id = thread.run_id.as_deref();
-
     // Generate agent reply.
-    let agent_reply = generate_agent_reply(agent, &req.content, &history, run_id, paths).await;
+    let agent_reply = generate_agent_reply(agent, &req.content, &history, thread, paths).await;
 
     let reply_msg = match agent_reply {
         Some(reply_content) => {
@@ -519,7 +620,7 @@ pub async fn complete_agent_reply(
     agent: &str,
     user_content: &str,
     history: &[ChatMessage],
-    run_id: Option<&str>,
+    thread: &ChatThread,
     paths: &Paths,
 ) -> Result<String> {
     let provider = llm::build_provider(agent, "default", &paths.setup).with_context(|| {
@@ -550,7 +651,7 @@ pub async fn complete_agent_reply(
         let selected_history =
             select_relevant_history(&prior_history, user_content, history_budget, excerpt_budget);
 
-        let mut system = agent_system_prompt(agent, run_id);
+        let mut system = agent_system_prompt(agent, thread);
         system.push_str(
             "\n\nPrefer explicit user-stated facts, previously confirmed preferences, and concrete operator details over generic assistant prose.",
         );
@@ -666,10 +767,10 @@ async fn generate_agent_reply(
     agent: &str,
     user_content: &str,
     history: &[ChatMessage],
-    run_id: Option<&str>,
+    thread: &ChatThread,
     paths: &Paths,
 ) -> Option<String> {
-    match complete_agent_reply(agent, user_content, history, run_id, paths).await {
+    match complete_agent_reply(agent, user_content, history, thread, paths).await {
         Ok(content) => Some(content),
         Err(e) => {
             tracing::warn!("PackChat agent reply failed for {} ({})", agent, e);
@@ -954,6 +1055,37 @@ fn is_context_window_error(err: &anyhow::Error) -> bool {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn default_thread_metadata() -> Value {
+    Value::Object(Default::default())
+}
+
+fn parse_chat_thread(row: sqlx::sqlite::SqliteRow) -> Result<ChatThread> {
+    Ok(ChatThread {
+        thread_id: row.get("thread_id"),
+        run_id: row.get("run_id"),
+        spec_id: row.get("spec_id"),
+        title: row.get("title"),
+        status: row.get("status"),
+        thread_kind: parse_thread_kind(row.get("thread_kind"))?,
+        metadata_json: row
+            .get::<Option<String>, _>("metadata_json")
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_else(default_thread_metadata),
+        created_at: parse_dt(row.get("created_at")),
+        updated_at: parse_dt(row.get("updated_at")),
+    })
+}
+
+fn parse_thread_kind(value: String) -> Result<ChatThreadKind> {
+    match value.as_str() {
+        "general" => Ok(ChatThreadKind::General),
+        "run" => Ok(ChatThreadKind::Run),
+        "spec" => Ok(ChatThreadKind::Spec),
+        "operator_model" => Ok(ChatThreadKind::OperatorModel),
+        other => anyhow::bail!("unknown chat thread kind: {other}"),
+    }
+}
 
 fn parse_dt(s: String) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(&s)

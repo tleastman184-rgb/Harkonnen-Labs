@@ -1,15 +1,29 @@
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::models::{
-    OperatorModelEntry, OperatorModelExport, OperatorModelLayerCheckpoint, OperatorModelProfile,
-    OperatorModelSession, OperatorModelUpdateCandidate,
+use crate::{
+    config::Paths,
+    models::{
+        OperatorModelEntry, OperatorModelExport, OperatorModelLayerCheckpoint,
+        OperatorModelProfile, OperatorModelScope, OperatorModelSession,
+        OperatorModelUpdateCandidate,
+    },
 };
+
+pub const OPERATOR_MODEL_DIRNAME: &str = "operator-model";
+pub const DEFAULT_OPERATOR_MODEL_LAYER: &str = "operating_rhythms";
+pub const LIGHT_GLOBAL_PROFILE_TOPICS: &[&str] = &[
+    "communication style",
+    "approval boundaries",
+    "escalation style",
+    "working rhythm",
+];
 
 #[derive(Debug, Clone)]
 pub struct OperatorModelStore {
@@ -21,12 +35,45 @@ impl OperatorModelStore {
         Self { pool }
     }
 
-    pub async fn create_profile(
+    /// Project profiles are the product default: stamp the commissioned repo first,
+    /// then fall back to a light global baseline only when no project profile exists.
+    pub async fn create_project_profile(
         &self,
-        scope: &str,
-        project_root: Option<&str>,
+        project_root: &Path,
         display_name: &str,
     ) -> Result<OperatorModelProfile> {
+        self.create_profile(
+            OperatorModelScope::Project,
+            Some(path_to_string(project_root)?),
+            display_name,
+        )
+        .await
+    }
+
+    /// Global profiles are intentionally small and stable. They should capture only
+    /// broad operator defaults, not repo-specific workflow detail.
+    pub async fn create_global_profile(&self, display_name: &str) -> Result<OperatorModelProfile> {
+        self.create_profile(OperatorModelScope::Global, None, display_name)
+            .await
+    }
+
+    pub async fn create_profile(
+        &self,
+        scope: OperatorModelScope,
+        project_root: Option<String>,
+        display_name: &str,
+    ) -> Result<OperatorModelProfile> {
+        if scope == OperatorModelScope::Project && project_root.is_none() {
+            return Err(anyhow!(
+                "project operator-model profiles require a project_root"
+            ));
+        }
+        if scope == OperatorModelScope::Global && project_root.is_some() {
+            return Err(anyhow!(
+                "global operator-model profiles cannot carry a project_root"
+            ));
+        }
+
         let profile_id = Uuid::new_v4().to_string();
         let now = Utc::now();
 
@@ -39,8 +86,8 @@ impl OperatorModelStore {
             "#,
         )
         .bind(&profile_id)
-        .bind(scope)
-        .bind(project_root)
+        .bind(scope.as_str())
+        .bind(project_root.as_deref())
         .bind(display_name)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
@@ -50,14 +97,127 @@ impl OperatorModelStore {
 
         Ok(OperatorModelProfile {
             profile_id,
-            scope: scope.to_string(),
-            project_root: project_root.map(|value| value.to_string()),
+            scope,
+            project_root,
             display_name: display_name.to_string(),
             status: "active".to_string(),
             current_version: 0,
             created_at: now,
             updated_at: now,
         })
+    }
+
+    pub async fn find_project_profile(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<OperatorModelProfile>> {
+        let project_root = path_to_string(project_root)?;
+        let row = sqlx::query(
+            r#"
+            SELECT profile_id, scope, project_root, display_name, status, current_version, created_at, updated_at
+            FROM operator_model_profiles
+            WHERE scope = 'project' AND project_root = ?1 AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(project_root)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_profile).transpose()
+    }
+
+    pub async fn find_active_global_profile(&self) -> Result<Option<OperatorModelProfile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT profile_id, scope, project_root, display_name, status, current_version, created_at, updated_at
+            FROM operator_model_profiles
+            WHERE scope = 'global' AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_profile).transpose()
+    }
+
+    /// Project-first resolution used by commissioning and preflight.
+    pub async fn resolve_effective_profile(
+        &self,
+        project_root: &Path,
+    ) -> Result<Option<OperatorModelProfile>> {
+        if let Some(profile) = self.find_project_profile(project_root).await? {
+            return Ok(Some(profile));
+        }
+        self.find_active_global_profile().await
+    }
+
+    pub async fn ensure_project_profile(
+        &self,
+        project_root: &Path,
+        display_name: &str,
+    ) -> Result<OperatorModelProfile> {
+        if let Some(profile) = self.find_project_profile(project_root).await? {
+            return Ok(profile);
+        }
+        self.create_project_profile(project_root, display_name)
+            .await
+    }
+
+    pub async fn start_project_session(
+        &self,
+        project_root: &Path,
+        display_name: &str,
+        thread_id: Option<&str>,
+        started_by: Option<&str>,
+    ) -> Result<OperatorModelSession> {
+        let profile = self
+            .ensure_project_profile(project_root, display_name)
+            .await?;
+        self.create_session(
+            &profile.profile_id,
+            thread_id,
+            Some(DEFAULT_OPERATOR_MODEL_LAYER),
+            started_by,
+        )
+        .await
+    }
+
+    pub async fn find_active_session_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<OperatorModelSession>> {
+        let row = sqlx::query(
+            r#"
+            SELECT session_id, profile_id, thread_id, status, pending_layer, started_by, created_at, updated_at, completed_at
+            FROM operator_model_sessions
+            WHERE profile_id = ?1 AND status IN ('active', 'review')
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(profile_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_session).transpose()
+    }
+
+    pub async fn update_session_thread(&self, session_id: &str, thread_id: &str) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE operator_model_sessions SET thread_id = ?2, updated_at = ?3 WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .bind(thread_id)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("update operator_model_session thread")?;
+        Ok(())
     }
 
     pub async fn get_profile(&self, profile_id: &str) -> Result<Option<OperatorModelProfile>> {
@@ -83,6 +243,25 @@ impl OperatorModelStore {
             ORDER BY updated_at DESC
             "#,
         )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(parse_profile).collect()
+    }
+
+    pub async fn list_profiles_by_scope(
+        &self,
+        scope: OperatorModelScope,
+    ) -> Result<Vec<OperatorModelProfile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT profile_id, scope, project_root, display_name, status, current_version, created_at, updated_at
+            FROM operator_model_profiles
+            WHERE scope = ?1
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(scope.as_str())
         .fetch_all(&self.pool)
         .await?;
 
@@ -145,12 +324,29 @@ impl OperatorModelStore {
 
         row.map(parse_session).transpose()
     }
+
+    pub fn export_root_for_profile(
+        &self,
+        paths: &Paths,
+        profile: &OperatorModelProfile,
+    ) -> PathBuf {
+        match profile.scope {
+            OperatorModelScope::Project => profile
+                .project_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.products.clone())
+                .join(".harkonnen")
+                .join(OPERATOR_MODEL_DIRNAME),
+            OperatorModelScope::Global => paths.factory.join(OPERATOR_MODEL_DIRNAME).join("global"),
+        }
+    }
 }
 
 fn parse_profile(row: sqlx::sqlite::SqliteRow) -> Result<OperatorModelProfile> {
     Ok(OperatorModelProfile {
         profile_id: row.get("profile_id"),
-        scope: row.get("scope"),
+        scope: parse_scope(row.get("scope"))?,
         project_root: row.get("project_root"),
         display_name: row.get("display_name"),
         status: row.get("status"),
@@ -239,6 +435,14 @@ fn parse_update_candidate(row: sqlx::sqlite::SqliteRow) -> Result<OperatorModelU
     })
 }
 
+fn parse_scope(value: String) -> Result<OperatorModelScope> {
+    match value.as_str() {
+        "project" => Ok(OperatorModelScope::Project),
+        "global" => Ok(OperatorModelScope::Global),
+        other => Err(anyhow!("unknown operator-model scope: {other}")),
+    }
+}
+
 fn parse_dt(value: String) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&value)?.with_timezone(&Utc))
 }
@@ -249,4 +453,10 @@ fn parse_optional_dt(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
 
 fn parse_json_value(value: String) -> Result<Value> {
     Ok(serde_json::from_str(&value)?)
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
 }

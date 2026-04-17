@@ -909,11 +909,28 @@ pub struct RunCausalGraph {
     pub hypotheses: Vec<CausalHypothesis>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorModelScope {
+    #[default]
+    Project,
+    Global,
+}
+
+impl OperatorModelScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorModelProfile {
     pub profile_id: String,
-    pub scope: String,
+    pub scope: OperatorModelScope,
     #[serde(default)]
     pub project_root: Option<String>,
     pub display_name: String,
