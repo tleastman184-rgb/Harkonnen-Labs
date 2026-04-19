@@ -904,7 +904,6 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
     )
 }
 
-
 fn render_operator_model_context(context: &crate::models::OperatorModelContext) -> String {
     let mut lines = Vec::new();
     if !context.summary.trim().is_empty() {
@@ -926,7 +925,10 @@ fn render_operator_model_context(context: &crate::models::OperatorModelContext) 
         ));
     }
     if !context.dependencies.is_empty() {
-        lines.push(format!("- Dependencies: {}", context.dependencies.join(" | ")));
+        lines.push(format!(
+            "- Dependencies: {}",
+            context.dependencies.join(" | ")
+        ));
     }
     if !context.open_questions.is_empty() {
         lines.push(format!(
@@ -935,7 +937,10 @@ fn render_operator_model_context(context: &crate::models::OperatorModelContext) 
         ));
     }
     if lines.is_empty() {
-        lines.push("- Operator-model profile exists, but no durable context has been distilled yet.".to_string());
+        lines.push(
+            "- Operator-model profile exists, but no durable context has been distilled yet."
+                .to_string(),
+        );
     }
     lines.join("\n")
 }

@@ -760,7 +760,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/cost", get(get_run_cost))
         .route("/api/runs/:id/decisions", get(get_run_decisions))
         .route("/api/runs/:id/traces", get(get_run_traces))
-        .route("/api/runs/:id/optimization-program", get(get_run_optimization_program))
+        .route(
+            "/api/runs/:id/optimization-program",
+            get(get_run_optimization_program),
+        )
         .route("/api/runs/:id/metric-attacks", get(get_run_metric_attacks))
         .route(
             "/api/runs/:id/evidence-match-report",
@@ -1745,7 +1748,11 @@ async fn get_run_optimization_program(
         .join("optimization_program.json");
     match read_optional_json::<OptimizationProgram>(&program_path).await {
         Ok(Some(program)) => (StatusCode::OK, Json(program)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "OptimizationProgram not yet generated").into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "OptimizationProgram not yet generated",
+        )
+            .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -3715,7 +3722,7 @@ async fn check_lease(
                             message: "Lease expired — resource is available.".to_string(),
                         }),
                     )
-                    .into_response();
+                        .into_response();
                 }
             }
         }
@@ -3754,7 +3761,10 @@ async fn check_lease(
 
     let allowed = violations.is_empty();
     let message = if allowed {
-        format!("Lease check passed for '{}' on '{}'", req.action, req.resource)
+        format!(
+            "Lease check passed for '{}' on '{}'",
+            req.action, req.resource
+        )
     } else {
         format!(
             "{} guardrail violation(s) for '{}' on '{}'",
@@ -3899,13 +3909,17 @@ async fn scout_draft(
         &uuid::Uuid::new_v4().to_string()[..8]
     );
 
-    let operator_model_context = match best_effort_operator_model_root(&app, product_path.as_deref()) {
-        Some(root) => app
-            .load_effective_operator_model_context(Some(&root))
-            .await
-            .unwrap_or(None),
-        None => app.load_effective_operator_model_context(None).await.unwrap_or(None),
-    };
+    let operator_model_context =
+        match best_effort_operator_model_root(&app, product_path.as_deref()) {
+            Some(root) => app
+                .load_effective_operator_model_context(Some(&root))
+                .await
+                .unwrap_or(None),
+            None => app
+                .load_effective_operator_model_context(None)
+                .await
+                .unwrap_or(None),
+        };
 
     let spec = maybe_llm_draft_spec(
         &app,
@@ -4020,7 +4034,11 @@ fn fallback_scout_draft_spec(
         .filter(|line| !line.is_empty())
         .collect();
     let purpose = lines.first().copied().unwrap_or(intent).to_string();
-    let mut acceptance_criteria = lines.iter().skip(1).map(|line| (*line).to_string()).collect::<Vec<_>>();
+    let mut acceptance_criteria = lines
+        .iter()
+        .skip(1)
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
     if acceptance_criteria.is_empty() {
         acceptance_criteria.push("run completes without errors".to_string());
     }
@@ -4030,13 +4048,15 @@ fn fallback_scout_draft_spec(
         "do not modify files outside the target product".to_string(),
     ];
     let mut dependencies = Vec::new();
-    let mut security_expectations = vec![
-        "secrets must not appear in logs or artifact bundles".to_string(),
-    ];
+    let mut security_expectations =
+        vec!["secrets must not appear in logs or artifact bundles".to_string()];
 
     if let Some(context) = operator_model_context {
         for item in context.guardrails.iter().take(3) {
-            push_unique(&mut constraints, format!("operator model guardrail: {item}"));
+            push_unique(
+                &mut constraints,
+                format!("operator model guardrail: {item}"),
+            );
         }
         for item in context.dependencies.iter().take(3) {
             push_unique(&mut dependencies, format!("operator dependency: {item}"));
@@ -4054,7 +4074,8 @@ fn fallback_scout_draft_spec(
         {
             push_unique(
                 &mut security_expectations,
-                "operator-defined approval, boundary, and credential handling rules are preserved".to_string(),
+                "operator-defined approval, boundary, and credential handling rules are preserved"
+                    .to_string(),
             );
         }
     }
@@ -4079,7 +4100,7 @@ fn fallback_scout_draft_spec(
             "reaching outside the workspace boundary".to_string(),
         ],
         rollback_requirements: vec![
-            "retain prior artifacts unless explicitly cleaned up".to_string(),
+            "retain prior artifacts unless explicitly cleaned up".to_string()
         ],
         dependencies,
         performance_expectations: vec!["commands should complete in a reasonable time".to_string()],
@@ -4100,9 +4121,16 @@ fn push_unique(items: &mut Vec<String>, value: String) {
 
 fn contains_security_signal(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    ["secret", "credential", "auth", "permission", "security", "boundary"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "secret",
+        "credential",
+        "auth",
+        "permission",
+        "security",
+        "boundary",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn slugify(s: &str) -> String {

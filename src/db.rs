@@ -733,6 +733,41 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     // The assignments are stored as JSON in assignments.json (file-based), so
     // the lease fields live on the Assignment struct. No SQLite table needed.
 
+    // ── v1-B: Memory supersession / invalidation persistence ─────────────────
+    // Tracks when a new memory entry supersedes an older one. The old entry's
+    // provenance.superseded_by field points at new_memory_id via this table.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_updates (
+            update_id       TEXT PRIMARY KEY,
+            old_memory_id   TEXT NOT NULL,
+            new_memory_id   TEXT NOT NULL,
+            reason          TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_updates_old_memory_id
+        ON memory_updates (old_memory_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_updates_created_at
+        ON memory_updates (created_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Phase B: Agent Trace Spine ────────────────────────────────────────────
     sqlx::query(
         r#"

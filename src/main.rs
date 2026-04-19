@@ -25,6 +25,7 @@ mod policy;
 mod reporting;
 mod scenarios;
 mod setup;
+mod soul_store;
 mod spec;
 mod streamingqa;
 mod tesseract;
@@ -69,6 +70,10 @@ async fn main() -> Result<()> {
             // setup check doesn't need the DB — just path + config discovery
             let paths = config::Paths::discover()?;
             cli::handle_setup(command, &paths).await?
+        }
+        Commands::Soul { command } => {
+            let paths = config::Paths::discover()?;
+            cli::handle_soul(command, &paths).await?
         }
         Commands::Serve(args) => {
             let app = AppContext::bootstrap().await?;

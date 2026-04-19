@@ -692,6 +692,16 @@ pub struct ScenarioResult {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    CompileError,
+    TestFailure,
+    WrongAnswer,
+    Timeout,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationSummary {
     pub passed: bool,
@@ -700,6 +710,8 @@ pub struct ValidationSummary {
     #[serde(default)]
     pub passed_scored_checks: usize,
     pub results: Vec<ScenarioResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<FailureKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

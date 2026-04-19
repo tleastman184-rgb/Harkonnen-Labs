@@ -53,6 +53,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: SetupCommands,
     },
+    Soul {
+        #[command(subcommand)]
+        command: SoulCommands,
+    },
     Serve(ServeArgs),
     Capacity {
         #[command(subcommand)]
@@ -250,6 +254,12 @@ pub enum SetupCommands {
     ClaudePack(SetupClaudePackArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub enum SoulCommands {
+    Bootstrap(SoulBootstrapArgs),
+    Show(SoulShowArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct SetupInitArgs {
     #[arg(long)]
@@ -288,6 +298,22 @@ pub struct SetupClaudePackArgs {
     pub winccoa: bool,
     #[arg(long, default_value_t = false)]
     pub no_settings: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SoulBootstrapArgs {
+    #[arg(long, default_value = "coobie")]
+    pub self_name: String,
+    #[arg(long)]
+    pub output_root: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SoulShowArgs {
+    #[arg(long, default_value = "coobie")]
+    pub self_name: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -720,6 +746,33 @@ pub async fn handle_setup(command: SetupCommands, paths: &Paths) -> Result<()> {
         SetupCommands::Init(args) => handle_setup_init(paths, args),
         SetupCommands::ClaudePack(args) => handle_setup_claude_pack(paths, args),
     }
+}
+
+pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
+    match command {
+        SoulCommands::Bootstrap(args) => {
+            crate::soul_store::require_coobie(&args.self_name)?;
+            let output = crate::soul_store::bootstrap_coobie(paths, args.output_root.as_deref())?;
+            println!("Soul Store root: {}", output.root.display());
+            println!("TypeDB schema: {}", output.schema_path.display());
+            println!("TypeDB seed: {}", output.seed_path.display());
+            println!(
+                "Identity projection: {}",
+                output.identity_json_path.display()
+            );
+            println!("TypeDB scaffold script: scripts/bootstrap-soul-store-typedb.sh");
+        }
+        SoulCommands::Show(args) => {
+            crate::soul_store::require_coobie(&args.self_name)?;
+            let identity = crate::soul_store::coobie_identity();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&identity)?);
+            } else {
+                println!("{}", crate::soul_store::render_identity_markdown(&identity));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_setup_check(paths: &Paths) -> Result<()> {

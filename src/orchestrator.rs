@@ -28,8 +28,7 @@ use crate::{
         HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent,
         OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal,
         ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
-        ScenarioResult, Spec, TwinEnvironment, TwinService, ValidationSummary,
-        WorkerHarnessConfig,
+        ScenarioResult, Spec, TwinEnvironment, TwinService, ValidationSummary, WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
@@ -2129,6 +2128,16 @@ impl AppContext {
         let implementation_plan = self
             .mason_implementation_plan(spec_obj, &intent, &briefing, &staged_product, target_source)
             .await;
+        self.record_decision(
+            run_id,
+            "mason",
+            "plan",
+            "implementation_plan_selected",
+            &format!("plan generated for spec '{}'", spec_obj.id),
+            &[],
+            "Mason derived the implementation plan from spec + Coobie briefing.",
+        )
+        .await;
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
 
@@ -2866,6 +2875,11 @@ next_actions={}",
 
             for iteration in 1u32..=3 {
                 let test_output = format_validation_failure_output(&validation);
+                let fix_kind = validation
+                    .failure_kind
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(crate::models::FailureKind::TestFailure);
                 match self
                     .mason_fix_from_validation_failure(
                         run_id,
@@ -2877,6 +2891,7 @@ next_actions={}",
                         iteration,
                         log_path,
                         &validation_episode,
+                        fix_kind.clone(),
                     )
                     .await?
                 {
@@ -5840,15 +5855,19 @@ Render Coobie's preflight markdown for the pack. Incorporate repo-local guidance
                 let (reasoning, body) = extract_reasoning(&resp.content);
                 let actions = vec!["render coobie preflight briefing markdown".to_string()];
                 self.record_agent_trace(
-                    run_id, "coobie", "briefing",
+                    run_id,
+                    "coobie",
+                    "briefing",
                     &trace_input_summary(&spec_obj.title),
-                    &reasoning, &actions,
+                    &reasoning,
+                    &actions,
                     "success",
                     resp.usage.as_ref(),
-                ).await;
+                )
+                .await;
                 if let Some(usage) = &resp.usage {
-                    self.record_llm_cost_event(run_id, "coobie", "briefing",
-                        "claude", "", usage).await;
+                    self.record_llm_cost_event(run_id, "coobie", "briefing", "claude", "", usage)
+                        .await;
                 }
                 Some(body.to_string())
             }
@@ -6120,18 +6139,28 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     let (reasoning, body) = extract_reasoning(&resp.content);
                     let actions = vec![format!("emit intent_package for spec '{}'", spec_obj.id)];
                     self.record_agent_trace(
-                        &spec_obj.id, "scout", "intake",
+                        &spec_obj.id,
+                        "scout",
+                        "intake",
                         &trace_input_summary(&spec_obj.title),
-                        &reasoning, &actions,
+                        &reasoning,
+                        &actions,
                         "success",
                         resp.usage.as_ref(),
-                    ).await;
+                    )
+                    .await;
                     if let Some(usage) = &resp.usage {
-                        self.record_llm_cost_event(&spec_obj.id, "scout", "intake",
-                            "claude", "", usage).await;
+                        self.record_llm_cost_event(
+                            &spec_obj.id,
+                            "scout",
+                            "intake",
+                            "claude",
+                            "",
+                            usage,
+                        )
+                        .await;
                     }
-                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(body.trim())
-                    {
+                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(body.trim()) {
                         return Ok(parsed);
                     }
                     let stripped = body
@@ -6260,17 +6289,31 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
             );
             if let Ok(resp) = provider.complete(req).await {
                 let (reasoning, body) = extract_reasoning(&resp.content);
-                let actions = vec![format!("emit optimization_program for spec '{}'", spec_obj.id)];
+                let actions = vec![format!(
+                    "emit optimization_program for spec '{}'",
+                    spec_obj.id
+                )];
                 self.record_agent_trace(
-                    run_id, "scout", "optimization_program",
+                    run_id,
+                    "scout",
+                    "optimization_program",
                     &trace_input_summary(&spec_obj.title),
-                    &reasoning, &actions,
+                    &reasoning,
+                    &actions,
                     "success",
                     resp.usage.as_ref(),
-                ).await;
+                )
+                .await;
                 if let Some(usage) = &resp.usage {
-                    self.record_llm_cost_event(run_id, "scout", "optimization_program",
-                        "claude", "", usage).await;
+                    self.record_llm_cost_event(
+                        run_id,
+                        "scout",
+                        "optimization_program",
+                        "claude",
+                        "",
+                        usage,
+                    )
+                    .await;
                 }
                 let stripped = body
                     .trim()
@@ -6377,15 +6420,26 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     program.objective_metric
                 )];
                 self.record_agent_trace(
-                    run_id, "sable", "metric_attacks",
+                    run_id,
+                    "sable",
+                    "metric_attacks",
                     &trace_input_summary(&format!("{} metric attack generation", spec_obj.id)),
-                    &reasoning, &actions,
+                    &reasoning,
+                    &actions,
                     "success",
                     resp.usage.as_ref(),
-                ).await;
+                )
+                .await;
                 if let Some(usage) = &resp.usage {
-                    self.record_llm_cost_event(run_id, "sable", "metric_attacks",
-                        "claude", "", usage).await;
+                    self.record_llm_cost_event(
+                        run_id,
+                        "sable",
+                        "metric_attacks",
+                        "claude",
+                        "",
+                        usage,
+                    )
+                    .await;
                 }
                 let stripped = body
                     .trim()
@@ -6489,17 +6543,31 @@ Produce the implementation plan markdown. Treat guardrails and required checks a
             match provider.complete(req).await {
                 Ok(resp) => {
                     let (reasoning, body) = extract_reasoning(&resp.content);
-                    let actions = vec![format!("produce implementation plan for spec '{}'", spec_obj.id)];
+                    let actions = vec![format!(
+                        "produce implementation plan for spec '{}'",
+                        spec_obj.id
+                    )];
                     self.record_agent_trace(
-                        &spec_obj.id, "mason", "plan",
+                        &spec_obj.id,
+                        "mason",
+                        "plan",
                         &trace_input_summary(&spec_obj.title),
-                        &reasoning, &actions,
+                        &reasoning,
+                        &actions,
                         "success",
                         resp.usage.as_ref(),
-                    ).await;
+                    )
+                    .await;
                     if let Some(usage) = &resp.usage {
-                        self.record_llm_cost_event(&spec_obj.id, "mason", "plan",
-                            "gemini", "", usage).await;
+                        self.record_llm_cost_event(
+                            &spec_obj.id,
+                            "mason",
+                            "plan",
+                            "gemini",
+                            "",
+                            usage,
+                        )
+                        .await;
                     }
                     return body.to_string();
                 }
@@ -6710,15 +6778,19 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
         let (reasoning, edit_body) = extract_reasoning(&response.content);
         let edit_actions = vec![format!("generate file edits for spec '{}'", spec_obj.id)];
         self.record_agent_trace(
-            run_id, "mason", "edits",
+            run_id,
+            "mason",
+            "edits",
             &trace_input_summary(&spec_obj.title),
-            &reasoning, &edit_actions,
+            &reasoning,
+            &edit_actions,
             "success",
             response.usage.as_ref(),
-        ).await;
+        )
+        .await;
         if let Some(usage) = &response.usage {
-            self.record_llm_cost_event(run_id, "mason", "edits",
-                "gemini", "", usage).await;
+            self.record_llm_cost_event(run_id, "mason", "edits", "gemini", "", usage)
+                .await;
         }
 
         let proposal = match parse_mason_edit_proposal(edit_body) {
@@ -6832,6 +6904,37 @@ Respond with a single JSON object only — no prose, no markdown, no explanation
                 } else {
                     proposal.summary.clone()
                 },
+                proposal_generated: true,
+                changed_files: Vec::new(),
+                git_branch: None,
+            };
+            self.write_mason_edit_application(run_dir, &application)
+                .await?;
+            return Ok(application);
+        }
+
+        // v1-A: Guardrail enforcement — check workspace lease before any writes.
+        let workspace_prefix = staged_product.to_string_lossy().to_string();
+        let (lease_allowed, lease_violations, lease_msg) =
+            self.check_mason_workspace_lease(&workspace_prefix).await;
+        if !lease_allowed {
+            self.record_decision(
+                run_id,
+                "mason",
+                "edits",
+                "workspace_write_blocked",
+                "skipped_lease_denied",
+                &[],
+                &lease_violations.join("; "),
+            )
+            .await;
+            let application = MasonEditApplicationArtifact {
+                run_id: run_id.to_string(),
+                spec_id: spec_obj.id.clone(),
+                product: target_source.label.clone(),
+                generated_at: Utc::now().to_rfc3339(),
+                status: "lease_denied".to_string(),
+                summary: lease_msg,
                 proposal_generated: true,
                 changed_files: Vec::new(),
                 git_branch: None,
@@ -7263,6 +7366,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         iteration: u32,
         log_path: &Path,
         episode_id: &str,
+        failure_kind: crate::models::FailureKind,
     ) -> Result<Option<MasonEditProposal>> {
         let Some(provider) = llm::build_provider("mason", "default", &self.paths.setup) else {
             return Ok(None);
@@ -7304,26 +7408,48 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
         let constraints = mason_slim_briefing(briefing);
 
+        let (system_prompt, user_suffix) = if failure_kind == crate::models::FailureKind::WrongAnswer {
+            (
+                "You are Mason, an implementation specialist for a software factory. \
+                 Tests ran successfully but produced wrong output — the program ran but \
+                 returned incorrect results. \
+                 Produce valid JSON only — a single raw object with keys: \
+                 \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). \
+                 Each edit: \"path\" (relative path in staged workspace), \
+                 \"action\" (must be \"write\"), \"summary\" (string), \
+                 \"content\" (full file contents after edit). \
+                 Only edit files in EDITABLE PATHS. \
+                 Study the expected vs actual diff carefully and fix the logic error. \
+                 Do not modify test files. If you cannot fix the problem, return edits as an empty array.",
+                "The test ran but returned wrong output. Study the expected vs actual diff above \
+                 and fix the implementation logic. Return corrected file contents as a JSON edit proposal.",
+            )
+        } else {
+            (
+                "You are Mason, an implementation specialist for a software factory. \
+                 Visible tests have run and produced failures. \
+                 Produce valid JSON only — a single raw object with keys: \
+                 \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). \
+                 Each edit: \"path\" (relative path in staged workspace), \
+                 \"action\" (must be \"write\"), \"summary\" (string), \
+                 \"content\" (full file contents after edit). \
+                 Only edit files in EDITABLE PATHS. \
+                 Fix the implementation so the tests pass — do not modify test files \
+                 unless they contain a clear error unrelated to the implementation. \
+                 If you cannot fix the problem, return edits as an empty array.",
+                "Fix the implementation so these tests pass and return the corrected \
+                 file contents as a JSON edit proposal.",
+            )
+        };
         let req = LlmRequest::simple(
-            "You are Mason, an implementation specialist for a software factory. \
-             Visible tests have run and produced failures. \
-             Produce valid JSON only — a single raw object with keys: \
-             \"summary\" (string), \"rationale\" (array of strings), \"edits\" (array). \
-             Each edit: \"path\" (relative path in staged workspace), \
-             \"action\" (must be \"write\"), \"summary\" (string), \
-             \"content\" (full file contents after edit). \
-             Only edit files in EDITABLE PATHS. \
-             Fix the implementation so the tests pass — do not modify test files \
-             unless they contain a clear error unrelated to the implementation. \
-             If you cannot fix the problem, return edits as an empty array.",
+            system_prompt,
             format!(
                 "SPEC:\n```yaml\n{spec_yaml}\n```\n\n\
                  CONSTRAINTS:\n{constraints}\n\n\
                  EDITABLE PATHS: {editable_list}\n\n\
                  FILE CONTEXT:\n{context_block}\n\n\
                  TEST FAILURES (iteration {iteration}):\n```\n{test_output}\n```\n\n\
-                 Fix the implementation so these tests pass and return the corrected \
-                 file contents as a JSON edit proposal.",
+                 {user_suffix}",
             ),
         );
 
@@ -8665,9 +8791,7 @@ Produce the validation analysis and note any checks Coobie asked for that are st
                 .split(|c: char| c == '_' || c == '-' || c.is_whitespace())
                 .filter(|w| w.len() >= 3)
                 .collect();
-            let metric_addressed = metric_terms
-                .iter()
-                .any(|term| plan_lower.contains(term));
+            let metric_addressed = metric_terms.iter().any(|term| plan_lower.contains(term));
             if !metric_addressed && !program.objective_metric.is_empty() {
                 advisory_concerns.push(format!(
                     "Plan does not appear to address the stated objective metric '{}': {}",
@@ -8799,17 +8923,26 @@ Produce the validation analysis and note any checks Coobie asked for that are st
                         addressed_guardrails: Vec<String>,
                     }
                     let (critique_reasoning, critique_body) = extract_reasoning(&resp.content);
-                    let critique_actions = vec![format!("critique implementation plan for spec '{}'", spec_obj.id)];
+                    let critique_actions = vec![format!(
+                        "critique implementation plan for spec '{}'",
+                        spec_obj.id
+                    )];
                     self.record_agent_trace(
-                        run_id, "coobie", "critique",
+                        run_id,
+                        "coobie",
+                        "critique",
                         &trace_input_summary(&format!("{} plan critique", spec_obj.id)),
-                        &critique_reasoning, &critique_actions,
+                        &critique_reasoning,
+                        &critique_actions,
                         "success",
                         resp.usage.as_ref(),
-                    ).await;
+                    )
+                    .await;
                     if let Some(usage) = &resp.usage {
-                        self.record_llm_cost_event(run_id, "coobie", "critique",
-                            "claude", "", usage).await;
+                        self.record_llm_cost_event(
+                            run_id, "coobie", "critique", "claude", "", usage,
+                        )
+                        .await;
                     }
                     let stripped = strip_json_fences(critique_body);
                     if let Ok(llm) = serde_json::from_str::<LlmCritique>(stripped.trim()) {
@@ -9196,7 +9329,6 @@ Write the twin environment narrative and identify any simulation gaps against Co
             git,
         })
     }
-
 
     pub async fn load_effective_operator_model_context(
         &self,
@@ -9920,6 +10052,160 @@ Return JSON only.",
             .collect()
     }
 
+    // ── v1-A: Workspace lease check ───────────────────────────────────────────
+
+    /// Check whether Mason is allowed to write to `workspace_prefix`.
+    ///
+    /// Reads the coordination JSON (same file the API writes), finds any active
+    /// non-expired claim whose `files` overlap the prefix, and evaluates
+    /// guardrails. Returns `(allowed, violations, message)`.
+    pub async fn check_mason_workspace_lease(
+        &self,
+        workspace_prefix: &str,
+    ) -> (bool, Vec<String>, String) {
+        let coord_path = self
+            .paths
+            .factory
+            .join("coordination")
+            .join("assignments.json");
+
+        let raw = match tokio::fs::read_to_string(&coord_path).await {
+            Ok(r) => r,
+            // No coordination file means no active claims — allow.
+            Err(_) => return (true, vec![], "No active coordination state — write allowed.".to_string()),
+        };
+
+        let state: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return (true, vec![], "Coordination state unreadable — write allowed.".to_string()),
+        };
+
+        let now = Utc::now();
+        let active = match state.get("active").and_then(|v| v.as_object()) {
+            Some(map) => map,
+            None => return (true, vec![], "No active claims — write allowed.".to_string()),
+        };
+
+        for (owner, assignment) in active {
+            if owner == "mason" {
+                continue; // Mason's own claim is fine.
+            }
+            // Check TTL: if expired, skip.
+            if let Some(expires_at) = assignment.get("expires_at").and_then(|v| v.as_str()) {
+                if !expires_at.is_empty() {
+                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                        if exp.with_timezone(&Utc) < now {
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Check if the files overlap with workspace_prefix.
+            let files = assignment
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let overlaps = files.iter().any(|f| {
+                f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f)
+            });
+            if !overlaps && !files.is_empty() {
+                continue;
+            }
+
+            // Another agent holds an active, non-expired, overlapping claim.
+            let status = assignment
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("active");
+            if status == "stale" {
+                continue;
+            }
+
+            let msg = format!(
+                "Cannot write to '{}': agent '{}' holds an active workspace lease",
+                workspace_prefix, owner
+            );
+            return (false, vec![msg.clone()], msg);
+        }
+
+        (true, vec![], "Workspace lease check passed.".to_string())
+    }
+
+    // ── v1-B: Memory supersession persistence ────────────────────────────────
+
+    /// Persist a memory supersession event: old_id was invalidated by new_id.
+    ///
+    /// Also updates the old entry's provenance.superseded_by on disk (via
+    /// MemoryStore) so retrieval hits include the invalidation reason.
+    pub async fn record_memory_supersession(
+        &self,
+        old_memory_id: &str,
+        new_memory_id: &str,
+        reason: &str,
+    ) {
+        let update_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO memory_updates (update_id, old_memory_id, new_memory_id, reason, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&update_id)
+        .bind(old_memory_id)
+        .bind(new_memory_id)
+        .bind(reason)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!("record_memory_supersession db write failed: {e}");
+        }
+
+        // Mark the old entry on disk as superseded so retrieval surfaces the flag.
+        if let Err(e) = self
+            .memory_store
+            .annotate_entry_status(old_memory_id, "superseded", Some(new_memory_id))
+            .await
+        {
+            tracing::warn!(
+                "record_memory_supersession file annotation failed for {old_memory_id}: {e}"
+            );
+        }
+    }
+
+    /// Return the full supersession history, most recent first.
+    pub async fn list_memory_updates(&self) -> Result<Vec<crate::models::MemoryUpdateRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT update_id, old_memory_id, new_memory_id, reason, created_at
+            FROM memory_updates
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::models::MemoryUpdateRecord {
+                    update_id: row.get("update_id"),
+                    old_memory_id: row.get("old_memory_id"),
+                    new_memory_id: row.get("new_memory_id"),
+                    reason: row.get("reason"),
+                    created_at: row.get("created_at"),
+                })
+            })
+            .collect()
+    }
+
     // ── Phase B: Agent Trace Spine ────────────────────────────────────────────
 
     /// Record a structured trace for one agent LLM call. Fire-and-forget.
@@ -9997,8 +10283,7 @@ Return JSON only.",
                 let created_at_str: String = row.get("created_at");
                 let reasoning_steps: Vec<String> =
                     serde_json::from_str(&rs_json).unwrap_or_default();
-                let actions_taken: Vec<String> =
-                    serde_json::from_str(&at_json).unwrap_or_default();
+                let actions_taken: Vec<String> = serde_json::from_str(&at_json).unwrap_or_default();
                 let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
@@ -18024,6 +18309,63 @@ fn validation_result_counts_for_coverage(scenario_id: &str) -> bool {
     ) || scenario_id.starts_with("test_command_")
 }
 
+fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::FailureKind> {
+    use crate::models::FailureKind;
+    let failing: Vec<&ScenarioResult> = results.iter().filter(|r| !r.passed).collect();
+    if failing.is_empty() {
+        return None;
+    }
+    // Compile / build failures: cargo_check, cargo_build, npm_build, etc.
+    let is_compile = failing.iter().any(|r| {
+        matches!(
+            r.scenario_id.as_str(),
+            "cargo_check"
+                | "cargo_build"
+                | "npm_build"
+                | "pnpm_build"
+                | "yarn_build"
+                | "node_bootstrap"
+                | "python_compile"
+        )
+    });
+    if is_compile {
+        return Some(FailureKind::CompileError);
+    }
+    // Wrong-answer: test ran but output didn't match expected
+    // Detected by "expected" / "got" / "assert" patterns in details.
+    let is_wrong_answer = failing.iter().any(|r| {
+        let d = r.details.to_lowercase();
+        (d.contains("expected") && d.contains("got"))
+            || d.contains("assertion failed")
+            || d.contains("assertionerror")
+            || d.contains("expected:")
+            || d.contains("left:")
+            || d.contains("wrong answer")
+    });
+    if is_wrong_answer {
+        return Some(FailureKind::WrongAnswer);
+    }
+    // Timeout
+    let is_timeout = failing.iter().any(|r| {
+        let d = r.details.to_lowercase();
+        d.contains("timed out") || d.contains("timeout") || d.contains("time limit exceeded")
+    });
+    if is_timeout {
+        return Some(FailureKind::Timeout);
+    }
+    // Real test run (not compile) — generic TestFailure
+    let is_test = failing.iter().any(|r| {
+        matches!(
+            r.scenario_id.as_str(),
+            "cargo_test" | "npm_test" | "pnpm_test" | "yarn_test" | "go_test" | "python_tests"
+        ) || r.scenario_id.starts_with("test_command_")
+    });
+    if is_test {
+        return Some(FailureKind::TestFailure);
+    }
+    Some(FailureKind::Unknown)
+}
+
 fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
     let scored_checks = results
         .iter()
@@ -18035,12 +18377,19 @@ fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
             result.passed && validation_result_counts_for_coverage(&result.scenario_id)
         })
         .count();
+    let all_passed = results.iter().all(|result| result.passed);
+    let failure_kind = if all_passed {
+        None
+    } else {
+        classify_failure_kind(&results)
+    };
 
     ValidationSummary {
-        passed: results.iter().all(|result| result.passed),
+        passed: all_passed,
         scored_checks,
         passed_scored_checks,
         results,
+        failure_kind,
     }
 }
 
@@ -18912,7 +19261,6 @@ fn render_agent_response_log(agent_executions: &[AgentExecution]) -> String {
     out
 }
 
-
 fn build_operator_model_transcript_excerpt(
     messages: &[crate::chat::ChatMessage],
     max_lines: usize,
@@ -18963,15 +19311,19 @@ fn fallback_operator_model_context(
         if lower.contains('?') {
             push_unique_limited(&mut context.open_questions, normalized.clone(), 5);
         }
-        if ["every ", "daily", "weekly", "monthly", "when ", "each ", "friday", "monday"]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        if [
+            "every ", "daily", "weekly", "monthly", "when ", "each ", "friday", "monday",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
         {
             push_unique_limited(&mut context.operating_rhythms, normalized.clone(), 5);
         }
-        if ["approve", "approval", "escalat", "human", "override", "confirm"]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        if [
+            "approve", "approval", "escalat", "human", "override", "confirm",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
         {
             push_unique_limited(&mut context.escalation_rules, normalized.clone(), 5);
         }
@@ -18981,9 +19333,18 @@ fn fallback_operator_model_context(
         {
             push_unique_limited(&mut context.dependencies, normalized.clone(), 5);
         }
-        if ["do not", "don't", "never", "must", "only", "avoid", "guardrail", "stay within"]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        if [
+            "do not",
+            "don't",
+            "never",
+            "must",
+            "only",
+            "avoid",
+            "guardrail",
+            "stay within",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
         {
             push_unique_limited(&mut context.guardrails, normalized.clone(), 6);
         }
