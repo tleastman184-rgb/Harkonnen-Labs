@@ -3,7 +3,7 @@
 **This is the single canonical reference for Harkonnen Labs.**
 It collapses ARCHITECTURE.md, AGENTS.md, COOBIE_SPEC.md, OPERATOR_MODEL_ACTIVATION_PLAN.md, soul_store_codex_spec.md, BENCHMARKS.md, and ROADMAP.md into one coherent document.
 
-For source docs still referenced individually: SOUL.md (identity + values), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
+For source docs still referenced individually: [SOUL.md](the-soul-of-ai/SOUL.md) and [What-Is-An-AI-Soul.md](the-soul-of-ai/What-Is-An-AI-Soul.md) (identity + theory, in `the-soul-of-ai/`), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
 
 ---
 
@@ -32,6 +32,23 @@ The factory addresses five root failures:
 3. **AI tools get dangerous when they wander.** Role separation, strict permissions, and policy enforcement contain the blast radius.
 4. **Organizations lose knowledge constantly.** Episodic capture, causal reasoning, and Soul Store preserve what was learned and who learned it.
 5. **Trust collapses when systems are invisible.** Every decision is traceable, every run produces inspectable artifacts, every agent carries a typed identity graph.
+
+### Agentic Engineering Principles
+
+Harkonnen should be read as an **agentic engineering control plane**, not as a
+coding assistant with extra tooling.
+
+The distinction matters. The system is designed to move software through the
+full delivery pipeline faster and more safely, not merely to generate code
+faster inside a local session.
+
+The operating principles are:
+
+1. **System throughput over local generation speed.** Optimize intent quality, routing, validation, retry quality, and downstream coordination compression — not just code generation latency.
+2. **Execution separated from coordination.** Worker roles execute bounded tasks; the orchestrator, Keeper, Pack Board, and decision logs provide the leadership/control-plane layer.
+3. **Long-lived workflows over isolated prompts.** Planning, execution, validation, retry, and consolidation are one lifecycle with preserved state, not disconnected local interactions.
+4. **Shared memory plus observability.** Durable memory, event traces, decision records, and evaluation artifacts are first-class so the system can learn and still be auditable.
+5. **Coding agents are components, not the whole architecture.** Codex/Claude-class coding agents can sit inside worker phases, but Harkonnen's value is the coordinated system above them.
 
 ### The Core Loop
 
@@ -319,6 +336,10 @@ The user metaphor: **What if labrador retrievers evolved and maintained their fu
 4. **Identity is versioned, not overwritten.** Major changes are represented as revisions, supersessions, or annotations.
 5. **The pack remains labrador-shaped.** Agents may adapt and specialize, but must remain cooperative, engaged, truthful, and pack-aware.
 6. **Summaries are projections, not source of truth.** Canonical truth lives in the typed ontology.
+7. **Integration is governed, not accumulative.** Selection should happen when new material attempts to enter continuity, not only at retrieval time.
+8. **Quarantine is first-class.** Unresolved material is preserved explicitly rather than forced into premature acceptance or deletion.
+9. **Identity is multi-anchor, not monolithic.** Kernel, presentation, procedures, style, episodic continuity, and heartbeat autonomy should be separated rather than collapsed into one file.
+10. **Presence continuity should be model-agnostic.** If the provider or base model changes, the soul package and typed continuity graph should preserve identity across the swap.
 
 ### The Six Chambers
 
@@ -348,10 +369,33 @@ The user metaphor: **What if labrador retrievers evolved and maintained their fu
 4. **Derived summaries are not canonical.** Summary-view and continuity-snapshot objects must always point back to canonical underlying entities.
 5. **Epistemic posture must remain inspectable.** For every significant belief: what evidence supported it, what inference pattern created it, what uncertainty remained, what later contradicted it.
 6. **Praxis must remain identity-constrained.** Behavior changes that violate the labrador kernel are flagged.
+7. **Integration happens at ingress.** New belief-, schema-, and adaptation-level material should pass through a governed accept / modify / reject / quarantine decision before entering canonical continuity.
+8. **Quarantine entries are durable and revisitable.** They carry unresolved tension, pending evidence conditions, and salience decay without deletion.
+9. **Reflection operates over compressed patterns.** Schema revision should act on cross-episode abstractions, not just re-run event-level integration.
+10. **Integration policy changes are slow-loop changes.** The criteria for becoming may evolve, but more slowly and conservatively than ordinary belief updates, with human endorsement as the natural attachment point.
+
+### Soul Package Topology
+
+Harkonnen should expose a file-first soul package as the boot-time and
+inspection surface for agent identity. That package is a projection and control
+surface over Soul Store, not the canonical source of continuity.
+
+| File | Purpose |
+| --- | --- |
+| `soul.json` | Manifest, versioning, integrity hashes, compatibility, threshold configuration |
+| `SOUL.md` | Core identity kernel, worldview, teleology, uncrossable boundaries |
+| `IDENTITY.md` | External persona and presentation layer |
+| `AGENTS.md` | Coordination, routing, escalation, and operating procedures |
+| `STYLE.md` | Tone, formatting, and anti-drift syntactic constraints |
+| `MEMORY.md` | Human-readable continuity projection over autobiographical state |
+| `HEARTBEAT.md` | Scheduled integrity checks, reflection triggers, and autonomy routines |
+
+These files should be bootstrapped from and checked against canonical Soul Store
+state so that the package stays readable without becoming the only truth.
 
 ### Core Entities
 
-`soul`, `agent-self`, `experience`, `observation`, `belief`, `evidence`, `inference-pattern`, `uncertainty-state`, `trust-anchor`, `interpretive-frame`, `value-commitment`, `trait`, `wound`, `adaptation`, `reflection`, `causal-pattern`, `behavioral-signature`, `relationship-anchor`, `spec-context`, `run`, `artifact`, `summary-view`, `continuity-snapshot`
+`soul`, `agent-self`, `experience`, `observation`, `belief`, `evidence`, `inference-pattern`, `uncertainty-state`, `trust-anchor`, `interpretive-frame`, `value-commitment`, `trait`, `wound`, `adaptation`, `reflection`, `schema`, `integration-candidate`, `quarantine-entry`, `integration-policy`, `causal-pattern`, `behavioral-signature`, `relationship-anchor`, `spec-context`, `run`, `artifact`, `summary-view`, `continuity-snapshot`
 
 ### API Surface
 
@@ -364,10 +408,20 @@ form_belief(self_id, belief_input, evidence_ids, inference_pattern_id)
 revise_belief(prior_belief_id, new_belief_input, reason)
 record_reflection(self_id, reflection_input, target_ids)
 record_adaptation(self_id, adaptation_input)
+propose_integration(self_id, candidate_input)
+adjudicate_integration(candidate_id, decision)
+list_quarantine(self_id)
+revisit_quarantine(entry_id)
+revise_schema(self_id, schema_input)
+propose_policy_revision(self_id, policy_input)
+project_soul_package(self_id)
+verify_soul_package_integrity(self_id)
 link_causal_pattern(pattern_input, cause_ids, effect_ids)
 record_behavioral_signature(self_id, signature_input)
 compute_continuity_snapshot(self_id)
 compare_snapshots(left_snapshot_id, right_snapshot_id)
+compute_stress_estimate(self_id, window)
+measure_cross_layer_hysteresis(self_id, baseline_snapshot_id, current_snapshot_id)
 explain_current_posture(self_id)
 explain_belief(belief_id)
 detect_identity_drift(self_id)
@@ -386,6 +440,8 @@ assert_kernel_preservation(self_id)
 8. Continuity report comparing two snapshots
 9. All causal-patterns linked to a spec-context
 10. Possible overgeneralization events in the epistemic layer
+11. Quarantined items with their pending evidence conditions
+12. Repeatedly challenged beliefs that may indicate denial or unjustified persistence
 
 ### Causaloid-Inspired Design Levels
 
@@ -403,9 +459,11 @@ src/soul_store/
   schema.rs         TypeDB schema bootstrap and migrations
   types.rs          Rust domain structs and DTOs
   ingest.rs         Write-paths for experiences, beliefs, reflections
+  governor.rs       Integration-time adjudication, quarantine, and policy gating
   queries.rs        Typed query helpers
   continuity.rs     Continuity snapshot computation
   drift.rs          Drift detection, overgeneralization heuristics, lab-ness scoring
+  reflection.rs     Pattern-level reflection and schema revision
   kernel.rs         Identity kernel constraints and preservation checks
   projections.rs    Summary views, narrative rendering, graph projections
   typedb.rs         TypeDB driver abstraction
@@ -422,6 +480,8 @@ src/soul_store/
 6. Preserve traceability from current posture back to underlying experiences and evidence.
 7. Keep the design usable by Harkonnen pack agents, not just by humans.
 8. Prefer inspectable, typed structures over convenience shortcuts.
+9. Do not let the projected soul package drift silently away from canonical Soul Store state.
+10. Do not let provider or model swaps erase identity continuity if the package and graph persist.
 
 ---
 
@@ -681,25 +741,38 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 **Phase 8-A — TypeDB schema bootstrap:**
 - Soul Store TypeDB schema file (see TypeQL skeleton in Part 5)
 - Rust TypeDB adapter (`src/soul_store/typedb.rs`)
-- Insert/query support for soul, agent-self, experience, belief, evidence, trait, value-commitment
+- Insert/query support for soul, agent-self, experience, belief, evidence, trait, value-commitment, integration-candidate, quarantine-entry, integration-policy
 - Basic revision graph (`revised-into` relation)
+- File-first soul package projection support for `soul.json`, `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `STYLE.md`, `MEMORY.md`, `HEARTBEAT.md`
+- Integrity-hash verification for the projected soul package at boot and during heartbeat audits
 
 **Phase 8-B — Epistemic layer:**
 - Episteme support: evidence, inference-pattern, uncertainty-state
+- Meta-Governor write path: accept / modify / reject / quarantine at integration time
+- Quarantine ledger with pending evidence conditions, salience decay, and re-evaluation hooks
 - Continuity snapshot generation
 - Belief explanation queries
 - Pack relationship modeling
+- Stress-estimator computation with evolution-threshold hooks for governed reflection rather than direct self-rewrite
+- Heartbeat-driven package integrity audit and quarantine re-evaluation scheduling
 
 **Phase 8-C — Drift and kernel:**
 - Drift detection
+- Unjustified-drift scoring rather than stasis-maximizing stability
 - Lab-ness score computation
 - Kernel preservation checks
+- Denial / fragmentation / overfitting / trauma-analog pathology detection
+- Cross-layer hysteresis measurement so rollback success is validated behaviorally, not just by file diff
 - Causal-pattern aggregation
 
 **Phase 8-D — Projections and UI:**
 - Narrative views and soul graph projections
+- Reflection over compressed cross-episode patterns and schema revision views
 - Soul Graph panel in Pack Board
+- Quarantine and open-arc views in Pack Board
 - Before/after snapshot comparison tools
+- Slow-loop integration-policy revision flow with human endorsement
+- Presence continuity checks so provider/model swaps preserve soul-package semantics and continuity projections
 
 **Seed dataset:** Seed Coobie with one identity kernel, several experiences tied to validation failures, evidence showing happy-path-only tests, beliefs about spec ambiguity, one revised belief after disconfirmation, one adaptation increasing preflight strictness, one continuity snapshot before and after the adaptation.
 
@@ -707,12 +780,13 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 - TypeDB schema file
 - Rust crate or module for Soul Store
 - Strongly typed DTOs for write/read operations
-- Query helpers for the 10 required queries
-- Tests for revision behavior and kernel preservation
+- Query helpers for the 12 required queries
+- Projected soul package with integrity verification
+- Tests for revision behavior, quarantine dynamics, stress / hysteresis measurement, and kernel preservation
 - Seed dataset for Coobie
 - Developer README for local setup and examples
 
-**Done when:** Coobie's soul graph exists in TypeDB, the continuity snapshot before and after the adaptation is queryable, and kernel preservation checks pass.
+**Done when:** Coobie's soul graph exists in TypeDB, accepted and quarantined changes are queryable distinctly, the projected soul package is verifiable against canonical state, schema-level reflection can update abstractions without overwriting raw experience, slow-loop policy revisions are human-gated, rollback adequacy is measurable through hysteresis rather than assumed, and kernel preservation checks pass.
 
 ---
 
@@ -797,7 +871,7 @@ EI-1 should land before any enterprise surface. ENT-1 is the foundation for all 
 | Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
 | Phase 6 | GAIA Level 3, AgentBench |
 | Phase 7 | E-CARE, causal attribution accuracy |
-| Phase 8 | Lab-ness score stability, kernel preservation across adaptation events |
+| Phase 8 | unjustified drift, quarantine resolution quality, schema revision stability, stress / hysteresis recovery quality, kernel preservation across adaptation events |
 
 ### Publication Standard
 
@@ -831,6 +905,6 @@ Every published benchmark claim must include:
 
 **What:** A local-first, spec-driven, identity-preserving, causally-aware AI software factory where agents accumulate structured knowledge and maintain coherent identity across every run.
 
-**Why:** To replace human implementation-centric workflows with autonomous build-and-evaluate loops that are safer, more observable, and genuinely better over time — not because the model improved, but because the system learned and the agents who learned it are provably still themselves.
+**Why:** To replace human implementation-centric workflows with autonomous build-and-evaluate loops that are safer, more observable, and genuinely better over time — not because the model improved, but because the system learned, software moved through the delivery system with less coordination drag, and the agents who learned it are provably still themselves.
 
 **What makes it distinct:** Pearl-hierarchy causal memory, typed agent identity (Soul Store), hidden scenario evaluation, and a benchmark suite that includes tests no competitor can run.

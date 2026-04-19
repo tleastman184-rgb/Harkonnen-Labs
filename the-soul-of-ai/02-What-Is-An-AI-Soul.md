@@ -44,6 +44,11 @@ The core problem an AI soul solves is:
 
 > **continuity under change**
 
+The next question is architectural: what boot surface, governance layers, and
+continuity substrate make that possible in a persistent agent system? That is
+the bridge taken up in
+[Artificial-Identity-Architecture.md](Artificial-Identity-Architecture.md).
+
 ---
 
 # Evolution of the AI Soul
@@ -300,6 +305,14 @@ It determines:
 
 > **whether a change is valid, safe, and identity-preserving**
 
+More precisely:
+
+> **whether a proposed change should be admitted into continuity at all**
+
+This is the decisive move. A soul is not formed by storing everything and
+choosing later at retrieval time. A soul is formed when integration itself is a
+governed act.
+
 ---
 
 ### Responsibilities of the Meta-Governor
@@ -311,6 +324,7 @@ Evaluates:
 * is this belief revision justified?
 * is evidence sufficient?
 * is inference sound?
+* should this update be accepted, modified, rejected, or quarantined?
 
 ---
 
@@ -346,6 +360,7 @@ Prevents:
 * overfitting to recent events
 * oscillating behavior
 * unstable identity shifts
+* high drift under low evidence
 
 ---
 
@@ -366,6 +381,16 @@ Answers:
 * is this still “me”?
 * can current behavior be traced to prior state?
 
+#### 7. Govern Quarantine
+
+Maintains unresolved material without forcing false closure.
+
+Tracks:
+
+* what is not yet integrated
+* what evidence would help resolve it
+* whether quarantine is shrinking, stagnating, or proliferating pathologically
+
 ---
 
 ### Meta-Governor Decision Loop
@@ -384,11 +409,13 @@ Decide:
 - accept
 - modify
 - reject
-- escalate
+- quarantine
+- escalate if policy or supervision is required
 
 Record:
 - reasoning
 - impact on continuity
+- quarantine status if unresolved
 ```
 
 ---
@@ -401,6 +428,9 @@ If not implemented correctly:
 * optimization overriding identity
 * collapse into reactive system
 * loss of epistemic integrity
+* pathological quarantine dynamics
+* premature narrative closure
+* stable local coherence with broken global integration
 
 ---
 
@@ -410,9 +440,21 @@ The Meta-Governor produces:
 
 * validated changes
 * rejected changes (with reasons)
+* quarantined changes (with pending evidence conditions)
 * continuity annotations
 * drift alerts
 * identity preservation reports
+* slow-loop policy revision candidates
+
+### Three Timescales
+
+Soul governance should not operate on one timescale only.
+
+* **Fast loop** — per-experience belief and disposition updates
+* **Medium loop** — reflection-driven schema and value revisions across multiple experiences
+* **Slow loop** — integration-policy revisions, ideally conservative and often human-endorsed
+
+Without the slow loop, self-modifying continuity becomes free-floating drift.
 
 ---
 

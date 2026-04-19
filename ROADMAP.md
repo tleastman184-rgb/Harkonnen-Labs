@@ -43,6 +43,10 @@ A structured gap analysis identified seven practical gaps. Gap-closure phases A�
 The factory has a complete foundation: core pipeline, PackChat control plane, layered Coobie memory, causal graph, Pearl hierarchy labeling, multi-hop retrieval, operator-reviewed consolidation Workbench, agent trace spine, optimization programs, and adversarial metric attacks. The remaining gaps before Tier 4 are concrete and bounded: guardrails are advisory instead of enforced, the memory invalidation persistence layer is incomplete, and there are no outbound integrations. Phase v1 closes those gaps. After that, Phase 2 makes Bramble's validation score meaningful and Phase 3 grounds Sable's twin.
 
 Benchmarking remains a parallel track. Each phase ships with at least one measurable gate.
+The benchmark philosophy should remain explicitly agentic-engineering shaped:
+measure how quickly and safely software moves through the delivery system, not
+just how quickly code is emitted. That means coordination compression, downstream
+validation speed, and time-to-root-cause matter alongside code-level success.
 
 ---
 
@@ -267,6 +271,37 @@ TypeDB 3.x changes the implementation assumptions: the old JVM burden objection 
 - `causal attribution accuracy` first run published — top-1 / top-3 vs semantic-only baseline
 
 **Done when:** The corpus has at least 30 labeled entries, the causal attribution accuracy benchmark has a published run, and E-CARE has a published score.
+
+---
+
+## Phase 8 — Soul Store And Governed Integration
+
+**Unlocks:** A persisted intelligence layer that does not merely remember, but
+decides what becomes part of itself. This is the phase where Harkonnen moves
+from identity continuity as a typed graph to identity continuity as a governed
+integration process.
+
+**What to build:**
+
+- Soul Store Meta-Governor with explicit `accept`, `modify`, `reject`, and `quarantine` outcomes for identity-relevant integration events
+- File-first soul package projection with `soul.json`, `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `STYLE.md`, `MEMORY.md`, and `HEARTBEAT.md`, generated from and checked against canonical continuity state
+- Integrity-hash verification and heartbeat audits so the projected soul package cannot drift silently away from Soul Store
+- Quarantine ledger: unresolved items persist with pending evidence conditions, salience decay, and re-evaluation triggers
+- Pattern-level reflection over compressed cross-episode structures so schema revision is distinct from ordinary belief revision
+- Stress-estimator computation so recurring unresolved strain triggers governed reflection instead of ad hoc self-rewrite
+- Slow-loop integration-policy revision flow, more conservative than ordinary updates and naturally attachable to human endorsement
+- Cross-layer hysteresis measurement so rollback quality is judged by residual behavioral drift, not only by restored file contents
+- Presence continuity checks so model/provider swaps preserve identity semantics rather than resetting the pack by accident
+- Pathology detection for trauma-analog overweighting, denial, fragmentation, and hyper-local overfitting
+
+**Benchmark gate:**
+
+- unjustified-drift score published
+- healthy quarantine-rate / resolution-rate baseline published
+- schema-revision stability benchmark published
+- stress / hysteresis recovery benchmark published
+
+**Done when:** Harkonnen can distinguish accepted, rejected, modified, and quarantined identity changes; the projected soul package is verifiable against canonical continuity state; reflection can revise schemas without overwriting raw experience; rollback quality is measured through hysteresis rather than assumed; and policy-level revision is slower, more conservative, and explicitly reviewable.
 
 ---
 
@@ -592,11 +627,12 @@ Benchmarks should advance in lockstep with implementation phases. When a phase s
 | --- | --- |
 | v1 | Decision audit completeness, memory supersession accuracy, WrongAnswer classification rate |
 | Phase 2 | SWE-bench Verified readiness, LiveCodeBench, Aider Polyglot |
-| Phase 3 | twin fidelity, hidden scenario delta, spec adherence rate, DevBench |
+| Phase 3 | twin fidelity, hidden scenario delta, spec adherence rate, DevBench, coordination-compression / downstream-validation time |
 | Phase 4b | StreamingQA belief-update accuracy |
 | Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
 | Phase 6 | GAIA Level 3, AgentBench |
 | Phase 7 | E-CARE, causal attribution accuracy |
+| Phase 8 | unjustified drift, quarantine resolution quality, schema revision stability, stress / hysteresis recovery quality |
 
 ### Always-on benchmarks
 

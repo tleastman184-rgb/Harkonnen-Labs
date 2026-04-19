@@ -26,9 +26,10 @@ use crate::{
         EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
         EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, HiddenScenarioCheckResult,
         HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent,
-        CommissioningBrief, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal,
-        ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
-        ScenarioResult, Spec, TwinEnvironment, TwinService, ValidationSummary, WorkerHarnessConfig,
+        CommissioningBrief, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
+        PriorCauseSignal, ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent,
+        RunRecord, ScenarioResult, SoulIdentityContext, Spec, TwinEnvironment, TwinService,
+        ValidationSummary, WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
@@ -5700,6 +5701,15 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 &mut open_questions,
             );
         }
+        let soul_identity_context = Some(build_coobie_soul_identity_context());
+        if let Some(context) = soul_identity_context.as_ref() {
+            apply_soul_preflight_guidance(
+                context,
+                &mut required_checks,
+                &mut recommended_guardrails,
+                &mut open_questions,
+            );
+        }
 
         // ── Phase 3: causal priors influence preflight ────────────────────────
         // Query this spec's causal history and inject concrete, cause-specific
@@ -5782,6 +5792,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             environment_risks,
             regulatory_considerations,
             operator_model_context,
+            soul_identity_context,
             recommended_guardrails,
             required_checks,
             open_questions,
@@ -19584,6 +19595,68 @@ fn apply_operator_model_preflight_guidance(
     for question in context.open_questions.iter().take(3) {
         open_questions.push(format!("Operator-model follow-up — {question}"));
     }
+    recommended_guardrails.dedup();
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
+fn build_coobie_soul_identity_context() -> SoulIdentityContext {
+    let identity = crate::soul_store::coobie_identity();
+    SoulIdentityContext {
+        self_name: identity.self_name.to_string(),
+        identity_thesis: identity.identity_thesis.to_string(),
+        preserved_invariants: identity
+            .invariants
+            .iter()
+            .map(|item| format!("{} — {}", item.name, item.narrative_summary))
+            .collect(),
+        baseline_beliefs: identity
+            .beliefs
+            .iter()
+            .map(|item| item.narrative_summary.to_string())
+            .collect(),
+        allowed_adaptations: identity
+            .adaptations
+            .iter()
+            .map(|item| item.narrative_summary.to_string())
+            .collect(),
+        forbidden_drift: identity
+            .forbidden_drift
+            .iter()
+            .map(|item| item.to_string())
+            .collect(),
+        adaptation_law: identity.adaptation_law.to_string(),
+    }
+}
+
+fn apply_soul_preflight_guidance(
+    context: &SoulIdentityContext,
+    required_checks: &mut Vec<String>,
+    recommended_guardrails: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    recommended_guardrails.push(format!(
+        "Soul Store preservation — {}",
+        context.identity_thesis
+    ));
+    for invariant in context.preserved_invariants.iter().take(4) {
+        recommended_guardrails.push(format!("Preserve Coobie's Labrador kernel — {invariant}"));
+    }
+    for adaptation in context.allowed_adaptations.iter().take(2) {
+        required_checks.push(format!(
+            "Soul Store adaptation check — if this run tightens posture, keep it within allowed adaptation bounds: {adaptation}"
+        ));
+    }
+    if !context.forbidden_drift.is_empty() {
+        required_checks.push(format!(
+            "Soul Store drift check — confirm the run does not push Coobie toward {}",
+            context.forbidden_drift.join(" | ")
+        ));
+    }
+    open_questions.push(format!(
+        "Soul Store preservation question — does the current plan remain legible to the pack while preserving {}'s adaptation law?",
+        context.self_name
+    ));
     recommended_guardrails.dedup();
     required_checks.dedup();
     open_questions.dedup();
