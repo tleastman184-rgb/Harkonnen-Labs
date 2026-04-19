@@ -32,7 +32,7 @@ use crate::models::{
     CausalEventEdge, CausalHypothesis, CausalHypothesisEvidence, CausalStreak, CoobieBriefing,
     CoobieEvidenceCitation, CounterfactualEstimate, CounterfactualOutcome, FactoryEpisode,
     InterventionPlan, LessonRecord, PearlHierarchyLevel, ProjectComponent, ProjectResumeRisk,
-    ScenarioBlueprint,
+    ScenarioBlueprint, SoulIdentityContext,
 };
 
 // ── Public reasoning trait ────────────────────────────────────────────────────
@@ -707,6 +707,11 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
         .as_ref()
         .map(render_operator_model_context)
         .unwrap_or_else(|| "- No operator-model context was attached to this run yet.".to_string());
+    let soul_identity_section = briefing
+        .soul_identity_context
+        .as_ref()
+        .map(render_soul_identity_context)
+        .unwrap_or_else(|| "- No Soul Store identity context was attached to this run yet.".to_string());
 
     format!(
         "# Coobie Preflight Response
@@ -736,6 +741,9 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 {}
 
 ## Operator Model Context
+{}
+
+## Soul Preservation Context
 {}
 
 ## Domain Signals
@@ -828,6 +836,7 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
             "No Harkonnen core memory hits were retrieved yet.",
         ),
         operator_model_section,
+        soul_identity_section,
         render_bullet_lines(
             &briefing.domain_signals,
             "No domain signals were detected yet."
@@ -941,6 +950,41 @@ fn render_operator_model_context(context: &crate::models::OperatorModelContext) 
             "- Operator-model profile exists, but no durable context has been distilled yet."
                 .to_string(),
         );
+    }
+    lines.join("\n")
+}
+
+fn render_soul_identity_context(context: &SoulIdentityContext) -> String {
+    let mut lines = Vec::new();
+    if !context.identity_thesis.trim().is_empty() {
+        lines.push(format!("- Identity thesis: {}", context.identity_thesis.trim()));
+    }
+    if !context.preserved_invariants.is_empty() {
+        lines.push(format!(
+            "- Preserved invariants: {}",
+            context.preserved_invariants.join(" | ")
+        ));
+    }
+    if !context.baseline_beliefs.is_empty() {
+        lines.push(format!(
+            "- Baseline beliefs: {}",
+            context.baseline_beliefs.join(" | ")
+        ));
+    }
+    if !context.allowed_adaptations.is_empty() {
+        lines.push(format!(
+            "- Allowed adaptations: {}",
+            context.allowed_adaptations.join(" | ")
+        ));
+    }
+    if !context.forbidden_drift.is_empty() {
+        lines.push(format!(
+            "- Forbidden drift: {}",
+            context.forbidden_drift.join(" | ")
+        ));
+    }
+    if !context.adaptation_law.trim().is_empty() {
+        lines.push(format!("- Adaptation law: {}", context.adaptation_law.trim()));
     }
     lines.join("\n")
 }

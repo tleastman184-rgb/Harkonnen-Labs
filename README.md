@@ -467,21 +467,22 @@ See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase build order. See [MASTE
 
 ## 🚀 Direction
 
-Near-term (active now):
+Near-term:
 
-* Phase 2 — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
-* Phase 3 — Ash live twin provisioning plus Flint documentation artifacts for richer hidden-scenario and DevBench evaluation
-* Parallel product track — Operator Model Activation so PackChat can interview the operator before commissioning, stamp the target repo, and feed Scout/Coobie/Keeper structured project context
+* **Phase 2** — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
+* **Phase 3** — Ash live twin provisioning plus Flint documentation artifacts for richer hidden-scenario and DevBench evaluation
+* **Operator Model full five-layer interview** — extend the MVP (v1-D) to cover dependencies, institutional knowledge, and friction layers; generate the full artifact set (`USER.md`, `HEARTBEAT.md`, `operating-model.json`)
 
-Mid-term (after the active numbered phases):
+Mid-term:
 
-* Phase 5b — Qdrant-backed long-term semantic memory, OCR ingest, and memory-module refactor
-* Phase 6 — TypeDB 3.x semantic graph for typed causal queries, GAIA Level 3, and AgentBench
-* DeepCausality Phase 2 — real causaloids derived from the causal link table once the semantic layer is live
+* **Phase 5b** — Qdrant-backed long-term semantic memory, OCR ingest, and memory-module refactor
+* **Phase 6** — TypeDB 3.x semantic graph for typed causal queries, GAIA Level 3, and AgentBench
+* **DeepCausality Phase 2** — real causaloids derived from the causal link table once the semantic layer is live
 
 Long-term:
 
-* Phase 7 — E-CARE, causal attribution corpus, and stronger publishable causal benchmark claims
-* **Self-improving software factory** — each run makes the next run better, and operator models become part of the commissioning loop
+* **Phase 7** — E-CARE, causal attribution corpus, and stronger publishable causal benchmark claims
+* **Phase 8 — Soul Store** — typed autobiographical, epistemic, ethical, and behavioral continuity store for persisted agent identities. Six chambers (Mythos, Episteme, Ethos, Pathos, Logos, Praxis) backed by TypeDB. See [MASTER_SPEC.md](MASTER_SPEC.md) Part 5 and [What-Is-An-AI-Soul.md](What-Is-An-AI-Soul.md) for the full design.
+* **Self-improving software factory** — each run makes the next run better, operator models stamp every commissioned repo, and Soul Store gives each Labrador a persistent identity that evolves without drifting
 
 

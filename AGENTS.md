@@ -3,6 +3,8 @@
 This file is the universal context document for all AI agents (Claude, Gemini, Codex)
 working in this repository. Read it before touching any code or spec.
 
+> **Canonical reference:** [MASTER_SPEC.md](MASTER_SPEC.md) is the single source of truth for architecture, agent design, Soul Store, benchmarks, and roadmap. This file provides agent-facing operational context; MASTER_SPEC.md has the full design depth.
+
 For structured machine-readable data, see `factory/context/`.
 For memory retrieval, see `factory/memory/` and ask Coobie.
 
@@ -67,7 +69,7 @@ factory/
   state.db              SQLite run metadata
 
 setups/                 Named environment TOML files
-BENCHMARKS.md           Benchmark strategy, benchmark map, reporting guidance
+MASTER_SPEC.md          Canonical architecture, agent design, Soul Store, benchmarks, roadmap
 harkonnen.toml          Active/default setup config
 .env.example            Environment variable template
 ```
@@ -96,7 +98,7 @@ cargo run -- setup check                       # Verify active setup (providers 
 
 ## Benchmarking
 
-Benchmark strategy lives in `BENCHMARKS.md`, runnable suites live in `factory/benchmarks/suites.yaml`, and benchmark reports are written to `factory/artifacts/benchmarks/`.
+Benchmark strategy lives in `MASTER_SPEC.md` (Part 6), runnable suites live in `factory/benchmarks/suites.yaml`, and benchmark reports are written to `factory/artifacts/benchmarks/`.
 
 The default benchmark gate is `local_regression` and runs `cargo fmt --check`, `cargo check`, and `cargo test -q`. LongMemEval and LoCoMo now run through native benchmark adapters, tau2-bench now has a PackChat launcher wrapper for external harnesses, and SWE-bench Verified/Pro remain adapter-ready so Harkonnen can publish comparable memory, PackChat, and coding-loop scores as the remaining integrations mature.
 
@@ -464,8 +466,9 @@ parallel product/control-plane track. Long-term roadmap work remains Phase 5b
 
 - **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
 - **Phase 3** — Ash live twin provisioning against running Docker stubs; Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter
-- **Parallel Product Track** — Operator Model Activation: PackChat-based elicitation workflow, approved operator-model storage, artifact export/import, and Scout/Coobie/Keeper integration
-- **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` split into the COOBIE_SPEC module tree
-- **Phase 6** — TypeDB 3.x semantic graph layer (COOBIE_SPEC.md Layer C); GAIA Level 3 and AgentBench adapters
+- **Operator Model full five-layer interview** — extend the v1-D MVP (two layers shipped) to cover dependencies, institutional knowledge, and friction; generate full artifact set
+- **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` refactor into a proper module tree
+- **Phase 6** — TypeDB 3.x semantic graph layer (see MASTER_SPEC.md Part 4); GAIA Level 3 and AgentBench adapters
 - **Phase 7** — causal attribution corpus, E-CARE adapter, and publishable causal benchmark baselines
+- **Phase 8 — Soul Store** — typed autobiographical + epistemic persistence for agents; six chambers backed by TypeDB; see MASTER_SPEC.md Part 5
 - **DeepCausality Phase 2** — real causaloids from the causal link table after the TypeDB layer is live

@@ -546,11 +546,28 @@ pub struct CoobieBriefing {
     pub regulatory_considerations: Vec<String>,
     #[serde(default)]
     pub operator_model_context: Option<OperatorModelContext>,
+    #[serde(default)]
+    pub soul_identity_context: Option<SoulIdentityContext>,
     pub recommended_guardrails: Vec<String>,
     pub required_checks: Vec<String>,
     pub open_questions: Vec<String>,
     pub coobie_response: String,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SoulIdentityContext {
+    pub self_name: String,
+    pub identity_thesis: String,
+    #[serde(default)]
+    pub preserved_invariants: Vec<String>,
+    #[serde(default)]
+    pub baseline_beliefs: Vec<String>,
+    #[serde(default)]
+    pub allowed_adaptations: Vec<String>,
+    #[serde(default)]
+    pub forbidden_drift: Vec<String>,
+    pub adaptation_law: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

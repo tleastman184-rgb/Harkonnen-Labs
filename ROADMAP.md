@@ -7,7 +7,7 @@ Phases 1, 4, 5, and gap-closure A–D are shipped. Phase 4b is partially shipped
 
 ## Maturity Ladder
 
-This roadmap absorbs the strategic guidance from `recentinsights.md` so there is one canonical sequence from today's factory state to true Phase 4 agentic intelligence.
+This roadmap is the canonical build sequence from today's factory state to true Phase 4 agentic intelligence and beyond.
 
 | Maturity phase | Meaning | Harkonnen status |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ This roadmap absorbs the strategic guidance from `recentinsights.md` so there is
 
 ### What still separates Harkonnen from Phase 4 (verified in source, 2026-04-18)
 
-The `recentinsights.md` review identified seven practical gaps. Gap-closure phases A–D addressed five of them. Three structural gaps remain before the system can legitimately claim Tier 4:
+A structured gap analysis identified seven practical gaps. Gap-closure phases A–D addressed five of them. Three structural gaps remain before the system can legitimately claim Tier 4:
 
 | Gap | Gap-closure status |
 | --- | --- |
@@ -205,7 +205,7 @@ Right now Sable judges against a twin that is a JSON manifest, not running infra
 
 ## Phase 5b — Memory Infrastructure (Qdrant + OCR)
 
-**Unlocks:** Semantic recall at scale and document ingest completeness. These are COOBIE.md Phase C and Phase B gaps that have been deferred because the SQLite vector store is sufficient for current run volume, but they become the bottleneck as the memory corpus grows.
+**Unlocks:** Semantic recall at scale and document ingest completeness. The SQLite vector store is sufficient for current run volume, but it becomes the bottleneck as the memory corpus grows.
 
 **What to build:**
 
