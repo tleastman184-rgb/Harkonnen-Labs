@@ -711,7 +711,9 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
         .soul_identity_context
         .as_ref()
         .map(render_soul_identity_context)
-        .unwrap_or_else(|| "- No Calvin Archive identity context was attached to this run yet.".to_string());
+        .unwrap_or_else(|| {
+            "- No Calvin Archive identity context was attached to this run yet.".to_string()
+        });
 
     format!(
         "# Coobie Preflight Response
@@ -957,7 +959,10 @@ fn render_operator_model_context(context: &crate::models::OperatorModelContext) 
 fn render_soul_identity_context(context: &SoulIdentityContext) -> String {
     let mut lines = Vec::new();
     if !context.identity_thesis.trim().is_empty() {
-        lines.push(format!("- Identity thesis: {}", context.identity_thesis.trim()));
+        lines.push(format!(
+            "- Identity thesis: {}",
+            context.identity_thesis.trim()
+        ));
     }
     if !context.preserved_invariants.is_empty() {
         lines.push(format!(
@@ -984,7 +989,10 @@ fn render_soul_identity_context(context: &SoulIdentityContext) -> String {
         ));
     }
     if !context.adaptation_law.trim().is_empty() {
-        lines.push(format!("- Adaptation law: {}", context.adaptation_law.trim()));
+        lines.push(format!(
+            "- Adaptation law: {}",
+            context.adaptation_law.trim()
+        ));
     }
     lines.join("\n")
 }

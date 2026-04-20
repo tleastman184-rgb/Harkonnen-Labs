@@ -56,7 +56,7 @@ Harkonnen decomposes execution into nine specialist agents:
 | **Piper** | Tool retriever | Runs build tools, fetches docs, executes helpers with live stdout/stderr streaming |
 | **Bramble** | Test retriever | Generates visible tests, runs lint and build, feeds pass/fail into Coobie scoring |
 | **Sable** | Scenario retriever | Executes hidden behavioral scenarios; its results are the ground truth, not Bramble's |
-| **Ash** | Twin retriever | Provisions digital twin manifests and dependency stubs for safe external-system simulation |
+| **Ash** | Twin retriever | Provisions compose-backed local twins with simulated fallback for safe external-system validation |
 | **Flint** | Artifact retriever | Collects outputs, packages artifact bundles for inspection and evidence |
 | **Coobie** | Memory retriever | Manages layered memory — episodic capture, causal reasoning, Palace patrol, and consolidation |
 | **Keeper** | Boundary retriever | Enforces policy, guards role boundaries, owns file-claim coordination |

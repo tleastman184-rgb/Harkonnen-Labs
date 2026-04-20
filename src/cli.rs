@@ -15,8 +15,8 @@ use crate::orchestrator::{AppContext, FailureHarness, RunRequest};
 use crate::reporting;
 use crate::setup::{
     available_template_names, command_available, compose_setup_id, default_provider_config,
-    slugify_machine_name, MachineConfig, McpConfig, McpSelfConfig, McpServerConfig,
-    ProviderConfig, RoutingConfig, SetupConfig, SystemDiscovery,
+    slugify_machine_name, MachineConfig, McpConfig, McpSelfConfig, McpServerConfig, ProviderConfig,
+    RoutingConfig, SetupConfig, SystemDiscovery,
 };
 
 #[derive(Parser, Debug)]
@@ -777,7 +777,8 @@ pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
     match command {
         SoulCommands::Bootstrap(args) => {
             crate::calvin_archive::require_coobie(&args.self_name)?;
-            let output = crate::calvin_archive::bootstrap_coobie(paths, args.output_root.as_deref())?;
+            let output =
+                crate::calvin_archive::bootstrap_coobie(paths, args.output_root.as_deref())?;
             println!("Calvin Archive root: {}", output.root.display());
             println!("TypeDB schema: {}", output.schema_path.display());
             println!("TypeDB seed: {}", output.seed_path.display());
@@ -794,7 +795,10 @@ pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&identity)?);
             } else {
-                println!("{}", crate::calvin_archive::render_identity_markdown(&identity));
+                println!(
+                    "{}",
+                    crate::calvin_archive::render_identity_markdown(&identity)
+                );
             }
         }
     }
@@ -1273,11 +1277,7 @@ fn credential_kind_options(name: &str) -> &'static [&'static str] {
             "openai-compatible",
             "gateway-token",
         ],
-        _ => &[
-            "standard-api-key",
-            "enterprise-api-key",
-            "gateway-token",
-        ],
+        _ => &["standard-api-key", "enterprise-api-key", "gateway-token"],
     }
 }
 
@@ -1787,11 +1787,11 @@ fn print_setup_mcp_preview(mcp: Option<&McpConfig>) {
 }
 
 fn interview_mcp_self(config: &mut SetupConfig) -> Result<()> {
-    let existing = config
-        .mcp
+    let existing = config.mcp.as_ref().and_then(|mcp| mcp.self_server.clone());
+    let default_enabled = existing
         .as_ref()
-        .and_then(|mcp| mcp.self_server.clone());
-    let default_enabled = existing.as_ref().map(|value| value.enabled).unwrap_or(false);
+        .map(|value| value.enabled)
+        .unwrap_or(false);
     if !prompt_bool("Expose Harkonnen itself as an MCP server?", default_enabled)? {
         if let Some(mcp) = &mut config.mcp {
             mcp.self_server = None;

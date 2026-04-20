@@ -21,12 +21,12 @@ use crate::{
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
         AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode, CheckpointAnswerRecord,
-        ConsolidationCandidate, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState,
-        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
-        EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
-        EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, HiddenScenarioCheckResult,
-        HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent,
-        CommissioningBrief, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
+        CommissioningBrief, ConsolidationCandidate, CoobieBriefing, CoobieEvidenceCitation,
+        EpisodeCausalState, EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation,
+        EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment,
+        EvidenceMatchReport, EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch,
+        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
+        LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
         PriorCauseSignal, ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent,
         RunRecord, ScenarioResult, SoulIdentityContext, Spec, TwinEnvironment, TwinFailureMode,
         TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
@@ -7445,7 +7445,9 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             serde_yaml::to_string(spec_obj).unwrap_or_else(|_| format!("{:?}", spec_obj));
         let constraints = mason_slim_briefing(briefing);
 
-        let (system_prompt, user_suffix) = if failure_kind == crate::models::FailureKind::WrongAnswer {
+        let (system_prompt, user_suffix) = if failure_kind
+            == crate::models::FailureKind::WrongAnswer
+        {
             (
                 "You are Mason, an implementation specialist for a software factory. \
                  Tests ran successfully but produced wrong output — the program ran but \
@@ -9318,7 +9320,9 @@ Write the twin environment narrative and identify any simulation gaps against Co
                 "up".to_string(),
                 "-d".to_string(),
             ];
-            let up = self.run_command_capture_owned("docker", &args, run_dir).await?;
+            let up = self
+                .run_command_capture_owned("docker", &args, run_dir)
+                .await?;
             if up.success {
                 compose_up_ok = true;
                 for _ in 0..10 {
@@ -9354,39 +9358,39 @@ Write the twin environment narrative and identify any simulation gaps against Co
             }
 
             let detail_prefix = format!("{} ({})", spec.name, spec.image);
-            let (status, details) = if matches!(
-                spec.failure_mode,
-                Some(TwinFailureMode::ConnectionRefusal)
-            ) {
-                (
-                    "failed".to_string(),
-                    format!("{detail_prefix} omitted from compose to simulate connection refusal."),
-                )
-            } else if compose_up_ok {
-                let endpoint = self
-                    .query_twin_service_endpoint(&compose_project, &compose_file, run_dir, spec)
-                    .await?;
-                if let Some(endpoint) = endpoint.clone() {
-                    endpoint_map.insert(service_name.clone(), endpoint.clone());
+            let (status, details) =
+                if matches!(spec.failure_mode, Some(TwinFailureMode::ConnectionRefusal)) {
                     (
-                        "running".to_string(),
-                        format!("{detail_prefix} running at {endpoint}"),
+                        "failed".to_string(),
+                        format!(
+                            "{detail_prefix} omitted from compose to simulate connection refusal."
+                        ),
                     )
+                } else if compose_up_ok {
+                    let endpoint = self
+                        .query_twin_service_endpoint(&compose_project, &compose_file, run_dir, spec)
+                        .await?;
+                    if let Some(endpoint) = endpoint.clone() {
+                        endpoint_map.insert(service_name.clone(), endpoint.clone());
+                        (
+                            "running".to_string(),
+                            format!("{detail_prefix} running at {endpoint}"),
+                        )
+                    } else {
+                        (
+                            "running".to_string(),
+                            format!("{detail_prefix} running with no published port binding."),
+                        )
+                    }
                 } else {
+                    let reason = compose_error.clone().unwrap_or_else(|| {
+                        "docker unavailable; falling back to simulated twin.".to_string()
+                    });
                     (
-                        "running".to_string(),
-                        format!("{detail_prefix} running with no published port binding."),
+                        "simulated".to_string(),
+                        format!("{detail_prefix} simulated. {reason}"),
                     )
-                }
-            } else {
-                let reason = compose_error.clone().unwrap_or_else(|| {
-                    "docker unavailable; falling back to simulated twin.".to_string()
-                });
-                (
-                    "simulated".to_string(),
-                    format!("{detail_prefix} simulated. {reason}"),
-                )
-            };
+                };
 
             container_statuses.push(status.clone());
             services.push(TwinService {
@@ -9411,7 +9415,10 @@ Write the twin environment narrative and identify any simulation gaps against Co
             "partial"
         } else if container_statuses.iter().any(|status| status == "running") {
             "running"
-        } else if container_statuses.iter().any(|status| status == "simulated") {
+        } else if container_statuses
+            .iter()
+            .any(|status| status == "simulated")
+        {
             "simulated"
         } else if container_statuses.iter().any(|status| status == "failed") {
             "failed"
@@ -9452,7 +9459,9 @@ Write the twin environment narrative and identify any simulation gaps against Co
             "down".to_string(),
             "--remove-orphans".to_string(),
         ];
-        let _ = self.run_command_capture_owned("docker", &args, run_dir).await?;
+        let _ = self
+            .run_command_capture_owned("docker", &args, run_dir)
+            .await?;
         Ok(())
     }
 
@@ -9496,9 +9505,17 @@ Write the twin environment narrative and identify any simulation gaps against Co
             normalize_twin_service_name(&spec.name),
             port.to_string(),
         ];
-        let output = self.run_command_capture_owned("docker", &args, run_dir).await?;
+        let output = self
+            .run_command_capture_owned("docker", &args, run_dir)
+            .await?;
         if output.success {
-            let endpoint = output.stdout.lines().last().unwrap_or("").trim().to_string();
+            let endpoint = output
+                .stdout
+                .lines()
+                .last()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if endpoint.is_empty() {
                 Ok(None)
             } else {
@@ -10347,18 +10364,36 @@ Return JSON only.",
         let raw = match tokio::fs::read_to_string(&coord_path).await {
             Ok(r) => r,
             // No coordination file means no active claims — allow.
-            Err(_) => return (true, vec![], "No active coordination state — write allowed.".to_string()),
+            Err(_) => {
+                return (
+                    true,
+                    vec![],
+                    "No active coordination state — write allowed.".to_string(),
+                )
+            }
         };
 
         let state: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
-            Err(_) => return (true, vec![], "Coordination state unreadable — write allowed.".to_string()),
+            Err(_) => {
+                return (
+                    true,
+                    vec![],
+                    "Coordination state unreadable — write allowed.".to_string(),
+                )
+            }
         };
 
         let now = Utc::now();
         let active = match state.get("active").and_then(|v| v.as_object()) {
             Some(map) => map,
-            None => return (true, vec![], "No active claims — write allowed.".to_string()),
+            None => {
+                return (
+                    true,
+                    vec![],
+                    "No active claims — write allowed.".to_string(),
+                )
+            }
         };
 
         for (owner, assignment) in active {
@@ -10379,16 +10414,12 @@ Return JSON only.",
             let files = assignment
                 .get("files")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|f| f.as_str())
-                        .collect::<Vec<_>>()
-                })
+                .map(|arr| arr.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            let overlaps = files.iter().any(|f| {
-                f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f)
-            });
+            let overlaps = files
+                .iter()
+                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f));
             if !overlaps && !files.is_empty() {
                 continue;
             }
@@ -10609,7 +10640,9 @@ Return JSON only.",
         };
 
         // Persist to export root
-        let export_root = self.operator_models.export_root_for_profile(&self.paths, &profile);
+        let export_root = self
+            .operator_models
+            .export_root_for_profile(&self.paths, &profile);
         tokio::fs::create_dir_all(&export_root).await?;
         let brief_path = export_root.join("commissioning-brief.json");
         let json = serde_json::to_string_pretty(&brief)?;
@@ -20310,4 +20343,145 @@ async fn apply_mason_proposal_edits(
         }
     }
     Ok(changed)
+}
+
+fn normalize_twin_service_name(input: &str) -> String {
+    input
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+}
+
+fn known_twin_dependency_spec(dependency: &str) -> Option<TwinServiceSpec> {
+    let name = normalize_twin_service_name(dependency);
+    let mut env = std::collections::BTreeMap::new();
+
+    match name.as_str() {
+        "postgres" | "postgresql" => {
+            env.insert("POSTGRES_USER".to_string(), "harkonnen".to_string());
+            env.insert("POSTGRES_PASSWORD".to_string(), "harkonnen".to_string());
+            env.insert("POSTGRES_DB".to_string(), "app".to_string());
+            Some(TwinServiceSpec {
+                name: "postgres".to_string(),
+                image: "postgres:16-alpine".to_string(),
+                port: Some(5432),
+                env,
+                failure_mode: None,
+            })
+        }
+        "redis" => Some(TwinServiceSpec {
+            name: "redis".to_string(),
+            image: "redis:7-alpine".to_string(),
+            port: Some(6379),
+            env,
+            failure_mode: None,
+        }),
+        "mysql" => {
+            env.insert("MYSQL_ROOT_PASSWORD".to_string(), "harkonnen".to_string());
+            env.insert("MYSQL_DATABASE".to_string(), "app".to_string());
+            Some(TwinServiceSpec {
+                name: "mysql".to_string(),
+                image: "mysql:8.4".to_string(),
+                port: Some(3306),
+                env,
+                failure_mode: None,
+            })
+        }
+        "mongo" | "mongodb" => Some(TwinServiceSpec {
+            name: "mongo".to_string(),
+            image: "mongo:7".to_string(),
+            port: Some(27017),
+            env,
+            failure_mode: None,
+        }),
+        "rabbitmq" => Some(TwinServiceSpec {
+            name: "rabbitmq".to_string(),
+            image: "rabbitmq:3-management".to_string(),
+            port: Some(5672),
+            env,
+            failure_mode: None,
+        }),
+        "kafka" => {
+            env.insert("KAFKA_CFG_NODE_ID".to_string(), "1".to_string());
+            env.insert(
+                "KAFKA_CFG_PROCESS_ROLES".to_string(),
+                "broker,controller".to_string(),
+            );
+            env.insert(
+                "KAFKA_CFG_CONTROLLER_LISTENER_NAMES".to_string(),
+                "CONTROLLER".to_string(),
+            );
+            env.insert(
+                "KAFKA_CFG_LISTENERS".to_string(),
+                "PLAINTEXT://:9092,CONTROLLER://:9093".to_string(),
+            );
+            env.insert(
+                "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP".to_string(),
+                "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT".to_string(),
+            );
+            env.insert(
+                "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS".to_string(),
+                "1@127.0.0.1:9093".to_string(),
+            );
+            env.insert("ALLOW_PLAINTEXT_LISTENER".to_string(), "yes".to_string());
+            Some(TwinServiceSpec {
+                name: "kafka".to_string(),
+                image: "bitnami/kafka:3.7".to_string(),
+                port: Some(9092),
+                env,
+                failure_mode: None,
+            })
+        }
+        "minio" => {
+            env.insert("MINIO_ROOT_USER".to_string(), "harkonnen".to_string());
+            env.insert("MINIO_ROOT_PASSWORD".to_string(), "harkonnen".to_string());
+            Some(TwinServiceSpec {
+                name: "minio".to_string(),
+                image: "minio/minio:latest".to_string(),
+                port: Some(9000),
+                env,
+                failure_mode: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_twin_compose_yaml(specs: &[TwinServiceSpec]) -> String {
+    let mut yaml = String::from("services:\n");
+    for spec in specs {
+        if matches!(spec.failure_mode, Some(TwinFailureMode::ConnectionRefusal)) {
+            continue;
+        }
+        let service_name = normalize_twin_service_name(&spec.name);
+        yaml.push_str(&format!("  {}:\n    image: {}\n", service_name, spec.image));
+        let mut env = spec.env.clone();
+        if matches!(spec.failure_mode, Some(TwinFailureMode::AuthExpiry)) {
+            env.insert("MOCK_AUTH_EXPIRED".to_string(), "true".to_string());
+        } else if matches!(spec.failure_mode, Some(TwinFailureMode::RateLimit)) {
+            env.insert("MOCK_RATE_LIMIT".to_string(), "10".to_string());
+        }
+        if !env.is_empty() {
+            yaml.push_str("    environment:\n");
+            for (key, value) in &env {
+                yaml.push_str(&format!(
+                    "      {}: \"{}\"\n",
+                    key,
+                    value.replace('"', "\\\"")
+                ));
+            }
+        }
+        if let Some(port) = spec.port {
+            yaml.push_str("    ports:\n");
+            yaml.push_str(&format!("      - \"{}\"\n", port));
+        }
+        if spec.image.starts_with("busybox:") {
+            yaml.push_str("    command: [\"sh\", \"-c\", \"sleep 3600\"]\n");
+        }
+        if spec.image.starts_with("minio/minio:") {
+            yaml.push_str("    command: [\"server\", \"/data\"]\n");
+        }
+    }
+    yaml
 }

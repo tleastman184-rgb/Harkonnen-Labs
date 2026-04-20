@@ -205,12 +205,10 @@ pub async fn run_with_overrides(
     };
 
     let mode = LcbMode::parse(get_override(overrides, "LCB_MODE"))?;
-    let agent =
-        get_override(overrides, "LCB_AGENT").unwrap_or_else(|| DEFAULT_AGENT.to_string());
+    let agent = get_override(overrides, "LCB_AGENT").unwrap_or_else(|| DEFAULT_AGENT.to_string());
     let direct_provider =
         get_override(overrides, "LCB_PROVIDER").unwrap_or_else(|| "anthropic".to_string());
-    let limit: Option<usize> =
-        get_override(overrides, "LCB_LIMIT").and_then(|v| v.parse().ok());
+    let limit: Option<usize> = get_override(overrides, "LCB_LIMIT").and_then(|v| v.parse().ok());
     let min_pass_rate: Option<f64> =
         get_override(overrides, "LCB_MIN_PASS_RATE").and_then(|v| v.parse().ok());
     let timeout_secs: u64 = get_override(overrides, "LCB_TIMEOUT_SECS")
@@ -218,12 +216,7 @@ pub async fn run_with_overrides(
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     let output_dir = get_override(overrides, "LCB_OUTPUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            paths
-                .artifacts
-                .join("benchmarks")
-                .join("livecodebench")
-        });
+        .unwrap_or_else(|| paths.artifacts.join("benchmarks").join("livecodebench"));
 
     let config = LcbRunConfig {
         dataset_path,
@@ -260,7 +253,8 @@ pub async fn run(paths: &Paths, config: &LcbRunConfig) -> Result<LcbRunOutput> {
     for problem in &problems {
         let test_cases = parse_test_cases(&problem.public_test_cases);
         let solution = generate_solution(paths, config, problem).await;
-        let (tc_passed, tc_total) = run_test_cases(&solution, &test_cases, config.timeout_secs).await;
+        let (tc_passed, tc_total) =
+            run_test_cases(&solution, &test_cases, config.timeout_secs).await;
         let passed = tc_total > 0 && tc_passed == tc_total;
 
         if passed {
@@ -371,11 +365,9 @@ pub async fn run(paths: &Paths, config: &LcbRunConfig) -> Result<LcbRunOutput> {
 async fn generate_solution(paths: &Paths, config: &LcbRunConfig, problem: &LcbProblem) -> String {
     let prompt = build_generation_prompt(problem);
     let raw = match config.mode {
-        LcbMode::Harkonnen => {
-            chat::complete_agent_reply(&config.agent, &prompt, &[], None, paths)
-                .await
-                .unwrap_or_default()
-        }
+        LcbMode::Harkonnen => chat::complete_agent_reply(&config.agent, &prompt, &[], None, paths)
+            .await
+            .unwrap_or_default(),
         LcbMode::Direct => generate_direct(paths, &config.direct_provider, problem).await,
     };
     extract_python_code(&raw)
@@ -413,7 +405,10 @@ fn build_generation_prompt(problem: &LcbProblem) -> String {
         problem.platform, problem.difficulty, problem.question_title, problem.question_content
     );
     if !problem.starter_code.is_empty() {
-        prompt.push_str(&format!("Starter code:\n```python\n{}\n```\n\n", problem.starter_code));
+        prompt.push_str(&format!(
+            "Starter code:\n```python\n{}\n```\n\n",
+            problem.starter_code
+        ));
     }
     prompt.push_str(
         "Write a complete Python solution that reads from stdin and writes to stdout. \
@@ -539,12 +534,8 @@ fn parse_test_cases(value: &serde_json::Value) -> Vec<LcbTestCase> {
     // The HuggingFace download encodes public_test_cases as a JSON string.
     // Handle both: a JSON string that deserialises to an array, and an inline array.
     match value {
-        serde_json::Value::String(s) => {
-            serde_json::from_str(s).unwrap_or_default()
-        }
-        serde_json::Value::Array(_) => {
-            serde_json::from_value(value.clone()).unwrap_or_default()
-        }
+        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+        serde_json::Value::Array(_) => serde_json::from_value(value.clone()).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -672,7 +663,10 @@ fn render_markdown(summary: &LcbSummary) -> String {
     for (diff, m) in &summary.metrics.by_difficulty {
         out.push_str(&format!(
             "| {} | {} | {} | {:.1}% |\n",
-            diff, m.total, m.passed, m.pass_rate * 100.0
+            diff,
+            m.total,
+            m.passed,
+            m.pass_rate * 100.0
         ));
     }
 
@@ -682,7 +676,10 @@ fn render_markdown(summary: &LcbSummary) -> String {
     for (platform, m) in &summary.metrics.by_platform {
         out.push_str(&format!(
             "| {} | {} | {} | {:.1}% |\n",
-            platform, m.total, m.passed, m.pass_rate * 100.0
+            platform,
+            m.total,
+            m.passed,
+            m.pass_rate * 100.0
         ));
     }
 

@@ -601,9 +601,7 @@ impl LlmProvider for OpenAiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url,
-    };
+    use super::{anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url};
 
     #[test]
     fn openai_base_url_defaults_to_public_api() {

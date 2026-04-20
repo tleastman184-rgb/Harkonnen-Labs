@@ -208,9 +208,7 @@ pub async fn run_with_overrides(
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     let output_dir = get_override(overrides, "POLYGLOT_OUTPUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            paths.artifacts.join("benchmarks").join("aider-polyglot")
-        });
+        .unwrap_or_else(|| paths.artifacts.join("benchmarks").join("aider-polyglot"));
 
     let config = PolyglotRunConfig {
         dataset_path,
@@ -223,7 +221,9 @@ pub async fn run_with_overrides(
         timeout_secs,
     };
 
-    run(paths, &config).await.map(PolyglotSuiteOutcome::Completed)
+    run(paths, &config)
+        .await
+        .map(PolyglotSuiteOutcome::Completed)
 }
 
 pub async fn run(paths: &Paths, config: &PolyglotRunConfig) -> Result<PolyglotRunOutput> {
@@ -250,9 +250,7 @@ pub async fn run(paths: &Paths, config: &PolyglotRunConfig) -> Result<PolyglotRu
             total_passed += 1;
         }
 
-        let lang_entry = by_language
-            .entry(exercise.language.clone())
-            .or_default();
+        let lang_entry = by_language.entry(exercise.language.clone()).or_default();
         lang_entry.total += 1;
         if passed {
             lang_entry.passed += 1;
@@ -348,7 +346,10 @@ async fn run_exercise(
 
     // Write test file and any extras first.
     let test_path = work_dir.join(&exercise.test_filename);
-    if tokio::fs::write(&test_path, &exercise.test_content).await.is_err() {
+    if tokio::fs::write(&test_path, &exercise.test_content)
+        .await
+        .is_err()
+    {
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         return (false, None, "failed to write test file".to_string());
     }
@@ -392,11 +393,7 @@ async fn generate_implementation(
     extract_implementation(&raw, &exercise.language)
 }
 
-async fn generate_direct(
-    paths: &Paths,
-    provider: &str,
-    exercise: &PolyglotExercise,
-) -> String {
+async fn generate_direct(paths: &Paths, provider: &str, exercise: &PolyglotExercise) -> String {
     let system = format!(
         "You are an expert {} programmer. Implement the given stub to pass the tests. \
         Return only the complete implementation file contents with no explanation or markdown fences.",
@@ -642,7 +639,10 @@ fn render_markdown(summary: &PolyglotSummary) -> String {
     for (lang, m) in &summary.metrics.by_language {
         out.push_str(&format!(
             "| {} | {} | {} | {:.1}% |\n",
-            lang, m.total, m.passed, m.pass_rate * 100.0
+            lang,
+            m.total,
+            m.passed,
+            m.pass_rate * 100.0
         ));
     }
 

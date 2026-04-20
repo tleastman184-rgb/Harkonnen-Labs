@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::process::Command;
 
-use crate::{aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval, streamingqa};
+use crate::{
+    aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval,
+    streamingqa,
+};
 
 const SKIP_EXIT_CODE: i32 = 10;
 const OUTPUT_LIMIT: usize = 8_000;

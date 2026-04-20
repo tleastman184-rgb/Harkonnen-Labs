@@ -20,6 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::{
+    calvin_archive::SoulBootstrapDocument,
     chat::{dispatch_message, ChatThread, ChatThreadKind, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
     llm::{self, LlmRequest},
@@ -36,7 +37,6 @@ use crate::{
     pidgin::{self, PidginTranslation},
     reporting,
     setup::command_available,
-    calvin_archive::SoulBootstrapDocument,
     tesseract,
 };
 
@@ -886,7 +886,8 @@ async fn get_soul_guide(Path(id): Path<String>) -> impl IntoResponse {
     if !crate::calvin_archive::supported_self(&id) {
         return (StatusCode::NOT_FOUND, "soul guide not found").into_response();
     }
-    let markdown = crate::calvin_archive::render_guide_markdown(&crate::calvin_archive::coobie_identity());
+    let markdown =
+        crate::calvin_archive::render_guide_markdown(&crate::calvin_archive::coobie_identity());
     (
         StatusCode::OK,
         [(
@@ -4208,6 +4209,7 @@ fn fallback_scout_draft_spec(
         dependencies,
         performance_expectations: vec!["commands should complete in a reasonable time".to_string()],
         security_expectations,
+        twin_services: Vec::new(),
         project_components: Vec::new(),
         scenario_blueprint: None,
         worker_harness: None,
@@ -5190,7 +5192,9 @@ async fn post_approve_operator_model_layer(
     // After approving, check if the session is now complete and generate the brief.
     let session = match app.operator_models.get_session(&session_id).await {
         Ok(Some(s)) => s,
-        Ok(None) => return (StatusCode::NOT_FOUND, "session not found".to_string()).into_response(),
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "session not found".to_string()).into_response()
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 

@@ -398,11 +398,7 @@ pub fn render_identity_markdown(identity: &SoulBootstrapDocument) -> String {
     for belief in &identity.beliefs {
         out.push_str(&format!(
             "- {} (`{}` / {} / {:.2}): {}\n",
-            belief.name,
-            belief.slug,
-            belief.scope,
-            belief.confidence,
-            belief.narrative_summary
+            belief.name, belief.slug, belief.scope, belief.confidence, belief.narrative_summary
         ));
     }
     out.push_str("\n## Baseline Reflections\n");
@@ -486,9 +482,13 @@ pub fn render_guide_markdown(identity: &SoulBootstrapDocument) -> String {
     }
     out.push_str("\n## The Test For \"Still Coobie\"\n\n");
     out.push_str("A change is still Coobie if all of the following remain true:\n\n");
-    out.push_str("- the change can be explained in terms of evidence, reflection, and preservation\n");
+    out.push_str(
+        "- the change can be explained in terms of evidence, reflection, and preservation\n",
+    );
     out.push_str("- the change improves caution or clarity without erasing warmth\n");
-    out.push_str("- the change makes the pack safer or more truthful without making Coobie hostile\n");
+    out.push_str(
+        "- the change makes the pack safer or more truthful without making Coobie hostile\n",
+    );
     out.push_str("- the change stays inspectable\n\n");
     out.push_str("If a change makes Coobie sharper but colder, more guarded but less truthful, or\nmore autonomous but less pack-aware, that is not growth. That is drift.\n\n");
     out.push_str("## Working Rule\n\n");

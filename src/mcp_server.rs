@@ -108,17 +108,15 @@ async fn get_health(State(state): State<Arc<McpState>>) -> impl IntoResponse {
 
 async fn get_sse(State(state): State<Arc<McpState>>) -> impl IntoResponse {
     let rx = state.app.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|item| {
-        match item {
-            Ok(event) => {
-                let event = Event::default()
-                    .event("live-event")
-                    .json_data(&event)
-                    .unwrap_or_else(|_| Event::default().event("live-event").data("{}"));
-                Some(Ok::<Event, Infallible>(event))
-            }
-            Err(_) => None,
+    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(event) => {
+            let event = Event::default()
+                .event("live-event")
+                .json_data(&event)
+                .unwrap_or_else(|_| Event::default().event("live-event").data("{}"));
+            Some(Ok::<Event, Infallible>(event))
         }
+        Err(_) => None,
     });
 
     Sse::new(stream).keep_alive(
@@ -128,10 +126,7 @@ async fn get_sse(State(state): State<Arc<McpState>>) -> impl IntoResponse {
     )
 }
 
-async fn post_rpc(
-    State(state): State<Arc<McpState>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn post_rpc(State(state): State<Arc<McpState>>, Json(body): Json<Value>) -> Response {
     if body.is_array() {
         return rpc_error(None, -32600, "batch requests are not supported").into_response();
     }
@@ -150,7 +145,10 @@ async fn post_rpc(
     }
 }
 
-async fn handle_rpc(state: &McpState, envelope: &RpcEnvelope) -> std::result::Result<Option<Value>, (i64, String)> {
+async fn handle_rpc(
+    state: &McpState,
+    envelope: &RpcEnvelope,
+) -> std::result::Result<Option<Value>, (i64, String)> {
     let id = envelope.id.clone();
     let method = envelope.method.trim();
     if method.is_empty() {
@@ -194,7 +192,10 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| (-32602, "tools/call requires params.name".to_string()))?;
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let result = match name {
         "list_runs" => {
@@ -203,11 +204,7 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
                 .and_then(Value::as_i64)
                 .unwrap_or(20)
                 .clamp(1, 100);
-            let runs = state
-                .app
-                .list_runs(limit)
-                .await
-                .map_err(internal_error)?;
+            let runs = state.app.list_runs(limit).await.map_err(internal_error)?;
             json!(runs)
         }
         "get_run" => {
@@ -275,11 +272,17 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
     Ok(text_tool_result_pretty(&result))
 }
 
-async fn read_resource(state: &McpState, params: &Value) -> std::result::Result<Value, (i64, String)> {
+async fn read_resource(
+    state: &McpState,
+    params: &Value,
+) -> std::result::Result<Value, (i64, String)> {
     let uri = required_string(params, "uri")?;
     let (mime_type, payload) = if uri == "harkonnen://runs" {
         let runs = state.app.list_runs(20).await.map_err(internal_error)?;
-        ("application/json", serde_json::to_string_pretty(&runs).map_err(internal_error)?)
+        (
+            "application/json",
+            serde_json::to_string_pretty(&runs).map_err(internal_error)?,
+        )
     } else if let Some(run_id) = uri.strip_prefix("harkonnen://runs/") {
         let run = state
             .app
@@ -313,7 +316,10 @@ async fn read_resource(state: &McpState, params: &Value) -> std::result::Result<
 
 fn get_prompt(params: &Value) -> std::result::Result<Value, (i64, String)> {
     let name = required_string(params, "name")?;
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let text = match name.as_str() {
         "briefing_for_spec" => {
             let spec_id = required_string(&arguments, "spec_id")?;
@@ -389,8 +395,7 @@ fn text_tool_result(text: &str) -> Value {
 }
 
 fn text_tool_result_pretty(value: &Value) -> Value {
-    let rendered = serde_json::to_string_pretty(value)
-        .unwrap_or_else(|_| value.to_string());
+    let rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     text_tool_result(&rendered)
 }
 
