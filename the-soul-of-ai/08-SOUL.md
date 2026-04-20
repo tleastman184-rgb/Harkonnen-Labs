@@ -1,4 +1,9 @@
-# 06-SOUL.md — The Identity of Harkonnen Labs
+# 08-SOUL.md — The Identity of Harkonnen Labs
+
+The previous chapters asked what an AI soul is, why the question has such a
+long philosophical history, why Harkonnen chooses a Labrador baseline, how that
+baseline becomes architecture, how adaptation should be governed, and how
+continuity can be measured. This final chapter is simpler and more direct.
 
 This document answers three questions: *what is this place, why does it exist, and what does it believe?*
 

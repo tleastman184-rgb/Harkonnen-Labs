@@ -2,6 +2,10 @@
 
 ## Introduction
 
+With the basic concept of an AI soul defined, its historical background laid
+out, and the Labrador baseline defended, the question stops being
+anthropological and becomes architectural.
+
 This chapter is the bridge between two claims:
 
 - an AI soul is the mechanism of continuity under change
@@ -22,9 +26,13 @@ stack backed by Soul Store.
 This chapter sits between three others:
 
 - [02-What-Is-An-AI-Soul.md](02-What-Is-An-AI-Soul.md), which defines the problem
-- [04-Governed-Integration.md](04-Governed-Integration.md), which explains how change
+- [03-Ontology-Of-The-Synthetic-Soul.md](03-Ontology-Of-The-Synthetic-Soul.md),
+  which gives the historical and philosophical background
+- [04-Why-Labradors.md](04-Why-Labradors.md), which explains why Harkonnen's
+  identity kernel is species-shaped rather than human-mimetic
+- [06-Governed-Integration.md](06-Governed-Integration.md), which explains how change
   must be adjudicated
-- [05-Identity-Continuity.md](05-Identity-Continuity.md), which formalizes the
+- [07-Identity-Continuity.md](07-Identity-Continuity.md), which formalizes the
   metrics and data architecture
 
 ---
@@ -289,8 +297,8 @@ The combined lesson is:
 > different depths
 
 The detailed mathematics belong in
-[05-Identity-Continuity.md](05-Identity-Continuity.md). The operational decision
-process belongs in [04-Governed-Integration.md](04-Governed-Integration.md).
+[07-Identity-Continuity.md](07-Identity-Continuity.md). The operational decision
+process belongs in [06-Governed-Integration.md](06-Governed-Integration.md).
 
 ---
 
@@ -358,3 +366,6 @@ It is a layered identity architecture in which:
 
 That is how an autonomous software factory becomes capable of long-horizon
 adaptation without becoming someone else by accident.
+
+The next chapter makes that last clause operational. If identity is to survive
+adaptation, then change cannot simply be stored. It has to be judged.

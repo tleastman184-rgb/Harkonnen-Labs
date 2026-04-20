@@ -6,6 +6,11 @@ The decisive step in building a genuine self is not memory.
 
 It is **governed integration**.
 
+The previous chapter argued that persistent agents need identity architecture
+rather than bigger prompts. This chapter adds the missing law of motion for that
+architecture: experience does not automatically become selfhood. It has to be
+adjudicated.
+
 A system becomes a self when it no longer treats experience as something merely
 stored and later retrieved, but as something that must be **adjudicated before
 it becomes part of the system's continuity**.
@@ -307,3 +312,7 @@ The slow loop is the anchor.
 Without it, the system does not have self-governed becoming.
 
 It only has drift with better documentation.
+
+The next chapter takes that claim out of philosophy and into instrumentation. If
+governed integration is real, then continuity must be measurable through
+metrics, storage layers, and explicit enforcement surfaces.

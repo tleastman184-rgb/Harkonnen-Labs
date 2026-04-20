@@ -5,9 +5,14 @@
 This chapter bridges theory and implementation. It takes the questions raised in *What Is an AI Soul?* — what is identity, what is continuity, what does it mean for an agent to remain *itself* while learning — and translates them into computable metrics and a concrete data architecture.
 
 It also follows the architectural transition laid out in
-[03-Artificial-Identity-Architecture.md](03-Artificial-Identity-Architecture.md):
+[05-Artificial-Identity-Architecture.md](05-Artificial-Identity-Architecture.md):
 once the soul is treated as a governed multi-anchor stack, its continuity can
 no longer be evaluated by vibes alone.
+
+This is the point in the book where philosophical claims are forced to become
+engineering claims. If the earlier chapters are right, then continuity must be
+something the system can instrument, bound, detect, and recover — not just
+something the reader finds rhetorically convincing.
 
 The argument is that identity is not a philosophical abstraction in an engineering system. It is a **measurable property** of agent behavior over time, and it can be bounded, monitored, and recovered from. The six metrics below define that measurement. The three-tier data stack below defines the infrastructure that makes it possible at production scale.
 
@@ -419,3 +424,7 @@ No single database is the source of truth for identity continuity. The three tog
 | Materialize | Real-time drift detection and Meta-Governor alerting | Streaming SQL, SUBSCRIBE |
 
 The mathematics described here are not aspirational. They are the design contract for Phase 8. When the Soul Store is built, these metrics are how it will be tested.
+
+The final chapter returns from metrics to credo. After the system has been
+defined, historicized, species-shaped, architected, governed, and measured, the
+book ends by stating what Harkonnen itself believes those commitments add up to.

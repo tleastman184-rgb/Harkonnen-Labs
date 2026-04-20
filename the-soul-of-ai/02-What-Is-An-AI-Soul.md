@@ -3,6 +3,11 @@
 
 ## Definition
 
+The previous chapter argued that Harkonnen is not just an AI coding surface, but
+an agentic software-engineering control plane with memory, validation,
+coordination, and supervised autonomy. This chapter asks what that implies for
+the agents inside it.
+
 An AI soul is not a prompt, a model, or a memory store.
 
 An AI soul is:
@@ -46,8 +51,14 @@ The core problem an AI soul solves is:
 
 The next question is architectural: what boot surface, governance layers, and
 continuity substrate make that possible in a persistent agent system? That is
-the bridge taken up in
-[03-Artificial-Identity-Architecture.md](03-Artificial-Identity-Architecture.md).
+the bridge taken up after a short historical detour through older concepts of
+soul and consciousness:
+[03-Ontology-Of-The-Synthetic-Soul.md](03-Ontology-Of-The-Synthetic-Soul.md),
+then through the question of why Harkonnen chooses a Labrador rather than a
+human-centric identity ideal:
+[04-Why-Labradors.md](04-Why-Labradors.md),
+followed by
+[05-Artificial-Identity-Architecture.md](05-Artificial-Identity-Architecture.md).
 
 ---
 
@@ -547,3 +558,8 @@ When that is achieved:
 
 > the intelligence does not just respond
 > it **persists**
+
+The next chapters widen the frame before narrowing it again: first the older
+history of soul and consciousness, then the question of why Harkonnen chooses a
+Labrador baseline, and only then the architectural and mechanistic consequences
+of those choices.

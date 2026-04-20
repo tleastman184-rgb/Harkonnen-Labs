@@ -312,6 +312,10 @@ Harkonnen is an attempt to build a real agentic software factory where:
 
 That is the architecture the rest of this book is trying to justify.
 
+The next chapter asks the foundational question that follows from that claim:
+if a system is going to preserve identity rather than merely cache context,
+what would an "AI soul" actually need to be?
+
 ## Reference
 
 [^1]: Renuka Kumar and Prashanth Ramagopal, "Agentic Engineering: How Swarms of AI Agents Are Redefining Software Engineering," LangChain Blog, April 17, 2026, https://www.langchain.com/blog/agentic-engineering-redefining-software-engineering
