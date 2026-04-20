@@ -450,11 +450,18 @@ impl ChatStore {
 
 /// Extract the target agent from message content.
 ///
-/// Looks for a leading `@name` mention.  Known agents: scout, mason, piper,
-/// bramble, sable, ash, flint, coobie, keeper.
+/// Looks for a leading `@name` mention. Known agents: scout, mason, piper,
+/// bramble, sable, ash, flint, coobie, keeper, plus user-facing aliases such
+/// as `@storm` for Piper and `@bear` for Keeper.
 /// Defaults to `"coobie"` when no mention is found.
 pub fn route_message(content: &str) -> &'static str {
     let lower = content.to_lowercase();
+    if lower.contains("@storm") {
+        return "piper";
+    }
+    if lower.contains("@bear") {
+        return "keeper";
+    }
     for agent in &[
         "scout", "mason", "piper", "bramble", "sable", "ash", "flint", "keeper", "coobie",
     ] {
@@ -555,12 +562,12 @@ fn agent_display(agent: &str) -> &'static str {
     match agent {
         "scout" => "Scout",
         "mason" => "Mason",
-        "piper" => "Piper",
+        "piper" => "Storm",
         "bramble" => "Bramble",
         "sable" => "Sable",
         "ash" => "Ash",
         "flint" => "Flint",
-        "keeper" => "Keeper",
+        "keeper" => "Bear",
         _ => "Coobie",
     }
 }

@@ -81,6 +81,7 @@ pub struct SpecAdherenceRunConfig {
     pub limit: Option<usize>,
     pub min_completeness: Option<f64>,
     pub mode: SpecAdherenceMode,
+    pub judge_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +136,8 @@ struct EntryResult {
     spec_path: String,
     output_path: String,
     output_origin: String,
+    #[serde(default)]
+    judge_provider: Option<String>,
     criteria_count: usize,
     completeness: f64,
     precision: f64,
@@ -214,15 +217,21 @@ struct WorkspaceStateSnapshot {
     files: Vec<WorkspaceFileEntry>,
 }
 
+struct JudgeProviderCandidate {
+    label: String,
+    provider: Box<dyn llm::LlmProvider>,
+}
+
 pub async fn run_with_overrides(
     paths: &Paths,
     overrides: &BTreeMap<String, String>,
 ) -> Result<SpecAdherenceSuiteOutcome> {
-    let dataset_path = read_env("SPEC_ADHERENCE_DATASET", overrides).map(PathBuf::from);
+    let dataset_path = resolve_explicit_dataset_path(overrides);
     let limit = parse_env_usize_with_overrides("SPEC_ADHERENCE_LIMIT", overrides)?;
     let min_completeness =
         parse_env_f64_with_overrides("SPEC_ADHERENCE_MIN_COMPLETENESS", overrides)?;
     let mode = SpecAdherenceMode::parse(overrides)?;
+    let judge_provider = read_env("SPEC_ADHERENCE_PROVIDER", overrides);
     let output_dir = read_env("SPEC_ADHERENCE_OUTPUT", overrides)
         .map(PathBuf::from)
         .unwrap_or_else(|| paths.artifacts.join("benchmarks").join("spec_adherence"));
@@ -233,6 +242,7 @@ pub async fn run_with_overrides(
         limit,
         min_completeness,
         mode,
+        judge_provider,
     };
 
     match run(paths, &config).await {
@@ -251,8 +261,8 @@ pub async fn run_with_overrides(
 }
 
 pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecAdherenceRunOutput> {
-    let provider_label = paths.setup.resolve_agent_provider_name("scout", "claude");
-    let Some(provider) = llm::build_provider("scout", "claude", &paths.setup) else {
+    let (provider_label, mut judge_candidates) = build_judge_provider_candidates(paths, config);
+    if judge_candidates.is_empty() {
         return Ok(SpecAdherenceRunOutput {
             output_dir: config.output_dir.clone(),
             summary_path: config.output_dir.join("spec_adherence_summary.json"),
@@ -265,18 +275,34 @@ pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecA
                     .to_string(),
             ),
         });
-    };
+    }
 
     tokio::fs::create_dir_all(&config.output_dir)
         .await
         .with_context(|| format!("creating {}", config.output_dir.display()))?;
 
-    let entries = if let Some(dataset_path) = &config.dataset_path {
+    let mut entries = if let Some(dataset_path) = &config.dataset_path {
         load_dataset_entries(paths, dataset_path, config.limit)?
     } else {
         let db_limit = config.limit.or(Some(DEFAULT_DB_LIMIT));
         let pool = open_pool(paths).await?;
         load_recent_run_entries(paths, &pool, db_limit).await?
+    };
+
+    let effective_dataset_path = if entries.is_empty() && config.dataset_path.is_none() {
+        if let Some(fixture_path) = resolve_fixture_dataset_path(paths) {
+            let loaded = load_dataset_entries(paths, &fixture_path, config.limit)?;
+            if loaded.is_empty() {
+                None
+            } else {
+                entries = loaded;
+                Some(fixture_path)
+            }
+        } else {
+            None
+        }
+    } else {
+        config.dataset_path.clone()
     };
 
     if entries.is_empty() {
@@ -288,7 +314,7 @@ pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecA
             provider_label,
             metrics: SpecAdherenceMetrics::default(),
             threshold_failure: Some(
-                "No benchmark entries available. Provide SPEC_ADHERENCE_DATASET or complete more runs."
+                "No benchmark entries available. Provide SPEC_ADHERENCE_DATASET, rely on the bundled smoke fixture, or complete more runs."
                     .to_string(),
             ),
         });
@@ -303,7 +329,7 @@ pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecA
 
     for entry in entries {
         let outcome = evaluate_entry(
-            &*provider,
+            &mut judge_candidates,
             &docs_root,
             config.mode,
             &entry,
@@ -334,6 +360,7 @@ pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecA
                     spec_path: entry.spec_path.display().to_string(),
                     output_path: entry.output_path.display().to_string(),
                     output_origin: entry.output_origin.clone(),
+                    judge_provider: None,
                     criteria_count: 0,
                     completeness: 0.0,
                     precision: 0.0,
@@ -365,8 +392,7 @@ pub async fn run(paths: &Paths, config: &SpecAdherenceRunConfig) -> Result<SpecA
     });
 
     let summary = SummaryArtifact {
-        dataset_path: config
-            .dataset_path
+        dataset_path: effective_dataset_path
             .as_ref()
             .map(|path| path.display().to_string()),
         mode: config.mode.as_str().to_string(),
@@ -430,7 +456,7 @@ pub fn render_step_stdout(output: &SpecAdherenceRunOutput) -> String {
 }
 
 async fn evaluate_entry(
-    provider: &dyn llm::LlmProvider,
+    judge_candidates: &mut [JudgeProviderCandidate],
     docs_root: &Path,
     mode: SpecAdherenceMode,
     entry: &EvaluationEntry,
@@ -465,8 +491,28 @@ async fn evaluate_entry(
         "You are an exacting software-delivery benchmark judge. Score whether a run artifact satisfies each requested criterion using only the supplied spec excerpt and artifact text. Return valid JSON only. Do not use markdown fences.",
         build_judge_prompt(&spec_obj, mode, entry, &criteria, &artifact_text, &supporting_doc),
     );
-    let raw = provider.complete(request).await?.content;
-    let envelope = parse_judge_response(&raw)?;
+    let mut envelope = None;
+    let mut used_provider = None;
+    let mut failures = Vec::new();
+    for candidate in judge_candidates.iter_mut() {
+        match candidate.provider.complete(request.clone()).await {
+            Ok(response) => match parse_judge_response(&response.content) {
+                Ok(parsed) => {
+                    used_provider = Some(candidate.label.clone());
+                    envelope = Some(parsed);
+                    break;
+                }
+                Err(error) => failures.push(format!(
+                    "{} parse failure: {}",
+                    candidate.label, error
+                )),
+            },
+            Err(error) => failures.push(format!("{} request failure: {}", candidate.label, error)),
+        }
+    }
+    let Some(envelope) = envelope else {
+        bail!("all judge providers failed: {}", failures.join(" | "));
+    };
 
     let mut criterion_results = Vec::with_capacity(criteria.len());
     let mut met = 0usize;
@@ -512,6 +558,7 @@ async fn evaluate_entry(
         spec_path: entry.spec_path.display().to_string(),
         output_path: entry.output_path.display().to_string(),
         output_origin: entry.output_origin.clone(),
+        judge_provider: used_provider,
         criteria_count,
         completeness,
         precision,
@@ -978,6 +1025,9 @@ fn render_markdown_summary(summary: &SummaryArtifact) -> String {
         lines.push(format!("- Spec: {}", entry.spec_path));
         lines.push(format!("- Output: {}", entry.output_path));
         lines.push(format!("- Origin: {}", entry.output_origin));
+        if let Some(provider) = &entry.judge_provider {
+            lines.push(format!("- Judge provider: {}", provider));
+        }
         if let Some(reason) = &entry.skipped_reason {
             lines.push(format!("- Skipped: {}", reason));
             continue;
@@ -1052,6 +1102,73 @@ fn read_env(name: &str, overrides: &BTreeMap<String, String>) -> Option<String> 
         .or_else(|| env::var(name).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn resolve_explicit_dataset_path(overrides: &BTreeMap<String, String>) -> Option<PathBuf> {
+    read_env("SPEC_ADHERENCE_DATASET", overrides).map(PathBuf::from)
+}
+
+fn resolve_fixture_dataset_path(paths: &Paths) -> Option<PathBuf> {
+    let candidates = [
+        paths
+            .root
+            .join("factory")
+            .join("benchmarks")
+            .join("fixtures")
+            .join("spec_adherence-smoke.jsonl"),
+        paths
+            .root
+            .join("factory")
+            .join("benchmarks")
+            .join("fixtures")
+            .join("spec_adherence.jsonl"),
+        paths
+            .artifacts
+            .join("benchmarks")
+            .join("fixtures")
+            .join("spec_adherence-smoke.jsonl"),
+    ];
+    candidates.iter().find(|path| path.exists()).cloned()
+}
+
+fn build_judge_provider_candidates(
+    paths: &Paths,
+    config: &SpecAdherenceRunConfig,
+) -> (String, Vec<JudgeProviderCandidate>) {
+    let mut requested = Vec::new();
+    if let Some(provider) = &config.judge_provider {
+        requested.push(provider.clone());
+    }
+    requested.push(paths.setup.resolve_agent_provider_name("scout", "claude"));
+    requested.push(paths.setup.providers.default.clone());
+    requested.push("gemini".to_string());
+    requested.push("codex".to_string());
+    requested.push("claude-sonnet".to_string());
+    requested.push("claude-haiku".to_string());
+
+    let mut labels = Vec::new();
+    let mut candidates = Vec::new();
+    for provider_name in requested {
+        if labels.contains(&provider_name) {
+            continue;
+        }
+        if let Some(provider) =
+            llm::build_provider("spec_adherence_judge", &provider_name, &paths.setup)
+        {
+            labels.push(provider_name.clone());
+            candidates.push(JudgeProviderCandidate {
+                label: provider_name,
+                provider,
+            });
+        }
+    }
+
+    let label = if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.join(" -> ")
+    };
+    (label, candidates)
 }
 
 #[cfg(test)]

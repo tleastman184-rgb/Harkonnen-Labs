@@ -1255,12 +1255,12 @@ impl SqliteCoobie {
                             .unwrap_or(false),
                     };
                 }
-                let ready = twin
+                let running = twin
                     .services
                     .iter()
-                    .filter(|s| s.status == "ready" || s.status == "running")
+                    .filter(|s| s.status == "running")
                     .count() as f32;
-                (ready / total).min(1.0)
+                (running / total).min(1.0)
             }
         };
 

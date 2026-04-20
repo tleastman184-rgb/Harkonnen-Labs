@@ -75,7 +75,7 @@ suites:
       Internal baseline: compare completeness and precision across recent runs,
       and use without-scout mode to estimate what Scout's formalization adds.
     setup_notes:
-      - "If SPEC_ADHERENCE_DATASET is unset, the adapter judges the most recent completed runs from the local SQLite DB."
+      - "If SPEC_ADHERENCE_DATASET is unset, the adapter first judges recent completed runs from the local SQLite DB and then falls back to the bundled smoke fixture if no usable run corpus exists."
       - "Optionally set SPEC_ADHERENCE_LIMIT for smoke runs and SPEC_ADHERENCE_OUTPUT for a custom artifact directory."
       - "Set SPEC_ADHERENCE_MIN_COMPLETENESS to fail the suite below a required aggregate completeness threshold."
       - "Set SPEC_ADHERENCE_MODE=without_scout or SPEC_ADHERENCE_WITHOUT_SCOUT=true to judge against derived intent criteria instead of Scout acceptance criteria."
@@ -89,6 +89,60 @@ suites:
       - id: "spec_adherence_adapter"
         label: "Spec adherence adapter"
         builtin: "spec_adherence"
+
+  - id: "harkonnen_scenario_delta"
+    title: "Hidden Scenario Delta"
+    subsystem: "factory"
+    category: "hidden_scenario_gap"
+    tier: "target"
+    description: >-
+      Harkonnen-native benchmark that compares visible validation pass rate with
+      hidden scenario pass rate across recent runs to quantify how much value
+      Sable is adding beyond Bramble's visible checks.
+    baseline_reference: >-
+      Internal baseline: a positive delta means visible validation is letting
+      issues through that hidden scenarios still catch.
+    setup_notes:
+      - "The adapter reads recent rows from coobie_episode_scores in the local SQLite DB."
+      - "Optionally set SCENARIO_DELTA_LIMIT for smoke runs and SCENARIO_DELTA_OUTPUT for a custom artifact directory."
+    tags:
+      - "internal"
+      - "phase3"
+      - "factory"
+      - "sable"
+      - "coobie"
+    steps:
+      - id: "scenario_delta_adapter"
+        label: "Scenario delta adapter"
+        builtin: "scenario_delta"
+
+  - id: "harkonnen_twin_fidelity"
+    title: "Twin Fidelity"
+    subsystem: "factory"
+    category: "twin_fidelity"
+    tier: "target"
+    description: >-
+      Harkonnen-native benchmark that summarizes the recent distribution of
+      Coobie's twin_fidelity_score so we can see how often Ash is provisioning
+      enough running services to resemble real conditions.
+    baseline_reference: >-
+      Internal baseline: track the share of recent runs above the "good"
+      fidelity threshold and watch the distribution shift upward as live twin
+      provisioning matures.
+    setup_notes:
+      - "The adapter reads recent rows from coobie_episode_scores in the local SQLite DB."
+      - "Optionally set TWIN_FIDELITY_LIMIT for smoke runs, TWIN_FIDELITY_OUTPUT for a custom artifact directory, and TWIN_FIDELITY_GOOD_MIN to change the threshold used for 'good' fidelity."
+    tags:
+      - "internal"
+      - "phase3"
+      - "factory"
+      - "ash"
+      - "coobie"
+      - "twin"
+    steps:
+      - id: "twin_fidelity_adapter"
+        label: "Twin fidelity adapter"
+        builtin: "twin_fidelity"
 
   - id: "longmemeval_raw_llm"
     title: "Raw LLM Baseline on LongMemEval"

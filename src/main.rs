@@ -27,12 +27,14 @@ mod orchestrator;
 mod pidgin;
 mod policy;
 mod reporting;
+mod scenario_delta;
 mod scenarios;
 mod setup;
 mod spec;
 mod spec_adherence;
 mod streamingqa;
 mod tesseract;
+mod twin_fidelity;
 mod workspace;
 
 use anyhow::Result;

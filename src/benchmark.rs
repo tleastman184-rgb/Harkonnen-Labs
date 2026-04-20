@@ -9,7 +9,7 @@ use tokio::process::Command;
 
 use crate::{
     aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval,
-    spec_adherence, streamingqa,
+    scenario_delta, spec_adherence, streamingqa, twin_fidelity,
 };
 
 const SKIP_EXIT_CODE: i32 = 10;
@@ -853,6 +853,42 @@ async fn run_builtin_step(
                 )
             }
             spec_adherence::SpecAdherenceSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "scenario_delta" => match scenario_delta::run_with_overrides(paths, &step.env).await? {
+            scenario_delta::ScenarioDeltaSuiteOutcome::Completed(output) => {
+                let status = scenario_delta::status_for_output(&output);
+                let reason = scenario_delta::reason_for_output(&output);
+                (
+                    status,
+                    scenario_delta::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            scenario_delta::ScenarioDeltaSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "twin_fidelity" => match twin_fidelity::run_with_overrides(paths, &step.env).await? {
+            twin_fidelity::TwinFidelitySuiteOutcome::Completed(output) => {
+                let status = twin_fidelity::status_for_output(&output);
+                let reason = twin_fidelity::reason_for_output(&output);
+                (
+                    status,
+                    twin_fidelity::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            twin_fidelity::TwinFidelitySuiteOutcome::Skipped(reason) => (
                 BenchmarkStatus::Skipped,
                 String::new(),
                 String::new(),

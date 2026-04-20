@@ -386,6 +386,34 @@ and the integration-governance design in [the-soul-of-ai/07-Governed-Integration
 
 ---
 
+## Parallel Product Track — Calvin Archive Visualizer
+
+**Why this is a prerequisite for Phase 8 debuggability:** The Calvin Archive is a six-chamber typed graph with revision history, quarantine ledger, causal links, and continuous D*/SSA signals. Without a visual surface, failures in integration governance are invisible — you cannot tell whether a quarantine is growing pathologically, whether a chamber is fragmenting, or whether D* drift is localised to one persona axis. The Pack Board's current flat list views cannot represent this structure. If you cannot see the archive, you cannot debug it.
+
+**Reference approach:** [pascalorg/editor](https://github.com/pascalorg/editor) demonstrates the right architectural pattern: a React Three Fiber + Three.js + WebGPU stack rendering a navigable spatial graph where structural regions (levels, in their case) map to distinct visual zones. The six Calvin Archive chambers map directly to that model — each chamber is a navigable region, memory entries are nodes, causal links are edges, quarantine items are visually flagged, and the revision graph is a traversable history layer.
+
+**What to build:**
+
+- **Chamber map view** — six spatial zones (Mythos, Episteme, Ethos, Pathos, Logos, Praxis) rendered as distinct regions in a 3D canvas using React Three Fiber. Nodes within each chamber represent memory entries; edge thickness encodes confidence; quarantine items rendered with a distinct glyph and salience-decay color fade.
+- **Causal link traversal** — click a node to expand its inbound/outbound causal links. Link labels show `PearlHierarchyLevel` (Associational / Interventional / Counterfactual). Paths that contributed to a quarantine are highlighted.
+- **Revision history rail** — a time-axis rail alongside the chamber map showing integration events (accept / modify / reject / quarantine) as stamped markers. Scrubbing the rail replays chamber state at that point in time using snapshots from TypeDB.
+- **Live D\* and SSA overlay** — Materialize SUBSCRIBE feed drives a real-time drift indicator per chamber. Chambers approaching the D\* bound shift color; an alert badge appears when the Meta-Governor fires.
+- **Quarantine ledger panel** — side panel listing open quarantine items with pending evidence conditions, salience decay progress, and a one-click "resolve / promote / dismiss" action that calls the Meta-Governor API.
+- **PackChat integration** — `@coobie what is in Ethos right now?` routes to a chamber query that highlights matching nodes in the visualizer. The visualizer and PackChat share a run context so Coobie's answers can be spatially anchored.
+
+**Technology notes:**
+
+- React Three Fiber + Three.js is the right rendering layer — WebGPU acceleration optional but worth targeting for large archives.
+- Zustand for local visualizer state (selected node, active chamber, time cursor). The archive data itself comes from `GET /api/coobie/query` and the TypeDB query surface from Phase 6.
+- The visualizer can be developed independently of the full Calvin Archive backend: stub the data layer with the existing SQLite memory entries and causal links (Phase 4) so the UI can be built and tested before Phase 8 ships.
+- Ship as a new Pack Board tab ("Archive") rather than a standalone app — it shares the same auth surface and avoids a separate deployment.
+
+**Dependency:** TypeDB query surface (Phase 6) required for chamber queries and revision history. D*/SSA live overlay requires Materialize (Phase 8). The stub-data path (SQLite causal links) can be used to develop the chamber map and traversal views before those phases land.
+
+**Done when:** An operator can open the Archive tab, navigate the six chambers, click through causal links, scrub the revision history rail, see live D* drift per chamber, and resolve a quarantine item without opening a database client.
+
+---
+
 ## Parallel Product Track — Operator Model Activation
 
 **Unlocks:** Better commissioning, fewer mid-run clarification failures, and a reusable operator context layer that Scout, Coobie, and Keeper can all consume.
@@ -519,10 +547,16 @@ This is a usability prerequisite for any team or multi-machine deployment. Most 
 
 **Why:** Basic operational hygiene for any hosted or multi-machine deployment.
 
-- `GET /health` — returns `{ status: "ok", version, uptime_secs, db_ok, memory_index_ok }`. Already exists as a concept; needs a real implementation that actually probes the DB and memory index.
-- `GET /api/status` — authenticated endpoint returning active runs, agent claim count, memory entry count, last benchmark run
+**Shipped (2026-04-20):**
+
+- `GET /health` — probes DB (`SELECT 1`) and `memory/index.json`; returns `{ status, version, uptime_secs, db_ok, memory_index_ok }`. Responds `503` if DB probe fails. `AppContext.started_at` tracks server boot time.
+- `GET /api/status` — returns `{ active_runs, agent_claim_count, memory_entry_count, last_benchmark_run }`. All queries fail-soft. `last_benchmark_run` returns `null` until the `benchmark_runs` table exists (wired for Phase 2+). Authentication deferred to EI-1.
+
+**Remaining:**
+
 - CORS configuration in setup TOML: `[server.cors]` with `allowed_origins` list, defaulting to `localhost` only
 - Structured JSON logging option (for log aggregators): `[server.logging] format = "json"` in setup TOML
+- Wire `GET /api/status` behind EI-1 auth (viewer role and above)
 
 ---
 
