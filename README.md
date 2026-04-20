@@ -467,6 +467,41 @@ See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase build order. See [MASTE
 
 ---
 
+## The AI Soul: Architecture of Continuity
+
+![The Artificial Soul: Architecture of Continuity](docs/assets/soul-architecture.png)
+
+Harkonnen moves beyond disposable chat sessions by building long-lived, agentic systems that require an **AI Soul** — a technical architecture that preserves identity and character as an agent learns. It replaces ephemeral prompts with a governed, file-first identity stack known as the **Calvin Archive**.
+
+### The Identity Kernel (The Posture)
+
+The **Labrador Baseline** is a species-level temperament — cooperative, truthful, and non-cynical — used as a hard constraint on agent evolution. Persistent agents are shaped by **character formation** rather than brittle, external rule-based constraints. Roles like Scout (intent), Mason (build), and Coobie (memory) coordinate as a socially grounded specialist pack.
+
+### The Mechanics of Continuity (The Structure)
+
+**Governed Integration:** The Meta-Governor adjudicates which experiences are admitted into the self to prevent behavioral drift. Raw experience flows through the Meta-Governor before it reaches the self — the archive does not simply accumulate; it decides.
+
+**Logical Memory Framework:** The system distinguishes between mere association and true causality to prevent repeating past failures. Memory is not a flat store — it is a causal graph with Pearl-hierarchy labels on every edge.
+
+### Calvin Archive: Six Chambers (Artificial Autobiography)
+
+The Calvin Archive is organized into six chambers, each holding a distinct category of identity-relevant knowledge:
+
+| Chamber | Position | What it holds |
+| --- | --- | --- |
+| **Mythos** | Left | Autobiographical continuity — how experience becomes narrative selfhood |
+| **Ethos** | Center | Identity kernel — the stable invariants the intelligence stands for |
+| **Episteme** | Right | Truth-formation — tracking evidence, inference, and trust |
+| **Pathos** | — | Affective and motivational patterns across runs |
+| **Logos** | — | Reasoning schemas and inference strategies |
+| **Praxis** | — | Behavioral dispositions and action patterns |
+
+The archive is backed by TypeDB (typed ontological layer), TimescaleDB (behavioral telemetry and stress accumulation), and Materialize (real-time `D*` drift monitoring). Four formal metrics govern identity stability: `D*` (Drift Bound), SSA (Semantic Soul Alignment), F (Variational Free Energy), and Φ (Integrated Information).
+
+Full design: [the-soul-of-ai/06-The-Calvin-Archive.md](the-soul-of-ai/06-The-Calvin-Archive.md) · [the-soul-of-ai/07-Governed-Integration.md](the-soul-of-ai/07-Governed-Integration.md) · [the-soul-of-ai/08-Identity-Continuity.md](the-soul-of-ai/08-Identity-Continuity.md)
+
+---
+
 ## 🚀 Direction
 
 Near-term:
