@@ -425,8 +425,8 @@ printf '
 printf '    1. Restart Claude Code — it will pick up the new MCP servers\n'
 printf '    2. Tell Coobie: "load your memory from factory/memory/index.json"\n'
 printf '    3. harkonnen spec validate factory/specs/examples/sample_feature.yaml\n'
-printf '    4. harkonnen setup claude-pack --target-path <path-to-SPO> --project-name SPO --project-type winccoa --domain "Siemens WinCC OA / industrial automation" --summary "SPO is a WinCC OA based Siemens product operated through a Claude-only Labrador pack." --winccoa\n'
-printf '    5. Open the SPO repo in Claude Code, run /agents, and start with Scout\n'
+printf '    4. harkonnen setup claude-pack --target-path <path-to-project> --project-name PlantOps --project-type winccoa --domain "OT / industrial automation" --summary "PlantOps is an industrial-control project operated through a Claude-only Labrador pack." --winccoa\n'
+printf '    5. Open the target repo in Claude Code, run /agents, and start with Scout\n'
 
 printf '\n  Binary:  %s\n' "$BIN"
 printf '  Setup:   %s\n' "$HARKONNEN_SETUP"

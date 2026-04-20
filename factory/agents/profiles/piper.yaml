@@ -1,5 +1,5 @@
 name: piper
-display_name: Piper
+display_name: Storm
 role: tool_retriever
 # Uses setup default — mostly mechanical tool execution, not judgment-heavy
 provider: claude-haiku

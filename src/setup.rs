@@ -74,6 +74,8 @@ pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
+    pub credential_kind: Option<String>,
+    #[serde(default)]
     pub usage_rights: Option<String>,
     #[serde(default)]
     pub surface: Option<String>,
@@ -93,7 +95,10 @@ pub struct RoutingConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
+    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    #[serde(rename = "self", default)]
+    pub self_server: Option<McpSelfConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,6 +109,19 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub tool_aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpSelfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub transport: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub auth_required: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +394,7 @@ pub fn default_provider_config(name: &str) -> ProviderConfig {
             model: "claude-sonnet-4-6".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             enabled: true,
+            credential_kind: Some("standard-api-key".to_string()),
             usage_rights: Some("standard".to_string()),
             surface: Some("claude-code".to_string()),
             base_url: None,
@@ -385,6 +404,7 @@ pub fn default_provider_config(name: &str) -> ProviderConfig {
             model: "gemini-2.0-flash".to_string(),
             api_key_env: "GEMINI_API_KEY".to_string(),
             enabled: true,
+            credential_kind: Some("standard-api-key".to_string()),
             usage_rights: Some("standard".to_string()),
             surface: Some("antigravity".to_string()),
             base_url: None,
@@ -394,6 +414,7 @@ pub fn default_provider_config(name: &str) -> ProviderConfig {
             model: "gpt-4o".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             enabled: true,
+            credential_kind: Some("standard-api-key".to_string()),
             usage_rights: Some("targeted".to_string()),
             surface: Some("vscode".to_string()),
             base_url: None,
@@ -403,6 +424,7 @@ pub fn default_provider_config(name: &str) -> ProviderConfig {
             model: "unknown".to_string(),
             api_key_env: "UNKNOWN_API_KEY".to_string(),
             enabled: false,
+            credential_kind: None,
             usage_rights: None,
             surface: None,
             base_url: None,

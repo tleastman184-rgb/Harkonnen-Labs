@@ -405,17 +405,35 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS chat_threads (
-            thread_id   TEXT PRIMARY KEY,
-            run_id      TEXT,
-            spec_id     TEXT,
-            title       TEXT NOT NULL DEFAULT '',
-            status      TEXT NOT NULL DEFAULT 'open',
-            created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            thread_id      TEXT PRIMARY KEY,
+            run_id         TEXT,
+            spec_id        TEXT,
+            title          TEXT NOT NULL DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'open',
+            thread_kind    TEXT NOT NULL DEFAULT 'general',
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "chat_threads",
+        "thread_kind",
+        "ALTER TABLE chat_threads ADD COLUMN thread_kind TEXT NOT NULL DEFAULT 'general'",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "chat_threads",
+        "metadata_json",
+        "ALTER TABLE chat_threads ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+    )
     .await?;
 
     sqlx::query(
@@ -447,6 +465,335 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_id
         ON chat_messages (thread_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Operator Model Activation tables ──────────────────────────────────────
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_profiles (
+            profile_id       TEXT PRIMARY KEY,
+            scope            TEXT NOT NULL,
+            project_root     TEXT,
+            display_name     TEXT NOT NULL DEFAULT '',
+            status           TEXT NOT NULL DEFAULT 'active',
+            current_version  INTEGER NOT NULL DEFAULT 0,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_profiles_scope_project
+        ON operator_model_profiles (scope, project_root)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_sessions (
+            session_id      TEXT PRIMARY KEY,
+            profile_id      TEXT NOT NULL REFERENCES operator_model_profiles(profile_id),
+            thread_id       TEXT,
+            status          TEXT NOT NULL,
+            pending_layer   TEXT,
+            started_by      TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            completed_at    TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_sessions_profile_status
+        ON operator_model_sessions (profile_id, status, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_layer_checkpoints (
+            checkpoint_id    TEXT PRIMARY KEY,
+            session_id       TEXT NOT NULL REFERENCES operator_model_sessions(session_id),
+            profile_id       TEXT NOT NULL REFERENCES operator_model_profiles(profile_id),
+            version          INTEGER NOT NULL,
+            layer            TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            summary_md       TEXT NOT NULL,
+            raw_notes_json   TEXT NOT NULL DEFAULT '{}',
+            approved_by      TEXT,
+            created_at       TEXT NOT NULL,
+            approved_at      TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_checkpoints_profile_layer
+        ON operator_model_layer_checkpoints (profile_id, version, layer, status)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_entries (
+            entry_id              TEXT PRIMARY KEY,
+            profile_id            TEXT NOT NULL REFERENCES operator_model_profiles(profile_id),
+            version               INTEGER NOT NULL,
+            layer                 TEXT NOT NULL,
+            entry_type            TEXT NOT NULL,
+            title                 TEXT NOT NULL,
+            content               TEXT NOT NULL,
+            details_json          TEXT NOT NULL DEFAULT '{}',
+            source_checkpoint_id  TEXT NOT NULL REFERENCES operator_model_layer_checkpoints(checkpoint_id),
+            status                TEXT NOT NULL DEFAULT 'current',
+            superseded_by         TEXT,
+            created_at            TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_entries_profile_layer
+        ON operator_model_entries (profile_id, version, layer, status)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_exports (
+            export_id       TEXT PRIMARY KEY,
+            profile_id      TEXT NOT NULL REFERENCES operator_model_profiles(profile_id),
+            version         INTEGER NOT NULL,
+            artifact_name   TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            content_type    TEXT NOT NULL,
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_exports_profile_version
+        ON operator_model_exports (profile_id, version, artifact_name)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operator_model_update_candidates (
+            candidate_id    TEXT PRIMARY KEY,
+            profile_id      TEXT NOT NULL REFERENCES operator_model_profiles(profile_id),
+            run_id          TEXT,
+            entry_id        TEXT,
+            proposal_kind   TEXT NOT NULL,
+            summary         TEXT NOT NULL,
+            proposal_json   TEXT NOT NULL DEFAULT '{}',
+            status          TEXT NOT NULL DEFAULT 'open',
+            confidence      REAL NOT NULL DEFAULT 0.0,
+            created_at      TEXT NOT NULL,
+            reviewed_at     TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_operator_model_update_candidates_profile_status
+        ON operator_model_update_candidates (profile_id, status, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Phase 5 — Consolidation Workbench ─────────────────────────────────────
+    // Candidates are generated by Coobie at the end of a run and surface what
+    // it *proposes* to promote.  The operator reviews and keeps/discards/edits
+    // each one before the final consolidate action writes anything durable.
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS consolidation_candidates (
+            candidate_id    TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            kind            TEXT NOT NULL,   -- 'lesson' | 'causal_link' | 'pattern'
+            status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'kept' | 'discarded'
+            content_json    TEXT NOT NULL DEFAULT '{}',
+            edited_json     TEXT,            -- operator-edited content, NULL = use content_json
+            confidence      REAL NOT NULL DEFAULT 0.5,
+            label           TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL,
+            reviewed_at     TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_consolidation_candidates_run_status
+        ON consolidation_candidates (run_id, status, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── A1: LLM cost events ───────────────────────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS run_cost_events (
+            event_id    TEXT PRIMARY KEY,
+            run_id      TEXT NOT NULL,
+            agent       TEXT NOT NULL DEFAULT '',
+            phase       TEXT NOT NULL DEFAULT '',
+            provider    TEXT NOT NULL DEFAULT '',
+            model       TEXT NOT NULL DEFAULT '',
+            input_tokens  INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms    INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_run_cost_events_run_id
+        ON run_cost_events (run_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── A2: Decision log ──────────────────────────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS decision_log (
+            decision_id     TEXT PRIMARY KEY,
+            run_id          TEXT NOT NULL,
+            agent           TEXT NOT NULL DEFAULT '',
+            phase           TEXT NOT NULL DEFAULT '',
+            decision_kind   TEXT NOT NULL DEFAULT '',
+            chose           TEXT NOT NULL DEFAULT '',
+            alternatives_json TEXT NOT NULL DEFAULT '[]',
+            justification   TEXT NOT NULL DEFAULT '',
+            approved_by     TEXT,
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_decision_log_run_id
+        ON decision_log (run_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── A3: ActionLease columns on assignments ────────────────────────────────
+    // The assignments are stored as JSON in assignments.json (file-based), so
+    // the lease fields live on the Assignment struct. No SQLite table needed.
+
+    // ── v1-B: Memory supersession / invalidation persistence ─────────────────
+    // Tracks when a new memory entry supersedes an older one. The old entry's
+    // provenance.superseded_by field points at new_memory_id via this table.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_updates (
+            update_id       TEXT PRIMARY KEY,
+            old_memory_id   TEXT NOT NULL,
+            new_memory_id   TEXT NOT NULL,
+            reason          TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_updates_old_memory_id
+        ON memory_updates (old_memory_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_updates_created_at
+        ON memory_updates (created_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Phase B: Agent Trace Spine ────────────────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_traces (
+            trace_id          TEXT PRIMARY KEY,
+            run_id            TEXT NOT NULL,
+            agent             TEXT NOT NULL DEFAULT '',
+            phase             TEXT NOT NULL DEFAULT '',
+            input_summary     TEXT NOT NULL DEFAULT '',
+            reasoning_steps   TEXT NOT NULL DEFAULT '[]',
+            actions_taken     TEXT NOT NULL DEFAULT '[]',
+            outcome           TEXT NOT NULL DEFAULT '',
+            input_tokens      INTEGER NOT NULL DEFAULT 0,
+            output_tokens     INTEGER NOT NULL DEFAULT 0,
+            latency_ms        INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_agent_traces_run_agent
+        ON agent_traces (run_id, agent, created_at)
         "#,
     )
     .execute(&pool)

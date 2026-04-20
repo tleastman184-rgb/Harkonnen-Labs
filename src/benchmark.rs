@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::process::Command;
 
-use crate::{config::Paths, frames, locomo, longmemeval, streamingqa};
+use crate::{
+    aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval,
+    scenario_delta, spec_adherence, streamingqa, twin_fidelity,
+};
 
 const SKIP_EXIT_CODE: i32 = 10;
 const OUTPUT_LIMIT: usize = 8_000;
@@ -760,6 +763,132 @@ async fn run_builtin_step(
                 )
             }
             streamingqa::StreamingQaSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "cladder" => match cladder::run_with_overrides(paths, &step.env).await? {
+            cladder::CladderSuiteOutcome::Completed(output) => {
+                let status = cladder::status_for_output(&output);
+                let reason = cladder::reason_for_output(&output);
+                (
+                    status,
+                    cladder::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            cladder::CladderSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "helmet" => match helmet::run_with_overrides(paths, &step.env).await? {
+            helmet::HelmetSuiteOutcome::Completed(output) => {
+                let status = helmet::status_for_output(&output);
+                let reason = helmet::reason_for_output(&output);
+                (
+                    status,
+                    helmet::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            helmet::HelmetSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "aider_polyglot" => match aider_polyglot::run_with_overrides(paths, &step.env).await? {
+            aider_polyglot::PolyglotSuiteOutcome::Completed(output) => {
+                let status = aider_polyglot::status_for_output(&output);
+                let reason = aider_polyglot::reason_for_output(&output);
+                (
+                    status,
+                    aider_polyglot::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            aider_polyglot::PolyglotSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "livecodebench" => match livecodebench::run_with_overrides(paths, &step.env).await? {
+            livecodebench::LcbSuiteOutcome::Completed(output) => {
+                let status = livecodebench::status_for_output(&output);
+                let reason = livecodebench::reason_for_output(&output);
+                (
+                    status,
+                    livecodebench::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            livecodebench::LcbSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "spec_adherence" => match spec_adherence::run_with_overrides(paths, &step.env).await? {
+            spec_adherence::SpecAdherenceSuiteOutcome::Completed(output) => {
+                let status = spec_adherence::status_for_output(&output);
+                let reason = spec_adherence::reason_for_output(&output);
+                (
+                    status,
+                    spec_adherence::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            spec_adherence::SpecAdherenceSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "scenario_delta" => match scenario_delta::run_with_overrides(paths, &step.env).await? {
+            scenario_delta::ScenarioDeltaSuiteOutcome::Completed(output) => {
+                let status = scenario_delta::status_for_output(&output);
+                let reason = scenario_delta::reason_for_output(&output);
+                (
+                    status,
+                    scenario_delta::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            scenario_delta::ScenarioDeltaSuiteOutcome::Skipped(reason) => (
+                BenchmarkStatus::Skipped,
+                String::new(),
+                String::new(),
+                Some(reason),
+            ),
+        },
+        "twin_fidelity" => match twin_fidelity::run_with_overrides(paths, &step.env).await? {
+            twin_fidelity::TwinFidelitySuiteOutcome::Completed(output) => {
+                let status = twin_fidelity::status_for_output(&output);
+                let reason = twin_fidelity::reason_for_output(&output);
+                (
+                    status,
+                    twin_fidelity::render_step_stdout(&output),
+                    String::new(),
+                    reason,
+                )
+            }
+            twin_fidelity::TwinFidelitySuiteOutcome::Skipped(reason) => (
                 BenchmarkStatus::Skipped,
                 String::new(),
                 String::new(),

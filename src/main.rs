@@ -1,8 +1,11 @@
 mod agents;
+mod aider_polyglot;
 mod api;
 mod benchmark;
+mod calvin_archive;
 mod capacity;
 mod chat;
+mod cladder;
 mod claude_pack;
 mod cli;
 mod config;
@@ -11,20 +14,27 @@ mod coobie_palace;
 mod db;
 mod embeddings;
 mod frames;
+mod helmet;
+mod livecodebench;
 mod llm;
 mod locomo;
 mod longmemeval;
+mod mcp_server;
 mod memory;
 mod models;
+mod operator_model;
 mod orchestrator;
 mod pidgin;
 mod policy;
 mod reporting;
+mod scenario_delta;
 mod scenarios;
 mod setup;
 mod spec;
+mod spec_adherence;
 mod streamingqa;
 mod tesseract;
+mod twin_fidelity;
 mod workspace;
 
 use anyhow::Result;
@@ -66,6 +76,14 @@ async fn main() -> Result<()> {
             // setup check doesn't need the DB — just path + config discovery
             let paths = config::Paths::discover()?;
             cli::handle_setup(command, &paths).await?
+        }
+        Commands::Mcp { command } => {
+            let app = AppContext::bootstrap().await?;
+            cli::handle_mcp(command, app).await?
+        }
+        Commands::Soul { command } => {
+            let paths = config::Paths::discover()?;
+            cli::handle_soul(command, &paths).await?
         }
         Commands::Serve(args) => {
             let app = AppContext::bootstrap().await?;

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectComponent {
@@ -313,6 +313,8 @@ pub struct Spec {
     pub performance_expectations: Vec<String>,
     pub security_expectations: Vec<String>,
     #[serde(default)]
+    pub twin_services: Vec<TwinServiceSpec>,
+    #[serde(default)]
     pub project_components: Vec<ProjectComponent>,
     #[serde(default)]
     pub scenario_blueprint: Option<ScenarioBlueprint>,
@@ -320,6 +322,26 @@ pub struct Spec {
     pub worker_harness: Option<WorkerHarnessConfig>,
     #[serde(default)]
     pub test_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwinFailureMode {
+    AuthExpiry,
+    RateLimit,
+    ConnectionRefusal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TwinServiceSpec {
+    pub name: String,
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_mode: Option<TwinFailureMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,11 +566,30 @@ pub struct CoobieBriefing {
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
     pub regulatory_considerations: Vec<String>,
+    #[serde(default)]
+    pub operator_model_context: Option<OperatorModelContext>,
+    #[serde(default)]
+    pub soul_identity_context: Option<SoulIdentityContext>,
     pub recommended_guardrails: Vec<String>,
     pub required_checks: Vec<String>,
     pub open_questions: Vec<String>,
     pub coobie_response: String,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SoulIdentityContext {
+    pub self_name: String,
+    pub identity_thesis: String,
+    #[serde(default)]
+    pub preserved_invariants: Vec<String>,
+    #[serde(default)]
+    pub baseline_beliefs: Vec<String>,
+    #[serde(default)]
+    pub allowed_adaptations: Vec<String>,
+    #[serde(default)]
+    pub forbidden_drift: Vec<String>,
+    pub adaptation_law: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -690,6 +731,16 @@ pub struct ScenarioResult {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    CompileError,
+    TestFailure,
+    WrongAnswer,
+    Timeout,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationSummary {
     pub passed: bool,
@@ -698,6 +749,8 @@ pub struct ValidationSummary {
     #[serde(default)]
     pub passed_scored_checks: usize,
     pub results: Vec<ScenarioResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<FailureKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +765,8 @@ pub struct TwinService {
 pub struct TwinEnvironment {
     pub name: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
     pub services: Vec<TwinService>,
     pub created_at: DateTime<Utc>,
 }
@@ -807,6 +862,29 @@ pub struct CounterfactualOutcome {
     pub confidence_gain: f32,
 }
 
+/// A candidate item surfaced by Coobie at end-of-run for operator review.
+/// Nothing is written to durable memory until the operator approves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationCandidate {
+    pub candidate_id: String,
+    pub run_id: String,
+    /// `"lesson"` | `"causal_link"` | `"pattern"`
+    pub kind: String,
+    /// `"pending"` | `"kept"` | `"discarded"`
+    pub status: String,
+    /// The raw proposed content (lesson record, causal link, etc.)
+    pub content_json: serde_json::Value,
+    /// If the operator edited the content, this holds the edited version.
+    #[serde(default)]
+    pub edited_json: Option<serde_json::Value>,
+    pub confidence: f64,
+    /// Human-readable one-liner shown in the Workbench card.
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub reviewed_at: Option<DateTime<Utc>>,
+}
+
 /// A causal pattern that has fired on consecutive runs of the same spec.
 /// Streak length ≥ 3 triggers escalation — the standard intervention alone
 /// is not breaking the cycle.
@@ -884,4 +962,323 @@ pub struct RunCausalGraph {
     pub links: Vec<CausalEventEdge>,
     #[serde(default)]
     pub hypotheses: Vec<CausalHypothesis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorModelScope {
+    #[default]
+    Project,
+    Global,
+}
+
+impl OperatorModelScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelProfile {
+    pub profile_id: String,
+    pub scope: OperatorModelScope,
+    #[serde(default)]
+    pub project_root: Option<String>,
+    pub display_name: String,
+    pub status: String,
+    pub current_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelSession {
+    pub session_id: String,
+    pub profile_id: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub pending_layer: Option<String>,
+    #[serde(default)]
+    pub started_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelLayerCheckpoint {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub profile_id: String,
+    pub version: i64,
+    pub layer: String,
+    pub status: String,
+    pub summary_md: String,
+    pub raw_notes_json: serde_json::Value,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub approved_at: Option<DateTime<Utc>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelEntry {
+    pub entry_id: String,
+    pub profile_id: String,
+    pub version: i64,
+    pub layer: String,
+    pub entry_type: String,
+    pub title: String,
+    pub content: String,
+    pub details_json: serde_json::Value,
+    pub source_checkpoint_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryUpdateRecord {
+    pub update_id: String,
+    pub old_memory_id: String,
+    pub new_memory_id: String,
+    pub reason: String,
+    pub created_at: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelExport {
+    pub export_id: String,
+    pub profile_id: String,
+    pub version: i64,
+    pub artifact_name: String,
+    pub content: String,
+    pub content_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorModelUpdateCandidate {
+    pub candidate_id: String,
+    pub profile_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    pub proposal_kind: String,
+    pub summary: String,
+    pub proposal_json: serde_json::Value,
+    pub status: String,
+    pub confidence: f64,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub reviewed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperatorModelContext {
+    pub profile_id: String,
+    pub scope: OperatorModelScope,
+    pub display_name: String,
+    #[serde(default)]
+    pub project_root: Option<String>,
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub operating_rhythms: Vec<String>,
+    #[serde(default)]
+    pub guardrails: Vec<String>,
+    #[serde(default)]
+    pub escalation_rules: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub transcript_excerpt: Vec<String>,
+}
+
+/// Artifact generated after both MVP interview layers are approved.
+/// Written to `<export_root>/commissioning-brief.json` and read by Scout/Coobie.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommissioningBrief {
+    pub profile_id: String,
+    pub generated_at: String,
+    /// Operating rhythm facts extracted from layer 1.
+    #[serde(default)]
+    pub operating_rhythms: Vec<String>,
+    /// Recurring decision patterns extracted from layer 2.
+    #[serde(default)]
+    pub recurring_decisions: Vec<String>,
+    /// Top-3 patterns for Scout intent prompt injection.
+    #[serde(default)]
+    pub top_patterns: Vec<String>,
+    #[serde(default)]
+    pub preferred_tools: Vec<String>,
+    #[serde(default)]
+    pub risk_tolerances: Vec<String>,
+}
+
+// ── Cost / usage tracking ─────────────────────────────────────────────────────
+
+/// Per-call LLM usage captured from provider response metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmCostEvent {
+    pub event_id: String,
+    pub run_id: String,
+    pub agent: String,
+    pub phase: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub latency_ms: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Aggregate cost summary for a run, returned by GET /api/runs/:id/cost.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunCostSummary {
+    pub run_id: String,
+    pub total_input_tokens: u32,
+    pub total_output_tokens: u32,
+    pub total_tokens: u32,
+    pub total_latency_ms: u64,
+    pub call_count: u32,
+    pub by_agent: Vec<AgentCostSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentCostSummary {
+    pub agent: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub call_count: u32,
+    pub latency_ms: u64,
+}
+
+// ── Decision log ──────────────────────────────────────────────────────────────
+
+/// A record of a significant agent decision: what was chosen, what was
+/// considered and rejected, and why. Answers governance question "why did
+/// the agent act and what alternatives were rejected?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub decision_id: String,
+    pub run_id: String,
+    pub agent: String,
+    pub phase: String,
+    /// e.g. "plan_critique", "mason_edit", "consolidation_promotion"
+    pub decision_kind: String,
+    pub chose: String,
+    pub alternatives: Vec<String>,
+    pub justification: String,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── Phase B: Agent Trace Spine ────────────────────────────────────────────────
+
+/// A structured trace of one significant agent LLM call — what went in,
+/// the reasoning steps, what actions were taken, and the outcome.
+///
+/// Reasoning steps are extracted from a leading `<reasoning>...</reasoning>` block
+/// when the agent prompt requests it; otherwise the full response is stored as a
+/// single step. This is the foundation for Coobie's self-improvement loop.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentTrace {
+    pub trace_id: String,
+    pub run_id: String,
+    pub agent: String,
+    pub phase: String,
+    /// Short summary of what was passed to the agent (not the full prompt).
+    pub input_summary: String,
+    /// Extracted reasoning steps (from `<reasoning>` block or split by newlines).
+    pub reasoning_steps: Vec<String>,
+    /// Actions the agent decided to take (edit files, run command, emit JSON, etc.)
+    pub actions_taken: Vec<String>,
+    /// One-line outcome: "success", "partial", "failed", or a description.
+    pub outcome: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub latency_ms: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+// ── Phase C: OptimizationProgram ──────────────────────────────────────────────
+
+/// Machine-readable success metric generated by Scout during spec intake.
+///
+/// Gives Coobie, Bramble, and Mason a shared, explicit definition of success
+/// so the plan critique can check "does this plan actually optimise the stated
+/// objective?" rather than only flagging guardrail violations.
+///
+/// Written to `optimization_program.json` in the run workspace and surfaced via
+/// `GET /api/runs/:id/optimization-program`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OptimizationProgram {
+    pub run_id: String,
+    pub spec_id: String,
+    /// Short identifier for the primary success metric ("latency_p95_ms", "test_pass_rate", etc.)
+    pub objective_metric: String,
+    /// Human-readable description of what the metric means and how it will be measured.
+    pub objective_description: String,
+    /// Files / modules / interfaces the implementation is allowed to change.
+    #[serde(default)]
+    pub editable_surface: Vec<String>,
+    /// Hard constraints that must hold regardless of metric value.
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    /// Ordered steps to evaluate whether the objective was met after a run.
+    #[serde(default)]
+    pub evaluation_plan: Vec<String>,
+    /// Optional wall-clock budget in seconds. None = unbounded.
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    pub generated_at: DateTime<Utc>,
+}
+
+// ── Phase D: MetricAttack ──────────────────────────────────────────────────────
+
+/// A red-team attack generated by Sable against the run's stated objective metric.
+///
+/// Each attack describes a concrete way an implementation could game the metric
+/// (shallow tests, output caching, hardcoded returns, etc.) and whether a probe
+/// scenario detected that pattern in this run.
+///
+/// Written to `metric_attacks.json` in the run workspace and surfaced via
+/// `GET /api/runs/:id/metric-attacks`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MetricAttack {
+    pub attack_id: String,
+    pub run_id: String,
+    /// Short description of how an implementation could game the objective metric.
+    pub exploit_description: String,
+    /// Observable signals in run artifacts or behaviour that would reveal this exploit.
+    #[serde(default)]
+    pub detection_signals: Vec<String>,
+    /// Guardrail or evaluation-plan additions that would prevent this exploit.
+    #[serde(default)]
+    pub mitigations: Vec<String>,
+    /// "detected" | "not_detected" | "inconclusive"
+    pub status: String,
+    pub generated_at: DateTime<Utc>,
 }

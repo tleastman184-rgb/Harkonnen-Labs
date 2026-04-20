@@ -1,0 +1,181 @@
+define
+attribute uuid, value string;
+attribute name, value string;
+attribute narrative_summary, value string;
+attribute confidence, value double;
+attribute scope, value string;
+attribute revision_reason, value string;
+attribute preservation_note, value string;
+attribute temperament_score, value double;
+attribute lab_ness_score, value double;
+attribute continuity_index, value double;
+attribute drift_severity, value double;
+attribute posture_label, value string;
+attribute behavior_frequency, value double;
+attribute status, value string;
+
+entity soul,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  plays contains_self:whole;
+
+entity agent_self,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns lab_ness_score,
+  owns continuity_index,
+  owns status,
+  plays contains_self:member,
+  plays anchored_by:anchored,
+  plays stabilizes:target,
+  plays destabilizes:target,
+  plays expressed_as:source;
+
+entity experience,
+  owns uuid @key,
+  owns narrative_summary,
+  owns scope;
+
+entity belief,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns confidence,
+  owns scope,
+  plays revised_into:prior,
+  plays revised_into:next,
+  plays reflected_on:target,
+  plays stabilizes:source;
+
+entity trait,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns temperament_score,
+  plays stabilizes:source,
+  plays destabilizes:source,
+  plays preserved:preserved_thing;
+
+entity value_commitment,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  plays anchored_by:anchor,
+  plays stabilizes:source;
+
+entity adaptation,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns revision_reason,
+  owns preservation_note,
+  plays preserved:preserver;
+
+entity reflection,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns revision_reason,
+  plays reflected_on:source;
+
+entity causal_pattern,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns confidence,
+  owns scope;
+
+entity behavioral_signature,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns posture_label,
+  owns behavior_frequency,
+  owns lab_ness_score,
+  plays expressed_as:pattern,
+  plays stabilizes:source,
+  plays destabilizes:source;
+
+entity relationship_anchor,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns confidence,
+  plays anchored_by:anchor,
+  plays stabilizes:source,
+  plays destabilizes:source;
+
+entity continuity_snapshot,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns continuity_index,
+  owns lab_ness_score,
+  owns posture_label;
+
+entity spec_context,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns scope;
+
+entity run_record,
+  owns uuid @key,
+  owns name,
+  owns narrative_summary,
+  owns status;
+
+relation contains_self,
+  relates whole,
+  relates member;
+
+relation anchored_by,
+  owns confidence,
+  relates anchored,
+  relates anchor;
+
+relation preserved,
+  owns preservation_note,
+  relates preserver,
+  relates preserved_thing;
+
+relation revised_into,
+  owns revision_reason,
+  owns preservation_note,
+  relates prior,
+  relates next;
+
+relation reflected_on,
+  relates source,
+  relates target;
+
+relation expressed_as,
+  owns confidence,
+  relates source,
+  relates pattern;
+
+relation stabilizes,
+  owns confidence,
+  relates source,
+  relates target;
+
+relation destabilizes,
+  owns confidence,
+  relates source,
+  relates target;
+
+relation causally_contributed_to,
+  owns confidence,
+  owns scope,
+  relates cause,
+  relates effect;
+
+relation belongs_to_run,
+  relates experience,
+  relates run;
+
+relation linked_to_spec,
+  relates source,
+  relates spec;

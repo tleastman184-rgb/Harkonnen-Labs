@@ -1,5 +1,5 @@
 name: keeper
-display_name: Keeper
+display_name: Bear
 role: boundary_retriever
 # Pins to Claude — policy enforcement must be reliable and not cost-optimized away
 provider: claude-sonnet

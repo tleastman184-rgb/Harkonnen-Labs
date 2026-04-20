@@ -47,7 +47,7 @@ agents:
       Routes to Claude on work-windows (only provider available).
 
   piper:
-    display_name: Piper
+    display_name: Storm
     role: tool_retriever
     profile_provider: default
     pinned: false
@@ -175,7 +175,7 @@ agents:
       Three backends, one source of truth: factory/memory/*.md files.
 
   keeper:
-    display_name: Keeper
+    display_name: Bear
     role: boundary_retriever
     profile_provider: claude
     pinned: true

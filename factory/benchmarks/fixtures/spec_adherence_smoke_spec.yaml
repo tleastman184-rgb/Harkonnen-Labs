@@ -1,0 +1,27 @@
+id: benchmark_docs_refresh
+title: Benchmark Docs Refresh
+purpose: Provide a concise onboarding README for the spec adherence benchmark adapter.
+scope:
+  - Document how to run the adapter locally.
+  - Explain how to validate the result.
+constraints:
+  - Keep the README concise and review-oriented.
+inputs:
+  - Existing benchmark suite wiring
+outputs:
+  - README.md
+acceptance_criteria:
+  - README includes a "Run" section with `cargo run -- benchmark run --suite harkonnen_spec_adherence`.
+  - README includes a "Validate" section with both `cargo check` and `cargo test -q`.
+  - README explains that the adapter can use either a JSONL dataset or recent completed runs.
+  - README notes that the smoke fixture lives under `factory/benchmarks/fixtures/`.
+forbidden_behaviors:
+  - Do not describe unsupported setup steps.
+rollback_requirements:
+  - Existing benchmark suites remain runnable.
+dependencies:
+  - SQLite run metadata
+performance_expectations:
+  - Benchmark startup should stay lightweight for smoke runs.
+security_expectations:
+  - Judge only repo-local fixture content for the smoke path.

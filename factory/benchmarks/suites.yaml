@@ -63,6 +63,119 @@ suites:
         label: "LongMemEval adapter"
         builtin: "longmemeval"
 
+  - id: "harkonnen_spec_adherence"
+    title: "Spec Adherence Rate"
+    subsystem: "factory"
+    category: "spec_adherence"
+    tier: "target"
+    description: >-
+      Harkonnen-native LLM-as-judge benchmark that scores whether recent run
+      outputs satisfy the spec acceptance criteria captured by Scout.
+    baseline_reference: >-
+      Internal baseline: compare completeness and precision across recent runs,
+      and use without-scout mode to estimate what Scout's formalization adds.
+    setup_notes:
+      - "If SPEC_ADHERENCE_DATASET is unset, the adapter first judges recent completed runs from the local SQLite DB and then falls back to the bundled smoke fixture if no usable run corpus exists."
+      - "Optionally set SPEC_ADHERENCE_LIMIT for smoke runs and SPEC_ADHERENCE_OUTPUT for a custom artifact directory."
+      - "Set SPEC_ADHERENCE_MIN_COMPLETENESS to fail the suite below a required aggregate completeness threshold."
+      - "Set SPEC_ADHERENCE_MODE=without_scout or SPEC_ADHERENCE_WITHOUT_SCOUT=true to judge against derived intent criteria instead of Scout acceptance criteria."
+    tags:
+      - "internal"
+      - "phase3"
+      - "factory"
+      - "scout"
+      - "spec"
+    steps:
+      - id: "spec_adherence_adapter"
+        label: "Spec adherence adapter"
+        builtin: "spec_adherence"
+
+  - id: "harkonnen_scenario_delta"
+    title: "Hidden Scenario Delta"
+    subsystem: "factory"
+    category: "hidden_scenario_gap"
+    tier: "target"
+    description: >-
+      Harkonnen-native benchmark that compares visible validation pass rate with
+      hidden scenario pass rate across recent runs to quantify how much value
+      Sable is adding beyond Bramble's visible checks.
+    baseline_reference: >-
+      Internal baseline: a positive delta means visible validation is letting
+      issues through that hidden scenarios still catch.
+    setup_notes:
+      - "The adapter reads recent rows from coobie_episode_scores in the local SQLite DB."
+      - "Optionally set SCENARIO_DELTA_LIMIT for smoke runs and SCENARIO_DELTA_OUTPUT for a custom artifact directory."
+    tags:
+      - "internal"
+      - "phase3"
+      - "factory"
+      - "sable"
+      - "coobie"
+    steps:
+      - id: "scenario_delta_adapter"
+        label: "Scenario delta adapter"
+        builtin: "scenario_delta"
+
+  - id: "harkonnen_twin_fidelity"
+    title: "Twin Fidelity"
+    subsystem: "factory"
+    category: "twin_fidelity"
+    tier: "target"
+    description: >-
+      Harkonnen-native benchmark that summarizes the recent distribution of
+      Coobie's twin_fidelity_score so we can see how often Ash is provisioning
+      enough running services to resemble real conditions.
+    baseline_reference: >-
+      Internal baseline: track the share of recent runs above the "good"
+      fidelity threshold and watch the distribution shift upward as live twin
+      provisioning matures.
+    setup_notes:
+      - "The adapter reads recent rows from coobie_episode_scores in the local SQLite DB."
+      - "Optionally set TWIN_FIDELITY_LIMIT for smoke runs, TWIN_FIDELITY_OUTPUT for a custom artifact directory, and TWIN_FIDELITY_GOOD_MIN to change the threshold used for 'good' fidelity."
+    tags:
+      - "internal"
+      - "phase3"
+      - "factory"
+      - "ash"
+      - "coobie"
+      - "twin"
+    steps:
+      - id: "twin_fidelity_adapter"
+        label: "Twin fidelity adapter"
+        builtin: "twin_fidelity"
+
+  - id: "harkonnen_devbench"
+    title: "Harkonnen on DevBench"
+    subsystem: "factory"
+    category: "software_engineering"
+    tier: "target"
+    description: >-
+      External full-software-lifecycle benchmark wiring for Harkonnen. This
+      suite is script-based so the repo can launch a local or hosted DevBench
+      adapter without baking benchmark-specific logic into the Rust runner.
+    baseline_reference: >-
+      Internal baseline: wire the adapter, publish the exact task mix and
+      command used, and report completion plus artifact quality through the
+      benchmark's own evaluator once the external harness is available.
+    required_env:
+      - "DEVBENCH_COMMAND"
+    setup_notes:
+      - "Set DEVBENCH_COMMAND to the exact command that runs the Harkonnen DevBench adapter."
+      - "If using a local checkout, point DEVBENCH_ROOT at the DevBench repository or adapter workspace."
+      - "A native bridge scaffold now lives at `scripts/devbench_harkonnen_adapter.py`; point DEVBENCH_COMMAND at that script with `--repo <devbench repo>` and `--task <task>` to generate a Harkonnen draft spec and adapter summary."
+      - "The wrapper exits with code 10 when DevBench is not configured so the suite can stay wired before the external harness is installed."
+      - "When the adapter expects repository docs or artifacts, point it at runs that include Flint-generated README/API outputs."
+    tags:
+      - "external"
+      - "phase3"
+      - "factory"
+      - "coding"
+      - "lifecycle"
+    steps:
+      - id: "devbench_adapter"
+        label: "DevBench adapter"
+        program: "./scripts/benchmark-devbench.sh"
+
   - id: "longmemeval_raw_llm"
     title: "Raw LLM Baseline on LongMemEval"
     subsystem: "baseline"
@@ -305,6 +418,131 @@ suites:
       - id: "tau2_adapter"
         label: "tau2-bench adapter"
         program: "./scripts/benchmark-tau2.sh"
+
+  - id: "mason_aider_polyglot"
+    title: "Mason on Aider Polyglot"
+    subsystem: "code_loop"
+    category: "software_engineering"
+    tier: "target"
+    description: >-
+      Multi-language code-editing benchmark for Mason using exercises sourced from
+      exercism.io. Rather than generating code from scratch, Mason receives a stub
+      implementation and must fill it in to pass pre-written tests. Exercises span
+      Python, Go, JavaScript, Rust, Ruby, and C++.
+    benchmark_url: "https://aider.chat/docs/benchmarks.html"
+    leaderboard_url: "https://aider.chat/docs/leaderboards/"
+    baseline_reference: >-
+      Report pass rate overall and by language. Compare against the Aider leaderboard
+      published score for the same underlying model to show what Mason's agent framing adds.
+    setup_notes:
+      - "Assemble a JSONL exercise file from exercism.io or the aider-bench corpus and set POLYGLOT_DATASET to that path."
+      - "A smoke fixture lives at factory/benchmarks/fixtures/aider-polyglot-smoke.jsonl for local validation."
+      - "The test command for each exercise is embedded in the dataset — the required language runtimes (python3, go, node, cargo, etc.) must be available on PATH."
+      - "Optional envs: POLYGLOT_LIMIT (smoke run size), POLYGLOT_OUTPUT (artifact dir), POLYGLOT_MIN_PASS_RATE (pass threshold), POLYGLOT_TIMEOUT_SECS (per-exercise timeout, default 30s)."
+    tags:
+      - "external"
+      - "mason"
+      - "coding"
+      - "multi-language"
+      - "polyglot"
+    steps:
+      - id: "aider_polyglot_adapter"
+        label: "Aider Polyglot adapter (harkonnen mode)"
+        builtin: "aider_polyglot"
+
+  - id: "mason_aider_polyglot_direct"
+    title: "Raw LLM Baseline on Aider Polyglot"
+    subsystem: "baseline"
+    category: "software_engineering"
+    tier: "target"
+    description: >-
+      Direct model-only Aider Polyglot baseline using the active provider without
+      Mason agent framing or Harkonnen orchestration. Enables a fair comparison to
+      the published Aider leaderboard (which also uses raw model calls).
+    benchmark_url: "https://aider.chat/docs/benchmarks.html"
+    leaderboard_url: "https://aider.chat/docs/leaderboards/"
+    baseline_reference: >-
+      Use this as the comparison line against the Aider published leaderboard.
+      Same exercises, same language split, raw model output.
+    setup_notes:
+      - "Set POLYGLOT_DATASET to the local JSONL exercise file."
+      - "Optionally set POLYGLOT_DIRECT_PROVIDER to target a specific named setup provider."
+    tags:
+      - "external"
+      - "baseline"
+      - "mason"
+      - "coding"
+      - "multi-language"
+      - "polyglot"
+    steps:
+      - id: "aider_polyglot_direct_adapter"
+        label: "Aider Polyglot raw-model adapter"
+        builtin: "aider_polyglot"
+        env:
+          POLYGLOT_MODE: "direct"
+
+  - id: "mason_livecodebench"
+    title: "Mason on LiveCodeBench"
+    subsystem: "code_loop"
+    category: "software_engineering"
+    tier: "target"
+    description: >-
+      Competitive-programming pass@1 benchmark for Mason's code generation.
+      Problems are sourced from LeetCode, AtCoder, and Codeforces after a
+      release cutoff, making the benchmark resistant to training-data contamination.
+      The adapter generates a Python solution per problem and executes it against
+      the problem's public test cases.
+    benchmark_url: "https://livecodebench.github.io/"
+    leaderboard_url: "https://livecodebench.github.io/leaderboard.html"
+    baseline_reference: >-
+      Report pass@1 overall and broken down by difficulty (easy/medium/hard) and
+      platform (leetcode/atcoder/codeforces). Compare against published frontier
+      model scores on the same problem set where available.
+    setup_notes:
+      - "Download the LiveCodeBench code_generation_lite dataset from HuggingFace and export as JSONL."
+      - "Set LCB_DATASET to the local JSONL file path, or place a smoke fixture at factory/benchmarks/fixtures/livecodebench.jsonl."
+      - "python3 must be available on PATH for test case execution."
+      - "Optional envs: LCB_LIMIT (smoke run size), LCB_OUTPUT (artifact dir), LCB_MIN_PASS_RATE (pass threshold), LCB_TIMEOUT_SECS (per-test timeout)."
+    tags:
+      - "external"
+      - "mason"
+      - "piper"
+      - "coding"
+      - "competitive"
+    steps:
+      - id: "livecodebench_adapter"
+        label: "LiveCodeBench adapter (harkonnen mode)"
+        builtin: "livecodebench"
+
+  - id: "mason_livecodebench_direct"
+    title: "Raw LLM Baseline on LiveCodeBench"
+    subsystem: "baseline"
+    category: "software_engineering"
+    tier: "target"
+    description: >-
+      Direct model-only LiveCodeBench baseline using the active provider without
+      Mason agent framing or Harkonnen orchestration.
+    benchmark_url: "https://livecodebench.github.io/"
+    leaderboard_url: "https://livecodebench.github.io/leaderboard.html"
+    baseline_reference: >-
+      Use this as the raw-model baseline so reporting can show what Mason's
+      agent framing adds over the same underlying provider on competitive coding.
+    setup_notes:
+      - "Set LCB_DATASET to the local JSONL file path."
+      - "python3 must be available on PATH."
+      - "Optionally set LCB_DIRECT_PROVIDER to target a specific named setup provider."
+    tags:
+      - "external"
+      - "baseline"
+      - "mason"
+      - "coding"
+      - "competitive"
+    steps:
+      - id: "livecodebench_direct_adapter"
+        label: "LiveCodeBench raw-model adapter"
+        builtin: "livecodebench"
+        env:
+          LCB_MODE: "direct"
 
   - id: "mason_swebench_verified"
     title: "Mason/Piper/Bramble on SWE-bench Verified"

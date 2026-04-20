@@ -3,6 +3,8 @@
 This file is the universal context document for all AI agents (Claude, Gemini, Codex)
 working in this repository. Read it before touching any code or spec.
 
+> **Canonical reference:** [MASTER_SPEC.md](MASTER_SPEC.md) is the single source of truth for architecture, agent design, Soul Store, benchmarks, and roadmap. This file provides agent-facing operational context; MASTER_SPEC.md has the full design depth.
+
 For structured machine-readable data, see `factory/context/`.
 For memory retrieval, see `factory/memory/` and ask Coobie.
 
@@ -67,7 +69,7 @@ factory/
   state.db              SQLite run metadata
 
 setups/                 Named environment TOML files
-BENCHMARKS.md           Benchmark strategy, benchmark map, reporting guidance
+MASTER_SPEC.md          Canonical architecture, agent design, Soul Store, benchmarks, roadmap
 harkonnen.toml          Active/default setup config
 .env.example            Environment variable template
 ```
@@ -96,7 +98,7 @@ cargo run -- setup check                       # Verify active setup (providers 
 
 ## Benchmarking
 
-Benchmark strategy lives in `BENCHMARKS.md`, runnable suites live in `factory/benchmarks/suites.yaml`, and benchmark reports are written to `factory/artifacts/benchmarks/`.
+Benchmark strategy lives in `MASTER_SPEC.md` (Part 6), runnable suites live in `factory/benchmarks/suites.yaml`, and benchmark reports are written to `factory/artifacts/benchmarks/`.
 
 The default benchmark gate is `local_regression` and runs `cargo fmt --check`, `cargo check`, and `cargo test -q`. LongMemEval and LoCoMo now run through native benchmark adapters, tau2-bench now has a PackChat launcher wrapper for external harnesses, and SWE-bench Verified/Pro remain adapter-ready so Harkonnen can publish comparable memory, PackChat, and coding-loop scores as the remaining integrations mature.
 
@@ -398,6 +400,8 @@ security_expectations: [auth, secrets, isolation]
 - **Boundary discipline**: never let factory code reach into `factory/scenarios/` (Sable only)
 - **Memory discipline**: after any run that produces a reusable pattern, store it via Coobie
 - **Setup portability**: never hardcode paths or provider names in Rust source — use `SetupConfig`
+- **Frontend on this workstation**: when you need `node` or `npm`, run them via `flatpak-spawn --host ...` rather than assuming the sandbox has a native Node toolchain
+- **TypeDB direction**: when Phase 6 opens, target the Rust-based TypeDB 3.x line in a container-first deployment; do not design around or install the legacy Java distribution
 - **MCP first**: prefer registering a new capability as an MCP server over adding Rust code
 
 ---
@@ -406,9 +410,14 @@ security_expectations: [auth, secrets, isolation]
 
 **[ROADMAP.md](ROADMAP.md) is the canonical phase-by-phase build order.**
 All agents and contributors must check it before starting new work.
-Phase 1 PackChat backend is already shipped.
-The next phases in order are: Bramble Tests → Ash Twins → Episodic Layer →
-Consolidation Workbench → TypeDB Semantic Layer.
+Phases 1, 4, 4b, and 5 are already shipped.
+The active numbered build phases are Phase 2 (Bramble real test execution) and
+Phase 3 (Flint docs, spec-grounded evaluation, and DevBench readiness, with
+live twin provisioning deferred unless a future product needs it), with
+Operator Model Activation running as a parallel product/control-plane track.
+Long-term roadmap work remains Phase 5b
+(memory infrastructure), Phase 6 (TypeDB semantic layer), and Phase 7
+(causal attribution corpus + E-CARE).
 
 ---
 
@@ -441,18 +450,27 @@ Consolidation Workbench → TypeDB Semantic Layer.
 - **Coobie Palace** (`src/coobie_palace.rs`) — den-based compound recall layer; patrol walks five dens (Spec, Test, Twin, Pack, Memory) before each run; compound scent elevates den-level streaks over individual cause scores; feeds directly into preflight briefing
 - **Causal feedback loop** — Sable scenario rationale written back to project memory as evidence after each run
 - **Semantic memory** — fastembed or OpenAI-compatible embeddings + SQLite vector store; hybrid vector + keyword retrieval
+- **Episodic state snapshots** — `state_before` / `state_after` workspace snapshots recorded for implementation and build episodes
+- **Cross-phase causal graph** — phase-sequence and failure-triggered links populate `causal_links`, surfaced through the causal events API
+- **Pearl hierarchy labeling** — Coobie hypotheses and causal graph edges carry associational / interventional / counterfactual levels
+- **Coobie multi-hop retrieval** — configurable retrieval depth with hop-by-hop source tracing in query responses
+- **Memory invalidation / fact-update tracking** — stale facts are marked superseded or challenged rather than silently overwritten
+- **Consolidation Workbench** — operator-reviewed keep/discard/edit flow before durable lesson promotion
 - **Native LongMemEval adapter** — paired Harkonnen vs raw-LLM comparison mode; `longmemeval_s_cleaned.json` support
 - **Native LoCoMo adapter** — paired Harkonnen vs raw-LLM comparison mode
+- **Native FRAMES, StreamingQA, HELMET, and CLADDER adapters** — benchmarked retrieval and causal-reasoning surfaces wired into the Rust runner
 - **First-class benchmark toolchain** — `benchmark list/run/report`; manifest-driven suites in `factory/benchmarks/suites.yaml`; CI workflow; LM Studio local routing
 - Keeper coordination API with claims, heartbeats, conflict detection, and release flow
-- Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, and Memory Board
+- Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, Memory Board, and Consolidation Workbench
 - Bootstrap scripts for home-linux and work-windows
 
 ### Planned (next build layer)
 
 - **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
-- **Phase 3** — Ash live twin provisioning against running Docker stubs; Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter
-- **Phase 4** — Episodic layer enrichment (causal link table, `state_before`/`state_after`); Coobie multi-hop retrieval chain; memory invalidation/fact-update tracking; Pearl hierarchy in `diagnose`; FRAMES, StreamingQA, HELMET, CLADDER adapters
-- **Phase 5** — Post-run consolidation Workbench (operator review before durable memory write); E-CARE adapter; causal attribution accuracy seeded failure corpus
-- **Phase 6** — TypeDB 3.x semantic graph layer (COOBIE_SPEC.md Layer C); GAIA Level 3 and AgentBench adapters
-- DeepCausality phase 2 integration (real causaloids from the causal link table)
+- **Phase 3** — Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter; twin provisioning remains deferred unless a future product needs running service virtualization
+- **Operator Model full five-layer interview** — extend the v1-D MVP (two layers shipped) to cover dependencies, institutional knowledge, and friction; generate full artifact set
+- **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` refactor into a proper module tree
+- **Phase 6** — TypeDB 3.x semantic graph layer (see MASTER_SPEC.md Part 4); GAIA Level 3 and AgentBench adapters
+- **Phase 7** — causal attribution corpus, E-CARE adapter, and publishable causal benchmark baselines
+- **Phase 8 — Soul Store** — typed autobiographical + epistemic persistence for agents; six chambers backed by TypeDB; see MASTER_SPEC.md Part 5
+- **DeepCausality Phase 2** — real causaloids from the causal link table after the TypeDB layer is live

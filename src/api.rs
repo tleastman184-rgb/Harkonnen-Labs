@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -20,15 +20,18 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::{
-    chat::{dispatch_message, OpenThreadRequest, PostMessageRequest},
+    calvin_archive::SoulBootstrapDocument,
+    chat::{dispatch_message, ChatThread, ChatThreadKind, OpenThreadRequest, PostMessageRequest},
     coobie::CausalReport,
+    llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, CoobieBriefing, EvidenceAnnotation,
-        EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchReport,
-        EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
-        PhaseAttributionRecord, PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec,
-        ValidationSummary,
+        AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing,
+        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
+        EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
+        MetricAttack, OperatorModelContext, OperatorModelProfile, OperatorModelScope,
+        OperatorModelSession, OptimizationProgram, PhaseAttributionRecord, PriorCauseSignal,
+        RunCheckpointRecord, RunEvent, RunRecord, Spec, ValidationSummary,
     },
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
@@ -172,6 +175,49 @@ struct MemoryBoardUpdateView {
     fresh_summary: String,
 }
 
+#[derive(Debug, Serialize)]
+struct OperatorModelSessionResponse {
+    profile: OperatorModelProfile,
+    session: OperatorModelSession,
+    thread: ChatThread,
+    export_root: String,
+    reused_existing_session: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OperatorModelProfileResponse {
+    profile: OperatorModelProfile,
+    export_root: String,
+    active_session: Option<OperatorModelSession>,
+    active_thread: Option<ChatThread>,
+    light_global_topics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SoulKernelResponse {
+    self_name: String,
+    kernel: SoulBootstrapDocument,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartOperatorModelSessionRequest {
+    project_root: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    started_by: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default = "default_resume_if_exists")]
+    resume_if_exists: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListOperatorModelProfilesQuery {
+    #[serde(default)]
+    scope: Option<OperatorModelScope>,
+}
+
 #[derive(Debug, Deserialize)]
 struct MemoryBoardStaleStatusArtifact {
     #[serde(default)]
@@ -230,6 +276,24 @@ pub struct Assignment {
     pub last_heartbeat_at: String,
     #[serde(default = "default_assignment_status")]
     pub status: String,
+    // ── ActionLease fields (Phase A3) ─────────────────────────────────────────
+    /// What kind of resource is claimed: "file", "workspace", "external", "agent"
+    #[serde(default = "default_resource_kind")]
+    pub resource_kind: String,
+    /// Seconds until Keeper auto-reaps this lease (0 = use global stale_after_seconds)
+    #[serde(default)]
+    pub ttl_secs: i64,
+    /// Constraints that must hold for any action against this resource.
+    /// Agents should call POST /api/coordination/check-lease before acting.
+    #[serde(default)]
+    pub guardrails: Vec<String>,
+    /// When this lease expires (computed from claimed_at + ttl_secs, empty if no TTL)
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+fn default_resource_kind() -> String {
+    "file".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,6 +357,32 @@ struct ClaimRequest {
     task: String,
     #[serde(default)]
     files: Vec<String>,
+    // ActionLease fields (Phase A3)
+    #[serde(default = "default_resource_kind")]
+    resource_kind: String,
+    /// 0 = use server-side stale_after_seconds
+    #[serde(default)]
+    ttl_secs: i64,
+    #[serde(default)]
+    guardrails: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckLeaseRequest {
+    /// The agent that wants to act
+    agent: String,
+    /// The file or resource being acted upon
+    resource: String,
+    /// Short description of the action (for audit trail)
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckLeaseResponse {
+    allowed: bool,
+    owner: Option<String>,
+    guardrail_violations: Vec<String>,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +439,15 @@ struct SetupCheckMcpStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct SetupCheckMcpSelfStatus {
+    enabled: bool,
+    transport: String,
+    host: Option<String>,
+    port: Option<u16>,
+    auth_required: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
 struct SetupCheckResponse {
     setup_name: String,
     platform: String,
@@ -356,6 +455,7 @@ struct SetupCheckResponse {
     providers: Vec<SetupCheckProviderStatus>,
     agent_routes: HashMap<String, String>,
     mcp_servers: Vec<SetupCheckMcpStatus>,
+    mcp_self: Option<SetupCheckMcpSelfStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,6 +724,22 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/runs/:id/lessons", get(get_run_lessons))
         .route("/api/runs/:id/state", get(get_run_state))
         .route("/api/runs/:id/consolidate", post(post_run_consolidate))
+        .route(
+            "/api/runs/:id/consolidation/candidates",
+            get(get_consolidation_candidates).post(post_generate_candidates),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/keep",
+            post(post_candidate_keep),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/discard",
+            post(post_candidate_discard),
+        )
+        .route(
+            "/api/runs/:id/consolidation/candidates/:cid/edit",
+            post(post_candidate_edit),
+        )
         .route("/api/chat", post(post_chat))
         .route("/api/coobie/query", post(post_coobie_query))
         .route("/api/agents/:id/chat", post(post_agent_chat))
@@ -637,11 +753,45 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
             "/api/chat/threads/:id/messages",
             get(list_chat_messages).post(post_chat_message),
         )
+        .route(
+            "/api/operator-model/sessions",
+            post(post_start_operator_model_session),
+        )
+        .route(
+            "/api/operator-model/profiles",
+            get(list_operator_model_profiles),
+        )
+        .route(
+            "/api/operator-model/profiles/:id",
+            get(get_operator_model_profile),
+        )
+        .route(
+            "/api/operator-model/sessions/:id",
+            get(get_operator_model_session),
+        )
+        .route(
+            "/api/operator-model/sessions/:id/approve-layer",
+            post(post_approve_operator_model_layer),
+        )
+        .route(
+            "/api/operator-model/profiles/:id/commissioning-brief",
+            get(get_operator_model_commissioning_brief),
+        )
+        .route("/api/soul/:id", get(get_soul_kernel))
+        .route("/api/soul/:id/guide", get(get_soul_guide))
         .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
         .route("/api/runs/:id/causal-report", get(get_causal_report))
         .route("/api/runs/:id/causal-events", get(get_run_causal_events))
+        .route("/api/runs/:id/cost", get(get_run_cost))
+        .route("/api/runs/:id/decisions", get(get_run_decisions))
+        .route("/api/runs/:id/traces", get(get_run_traces))
+        .route(
+            "/api/runs/:id/optimization-program",
+            get(get_run_optimization_program),
+        )
+        .route("/api/runs/:id/metric-attacks", get(get_run_metric_attacks))
         .route(
             "/api/runs/:id/evidence-match-report",
             get(get_run_evidence_match_report),
@@ -673,6 +823,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route("/api/spec/validate", post(post_spec_validate))
         .route("/api/memory/init", post(post_memory_init))
         .route("/api/memory/index", post(post_memory_index))
+        .route("/api/memory/updates", get(get_memory_updates))
         .route("/api/runs/start", post(start_run))
         .route("/api/runs/:id/report", get(get_run_report))
         .route("/api/runs/:id/package", post(post_run_package))
@@ -686,8 +837,11 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
             get(get_coordination_policy_events),
         )
         .route("/api/coordination/claim", post(claim_task))
+        .route("/api/coordination/check-lease", post(check_lease))
         .route("/api/coordination/heartbeat", post(heartbeat_task))
         .route("/api/coordination/release", post(release_task))
+        .route("/health", get(get_health))
+        .route("/api/status", get(get_server_status))
         .layer(cors)
         .with_state(app);
 
@@ -713,6 +867,38 @@ async fn get_run(Path(id): Path<String>, State(app): State<AppContext>) -> impl 
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+async fn get_soul_kernel(Path(id): Path<String>) -> impl IntoResponse {
+    if !crate::calvin_archive::supported_self(&id) {
+        return (StatusCode::NOT_FOUND, "soul baseline not found").into_response();
+    }
+    let kernel = crate::calvin_archive::coobie_identity();
+    (
+        StatusCode::OK,
+        Json(SoulKernelResponse {
+            self_name: id,
+            kernel,
+        }),
+    )
+        .into_response()
+}
+
+async fn get_soul_guide(Path(id): Path<String>) -> impl IntoResponse {
+    if !crate::calvin_archive::supported_self(&id) {
+        return (StatusCode::NOT_FOUND, "soul guide not found").into_response();
+    }
+    let markdown =
+        crate::calvin_archive::render_guide_markdown(&crate::calvin_archive::coobie_identity());
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
+        markdown,
+    )
+        .into_response()
 }
 
 async fn get_directory_browser(
@@ -1112,7 +1298,10 @@ async fn post_run_consolidate(
     State(app): State<AppContext>,
 ) -> impl IntoResponse {
     match app.get_run(&id).await {
-        Ok(Some(_)) => match app.consolidate_run_for_operator(&id).await {
+        // If candidates exist and some are kept, only promote those.
+        // Otherwise fall back to the legacy auto-promote path so old clients
+        // that call /consolidate directly still work.
+        Ok(Some(_)) => match app.promote_kept_candidates(&id).await {
             Ok(new_lessons) => match build_memory_board(&app, &id).await {
                 Ok(Some(memory_board)) => (
                     StatusCode::OK,
@@ -1133,6 +1322,158 @@ async fn post_run_consolidate(
         },
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+// ── Phase 5 — Consolidation Workbench ────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct CandidatesResponse {
+    run_id: String,
+    total: usize,
+    pending: usize,
+    kept: usize,
+    discarded: usize,
+    candidates: Vec<ConsolidationCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditCandidateRequest {
+    content: serde_json::Value,
+}
+
+/// `GET /api/runs/:id/consolidation/candidates` — list all candidates.
+async fn get_consolidation_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_consolidation_candidates(&id).await {
+            Ok(candidates) => {
+                let total = candidates.len();
+                let pending = candidates.iter().filter(|c| c.status == "pending").count();
+                let kept = candidates.iter().filter(|c| c.status == "kept").count();
+                let discarded = candidates
+                    .iter()
+                    .filter(|c| c.status == "discarded")
+                    .count();
+                (
+                    StatusCode::OK,
+                    Json(CandidatesResponse {
+                        run_id: id,
+                        total,
+                        pending,
+                        kept,
+                        discarded,
+                        candidates,
+                    }),
+                )
+                    .into_response()
+            }
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates` — generate candidates.
+async fn post_generate_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.generate_consolidation_candidates(&id).await {
+            Ok(new_candidates) => match app.list_consolidation_candidates(&id).await {
+                Ok(all_candidates) => {
+                    let total = all_candidates.len();
+                    let pending = all_candidates
+                        .iter()
+                        .filter(|c| c.status == "pending")
+                        .count();
+                    let kept = all_candidates.iter().filter(|c| c.status == "kept").count();
+                    let discarded = all_candidates
+                        .iter()
+                        .filter(|c| c.status == "discarded")
+                        .count();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "run_id": id,
+                            "new_candidates": new_candidates.len(),
+                            "total": total,
+                            "pending": pending,
+                            "kept": kept,
+                            "discarded": discarded,
+                            "candidates": all_candidates,
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+            },
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/keep`
+async fn post_candidate_keep(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.review_consolidation_candidate(&cid, "kept").await {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "kept", "candidate_id": cid})),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/discard`
+async fn post_candidate_discard(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.review_consolidation_candidate(&cid, "discarded").await {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "discarded", "candidate_id": cid})),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/runs/:id/consolidation/candidates/:cid/edit`
+async fn post_candidate_edit(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+    Json(body): Json<EditCandidateRequest>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.edit_consolidation_candidate(&cid, body.content).await {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "kept", "candidate_id": cid})),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 
@@ -1422,6 +1763,76 @@ async fn get_run_causal_events(
             Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/runs/:id/cost` — aggregate token/latency cost for a run.
+async fn get_run_cost(Path(id): Path<String>, State(app): State<AppContext>) -> impl IntoResponse {
+    match app.get_run_cost_summary(&id).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/runs/:id/decisions` — decision log for a run.
+async fn get_run_decisions(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.list_run_decisions(&id).await {
+        Ok(decisions) => (StatusCode::OK, Json(decisions)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/runs/:id/traces` — agent trace spine for a run.
+async fn get_run_traces(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.list_run_traces(&id).await {
+        Ok(traces) => (StatusCode::OK, Json(traces)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/runs/:id/optimization-program` — machine-readable success metric for a run.
+async fn get_run_optimization_program(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let program_path = app
+        .paths
+        .workspaces
+        .join(&id)
+        .join("run")
+        .join("optimization_program.json");
+    match read_optional_json::<OptimizationProgram>(&program_path).await {
+        Ok(Some(program)) => (StatusCode::OK, Json(program)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "OptimizationProgram not yet generated",
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/runs/:id/metric-attacks` — Sable's red-team attacks against the objective metric.
+async fn get_run_metric_attacks(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let attacks_path = app
+        .paths
+        .workspaces
+        .join(&id)
+        .join("run")
+        .join("metric_attacks.json");
+    match read_optional_json::<Vec<MetricAttack>>(&attacks_path).await {
+        Ok(Some(attacks)) => (StatusCode::OK, Json(attacks)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Metric attacks not yet generated").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -3282,6 +3693,13 @@ async fn claim_task(
     let files = req.files.clone();
     let claimed_at = now.to_rfc3339();
 
+    // Compute expires_at from TTL if provided.
+    let expires_at = if req.ttl_secs > 0 {
+        (now + ChronoDuration::seconds(req.ttl_secs)).to_rfc3339()
+    } else {
+        String::new()
+    };
+
     state.active.insert(
         agent.clone(),
         Assignment {
@@ -3291,6 +3709,10 @@ async fn claim_task(
             claimed_at: claimed_at.clone(),
             last_heartbeat_at: claimed_at,
             status: "active".to_string(),
+            resource_kind: req.resource_kind,
+            ttl_secs: req.ttl_secs,
+            guardrails: req.guardrails,
+            expires_at,
         },
     );
     state.updated_at = now.to_rfc3339();
@@ -3315,6 +3737,115 @@ async fn claim_task(
         Ok(()) => (StatusCode::OK, Json(state)).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+/// `POST /api/coordination/check-lease` — verify an agent is allowed to act
+/// on a resource and that no guardrail violations exist.
+///
+/// Returns 200 with `allowed: true` when safe to proceed, or `allowed: false`
+/// with `guardrail_violations` describing what must be resolved first.
+async fn check_lease(
+    State(app): State<AppContext>,
+    Json(req): Json<CheckLeaseRequest>,
+) -> impl IntoResponse {
+    let state = match ensure_assignments_state(&app).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    let now = Utc::now();
+
+    // Find the assignment that owns this resource.
+    let owner_entry = state.active.iter().find(|(_, assignment)| {
+        assignment
+            .files
+            .iter()
+            .any(|f| req.resource.starts_with(f.as_str()) || f.starts_with(req.resource.as_str()))
+    });
+
+    let (owner, guardrails) = match owner_entry {
+        Some((owner, assignment)) => (Some(owner.clone()), assignment.guardrails.clone()),
+        None => (None, vec![]),
+    };
+
+    // Check TTL expiry: if the claim has an expires_at and it has passed, the
+    // resource is effectively unclaimed — allow access.
+    if let Some((_, assignment)) = owner_entry {
+        if !assignment.expires_at.is_empty() {
+            if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&assignment.expires_at) {
+                if expires.with_timezone(&Utc) < now {
+                    return (
+                        StatusCode::OK,
+                        Json(CheckLeaseResponse {
+                            allowed: true,
+                            owner: Some(assignment.agent.clone()),
+                            guardrail_violations: vec![],
+                            message: "Lease expired — resource is available.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    // If owned by someone else and not expired, check guardrails.
+    if let Some(ref owner_name) = owner {
+        if owner_name != &req.agent {
+            let response = CheckLeaseResponse {
+                allowed: false,
+                owner: Some(owner_name.clone()),
+                guardrail_violations: vec![format!(
+                    "{} holds an active lease on {}",
+                    owner_name, req.resource
+                )],
+                message: format!(
+                    "Cannot perform '{}' on '{}': owned by {}",
+                    req.action, req.resource, owner_name
+                ),
+            };
+            return (StatusCode::OK, Json(response)).into_response();
+        }
+    }
+
+    // Resource is owned by the requesting agent (or unowned). Check guardrails.
+    // A guardrail starting with "require:" demands the action description contains
+    // the keyword after the colon. All others are advisory strings.
+    let mut violations: Vec<String> = Vec::new();
+    for g in &guardrails {
+        if let Some(keyword) = g.strip_prefix("require:") {
+            if !req.action.to_lowercase().contains(&keyword.to_lowercase()) {
+                violations.push(format!("Action must satisfy guardrail: {g}"));
+            }
+        }
+    }
+
+    let allowed = violations.is_empty();
+    let message = if allowed {
+        format!(
+            "Lease check passed for '{}' on '{}'",
+            req.action, req.resource
+        )
+    } else {
+        format!(
+            "{} guardrail violation(s) for '{}' on '{}'",
+            violations.len(),
+            req.action,
+            req.resource
+        )
+    };
+
+    (
+        StatusCode::OK,
+        Json(CheckLeaseResponse {
+            allowed,
+            owner,
+            guardrail_violations: violations,
+            message,
+        }),
+    )
+        .into_response()
 }
 
 async fn heartbeat_task(
@@ -3440,65 +3971,42 @@ async fn scout_draft(
         &uuid::Uuid::new_v4().to_string()[..8]
     );
 
-    // Build a structured spec from the intent text.
-    // Lines starting with verbs become acceptance_criteria; everything else is purpose.
-    let lines: Vec<&str> = intent
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let purpose = lines.first().copied().unwrap_or(&intent);
+    let operator_model_context =
+        match best_effort_operator_model_root(&app, product_path.as_deref()) {
+            Some(root) => app
+                .load_effective_operator_model_context(Some(&root))
+                .await
+                .unwrap_or(None),
+            None => app
+                .load_effective_operator_model_context(None)
+                .await
+                .unwrap_or(None),
+        };
 
-    let criteria: Vec<String> = lines.iter().skip(1).map(|l| format!("  - {l}")).collect();
+    let spec = maybe_llm_draft_spec(
+        &app,
+        &spec_id,
+        &intent,
+        &product,
+        product_path.as_deref(),
+        operator_model_context.as_ref(),
+    )
+    .await
+    .unwrap_or_else(|| {
+        fallback_scout_draft_spec(
+            &spec_id,
+            &intent,
+            &product,
+            product_path.as_deref(),
+            operator_model_context.as_ref(),
+        )
+    });
 
-    let criteria_block = if criteria.is_empty() {
-        "  - run completes without errors".to_string()
-    } else {
-        criteria.join("\n")
+    let spec_yaml = match serde_yaml::to_string(&spec) {
+        Ok(text) => text,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let product_input = product_path
-        .as_ref()
-        .map(|path| format!("  - \"product directory: {path}\""))
-        .unwrap_or_else(|| format!("  - \"product directory: products/{product}/\""));
-
-    let spec_yaml = format!(
-        r#"id: {spec_id}
-title: {title}
-purpose: >
-  {purpose}
-scope:
-  - {product}
-constraints:
-  - remain within the {product} workspace boundary
-  - do not modify files outside the target product
-inputs:
-{product_input}
-outputs:
-  - implementation artifacts in the run workspace
-  - validation.json with pass/fail verdict
-acceptance_criteria:
-{criteria_block}
-forbidden_behaviors:
-  - deleting unrelated files
-  - reaching outside the workspace boundary
-rollback_requirements:
-  - retain prior artifacts unless explicitly cleaned up
-dependencies: []
-performance_expectations:
-  - commands should complete in a reasonable time
-security_expectations:
-  - secrets must not appear in logs or artifact bundles
-"#,
-        spec_id = spec_id,
-        title = title_case(&product),
-        purpose = purpose,
-        product = product,
-        product_input = product_input,
-        criteria_block = criteria_block,
-    );
-
-    // Save to factory/specs/drafts/
     let drafts_dir = app.paths.factory.join("specs").join("drafts");
     if let Err(e) = tokio::fs::create_dir_all(&drafts_dir).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -3521,6 +4029,215 @@ security_expectations:
         }),
     )
         .into_response()
+}
+
+/// Load the top-3 patterns from `commissioning-brief.json` for the given profile.
+/// Returns an empty string if no brief exists or loading fails.
+async fn load_commissioning_brief_patterns(app: &AppContext, profile_id: &str) -> String {
+    let profile = match app.operator_models.get_profile(profile_id).await {
+        Ok(Some(p)) => p,
+        _ => return String::new(),
+    };
+    let brief_path = app
+        .operator_models
+        .export_root_for_profile(&app.paths, &profile)
+        .join("commissioning-brief.json");
+
+    let json = match tokio::fs::read_to_string(&brief_path).await {
+        Ok(j) => j,
+        Err(_) => return String::new(),
+    };
+    let brief: crate::models::CommissioningBrief = match serde_json::from_str(&json) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+
+    brief
+        .top_patterns
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(i, p)| format!("{}. {p}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn best_effort_operator_model_root(app: &AppContext, raw: Option<&str>) -> Option<PathBuf> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        app.paths.root.join(candidate)
+    };
+    absolute.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+async fn maybe_llm_draft_spec(
+    app: &AppContext,
+    spec_id: &str,
+    intent: &str,
+    product: &str,
+    product_path: Option<&str>,
+    operator_model_context: Option<&OperatorModelContext>,
+) -> Option<Spec> {
+    let provider = llm::build_provider("scout", "claude", &app.paths.setup)?;
+    let operator_context_json = operator_model_context
+        .map(|context| serde_json::to_string_pretty(context).unwrap_or_default())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "null".to_string());
+
+    // Inject top-3 commissioning brief patterns if a brief exists for this profile.
+    let brief_patterns_text = if let Some(ctx) = operator_model_context {
+        load_commissioning_brief_patterns(app, &ctx.profile_id).await
+    } else {
+        String::new()
+    };
+
+    let product_path_text = product_path.unwrap_or("products/<product>");
+    let brief_section = if brief_patterns_text.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCOMMISSIONING BRIEF (operator's top patterns — treat as strong constraints):\n{brief_patterns_text}")
+    };
+    let request = LlmRequest::simple(
+        "You are Scout, drafting a Harkonnen factory spec from operator intent. Respond with valid YAML only, no markdown fences. Use this schema exactly: id, title, purpose, scope, constraints, inputs, outputs, acceptance_criteria, forbidden_behaviors, rollback_requirements, dependencies, performance_expectations, security_expectations. Make the draft concrete, bounded, and operational. If operator-model context is present, treat its guardrails, escalation rules, dependencies, and rhythms as first-class commissioning constraints. If a commissioning brief is present, incorporate its top patterns into constraints and acceptance_criteria.",
+        format!(
+            "SPEC ID: {spec_id}\nPRODUCT: {product}\nPRODUCT PATH: {product_path_text}\n\nINTENT:\n{intent}\n\nOPERATOR MODEL CONTEXT:\n```json\n{operator_context_json}\n```{brief_section}\n\nReturn YAML only.",
+        ),
+    );
+    let response = provider.complete(request).await.ok()?;
+    let body = response.content.trim();
+    let stripped = body
+        .trim_start_matches("```yaml")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let mut parsed = serde_yaml::from_str::<Spec>(stripped).ok()?;
+    parsed.id = spec_id.to_string();
+    if parsed.title.trim().is_empty() {
+        parsed.title = title_case(product);
+    }
+    if parsed.scope.is_empty() {
+        parsed.scope.push(product.to_string());
+    }
+    Some(parsed)
+}
+
+fn fallback_scout_draft_spec(
+    spec_id: &str,
+    intent: &str,
+    product: &str,
+    product_path: Option<&str>,
+    operator_model_context: Option<&OperatorModelContext>,
+) -> Spec {
+    let lines: Vec<&str> = intent
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let purpose = lines.first().copied().unwrap_or(intent).to_string();
+    let mut acceptance_criteria = lines
+        .iter()
+        .skip(1)
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    if acceptance_criteria.is_empty() {
+        acceptance_criteria.push("run completes without errors".to_string());
+    }
+
+    let mut constraints = vec![
+        format!("remain within the {product} workspace boundary"),
+        "do not modify files outside the target product".to_string(),
+    ];
+    let mut dependencies = Vec::new();
+    let mut security_expectations =
+        vec!["secrets must not appear in logs or artifact bundles".to_string()];
+
+    if let Some(context) = operator_model_context {
+        for item in context.guardrails.iter().take(3) {
+            push_unique(
+                &mut constraints,
+                format!("operator model guardrail: {item}"),
+            );
+        }
+        for item in context.dependencies.iter().take(3) {
+            push_unique(&mut dependencies, format!("operator dependency: {item}"));
+        }
+        if !context.escalation_rules.is_empty() {
+            push_unique(
+                &mut acceptance_criteria,
+                "approval and escalation boundaries remain explicit for any action outside the operator model".to_string(),
+            );
+        }
+        if context
+            .guardrails
+            .iter()
+            .any(|item| contains_security_signal(item))
+        {
+            push_unique(
+                &mut security_expectations,
+                "operator-defined approval, boundary, and credential handling rules are preserved"
+                    .to_string(),
+            );
+        }
+    }
+
+    Spec {
+        id: spec_id.to_string(),
+        title: title_case(product),
+        purpose,
+        scope: vec![product.to_string()],
+        constraints,
+        inputs: vec![format!(
+            "product directory: {}",
+            product_path.unwrap_or(&format!("products/{product}/"))
+        )],
+        outputs: vec![
+            "implementation artifacts in the run workspace".to_string(),
+            "validation.json with pass/fail verdict".to_string(),
+        ],
+        acceptance_criteria,
+        forbidden_behaviors: vec![
+            "deleting unrelated files".to_string(),
+            "reaching outside the workspace boundary".to_string(),
+        ],
+        rollback_requirements: vec![
+            "retain prior artifacts unless explicitly cleaned up".to_string()
+        ],
+        dependencies,
+        performance_expectations: vec!["commands should complete in a reasonable time".to_string()],
+        security_expectations,
+        twin_services: Vec::new(),
+        project_components: Vec::new(),
+        scenario_blueprint: None,
+        worker_harness: None,
+        test_commands: Vec::new(),
+    }
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if items.iter().any(|existing| existing == &value) {
+        return;
+    }
+    items.push(value);
+}
+
+fn contains_security_signal(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "secret",
+        "credential",
+        "auth",
+        "permission",
+        "security",
+        "boundary",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn slugify(s: &str) -> String {
@@ -3614,6 +4331,18 @@ async fn get_setup_check(State(app): State<AppContext>) -> impl IntoResponse {
         })
         .unwrap_or_default();
 
+    let mcp_self = setup
+        .mcp
+        .as_ref()
+        .and_then(|mcp| mcp.self_server.as_ref())
+        .map(|self_server| SetupCheckMcpSelfStatus {
+            enabled: self_server.enabled,
+            transport: self_server.transport.clone(),
+            host: self_server.host.clone(),
+            port: self_server.port,
+            auth_required: self_server.auth_required,
+        });
+
     (
         StatusCode::OK,
         Json(SetupCheckResponse {
@@ -3623,6 +4352,7 @@ async fn get_setup_check(State(app): State<AppContext>) -> impl IntoResponse {
             providers,
             agent_routes,
             mcp_servers,
+            mcp_self,
         }),
     )
         .into_response()
@@ -3698,6 +4428,14 @@ async fn post_memory_index(State(app): State<AppContext>) -> impl IntoResponse {
         )
             .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/memory/updates` — list all persisted memory supersession records.
+async fn get_memory_updates(State(app): State<AppContext>) -> impl IntoResponse {
+    match app.list_memory_updates().await {
+        Ok(records) => (StatusCode::OK, Json(records)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -4004,6 +4742,8 @@ async fn get_run_artifact(
 #[derive(Deserialize)]
 struct ListThreadsQuery {
     run_id: Option<String>,
+    #[serde(default)]
+    thread_kind: Option<ChatThreadKind>,
     #[serde(default = "default_thread_limit")]
     limit: usize,
 }
@@ -4016,7 +4756,11 @@ async fn list_chat_threads(
     Query(q): Query<ListThreadsQuery>,
     State(app): State<AppContext>,
 ) -> impl IntoResponse {
-    match app.chat.list_threads(q.run_id.as_deref(), q.limit).await {
+    match app
+        .chat
+        .list_threads(q.run_id.as_deref(), q.thread_kind.as_ref(), q.limit)
+        .await
+    {
         Ok(threads) => (StatusCode::OK, Json(threads)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -4068,4 +4812,540 @@ async fn post_chat_message(
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+fn default_resume_if_exists() -> bool {
+    true
+}
+
+fn normalize_project_root(app: &AppContext, raw: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(raw.trim());
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        app.paths.root.join(candidate)
+    };
+    let canonical = absolute.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project_root is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn default_project_profile_name(project_root: &FsPath) -> String {
+    project_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{} operator model", value))
+        .unwrap_or_else(|| "project operator model".to_string())
+}
+
+async fn operator_model_profile_response(
+    app: &AppContext,
+    profile: OperatorModelProfile,
+) -> Result<OperatorModelProfileResponse, String> {
+    let active_session = app
+        .operator_models
+        .find_active_session_for_profile(&profile.profile_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let active_thread = match active_session
+        .as_ref()
+        .and_then(|session| session.thread_id.as_deref())
+    {
+        Some(thread_id) => app
+            .chat
+            .get_thread(thread_id)
+            .await
+            .map_err(|e| e.to_string())?,
+        None => None,
+    };
+    Ok(OperatorModelProfileResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        light_global_topics: crate::operator_model::LIGHT_GLOBAL_PROFILE_TOPICS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        profile,
+        active_session,
+        active_thread,
+    })
+}
+
+async fn list_operator_model_profiles(
+    Query(q): Query<ListOperatorModelProfilesQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let profiles = match q.scope {
+        Some(scope) => app.operator_models.list_profiles_by_scope(scope).await,
+        None => app.operator_models.list_profiles().await,
+    };
+
+    match profiles {
+        Ok(profiles) => {
+            let mut responses = Vec::with_capacity(profiles.len());
+            for profile in profiles {
+                match operator_model_profile_response(&app, profile).await {
+                    Ok(response) => responses.push(response),
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                    }
+                }
+            }
+            (StatusCode::OK, Json(responses)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_operator_model_profile(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.operator_models.get_profile(&id).await {
+        Ok(Some(profile)) => match operator_model_profile_response(&app, profile).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "operator-model profile not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_operator_model_session(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    let session = match app.operator_models.get_session(&id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "operator-model session not found").into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let profile = match app.operator_models.get_profile(&session.profile_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "operator-model profile not found").into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let thread = match session.thread_id.as_deref() {
+        Some(thread_id) => match app.chat.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, "operator-model thread not found").into_response()
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "operator-model session has no thread",
+            )
+                .into_response()
+        }
+    };
+
+    let response = OperatorModelSessionResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        profile,
+        session,
+        thread,
+        reused_existing_session: true,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn post_start_operator_model_session(
+    State(app): State<AppContext>,
+    Json(req): Json<StartOperatorModelSessionRequest>,
+) -> impl IntoResponse {
+    let project_root = match normalize_project_root(&app, &req.project_root) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let display_name = req
+        .display_name
+        .clone()
+        .unwrap_or_else(|| default_project_profile_name(&project_root));
+
+    let profile = match app
+        .operator_models
+        .ensure_project_profile(&project_root, &display_name)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let existing_session = if req.resume_if_exists {
+        match app
+            .operator_models
+            .find_active_session_for_profile(&profile.profile_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    } else {
+        None
+    };
+
+    let project_root_text = match project_root.to_str() {
+        Some(value) => value.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "project_root is not valid UTF-8: {}",
+                    project_root.display()
+                ),
+            )
+                .into_response()
+        }
+    };
+
+    let thread_title = req
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Operator model: {}", display_name));
+
+    let mut reused_existing_session = false;
+    let session = if let Some(session) = existing_session {
+        reused_existing_session = true;
+        session
+    } else {
+        let thread = match app
+            .chat
+            .open_thread(&OpenThreadRequest {
+                run_id: None,
+                spec_id: None,
+                title: Some(thread_title.clone()),
+                thread_kind: ChatThreadKind::OperatorModel,
+                metadata_json: Some(serde_json::json!({
+                    "scope": "project",
+                    "profile_id": profile.profile_id,
+                    "project_root": project_root_text,
+                    "pending_layer": crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER,
+                })),
+            })
+            .await
+        {
+            Ok(thread) => thread,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        match app
+            .operator_models
+            .create_session(
+                &profile.profile_id,
+                Some(&thread.thread_id),
+                Some(crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER),
+                req.started_by.as_deref(),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    };
+
+    let thread = match session.thread_id.as_deref() {
+        Some(thread_id) => match app.chat.get_thread(thread_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) => {
+                let thread = match app
+                    .chat
+                    .open_thread(&OpenThreadRequest {
+                        run_id: None,
+                        spec_id: None,
+                        title: Some(thread_title),
+                        thread_kind: ChatThreadKind::OperatorModel,
+                        metadata_json: Some(serde_json::json!({
+                            "scope": "project",
+                            "profile_id": profile.profile_id,
+                            "project_root": project_root_text,
+                            "session_id": session.session_id,
+                            "pending_layer": session.pending_layer.clone().unwrap_or_else(|| crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER.to_string()),
+                        })),
+                    })
+                    .await
+                {
+                    Ok(thread) => thread,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    }
+                };
+                if let Err(e) = app
+                    .operator_models
+                    .update_session_thread(&session.session_id, &thread.thread_id)
+                    .await
+                {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+                thread
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        None => {
+            let thread = match app
+                .chat
+                .open_thread(&OpenThreadRequest {
+                    run_id: None,
+                    spec_id: None,
+                    title: Some(thread_title),
+                    thread_kind: ChatThreadKind::OperatorModel,
+                    metadata_json: Some(serde_json::json!({
+                        "scope": "project",
+                        "profile_id": profile.profile_id,
+                        "project_root": project_root_text,
+                        "session_id": session.session_id,
+                        "pending_layer": session.pending_layer.clone().unwrap_or_else(|| crate::operator_model::DEFAULT_OPERATOR_MODEL_LAYER.to_string()),
+                    })),
+                })
+                .await
+            {
+                Ok(thread) => thread,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            };
+            if let Err(e) = app
+                .operator_models
+                .update_session_thread(&session.session_id, &thread.thread_id)
+                .await
+            {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+            thread
+        }
+    };
+
+    if !reused_existing_session {
+        let kickoff = format!(
+            "I'm ready to build the operator model for `{}`. We'll treat this as a project-scoped profile and stamp the repo under `.harkonnen/operator-model/`. Let's start with operating rhythms: what recurring work, triggers, or timing patterns shape how work actually moves in this repo? Optional question for the initial questionnaire: do you want a personal supervisor card for the operator, and if so which reference image should travel with the markdown template at `/actioncards/user-supervisor-card-template.md`? If not, Jerry remains the default supervisor representation in the system.",
+            project_root_text
+        );
+        if let Err(e) = app
+            .chat
+            .append_message(&thread.thread_id, "agent", Some("coobie"), &kickoff, None)
+            .await
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+
+    let response = OperatorModelSessionResponse {
+        export_root: app
+            .operator_models
+            .export_root_for_profile(&app.paths, &profile)
+            .display()
+            .to_string(),
+        profile,
+        session,
+        thread,
+        reused_existing_session,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ApproveOperatorModelLayerRequest {
+    /// The layer being approved (e.g. "operating_rhythms", "recurring_decisions").
+    layer: String,
+    /// The PackChat thread_id for this session (used for transcript synthesis).
+    thread_id: String,
+    #[serde(default)]
+    approved_by: Option<String>,
+}
+
+async fn post_approve_operator_model_layer(
+    State(app): State<AppContext>,
+    Path(session_id): Path<String>,
+    Json(req): Json<ApproveOperatorModelLayerRequest>,
+) -> impl IntoResponse {
+    let checkpoint = match app
+        .approve_operator_model_layer(
+            &session_id,
+            &req.layer,
+            &req.thread_id,
+            req.approved_by.as_deref(),
+        )
+        .await
+    {
+        Ok(cp) => cp,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // After approving, check if the session is now complete and generate the brief.
+    let session = match app.operator_models.get_session(&session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "session not found".to_string()).into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let brief = if session.status == "completed" {
+        match app.generate_commissioning_brief(&session.profile_id).await {
+            Ok(brief) => Some(brief),
+            Err(e) => {
+                tracing::warn!(
+                    "failed to generate commissioning brief for {}: {e}",
+                    session.profile_id
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Prompt the next layer if not complete.
+    if session.status == "active" {
+        if let Some(next) = session.pending_layer.as_deref() {
+            let next_prompt = layer_transition_prompt(next);
+            let _ = app
+                .chat
+                .append_message(&req.thread_id, "agent", Some("coobie"), &next_prompt, None)
+                .await;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "checkpoint": checkpoint,
+            "session_status": session.status,
+            "pending_layer": session.pending_layer,
+            "commissioning_brief": brief,
+        })),
+    )
+        .into_response()
+}
+
+async fn get_operator_model_commissioning_brief(
+    State(app): State<AppContext>,
+    Path(profile_id): Path<String>,
+) -> impl IntoResponse {
+    match app.generate_commissioning_brief(&profile_id).await {
+        Ok(brief) => (StatusCode::OK, Json(brief)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn layer_transition_prompt(next_layer: &str) -> String {
+    match next_layer {
+        "recurring_decisions" => {
+            "Layer 1 (operating rhythms) approved. Moving to Layer 2: **recurring decisions**.\n\n\
+            Walk me through the decisions you find yourself making repeatedly in this repo — \
+            things like: how you choose between approaches, when you escalate, what tools or \
+            patterns you default to, and where your risk tolerance sits. \
+            Be concrete — \"I always X when Y\" is more useful than general preferences."
+                .to_string()
+        }
+        other => format!(
+            "Layer approved. Moving to the next layer: **{other}**. \
+            Please share what's relevant for this area."
+        ),
+    }
+}
+
+// ── Health and operational endpoints ─────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+    uptime_secs: u64,
+    db_ok: bool,
+    memory_index_ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerStatusResponse {
+    active_runs: usize,
+    agent_claim_count: usize,
+    memory_entry_count: usize,
+    last_benchmark_run: Option<String>,
+}
+
+async fn get_health(State(app): State<AppContext>) -> impl IntoResponse {
+    let db_ok = sqlx::query("SELECT 1")
+        .fetch_one(&app.pool)
+        .await
+        .is_ok();
+
+    let memory_index_ok = app.paths.memory.join("index.json").exists();
+
+    let body = HealthResponse {
+        status: if db_ok { "ok" } else { "degraded" },
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: app.started_at.elapsed().as_secs(),
+        db_ok,
+        memory_index_ok,
+    };
+
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (code, Json(body)).into_response()
+}
+
+async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
+    let active_runs = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM runs WHERE status = 'running'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap_or(0) as usize;
+
+    let agent_claim_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM assignments WHERE status = 'active'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap_or(0) as usize;
+
+    let memory_entry_count = app
+        .memory_store
+        .list_entries()
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let last_benchmark_run: Option<String> = sqlx::query_scalar(
+        "SELECT created_at FROM benchmark_runs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&app.pool)
+    .await
+    .unwrap_or(None);
+
+    (
+        StatusCode::OK,
+        Json(ServerStatusResponse {
+            active_runs,
+            agent_claim_count,
+            memory_entry_count,
+            last_benchmark_run,
+        }),
+    )
+        .into_response()
 }

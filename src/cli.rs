@@ -15,8 +15,8 @@ use crate::orchestrator::{AppContext, FailureHarness, RunRequest};
 use crate::reporting;
 use crate::setup::{
     available_template_names, command_available, compose_setup_id, default_provider_config,
-    slugify_machine_name, MachineConfig, McpConfig, McpServerConfig, ProviderConfig, RoutingConfig,
-    SetupConfig, SystemDiscovery,
+    slugify_machine_name, MachineConfig, McpConfig, McpSelfConfig, McpServerConfig, ProviderConfig,
+    RoutingConfig, SetupConfig, SystemDiscovery,
 };
 
 #[derive(Parser, Debug)]
@@ -52,6 +52,14 @@ pub enum Commands {
     Setup {
         #[command(subcommand)]
         command: SetupCommands,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+    Soul {
+        #[command(subcommand)]
+        command: SoulCommands,
     },
     Serve(ServeArgs),
     Capacity {
@@ -250,6 +258,17 @@ pub enum SetupCommands {
     ClaudePack(SetupClaudePackArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub enum McpCommands {
+    Serve(McpServeArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SoulCommands {
+    Bootstrap(SoulBootstrapArgs),
+    Show(SoulShowArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct SetupInitArgs {
     #[arg(long)]
@@ -288,6 +307,32 @@ pub struct SetupClaudePackArgs {
     pub winccoa: bool,
     #[arg(long, default_value_t = false)]
     pub no_settings: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct McpServeArgs {
+    #[arg(long)]
+    pub transport: Option<String>,
+    #[arg(long)]
+    pub host: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
+}
+
+#[derive(Args, Debug)]
+pub struct SoulBootstrapArgs {
+    #[arg(long, default_value = "coobie")]
+    pub self_name: String,
+    #[arg(long)]
+    pub output_root: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SoulShowArgs {
+    #[arg(long, default_value = "coobie")]
+    pub self_name: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -722,6 +767,44 @@ pub async fn handle_setup(command: SetupCommands, paths: &Paths) -> Result<()> {
     }
 }
 
+pub async fn handle_mcp(command: McpCommands, app: AppContext) -> Result<()> {
+    match command {
+        McpCommands::Serve(args) => crate::mcp_server::handle_mcp_serve(app, args).await,
+    }
+}
+
+pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
+    match command {
+        SoulCommands::Bootstrap(args) => {
+            crate::calvin_archive::require_coobie(&args.self_name)?;
+            let output =
+                crate::calvin_archive::bootstrap_coobie(paths, args.output_root.as_deref())?;
+            println!("Calvin Archive root: {}", output.root.display());
+            println!("TypeDB schema: {}", output.schema_path.display());
+            println!("TypeDB seed: {}", output.seed_path.display());
+            println!(
+                "Identity projection: {}",
+                output.identity_json_path.display()
+            );
+            println!("Soul guide: {}", output.guide_path.display());
+            println!("TypeDB scaffold script: scripts/bootstrap-calvin-archive-typedb.sh");
+        }
+        SoulCommands::Show(args) => {
+            crate::calvin_archive::require_coobie(&args.self_name)?;
+            let identity = crate::calvin_archive::coobie_identity();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&identity)?);
+            } else {
+                println!(
+                    "{}",
+                    crate::calvin_archive::render_identity_markdown(&identity)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_setup_check(paths: &Paths) -> Result<()> {
     let s = &paths.setup;
     println!("Setup:       {}", s.setup.name);
@@ -797,6 +880,25 @@ fn handle_setup_check(paths: &Paths) -> Result<()> {
                 }
             );
         }
+        if let Some(self_server) = &mcp.self_server {
+            println!(
+                "  [self ] transport={}{}{}{}",
+                self_server.transport,
+                self_server
+                    .host
+                    .as_ref()
+                    .map(|value| format!(" host={value}"))
+                    .unwrap_or_default(),
+                self_server
+                    .port
+                    .map(|value| format!(" port={value}"))
+                    .unwrap_or_default(),
+                self_server
+                    .auth_required
+                    .map(|value| format!(" auth_required={value}"))
+                    .unwrap_or_default(),
+            );
+        }
     } else {
         println!();
         println!("MCP Servers: none configured");
@@ -857,6 +959,7 @@ fn handle_setup_init(paths: &Paths, args: SetupInitArgs) -> Result<()> {
     rebalance_agent_routing(&mut config, interactive)?;
     if interactive {
         interview_mcp_servers(&mut config, &discovery)?;
+        interview_mcp_self(&mut config)?;
     }
     normalize_mcp_servers(&mut config);
 
@@ -1009,7 +1112,7 @@ fn handle_setup_claude_pack(paths: &Paths, args: SetupClaudePackArgs) -> Result<
     println!("  1. Open the target repo in Claude Code and restart it if settings changed.");
     println!("  2. Run /agents to confirm the Labradors are available.");
     println!("  3. Ask Scout to draft the first Harkonnen spec for the target project.");
-    println!("  4. Use Keeper before any risky WinCC OA or environment-facing action.");
+    println!("  4. Use Keeper before any risky operational or environment-facing action.");
     Ok(())
 }
 
@@ -1107,7 +1210,22 @@ fn configure_provider_prompt(name: &str, slot: &mut Option<ProviderConfig>) -> R
     )?;
     provider.enabled = has_access;
     if has_access {
+        let credential_kind_default = provider
+            .credential_kind
+            .clone()
+            .unwrap_or_else(|| default_credential_kind(name).to_string());
+        let credential_kind = prompt_choice(
+            &format!("Credential type for {name}"),
+            credential_kind_options(name),
+            &credential_kind_default,
+        )?;
+        provider.credential_kind = Some(credential_kind.clone());
+
         provider.model = prompt_text(&format!("Model for {name}"), &provider.model)?;
+        provider.api_key_env = prompt_text(
+            &format!("Credential env var for {name}"),
+            &provider.api_key_env,
+        )?;
         let usage_default = provider
             .usage_rights
             .clone()
@@ -1125,10 +1243,10 @@ fn configure_provider_prompt(name: &str, slot: &mut Option<ProviderConfig>) -> R
             &format!("Preferred surface for {name}"),
             &surface_default,
         )?);
-        if matches!(provider.provider_type.as_str(), "openai" | "codex") {
+        if should_prompt_base_url(name, &provider, &credential_kind) {
             let base_url_default = provider.base_url.clone().unwrap_or_default();
             let base_url = prompt_text(
-                &format!("OpenAI-compatible base URL for {name} (blank for default OpenAI API)"),
+                &format!("Base URL for {name} (blank for the provider's public API)"),
                 &base_url_default,
             )?;
             provider.base_url = if base_url.trim().is_empty() {
@@ -1136,10 +1254,43 @@ fn configure_provider_prompt(name: &str, slot: &mut Option<ProviderConfig>) -> R
             } else {
                 Some(base_url)
             };
+        } else {
+            provider.base_url = None;
         }
     }
     *slot = Some(provider);
     Ok(())
+}
+
+fn default_credential_kind(name: &str) -> &'static str {
+    match name {
+        "codex" => "standard-api-key",
+        _ => "standard-api-key",
+    }
+}
+
+fn credential_kind_options(name: &str) -> &'static [&'static str] {
+    match name {
+        "codex" => &[
+            "standard-api-key",
+            "enterprise-api-key",
+            "openai-compatible",
+            "gateway-token",
+        ],
+        _ => &["standard-api-key", "enterprise-api-key", "gateway-token"],
+    }
+}
+
+fn should_prompt_base_url(name: &str, provider: &ProviderConfig, credential_kind: &str) -> bool {
+    if provider.base_url.is_some() {
+        return true;
+    }
+
+    match credential_kind {
+        "enterprise-api-key" | "gateway-token" => true,
+        "openai-compatible" => true,
+        _ => matches!(name, "codex"),
+    }
 }
 
 fn normalize_provider_defaults(config: &mut SetupConfig) -> Result<()> {
@@ -1357,7 +1508,10 @@ fn interview_mcp_servers(config: &mut SetupConfig, discovery: &SystemDiscovery) 
     config.mcp = if servers.is_empty() {
         None
     } else {
-        Some(McpConfig { servers })
+        Some(McpConfig {
+            servers,
+            self_server: config.mcp.as_ref().and_then(|mcp| mcp.self_server.clone()),
+        })
     };
     Ok(())
 }
@@ -1590,7 +1744,7 @@ fn normalize_mcp_servers(config: &mut SetupConfig) {
         !name.is_empty() && !command.is_empty() && seen.insert(name.to_string())
     });
 
-    if mcp.servers.is_empty() {
+    if mcp.servers.is_empty() && mcp.self_server.is_none() {
         config.mcp = None;
     }
 }
@@ -1598,7 +1752,7 @@ fn normalize_mcp_servers(config: &mut SetupConfig) {
 fn print_setup_mcp_preview(mcp: Option<&McpConfig>) {
     println!();
     match mcp {
-        Some(mcp) if !mcp.servers.is_empty() => {
+        Some(mcp) if !mcp.servers.is_empty() || mcp.self_server.is_some() => {
             println!("Selected MCP servers:");
             for server in &mcp.servers {
                 let aliases = server
@@ -1608,9 +1762,85 @@ fn print_setup_mcp_preview(mcp: Option<&McpConfig>) {
                     .unwrap_or_else(|| "no aliases".to_string());
                 println!("  - {} via {} [{}]", server.name, server.command, aliases);
             }
+            if let Some(self_server) = &mcp.self_server {
+                println!(
+                    "  - self via {}{}{}{}",
+                    self_server.transport,
+                    self_server
+                        .host
+                        .as_ref()
+                        .map(|value| format!(" host={value}"))
+                        .unwrap_or_default(),
+                    self_server
+                        .port
+                        .map(|value| format!(" port={value}"))
+                        .unwrap_or_default(),
+                    self_server
+                        .auth_required
+                        .map(|value| format!(" auth_required={value}"))
+                        .unwrap_or_default(),
+                );
+            }
         }
         _ => println!("Selected MCP servers: none"),
     }
+}
+
+fn interview_mcp_self(config: &mut SetupConfig) -> Result<()> {
+    let existing = config.mcp.as_ref().and_then(|mcp| mcp.self_server.clone());
+    let default_enabled = existing
+        .as_ref()
+        .map(|value| value.enabled)
+        .unwrap_or(false);
+    if !prompt_bool("Expose Harkonnen itself as an MCP server?", default_enabled)? {
+        if let Some(mcp) = &mut config.mcp {
+            mcp.self_server = None;
+        }
+        return Ok(());
+    }
+
+    let mut self_server = existing.unwrap_or(McpSelfConfig {
+        enabled: true,
+        transport: "sse".to_string(),
+        host: Some("127.0.0.1".to_string()),
+        port: Some(3001),
+        auth_required: Some(true),
+    });
+
+    self_server.enabled = true;
+    self_server.transport = prompt_choice(
+        "Self MCP transport (sse, stdio)",
+        &["sse", "stdio"],
+        &self_server.transport,
+    )?;
+    if self_server.transport == "sse" {
+        let host_default = self_server
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        self_server.host = Some(prompt_text("Self MCP host", &host_default)?);
+        let port_default = self_server.port.unwrap_or(3001).to_string();
+        let port = prompt_text("Self MCP port", &port_default)?;
+        self_server.port = Some(
+            port.parse::<u16>()
+                .with_context(|| format!("invalid MCP port: {port}"))?,
+        );
+        self_server.auth_required = Some(prompt_bool(
+            "Require auth for self MCP server?",
+            self_server.auth_required.unwrap_or(true),
+        )?);
+    } else {
+        self_server.host = None;
+        self_server.port = None;
+        self_server.auth_required = Some(false);
+    }
+
+    let mcp = config.mcp.get_or_insert(McpConfig {
+        servers: Vec::new(),
+        self_server: None,
+    });
+    mcp.self_server = Some(self_server);
+    Ok(())
 }
 
 fn render_generated_setup(config: &SetupConfig) -> Result<String> {
@@ -1690,6 +1920,9 @@ fn print_agent_routing(paths: &Paths, setup: &SetupConfig) -> Result<()> {
 
 fn provider_notes(config: &ProviderConfig) -> String {
     let mut notes = Vec::new();
+    if let Some(credential_kind) = &config.credential_kind {
+        notes.push(format!("credential: {credential_kind}"));
+    }
     if let Some(surface) = &config.surface {
         notes.push(format!("surface: {surface}"));
     }
@@ -1716,6 +1949,17 @@ fn prompt_text(label: &str, default: &str) -> Result<String> {
         Ok(default.to_string())
     } else {
         Ok(trimmed.to_string())
+    }
+}
+
+fn prompt_choice(label: &str, options: &[&str], default: &str) -> Result<String> {
+    loop {
+        let joined = options.join(", ");
+        let chosen = prompt_text(&format!("{label} ({joined})"), default)?;
+        if options.iter().any(|option| *option == chosen) {
+            return Ok(chosen);
+        }
+        println!("Please choose one of: {joined}");
     }
 }
 

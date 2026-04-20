@@ -49,10 +49,25 @@ impl LlmRequest {
     }
 }
 
+/// Token and latency usage for a single LLM call.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LlmUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub latency_ms: u64,
+}
+
+impl LlmUsage {
+    pub fn total_tokens(&self) -> u32 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 /// Resolved response from any provider.
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    pub usage: Option<LlmUsage>,
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -107,11 +122,15 @@ pub fn build_provider_with_capacity(
             "anthropic" | "claude" => Box::new(AnthropicClient {
                 api_key,
                 model: provider_cfg.model.clone(),
+                base_url: anthropic_messages_url(provider_cfg.base_url.as_deref()),
                 http: build_http_client(),
             }),
             "gemini" | "google" => Box::new(GeminiClient {
-                api_key,
-                model: provider_cfg.model.clone(),
+                base_url: gemini_generate_content_url(
+                    provider_cfg.base_url.as_deref(),
+                    &provider_cfg.model,
+                    &api_key,
+                ),
                 http: build_http_client(),
             }),
             "openai" | "codex" => Box::new(OpenAiClient {
@@ -157,11 +176,58 @@ fn openai_chat_completions_url(base_url: Option<&str>) -> String {
     }
 }
 
+fn anthropic_messages_url(base_url: Option<&str>) -> String {
+    let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "https://api.anthropic.com/v1/messages".to_string();
+    };
+
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/messages") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
+fn gemini_generate_content_url(base_url: Option<&str>, model: &str, api_key: &str) -> String {
+    let model = model.trim_start_matches("models/");
+    let base = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let trimmed = value.trim_end_matches('/');
+            if trimmed.contains("{model}") {
+                trimmed.replace("{model}", model)
+            } else if trimmed.ends_with(":generateContent") {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1beta") {
+                format!("{trimmed}/models/{model}:generateContent")
+            } else {
+                format!("{trimmed}/v1beta/models/{model}:generateContent")
+            }
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                model
+            )
+        });
+
+    if base.contains("?") {
+        format!("{base}&key={api_key}")
+    } else {
+        format!("{base}?key={api_key}")
+    }
+}
+
 // ── Anthropic ─────────────────────────────────────────────────────────────────
 
 struct AnthropicClient {
     api_key: String,
     model: String,
+    base_url: String,
     http: reqwest::Client,
 }
 
@@ -183,6 +249,16 @@ struct AnthropicMessage<'a> {
 #[derive(Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    #[serde(default)]
+    usage: AnthropicUsage,
+}
+
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -223,9 +299,10 @@ impl LlmProvider for AnthropicClient {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
+            let t0 = std::time::Instant::now();
             let resp = self
                 .http
-                .post("https://api.anthropic.com/v1/messages")
+                .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -256,9 +333,15 @@ impl LlmProvider for AnthropicClient {
                 bail!("Anthropic API error {}: {}", status, body);
             }
 
+            let latency_ms = t0.elapsed().as_millis() as u64;
             let parsed: AnthropicResponse =
                 resp.json().await.context("parsing Anthropic response")?;
 
+            let usage = Some(LlmUsage {
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                latency_ms,
+            });
             let content = parsed
                 .content
                 .into_iter()
@@ -266,7 +349,7 @@ impl LlmProvider for AnthropicClient {
                 .collect::<Vec<_>>()
                 .join("");
 
-            return Ok(LlmResponse { content });
+            return Ok(LlmResponse { content, usage });
         }
     }
 }
@@ -274,8 +357,7 @@ impl LlmProvider for AnthropicClient {
 // ── Gemini ────────────────────────────────────────────────────────────────────
 
 struct GeminiClient {
-    api_key: String,
-    model: String,
+    base_url: String,
     http: reqwest::Client,
 }
 
@@ -309,6 +391,16 @@ struct GeminiGenerationConfig {
 #[derive(Deserialize)]
 struct GeminiResponse {
     candidates: Vec<GeminiCandidate>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: GeminiUsageMetadata,
+}
+
+#[derive(Deserialize, Default)]
+struct GeminiUsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: u32,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -368,16 +460,10 @@ impl LlmProvider for GeminiClient {
             },
         };
 
-        // Gemini model IDs use "gemini-2.0-flash" style; strip any "models/" prefix if present
-        let model = self.model.trim_start_matches("models/");
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, self.api_key
-        );
-
+        let t0 = std::time::Instant::now();
         let resp = self
             .http
-            .post(&url)
+            .post(&self.base_url)
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -390,8 +476,14 @@ impl LlmProvider for GeminiClient {
             bail!("Gemini API error {}: {}", status, body);
         }
 
+        let latency_ms = t0.elapsed().as_millis() as u64;
         let parsed: GeminiResponse = resp.json().await.context("parsing Gemini response")?;
 
+        let usage = Some(LlmUsage {
+            input_tokens: parsed.usage_metadata.prompt_token_count,
+            output_tokens: parsed.usage_metadata.candidates_token_count,
+            latency_ms,
+        });
         let content = parsed
             .candidates
             .into_iter()
@@ -400,7 +492,7 @@ impl LlmProvider for GeminiClient {
             .collect::<Vec<_>>()
             .join("");
 
-        Ok(LlmResponse { content })
+        Ok(LlmResponse { content, usage })
     }
 }
 
@@ -430,6 +522,16 @@ struct OpenAiMessage<'a> {
 #[derive(Deserialize)]
 struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: OpenAiUsage,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -461,6 +563,7 @@ impl LlmProvider for OpenAiClient {
             messages,
         };
 
+        let t0 = std::time::Instant::now();
         let resp = self
             .http
             .post(&self.base_url)
@@ -477,8 +580,14 @@ impl LlmProvider for OpenAiClient {
             bail!("OpenAI API error {}: {}", status, body);
         }
 
+        let latency_ms = t0.elapsed().as_millis() as u64;
         let parsed: OpenAiResponse = resp.json().await.context("parsing OpenAI response")?;
 
+        let usage = Some(LlmUsage {
+            input_tokens: parsed.usage.prompt_tokens,
+            output_tokens: parsed.usage.completion_tokens,
+            latency_ms,
+        });
         let content = parsed
             .choices
             .into_iter()
@@ -486,13 +595,13 @@ impl LlmProvider for OpenAiClient {
             .collect::<Vec<_>>()
             .join("");
 
-        Ok(LlmResponse { content })
+        Ok(LlmResponse { content, usage })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::openai_chat_completions_url;
+    use super::{anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url};
 
     #[test]
     fn openai_base_url_defaults_to_public_api() {
@@ -523,6 +632,42 @@ mod tests {
         assert_eq!(
             openai_chat_completions_url(Some("http://localhost:1234/v1/chat/completions")),
             "http://localhost:1234/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn anthropic_base_url_defaults_to_public_api() {
+        assert_eq!(
+            anthropic_messages_url(None),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn anthropic_base_url_appends_messages_endpoint() {
+        assert_eq!(
+            anthropic_messages_url(Some("https://gateway.example.com/anthropic")),
+            "https://gateway.example.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn gemini_base_url_defaults_to_public_api() {
+        assert_eq!(
+            gemini_generate_content_url(None, "gemini-2.0-flash", "test-key"),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=test-key"
+        );
+    }
+
+    #[test]
+    fn gemini_base_url_accepts_template_path() {
+        assert_eq!(
+            gemini_generate_content_url(
+                Some("https://gateway.example.com/google/v1beta/models/{model}:generateContent"),
+                "models/gemini-2.0-flash",
+                "test-key"
+            ),
+            "https://gateway.example.com/google/v1beta/models/gemini-2.0-flash:generateContent?key=test-key"
         );
     }
 }

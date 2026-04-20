@@ -32,7 +32,7 @@ use crate::models::{
     CausalEventEdge, CausalHypothesis, CausalHypothesisEvidence, CausalStreak, CoobieBriefing,
     CoobieEvidenceCitation, CounterfactualEstimate, CounterfactualOutcome, FactoryEpisode,
     InterventionPlan, LessonRecord, PearlHierarchyLevel, ProjectComponent, ProjectResumeRisk,
-    ScenarioBlueprint,
+    ScenarioBlueprint, SoulIdentityContext,
 };
 
 // ── Public reasoning trait ────────────────────────────────────────────────────
@@ -702,6 +702,18 @@ pub fn render_coobie_briefing_response(briefing: &CoobieBriefing) -> String {
         .project_memory_root
         .clone()
         .unwrap_or_else(|| "not recorded".to_string());
+    let operator_model_section = briefing
+        .operator_model_context
+        .as_ref()
+        .map(render_operator_model_context)
+        .unwrap_or_else(|| "- No operator-model context was attached to this run yet.".to_string());
+    let soul_identity_section = briefing
+        .soul_identity_context
+        .as_ref()
+        .map(render_soul_identity_context)
+        .unwrap_or_else(|| {
+            "- No Calvin Archive identity context was attached to this run yet.".to_string()
+        });
 
     format!(
         "# Coobie Preflight Response
@@ -728,6 +740,12 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 {}
 
 ## Core Memory Context
+{}
+
+## Operator Model Context
+{}
+
+## Soul Preservation Context
 {}
 
 ## Domain Signals
@@ -819,6 +837,8 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
             &briefing.core_memory_hits,
             "No Harkonnen core memory hits were retrieved yet.",
         ),
+        operator_model_section,
+        soul_identity_section,
         render_bullet_lines(
             &briefing.domain_signals,
             "No domain signals were detected yet."
@@ -893,6 +913,88 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
         ),
         render_bullet_lines(&briefing.open_questions, "No open questions were raised."),
     )
+}
+
+fn render_operator_model_context(context: &crate::models::OperatorModelContext) -> String {
+    let mut lines = Vec::new();
+    if !context.summary.trim().is_empty() {
+        lines.push(format!("- Summary: {}", context.summary.trim()));
+    }
+    if !context.operating_rhythms.is_empty() {
+        lines.push(format!(
+            "- Operating rhythms: {}",
+            context.operating_rhythms.join(" | ")
+        ));
+    }
+    if !context.guardrails.is_empty() {
+        lines.push(format!("- Guardrails: {}", context.guardrails.join(" | ")));
+    }
+    if !context.escalation_rules.is_empty() {
+        lines.push(format!(
+            "- Escalation rules: {}",
+            context.escalation_rules.join(" | ")
+        ));
+    }
+    if !context.dependencies.is_empty() {
+        lines.push(format!(
+            "- Dependencies: {}",
+            context.dependencies.join(" | ")
+        ));
+    }
+    if !context.open_questions.is_empty() {
+        lines.push(format!(
+            "- Open questions: {}",
+            context.open_questions.join(" | ")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(
+            "- Operator-model profile exists, but no durable context has been distilled yet."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+fn render_soul_identity_context(context: &SoulIdentityContext) -> String {
+    let mut lines = Vec::new();
+    if !context.identity_thesis.trim().is_empty() {
+        lines.push(format!(
+            "- Identity thesis: {}",
+            context.identity_thesis.trim()
+        ));
+    }
+    if !context.preserved_invariants.is_empty() {
+        lines.push(format!(
+            "- Preserved invariants: {}",
+            context.preserved_invariants.join(" | ")
+        ));
+    }
+    if !context.baseline_beliefs.is_empty() {
+        lines.push(format!(
+            "- Baseline beliefs: {}",
+            context.baseline_beliefs.join(" | ")
+        ));
+    }
+    if !context.allowed_adaptations.is_empty() {
+        lines.push(format!(
+            "- Allowed adaptations: {}",
+            context.allowed_adaptations.join(" | ")
+        ));
+    }
+    if !context.forbidden_drift.is_empty() {
+        lines.push(format!(
+            "- Forbidden drift: {}",
+            context.forbidden_drift.join(" | ")
+        ));
+    }
+    if !context.adaptation_law.trim().is_empty() {
+        lines.push(format!(
+            "- Adaptation law: {}",
+            context.adaptation_law.trim()
+        ));
+    }
+    lines.join("\n")
 }
 
 pub fn render_coobie_report_response(report: &CausalReport) -> String {
@@ -1153,12 +1255,12 @@ impl SqliteCoobie {
                             .unwrap_or(false),
                     };
                 }
-                let ready = twin
+                let running = twin
                     .services
                     .iter()
-                    .filter(|s| s.status == "ready" || s.status == "running")
+                    .filter(|s| s.status == "running")
                     .count() as f32;
-                (ready / total).min(1.0)
+                (running / total).min(1.0)
             }
         };
 
