@@ -1,7 +1,7 @@
 # Harkonnen Labs — Execution Roadmap
 
 **This is the canonical build order from 2026-04-17 forward.**
-Phases 1, 4, 4b, 5, and v1 (A–D) are shipped. Phase 2 is the active build target.
+Phases 1, 4, 4b, 5, v1 (A–D), and 2 are shipped. Phase 3 is the active build target.
 
 ---
 
@@ -157,27 +157,86 @@ validation speed, and time-to-root-cause matter alongside code-level success.
 **Unlocks:** Sable's scenario evaluation becomes grounded.
 Right now Sable judges against a twin that is a JSON manifest, not running infrastructure.
 
-**What to build:**
+### 3-A — Models and Spec extension
 
-- Ash generates a `docker-compose.yml` in the run workspace from the twin manifest — one service stub per declared external dependency
-- `ash_provision_twin` spawns the compose stack before Sable runs, tears it down after
-- Network address and port bindings written to `twin_env.json` so Mason/Piper can reference them
-- `twin_fidelity_score` derived from which declared dependencies actually had running stubs
-- Failure injection: Ash can set env vars on stubs to simulate auth expiry, rate limits, or connection refusal per scenario config
-- **Flint documentation phase** — Flint produces a documentation artifact (README, API reference, or inline doc comments) as a first-class phase output. Required for DevBench. Flint reads the spec and Mason's implementation artifacts, then generates docs under `artifacts/docs/`.
-- **DevBench adapter** — maps Harkonnen's full run to DevBench's evaluation format. Each Labrador phase maps to a DevBench lifecycle stage.
-- **Spec Adherence Rate benchmark** — LLM-as-judge grader that extracts requirements from the spec and scores completeness and precision. Run with and without Scout's formalization step.
-- **Hidden Scenario Delta benchmark** — tracks `visible_test_pass_rate` versus `hidden_scenario_pass_rate` across a corpus and surfaces the gap. Requires Phase 2 real test results.
+- Add `TwinFailureMode` enum to `src/models.rs`: `AuthExpiry`, `RateLimit`, `ConnectionRefusal`
+- Add `TwinServiceSpec` struct to `src/models.rs`: `name: String`, `image: String`, `port: Option<u16>`, `env: BTreeMap<String, String>`, `failure_mode: Option<TwinFailureMode>`
+- Add `twin_services: Vec<TwinServiceSpec>` (serde default empty) to the `Spec` struct in `src/models.rs`
+- Add `compose_project: Option<String>` to `TwinEnvironment` so teardown can find the right stack by project name
+
+### 3-B — `ash_provision_twin` in `src/orchestrator.rs`
+
+Replaces the current `build_twin_environment` call in the twin phase.
+
+- If `spec.twin_services` is empty AND `spec.dependencies` is non-empty, derive `TwinServiceSpec` entries automatically by mapping known names (postgres, redis, mysql, mongo, rabbitmq, kafka, minio) to well-known images and default ports; unknown deps get `busybox:latest` as a placeholder
+- Generate `docker-compose.yml` in `run_dir/` — one service per spec, applying `failure_mode` env vars: `AuthExpiry → MOCK_AUTH_EXPIRED=true`, `RateLimit → MOCK_RATE_LIMIT=10`, `ConnectionRefusal` → service omitted from compose entirely
+- Run `docker compose -p <project> -f <compose_file> up -d` (fall back gracefully to simulated mode if docker is unavailable — check `setup.machine.fingerprint.docker`)
+- Poll readiness: retry `docker compose -p <project> ps` up to 10 times with 1-second intervals; mark each service "running" or "failed"
+- Get port bindings: `docker compose -p <project> port <service> <internal_port>` for each service; write `twin_env.json` to run_dir: `{ "services": { "postgres": "127.0.0.1:54321", ... } }`
+- Build and return a `TwinEnvironment` where each service's `status` is `"running"`, `"failed"`, or `"simulated"` (if docker unavailable)
+
+### 3-C — `ash_teardown_twin` in `src/orchestrator.rs`
+
+- Called after the Sable/hidden-scenarios phase completes (currently line ~3200 in orchestrator)
+- Runs `docker compose -p <project> down --remove-orphans`
+- Logs teardown result to the run event log; does not fail the run if teardown errors
+
+### 3-D — Wire provisioning into the run lifecycle
+
+- Replace `let twin = self.build_twin_environment(run_id, spec_obj);` with `let (twin, compose_project) = self.ash_provision_twin(run_id, spec_obj, &run_dir).await?;`
+- Store `compose_project` in the blackboard so teardown can find it
+- Add teardown call after the hidden-scenarios phase completes
+- Pass `twin_env.json` path to Sable's scenario evaluation context so scenarios can reference real port bindings
+
+### 3-E — Update `twin_fidelity_score` in `src/coobie.rs`
+
+- Change the fidelity computation (currently line ~1221) to count services where `status == "running"` rather than just counting total services
+- Formula: `running_count / total_declared` — gracefully handles zero total (returns 0.1 as before)
+
+### 3-F — Flint documentation phase
+
+- After `self.package_artifacts(run_id)` in the Flint phase, call a new `flint_generate_docs` method
+- `flint_generate_docs` reads the spec and Mason's implementation artifacts from the run dir, calls the Flint LLM agent to generate a `README.md` and optionally an `API.md`
+- Writes output to `artifacts/docs/<run_id>/README.md` and `artifacts/docs/<run_id>/API.md`
+- Adds `docs/README.md` to `blackboard.artifact_refs`
+- Required for DevBench — must land in Phase 3
+
+### 3-G — `src/spec_adherence.rs` — LLM-as-judge benchmark
+
+New builtin benchmark module (follows the same pattern as `cladder.rs`).
+
+- Loads a JSONL file where each line is `{ "run_id": "...", "spec_path": "...", "output_path": "..." }`, OR if no dataset is provided, queries the local SQLite DB for the last N completed runs
+- For each entry: reads the spec's `acceptance_criteria` list and Mason's primary output artifact, asks an LLM judge to score each criterion as met/partial/unmet
+- Metrics: `completeness` (fraction of criteria met or partial), `precision` (fraction fully met)
+- Env: `SPEC_ADHERENCE_DATASET`, `SPEC_ADHERENCE_LIMIT`, `SPEC_ADHERENCE_OUTPUT`, `SPEC_ADHERENCE_MIN_COMPLETENESS`
+- Builtin name: `"spec_adherence"`
+- Also supports a `without_scout` mode to measure what Scout's formalization step contributes
+
+### 3-H — `src/scenario_delta.rs` — Hidden Scenario Delta benchmark
+
+New builtin benchmark module — Harkonnen-native, no external dataset.
+
+- Queries `coobie_episode_scores` in the local SQLite DB for runs where both `validation_passed` and `scenario_passed` are recorded
+- Computes: `visible_pass_rate` (fraction where `validation_passed = 1`), `hidden_pass_rate` (fraction where `scenario_passed = 1`), `delta = visible_pass_rate - hidden_pass_rate`
+- A large positive delta means Bramble passes things that Sable catches — proves the hidden scenario value
+- Writes `scenario_delta_report.md` and `scenario_delta_summary.json` to artifact dir
+- Builtin name: `"scenario_delta"`
+- Env: `SCENARIO_DELTA_LIMIT` (max runs to include), `SCENARIO_DELTA_OUTPUT`
+
+### 3-I — `suites.yaml` entries
+
+- `harkonnen_spec_adherence` — Spec Adherence Rate (harkonnen-native, builtin: `spec_adherence`)
+- `harkonnen_scenario_delta` — Hidden Scenario Delta (harkonnen-native, builtin: `scenario_delta`)
+- `harkonnen_twin_fidelity` — Twin Fidelity (harkonnen-native: queries last N runs for `twin_fidelity_score` distribution, builtin: `scenario_delta` or new `twin_fidelity` builtin)
 
 **Benchmark gate:**
 
-- repo-native `twin fidelity` benchmark suite
-- repo-native `hidden scenario integrity` benchmark
-- `hidden scenario delta` first run published
-- `spec adherence rate` first run published
-- `DevBench` adapter wired, even if early scores are unpublished
+- At least one run with `twin_fidelity_score > 0.5` from real Docker containers
+- `spec_adherence` first run published — completeness and precision against local run corpus
+- `scenario_delta` first run published — visible vs hidden pass rate gap across recent runs
+- `DevBench` adapter wired (script-based, not builtin — deferred to after Flint docs land)
 
-**Done when:** A spec with a twin declaration actually starts Docker containers, Sable's hidden scenarios run against live stubs, Flint produces a doc artifact, and the spec adherence and hidden scenario delta benchmarks have baseline runs.
+**Done when:** A spec with `twin_services` actually starts Docker containers; `twin_env.json` contains real port bindings; Sable receives those bindings; `twin_fidelity_score` reflects real container health; Flint produces a doc artifact per run; and `spec_adherence` and `scenario_delta` have first-run baselines.
 
 ---
 
@@ -341,6 +400,7 @@ and the integration-governance design in [the-soul-of-ai/07-Governed-Integration
 - Coobie preflight integration so operator-model assumptions contribute to `required_checks`, guardrails, and escalation rules
 
 **Current shipped slice:** project-first operator-model resolution now influences Scout draft generation and Coobie preflight guidance. The remaining product work is the checkpoint/export/review loop that turns the interview into durable stamped artifacts with operator approval.
+
 - Review loop after runs: consolidation can propose operator-model updates, which the operator can keep/discard/edit before promotion
 - Import/export compatibility with OB1-style operating artifacts, but no direct code dependency on OB1
 

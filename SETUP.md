@@ -2,6 +2,10 @@
 
 Harkonnen Labs can now generate a machine-specific setup file by fingerprinting the host, asking which model providers are available, and writing a reusable config under `setups/machines/`.
 
+Generated machine profiles are clone-local operational files. They are useful to
+keep around on your machine, but they normally should not be committed to the
+public repository.
+
 ## First run
 
 Start the guided setup interview:
@@ -12,9 +16,9 @@ cargo run -- setup init
 
 This flow now starts with identity first:
 
-- machine name, for example `caleb-siemens-laptop`
+- machine name, for example `builder-laptop-01`
 - setup role, for example `home`, `work`, or `lab`
-- optional organization or team, for example `blue-origin`
+- optional organization or team, for example `research-lab`
 
 Then it will:
 
@@ -45,13 +49,13 @@ That makes it much easier to transfer Harkonnen Labs into another environment wi
 Preview a generated home setup without writing a file:
 
 ```bash
-cargo run -- setup init --non-interactive --machine-name caleb-siemens-laptop --role home
+cargo run -- setup init --non-interactive --machine-name builder-laptop-01 --role home
 ```
 
 Preview a work setup for the same Linux machine:
 
 ```bash
-cargo run -- setup init --non-interactive --machine-name caleb-siemens-laptop --role work
+cargo run -- setup init --non-interactive --machine-name builder-laptop-01 --role work
 ```
 
 Preview a transfer-ready setup for another organization:
@@ -59,9 +63,9 @@ Preview a transfer-ready setup for another organization:
 ```bash
 cargo run -- setup init \
   --non-interactive \
-  --machine-name caleb-siemens-laptop \
+  --machine-name builder-laptop-01 \
   --role work \
-  --organization blue-origin \
+  --organization research-lab \
   --template home-linux
 ```
 
@@ -70,11 +74,11 @@ Write a machine config directly:
 ```bash
 cargo run -- setup init \
   --non-interactive \
-  --machine-name caleb-siemens-laptop \
+  --machine-name builder-laptop-01 \
   --role work \
-  --organization blue-origin \
+  --organization research-lab \
   --template home-linux \
-  --write setups/machines/blue-origin-caleb-siemens-laptop-work.toml
+  --write setups/machines/research-lab-builder-laptop-01-work.toml
 ```
 
 Generate a Windows-oriented work setup on a Windows host:
@@ -106,7 +110,7 @@ For the full operator walkthrough, see [WORK_WINDOWS_QUICKSTART.md](./WORK_WINDO
 Linux or macOS:
 
 ```bash
-export HARKONNEN_SETUP=setups/machines/caleb-siemens-laptop-home.toml
+export HARKONNEN_SETUP=setups/machines/builder-laptop-01-home.toml
 cargo run -- setup check
 ```
 
@@ -134,11 +138,11 @@ Once your setup is working, you can stamp a separate repo with a Claude-only Har
 
 ```bash
 cargo run -- setup claude-pack \
-  --target-path ../SPO \
-  --project-name SPO \
+  --target-path ../PlantOps \
+  --project-name PlantOps \
   --project-type winccoa \
-  --domain "Siemens WinCC OA / industrial automation" \
-  --summary "SPO is a WinCC OA based Siemens product operated through a Claude-only Labrador pack." \
+  --domain "OT / industrial automation" \
+  --summary "PlantOps is an industrial-control project operated through a Claude-only Labrador pack." \
   --winccoa
 ```
 

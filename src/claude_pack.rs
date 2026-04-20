@@ -296,7 +296,7 @@ fn build_project_profile(target_root: &Path, req: ClaudePackRequest) -> ProjectP
     let include_winccoa = req.include_winccoa || project_type.eq_ignore_ascii_case("winccoa");
     let domain = req.domain.unwrap_or_else(|| {
         if include_winccoa {
-            "Siemens WinCC OA / industrial automation".to_string()
+            "OT / industrial automation".to_string()
         } else {
             "software product engineering".to_string()
         }
@@ -304,7 +304,7 @@ fn build_project_profile(target_root: &Path, req: ClaudePackRequest) -> ProjectP
     let summary = req.summary.unwrap_or_else(|| {
         if include_winccoa {
             format!(
-                "{name} is a Siemens WinCC OA product prepared for a machine-aware Harkonnen Labrador pack."
+                "{name} is an industrial-control product prepared for a machine-aware Harkonnen Labrador pack."
             )
         } else {
             format!("{name} is prepared for a machine-aware Harkonnen Labrador pack.")
@@ -682,7 +682,7 @@ Local validation commands:
         out.push_str(
             r#"
 Suggested WinCC OA opener:
-`Use Scout to draft a WinCC OA-safe Harkonnen spec for the SPO task, then have Ash outline the twin/simulation approach and Keeper identify any live-system risks.`
+`Use Scout to draft a WinCC OA-safe Harkonnen spec for the target task, then have Ash outline the twin/simulation approach and Keeper identify any live-system risks.`
 "#,
         );
     }

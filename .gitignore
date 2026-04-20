@@ -1,6 +1,7 @@
 target/
 target-host/
 .env
+.claude/settings.local.json
 
 # Python bytecode
 __pycache__/
@@ -15,12 +16,19 @@ __pycache__/
 # Generated indexes and caches — rebuilt by `harkonnen memory init`
 factory/memory/index.json
 **/project-memory/index.json
+factory/coordination/*.json
+factory/coordination/assignments.md
+factory/state/*.json
 
 # Factory runtime directories — not source
 factory/logs/
 factory/artifacts/
 factory/workspaces/
 products/
+
+# Clone-local setup files — generated per machine, not portable source
+setups/discovered-*.toml
+setups/machines/*.toml
 
 # fastembed model cache — downloaded on first run, never committed
 .fastembed_cache/

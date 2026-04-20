@@ -363,7 +363,7 @@ Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor White
 Write-Host "    1. Restart Claude Code - it will pick up the new MCP servers"
 Write-Host "    2. Validate the factory: harkonnen spec validate factory\specs\examples\sample_feature.yaml"
-Write-Host '    3. Export a Labrador pack into SPO: harkonnen setup claude-pack --target-path <path-to-SPO> --project-name SPO --project-type winccoa --domain "Siemens WinCC OA / industrial automation" --summary "SPO is a WinCC OA based Siemens product operated through a Claude-only Labrador pack." --winccoa'
+Write-Host '    3. Export a Labrador pack into an OT repo: harkonnen setup claude-pack --target-path <path-to-project> --project-name PlantOps --project-type winccoa --domain "OT / industrial automation" --summary "PlantOps is an industrial-control project operated through a Claude-only Labrador pack." --winccoa'
 Write-Host "    4. Launch the Pack Board: .\scripts\launch-pack-board-windows.ps1 -OpenBrowser"
 Write-Host "    5. Open the target repo in Claude Code, run /agents, and start with Scout"
 Write-Host ""

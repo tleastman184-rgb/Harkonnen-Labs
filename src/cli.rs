@@ -1063,7 +1063,7 @@ fn handle_setup_claude_pack(paths: &Paths, args: SetupClaudePackArgs) -> Result<
     println!("  1. Open the target repo in Claude Code and restart it if settings changed.");
     println!("  2. Run /agents to confirm the Labradors are available.");
     println!("  3. Ask Scout to draft the first Harkonnen spec for the target project.");
-    println!("  4. Use Keeper before any risky WinCC OA or environment-facing action.");
+    println!("  4. Use Keeper before any risky operational or environment-facing action.");
     Ok(())
 }
 

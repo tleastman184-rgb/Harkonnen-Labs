@@ -96,10 +96,10 @@ Stamp the target repo with a Claude Labrador pack:
 cargo run -- setup claude-pack --target-path ..\YourRepo --project-name YourRepo --project-type generic
 ```
 
-For a WinCC OA / OT-style repo, use the richer export:
+For an OT / industrial-controls repo, use the richer export:
 
 ```powershell
-cargo run -- setup claude-pack --target-path ..\SPO --project-name SPO --project-type winccoa --domain "Siemens WinCC OA / industrial automation" --summary "SPO is operated through a Claude-only Labrador pack." --winccoa
+cargo run -- setup claude-pack --target-path ..\PlantOps --project-name PlantOps --project-type winccoa --domain "OT / industrial automation" --summary "PlantOps is operated through a Claude-only Labrador pack." --winccoa
 ```
 
 ## Seed Coobie with project knowledge
