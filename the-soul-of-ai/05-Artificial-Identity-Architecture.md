@@ -48,9 +48,9 @@ This chapter sits between several others:
 - [06-The-Calvin-Archive.md](06-The-Calvin-Archive.md), which explains why the
   continuity subsystem is framed as a robopsychological archive rather than a
   mere laws engine
-- [07-Governed-Integration.md](07-Governed-Integration.md), which explains how change
+- [08-Governed-Integration.md](08-Governed-Integration.md), which explains how change
   must be adjudicated
-- [08-Identity-Continuity.md](08-Identity-Continuity.md), which formalizes the
+- [09-Identity-Continuity.md](09-Identity-Continuity.md), which formalizes the
   metrics and data architecture
 
 If Chapter 4 asked what kind of synthetic creature Harkonnen wants its agents
@@ -319,8 +319,8 @@ The combined lesson is:
 > different depths
 
 The detailed mathematics belong in
-[08-Identity-Continuity.md](08-Identity-Continuity.md). The operational decision
-process belongs in [07-Governed-Integration.md](07-Governed-Integration.md).
+[09-Identity-Continuity.md](09-Identity-Continuity.md). The operational decision
+process belongs in [08-Governed-Integration.md](08-Governed-Integration.md).
 
 ---
 

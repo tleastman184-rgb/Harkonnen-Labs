@@ -139,6 +139,7 @@ question:
 - how that identity becomes architecture
 - why the continuity subsystem is better understood as the Calvin Archive than
   as a mere laws engine or memory table
+- how experience becomes autobiography through the six chambers
 - how change is governed
 - how continuity is measured
 - what Harkonnen itself therefore believes
@@ -155,15 +156,15 @@ question:
 | [04-Why-Labradors.md](04-Why-Labradors.md) | Why Harkonnen anchors its agents to a Labrador baseline: temperament over mere law, companion species over human mimicry, and a middle ground between toolhood and personhood. |
 | [05-Artificial-Identity-Architecture.md](05-Artificial-Identity-Architecture.md) | Why persistent agents need more than a static `SOUL.md`: the move from session-bound models to file-first, multi-anchor identity architecture, and how Harkonnen carries the soul-file idea forward into the Calvin Archive. |
 | [06-The-Calvin-Archive.md](06-The-Calvin-Archive.md) | Why Harkonnen names its continuity subsystem after Susan Calvin: not a laws engine, but a robopsychological archive of continuity, revision, precedent, and diagnosis. |
-| [07-Governed-Integration.md](07-Governed-Integration.md) | Why selfhood requires integration-time adjudication, what quarantine is for, how the Meta-Governor should work, and why multi-timescale revision matters. |
-| [08-Identity-Continuity.md](08-Identity-Continuity.md) | The mathematics of identity: drift bounds, semantic soul alignment, variational free energy, integrated information, stress accumulation, hysteresis, and the three-tier data architecture (TimescaleDB, TypeDB, Materialize) that enforces them at production scale. |
-| [09-SOUL.md](09-SOUL.md) | The identity of Harkonnen Labs specifically — what it believes, why it exists, and how to make trade-offs when the answer isn't obvious. |
-| [10-Glossary.md](10-Glossary.md) | A reference glossary that marks which terms are industry-wide, which come from specialist research traditions, and which are Harkonnen-specific explanatory vocabulary. |
+| [07-Memory-As-Autobiography.md](07-Memory-As-Autobiography.md) | How raw experience becomes selfhood: the journey of a single event through the six chambers, what makes an experience identity-relevant, the Labrador as autobiographical subject, and why autobiography requires selectivity and governance. |
+| [08-Governed-Integration.md](08-Governed-Integration.md) | Why selfhood requires integration-time adjudication, what quarantine is for, how the Meta-Governor should work, and why multi-timescale revision matters. |
+| [09-Identity-Continuity.md](09-Identity-Continuity.md) | The mathematics of identity: drift bounds, semantic soul alignment, variational free energy, integrated information, stress accumulation, hysteresis, and the three-tier data architecture (TimescaleDB, TypeDB, Materialize) that enforces them at production scale. |
+| [10-SOUL.md](10-SOUL.md) | The identity of Harkonnen Labs specifically — what it believes, why it exists, and how to make trade-offs when the answer isn't obvious. |
+| [11-Glossary.md](11-Glossary.md) | A reference glossary that marks which terms are industry-wide, which come from specialist research traditions, and which are Harkonnen-specific explanatory vocabulary. |
 
 ---
 
 More chapters will be added here as the thinking develops. Likely candidates:
 
 - What does it mean for an agent to *learn*?
-- Memory as autobiography — how the Calvin Archive chambers map to the way humans construct identity over time
 - The ethics of persistent intelligences — what obligations arise when an agent accumulates a self

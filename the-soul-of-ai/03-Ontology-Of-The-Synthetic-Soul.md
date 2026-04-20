@@ -508,7 +508,7 @@ That is why the next chapters turn from history to construction:
   architecture
 - [06-The-Calvin-Archive.md](06-The-Calvin-Archive.md) explains why Harkonnen
   names its continuity subsystem after Susan Calvin
-- [07-Governed-Integration.md](07-Governed-Integration.md) explains how change
+- [08-Governed-Integration.md](08-Governed-Integration.md) explains how change
   must be adjudicated
-- [08-Identity-Continuity.md](08-Identity-Continuity.md) turns the argument into
+- [09-Identity-Continuity.md](09-Identity-Continuity.md) turns the argument into
   metrics and infrastructure
