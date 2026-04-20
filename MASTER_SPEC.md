@@ -804,16 +804,16 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 - **EI-7** — Cost budget enforcement (`max_cost_usd` on runs, hard cap in setup TOML)
 - **EI-8** — Health and operational endpoints
 
-### Parallel Track — Enterprise Integration (Siemens / Copilot Studio)
+### Parallel Track — Hosted And Team Integrations
 
 - **ENT-1** — Harkonnen as an MCP server (resources, tools, and prompts via `rmcp` crate)
-- **ENT-2** — Copilot Studio connector (OpenAPI spec + Power Platform manifest + topic templates)
-- **ENT-3** — Entra ID authentication (OAuth2/OIDC JWT validation alongside API key path)
-- **ENT-4** — Enterprise knowledge base ingest (SharePoint / Graph API via incremental delta sync)
-- **ENT-5** — Microsoft Teams integration (Adaptive Cards, Actionable Cards for checkpoints, bot commands)
-- **ENT-6** — Siemens machine profile hardening
+- **ENT-2** — External connector surface (OpenAPI spec, connector manifests, and workflow templates for MCP-limited clients)
+- **ENT-3** — OIDC authentication (JWT validation alongside API key path)
+- **ENT-4** — Knowledge base ingest (wiki, drive, and document-system connectors with incremental sync)
+- **ENT-5** — ChatOps integration (Slack, Discord, Teams, or similar notification + approval surfaces)
+- **ENT-6** — Clone-local profile and hosted deployment hardening
 
-EI-1 should land before any enterprise surface. ENT-1 is the foundation for all ENT tracks.
+EI-1 should land before any hosted or team surface. ENT-1 is the foundation for all ENT tracks.
 
 ---
 

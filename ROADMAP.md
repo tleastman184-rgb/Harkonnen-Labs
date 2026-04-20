@@ -525,19 +525,30 @@ This is a usability prerequisite for any team or multi-machine deployment. Most 
 
 ---
 
-## Parallel Product Track — Enterprise Integration (Siemens / Copilot Studio)
+## Parallel Product Track — Hosted And Team Integrations
 
-**Context:** The `setups/machines/caleb-siemens-laptop.toml` machine profile already exists and routes Claude as the default provider. The MCP server pattern is established in `harkonnen.toml`. This track formalizes the bridge between Harkonnen and the Siemens enterprise environment: Copilot Studio as a second control-plane surface, the internal knowledge base as a Coobie memory source, Microsoft Teams as the notification channel (replaces Slack in enterprise deployments), and Entra ID for auth.
+**Context:** Harkonnen should be usable beyond the Pack Board and local CLI.
+This track formalizes the bridge from the local-first factory into external
+control planes, workflow tools, shared knowledge systems, and chat surfaces
+without hard-coding any one vendor or employer.
 
-The architecture is: Harkonnen exposes itself **as an MCP server** that Copilot Studio consumes. Copilot Studio already supports custom MCP servers (announced 2024–2025). This means no bespoke connector API is needed — the same MCP protocol that Claude Desktop and VS Code already use works natively inside Copilot Studio. Claude is accessed through the Anthropic API, configured in the Siemens machine profile.
+The architecture is: Harkonnen exposes itself **as an MCP server** first. That
+lets Claude Desktop, Claude Code, VS Code, workflow tools, and any other
+MCP-capable client consume factory operations through one protocol instead of
+bespoke per-client integrations. For clients that cannot yet consume MCP
+directly, Harkonnen can expose a narrower connector or OpenAPI surface on top.
 
-This is independent of the consumer EI track. EI-1 (auth) should land first because every enterprise surface needs it.
+This is independent of the consumer EI track. EI-1 (auth) should land first
+because every hosted or shared surface needs it.
 
 ---
 
 ### ENT-1 — Harkonnen as an MCP Server
 
-**Why first:** MCP is the integration primitive. Once Harkonnen exposes itself as an MCP server, Copilot Studio, Claude Desktop, VS Code, and any other MCP-capable client can consume factory operations without bespoke connectors. This is the foundation for ENT-2 onward.
+**Why first:** MCP is the integration primitive. Once Harkonnen exposes itself
+as an MCP server, Claude Desktop, Claude Code, VS Code, workflow tools, and any
+other MCP-capable client can consume factory operations without bespoke
+connectors. This is the foundation for ENT-2 onward.
 
 **What to build:**
 
@@ -555,7 +566,7 @@ This is independent of the consumer EI track. EI-1 (auth) should land first beca
   - `ask_coobie(question, context)` — routes to Coobie's `dispatch_message`, returns the response
   - `ingest_memory(content, source, tags)` — pushes a document or note into Coobie's memory ingest pipeline
   - `list_decisions(run_id)` — returns the decision audit log for a run
-- **Prompts** (parameterized prompt templates for Copilot Studio):
+- **Prompts** (parameterized prompt templates for external clients):
   - `briefing_for_spec(spec_id)` — pre-built Coobie briefing prompt
   - `diagnose_run(run_id)` — causal diagnosis prompt for a completed run
 - MCP server transport registered in setup TOML under `[mcp.self]` — enables it when the flag is set:
@@ -563,138 +574,165 @@ This is independent of the consumer EI track. EI-1 (auth) should land first beca
 ```toml
 [mcp.self]
 enabled = true
-transport = "sse"          # "stdio" for Claude Desktop / VS Code; "sse" for Copilot Studio
+transport = "sse"          # "stdio" for Claude Desktop / VS Code; "sse" for hosted clients
 port = 3001                # separate port from the main HTTP API
 auth_required = true       # reuses EI-1 API key
 ```
 
 - CLI command `harkonnen mcp serve` starts the MCP server as a standalone process alongside the main server
 
-**Done when:** Claude Desktop or VS Code can list factory runs, trigger a run, and ask Coobie a question via MCP tool calls. Copilot Studio can discover the server and invoke the same tools.
+**Done when:** Claude Desktop, Claude Code, or VS Code can list factory runs,
+trigger a run, and ask Coobie a question via MCP tool calls. An SSE-capable
+hosted client can discover the same server and invoke the same tools.
 
 ---
 
-### ENT-2 — Copilot Studio Connector
+### ENT-2 — External Connector Surface
 
-**Why:** Copilot Studio agents compose actions from connectors. The MCP server (ENT-1) gives Copilot Studio native MCP access if the tenant has MCP support enabled. For tenants that don't yet have MCP preview access, a Power Platform custom connector backed by the Harkonnen REST API gives the same capability via OpenAPI.
+**Why:** Some external tools can call OpenAPI connectors or workflow actions
+but cannot yet consume MCP directly. A thin connector layer backed by the
+Harkonnen REST API provides the same operational capability without forcing
+bespoke logic into the core factory.
 
 **What to build:**
 
-- `factory/copilot-studio/harkonnen-connector.json` — OpenAPI 3.0 spec covering the key Harkonnen endpoints: `POST /api/runs`, `GET /api/runs/:id`, `GET /api/runs/:id/traces`, `GET /api/runs/:id/decisions`, `POST /api/chat/threads/:id/messages`, `POST /api/coordination/checkpoints/:id/reply`
-- `factory/copilot-studio/connector-manifest.yaml` — Power Platform connector manifest wrapping the OpenAPI spec. Includes display names, descriptions, and action categories in the format Copilot Studio's action library expects.
-- `factory/copilot-studio/topic-templates/` — three starter Copilot Studio topic YAML files:
+- `factory/connectors/harkonnen-openapi.json` — OpenAPI 3.0 spec covering the key Harkonnen endpoints: `POST /api/runs`, `GET /api/runs/:id`, `GET /api/runs/:id/traces`, `GET /api/runs/:id/decisions`, `POST /api/chat/threads/:id/messages`, `POST /api/coordination/checkpoints/:id/reply`
+- `factory/connectors/manifest.yaml` — connector manifest with display names, descriptions, and action categories for external workflow tools
+- `factory/connectors/workflow-templates/` — starter workflow templates:
   - `run-spec.yaml` — triggers a factory run from a natural-language request, polls status, posts outcome
   - `ask-coobie.yaml` — routes a question to Coobie and surfaces the answer with run context
   - `checkpoint-review.yaml` — presents pending checkpoints and handles approve/reject inline in the conversation
-- Authentication: OAuth2 client credentials flow using Entra ID (see ENT-3). Connector authenticates as a service principal, not as the individual user.
-- Documentation at `factory/copilot-studio/README.md`: step-by-step setup for importing the connector into a Power Platform environment and wiring it to a Copilot Studio agent.
+- Authentication: OAuth2 client credentials flow using the generic OIDC path from ENT-3. The connector authenticates as a service principal, not as the individual user.
+- Documentation at `factory/connectors/README.md`: step-by-step setup for importing the connector into an external workflow or agent platform.
 
-**Done when:** A Copilot Studio agent in the Siemens tenant can trigger a Harkonnen run, ask Coobie a question, and approve a checkpoint — all from a Teams or web chat window, without touching the Pack Board.
+**Done when:** An external workflow client can trigger a Harkonnen run, ask
+Coobie a question, and approve a checkpoint from a chat or automation surface
+without touching the Pack Board.
 
 ---
 
-### ENT-3 — Entra ID Authentication
+### ENT-3 — OIDC Authentication
 
-**Why:** In a Siemens enterprise environment, API keys are not acceptable for team or shared-service deployments. Entra ID (Azure AD) is the identity plane for everything Microsoft-adjacent. Copilot Studio, Teams bots, and Power Automate flows all authenticate via Entra ID service principals.
+**Why:** API keys are convenient for local development, but shared and hosted
+deployments need a standard identity plane. A generic OIDC/JWT path keeps the
+core server vendor-neutral while still supporting hosted clients, bots, and
+workflow tools.
 
 **What to build:**
 
-- OAuth2/OIDC JWT validation middleware in `src/api.rs` — alongside the existing API key path. Either an API key **or** a valid Entra ID JWT is accepted on protected routes.
-- `[auth.entra]` section in setup TOML:
+- OAuth2/OIDC JWT validation middleware in `src/api.rs` — alongside the existing API key path. Either an API key **or** a valid OIDC JWT is accepted on protected routes.
+- `[auth.oidc]` section in setup TOML:
 
 ```toml
-[auth.entra]
+[auth.oidc]
 enabled = true
-tenant_id = "ENTRA_TENANT_ID"          # from env var
-client_id = "ENTRA_CLIENT_ID"          # the registered app ID
-audience  = "api://harkonnen-factory"  # must match the app's Application ID URI
+issuer = "OIDC_ISSUER_URL"
+client_id = "OIDC_CLIENT_ID"
+audience  = "harkonnen-factory"
 ```
 
-- JWT validation: fetch JWKS from `https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys`, validate signature, `aud`, `iss`, and expiry. Use the `jsonwebtoken` crate (already common in Rust ecosystems).
-- Role claims: map Entra ID app roles to Harkonnen roles — `Harkonnen.Operator` (full access), `Harkonnen.Viewer` (read-only), `Harkonnen.Agent` (for service principal Copilot Studio connector)
+- JWT validation: fetch JWKS from the configured issuer, validate signature, `aud`, `iss`, and expiry. Use the `jsonwebtoken` crate.
+- Role claims: map OIDC app roles or scopes to Harkonnen roles — `Harkonnen.Operator` (full access), `Harkonnen.Viewer` (read-only), `Harkonnen.Agent` (service principal / automation)
 - `GET /api/auth/me` — returns the authenticated identity and resolved role for debugging
-- The Siemens machine profile (`setups/machines/caleb-siemens-laptop.toml`) gains an `[auth.entra]` section. Local dev can still use `HARKONNEN_API_KEY` for bypass.
 
-**Done when:** A Copilot Studio connector authenticating as an Entra ID service principal can call the Harkonnen API without an API key, and a viewer-role principal cannot trigger runs or approve checkpoints.
+**Done when:** An external connector authenticating as an OIDC service
+principal can call the Harkonnen API without an API key, and a viewer-role
+principal cannot trigger runs or approve checkpoints.
 
 ---
 
-### ENT-4 — Enterprise Knowledge Base Ingest (SharePoint / Graph API)
+### ENT-4 — Knowledge Base Ingest
 
-**Why:** The value of Coobie's memory is proportional to what's in it. In a Siemens context, the authoritative knowledge lives in SharePoint document libraries, Teams wikis, and internal project sites — not in files you can paste into the terminal. A Graph API connector makes that knowledge available to Coobie without manual re-entry.
+**Why:** The value of Coobie's memory is proportional to what's in it. In many
+real deployments, the authoritative knowledge lives in shared drives, wikis,
+document libraries, or hosted knowledge systems rather than in files you can
+paste into the terminal. Connectors make that knowledge available to Coobie
+without manual re-entry.
 
 **What to build:**
 
-- `src/integrations/graph.rs` — Microsoft Graph API client. Authenticates via Entra ID client credentials (same service principal as ENT-3). Uses the Graph `v1.0` and `beta` endpoints.
-- CLI command `harkonnen memory ingest --source sharepoint --site <site-url> --library <library-name>` — walks a SharePoint document library, downloads files, pipes each through the existing `memory ingest` extraction pipeline (text, PDF, OCR via Phase 5b), and writes results to Coobie's memory store.
-- `harkonnen memory ingest --source teams-wiki --team <team-id> --channel <channel-id>` — ingests a Teams wiki tab as a structured memory document.
-- Incremental sync: store the Graph API `deltaLink` from each sync in a `graph_sync_state` table. Re-running the command fetches only changed/added documents since the last run.
-- `harkonnen memory ingest --source graph-search --query "<search terms>"` — queries Microsoft Search via Graph and ingests top results. Useful for pulling in content you don't know the exact location of.
-- `[integrations.graph]` section in setup TOML:
+- `src/integrations/knowledge.rs` — generic knowledge-source client layer with provider adapters for document systems and hosted search APIs
+- CLI commands such as:
+  - `harkonnen memory ingest --source docs --collection <collection-id>`
+  - `harkonnen memory ingest --source wiki --space <space-id>`
+  - `harkonnen memory ingest --source search --query "<search terms>"`
+- Incremental sync state table so repeated runs fetch only changed or added documents
+- `[integrations.knowledge]` section in setup TOML:
 
 ```toml
-[integrations.graph]
+[integrations.knowledge]
 enabled = true
-tenant_id = "ENTRA_TENANT_ID"
-client_id = "ENTRA_CLIENT_ID"
-client_secret_env = "ENTRA_CLIENT_SECRET"
+provider = "generic"
+client_id = "KNOWLEDGE_CLIENT_ID"
+client_secret_env = "KNOWLEDGE_CLIENT_SECRET"
 ```
 
-- Bidirectional write-back (deferred to v2): after consolidation promotes a lesson, optionally write a summary back to a designated SharePoint list as a structured knowledge item. Operators can review and approve write-back separately from promoting within Harkonnen.
+- Bidirectional write-back (deferred to v2): after consolidation promotes a lesson, optionally write a summary back to a designated knowledge sink as a structured item. Operators can review and approve write-back separately from promoting within Harkonnen.
 
-**Done when:** Running `harkonnen memory ingest --source sharepoint` against a Siemens document library adds its contents to Coobie's retrievable memory, and subsequent runs against related specs can cite those documents in the briefing.
+**Done when:** Running a knowledge-source ingest adds shared documents into
+Coobie's retrievable memory, and subsequent runs against related specs can cite
+those documents in the briefing.
 
 ---
 
-### ENT-5 — Microsoft Teams Integration
+### ENT-5 — ChatOps Integration
 
-**Why:** Siemens uses Teams, not Slack. The Teams integration replaces EI-3 in enterprise deployments. The delivery format is Adaptive Cards (Teams' equivalent of Slack Block Kit) rather than plain webhooks.
+**Why:** Many teams want checkpoint approvals, notifications, and lightweight
+questions to flow through chat surfaces rather than only through the Pack
+Board. The integration should support at least one rich-card surface and one
+plain webhook or bot surface.
 
-**Outbound (Teams notifies operator):**
+**Outbound (chat surface notifies operator):**
 
-- Adaptive Card on `run.completed`: outcome badge, agent trace count, cost, decision count, Coobie's top advisory concern, Pack Board button. Card is posted to a configured channel via the Teams Incoming Webhook URL.
-- Checkpoint notification as an Actionable Adaptive Card — the operator can click Approve or Reject directly in the Teams message. The card's action calls back to `POST /api/coordination/checkpoints/:id/reply` using the ENT-3 service principal.
+- Rich-card message on `run.completed`: outcome badge, agent trace count, cost, decision count, Coobie's top advisory concern, Pack Board button.
+- Checkpoint notification as an actionable card or message component — the operator can click Approve or Reject directly in chat. The callback goes to `POST /api/coordination/checkpoints/:id/reply` using the ENT-3 principal.
 - `run.failed` card with Coobie's causal diagnosis summary and a "Diagnose in Coobie" deep link into PackChat.
 - `metric_attack.detected` card: exploit description, detection signal, suggested mitigation, link to `GET /api/runs/:id/metric-attacks`.
 
-**Inbound (Teams bot commands):**
+**Inbound (bot commands):**
 
-- Bot registered as a Teams app in the Siemens tenant via the Bot Framework. Commands mirror the Slack interface:
+- Bot or slash-command surface with commands such as:
   - `@Harkonnen run <spec-id>` — triggers run, replies with run ID card
   - `@Harkonnen status <run-id>` — current phase + last event
   - `@Harkonnen ask <question>` — routes to Coobie, replies with the response as a card
   - `@Harkonnen checkpoints` — lists open checkpoints for the current operator
-- Bot can be scoped to a specific Teams channel or allowed globally within the tenant.
+- Bot can be scoped to a specific room or channel or allowed more broadly.
 
-**Config:** `[integrations.teams]` in setup TOML:
+**Config:** `[integrations.chatops]` in setup TOML:
 
 ```toml
-[integrations.teams]
+[integrations.chatops]
 enabled = true
-incoming_webhook_url_env = "TEAMS_WEBHOOK_URL"
-bot_app_id_env           = "TEAMS_BOT_APP_ID"
-bot_app_password_env     = "TEAMS_BOT_PASSWORD"
-checkpoint_callback_base = "https://harkonnen.internal/api"
+provider = "generic"
+incoming_webhook_url_env = "CHATOPS_WEBHOOK_URL"
+bot_app_id_env           = "CHATOPS_BOT_APP_ID"
+bot_app_password_env     = "CHATOPS_BOT_PASSWORD"
+checkpoint_callback_base = "https://harkonnen.example/api"
 ```
 
-**Done when:** A completed run posts an Adaptive Card to the configured Teams channel, a checkpoint can be approved from within Teams without opening the Pack Board, and `@Harkonnen ask` routes to Coobie.
+**Done when:** A completed run posts a rich message to the configured chat
+surface, a checkpoint can be approved from chat without opening the Pack Board,
+and `@Harkonnen ask` routes to Coobie.
 
 ---
 
-### ENT-6 — Siemens Machine Profile Hardening
+### ENT-6 — Clone-Local Profile And Hosted Deployment Hardening
 
-**Why:** The `caleb-siemens-laptop.toml` profile exists but was generated from the `home-linux` template. It needs enterprise-specific config blocks for auth, integrations, and MCP self-exposure so that `cargo run -- setup check` on the Siemens machine validates the full enterprise stack.
+**Why:** Local machine profiles are useful operationally, but they are
+clone-local and should not become part of the canonical repo state. This phase
+hardens setup generation, self-hosted deployment config, and validation so
+public clones stay clean while still supporting richer local environments.
 
 **What to build:**
 
-- Add `[auth.entra]` block to `caleb-siemens-laptop.toml` (populated from env vars, not hardcoded)
-- Add `[integrations.teams]` block
-- Add `[integrations.graph]` block
-- Add `[mcp.self]` block with `transport = "sse"` and the Copilot Studio port
-- Add a `siemens-enterprise` setup template to `setups/` so future Siemens machines can init from it rather than `home-linux`
-- `cargo run -- setup check` extended to validate: Entra ID env vars present, Teams webhook reachable, Graph API credentials valid, MCP self-server starts cleanly
+- Keep generated machine profiles under `setups/machines/` and out of Git by default
+- Add optional `[auth.oidc]`, `[integrations.chatops]`, `[integrations.knowledge]`, and `[mcp.self]` blocks to generated profiles when the setup interview selects them
+- Add `[mcp.self]` support with `transport = "sse"` for hosted clients
+- `cargo run -- setup check` extended to validate selected integrations and MCP self-server startup for the active local profile
 
-**Done when:** Running `cargo run -- setup check` on the Siemens laptop reports green for all enterprise integration checks, and a second Siemens machine can be provisioned from the `siemens-enterprise` template.
+**Done when:** Running `cargo run -- setup check` on a locally generated
+profile reports green for the selected integrations, and a second machine can
+be provisioned from the same public templates without inheriting private state.
 
 ---
 
