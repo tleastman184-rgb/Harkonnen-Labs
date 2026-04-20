@@ -15,8 +15,8 @@ use crate::orchestrator::{AppContext, FailureHarness, RunRequest};
 use crate::reporting;
 use crate::setup::{
     available_template_names, command_available, compose_setup_id, default_provider_config,
-    slugify_machine_name, MachineConfig, McpConfig, McpServerConfig, ProviderConfig, RoutingConfig,
-    SetupConfig, SystemDiscovery,
+    slugify_machine_name, MachineConfig, McpConfig, McpSelfConfig, McpServerConfig,
+    ProviderConfig, RoutingConfig, SetupConfig, SystemDiscovery,
 };
 
 #[derive(Parser, Debug)]
@@ -52,6 +52,10 @@ pub enum Commands {
     Setup {
         #[command(subcommand)]
         command: SetupCommands,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
     },
     Soul {
         #[command(subcommand)]
@@ -255,6 +259,11 @@ pub enum SetupCommands {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum McpCommands {
+    Serve(McpServeArgs),
+}
+
+#[derive(Subcommand, Debug)]
 pub enum SoulCommands {
     Bootstrap(SoulBootstrapArgs),
     Show(SoulShowArgs),
@@ -298,6 +307,16 @@ pub struct SetupClaudePackArgs {
     pub winccoa: bool,
     #[arg(long, default_value_t = false)]
     pub no_settings: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct McpServeArgs {
+    #[arg(long)]
+    pub transport: Option<String>,
+    #[arg(long)]
+    pub host: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -748,6 +767,12 @@ pub async fn handle_setup(command: SetupCommands, paths: &Paths) -> Result<()> {
     }
 }
 
+pub async fn handle_mcp(command: McpCommands, app: AppContext) -> Result<()> {
+    match command {
+        McpCommands::Serve(args) => crate::mcp_server::handle_mcp_serve(app, args).await,
+    }
+}
+
 pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
     match command {
         SoulCommands::Bootstrap(args) => {
@@ -851,6 +876,25 @@ fn handle_setup_check(paths: &Paths) -> Result<()> {
                 }
             );
         }
+        if let Some(self_server) = &mcp.self_server {
+            println!(
+                "  [self ] transport={}{}{}{}",
+                self_server.transport,
+                self_server
+                    .host
+                    .as_ref()
+                    .map(|value| format!(" host={value}"))
+                    .unwrap_or_default(),
+                self_server
+                    .port
+                    .map(|value| format!(" port={value}"))
+                    .unwrap_or_default(),
+                self_server
+                    .auth_required
+                    .map(|value| format!(" auth_required={value}"))
+                    .unwrap_or_default(),
+            );
+        }
     } else {
         println!();
         println!("MCP Servers: none configured");
@@ -911,6 +955,7 @@ fn handle_setup_init(paths: &Paths, args: SetupInitArgs) -> Result<()> {
     rebalance_agent_routing(&mut config, interactive)?;
     if interactive {
         interview_mcp_servers(&mut config, &discovery)?;
+        interview_mcp_self(&mut config)?;
     }
     normalize_mcp_servers(&mut config);
 
@@ -1463,7 +1508,10 @@ fn interview_mcp_servers(config: &mut SetupConfig, discovery: &SystemDiscovery) 
     config.mcp = if servers.is_empty() {
         None
     } else {
-        Some(McpConfig { servers })
+        Some(McpConfig {
+            servers,
+            self_server: config.mcp.as_ref().and_then(|mcp| mcp.self_server.clone()),
+        })
     };
     Ok(())
 }
@@ -1696,7 +1744,7 @@ fn normalize_mcp_servers(config: &mut SetupConfig) {
         !name.is_empty() && !command.is_empty() && seen.insert(name.to_string())
     });
 
-    if mcp.servers.is_empty() {
+    if mcp.servers.is_empty() && mcp.self_server.is_none() {
         config.mcp = None;
     }
 }
@@ -1704,7 +1752,7 @@ fn normalize_mcp_servers(config: &mut SetupConfig) {
 fn print_setup_mcp_preview(mcp: Option<&McpConfig>) {
     println!();
     match mcp {
-        Some(mcp) if !mcp.servers.is_empty() => {
+        Some(mcp) if !mcp.servers.is_empty() || mcp.self_server.is_some() => {
             println!("Selected MCP servers:");
             for server in &mcp.servers {
                 let aliases = server
@@ -1714,9 +1762,85 @@ fn print_setup_mcp_preview(mcp: Option<&McpConfig>) {
                     .unwrap_or_else(|| "no aliases".to_string());
                 println!("  - {} via {} [{}]", server.name, server.command, aliases);
             }
+            if let Some(self_server) = &mcp.self_server {
+                println!(
+                    "  - self via {}{}{}{}",
+                    self_server.transport,
+                    self_server
+                        .host
+                        .as_ref()
+                        .map(|value| format!(" host={value}"))
+                        .unwrap_or_default(),
+                    self_server
+                        .port
+                        .map(|value| format!(" port={value}"))
+                        .unwrap_or_default(),
+                    self_server
+                        .auth_required
+                        .map(|value| format!(" auth_required={value}"))
+                        .unwrap_or_default(),
+                );
+            }
         }
         _ => println!("Selected MCP servers: none"),
     }
+}
+
+fn interview_mcp_self(config: &mut SetupConfig) -> Result<()> {
+    let existing = config
+        .mcp
+        .as_ref()
+        .and_then(|mcp| mcp.self_server.clone());
+    let default_enabled = existing.as_ref().map(|value| value.enabled).unwrap_or(false);
+    if !prompt_bool("Expose Harkonnen itself as an MCP server?", default_enabled)? {
+        if let Some(mcp) = &mut config.mcp {
+            mcp.self_server = None;
+        }
+        return Ok(());
+    }
+
+    let mut self_server = existing.unwrap_or(McpSelfConfig {
+        enabled: true,
+        transport: "sse".to_string(),
+        host: Some("127.0.0.1".to_string()),
+        port: Some(3001),
+        auth_required: Some(true),
+    });
+
+    self_server.enabled = true;
+    self_server.transport = prompt_choice(
+        "Self MCP transport (sse, stdio)",
+        &["sse", "stdio"],
+        &self_server.transport,
+    )?;
+    if self_server.transport == "sse" {
+        let host_default = self_server
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        self_server.host = Some(prompt_text("Self MCP host", &host_default)?);
+        let port_default = self_server.port.unwrap_or(3001).to_string();
+        let port = prompt_text("Self MCP port", &port_default)?;
+        self_server.port = Some(
+            port.parse::<u16>()
+                .with_context(|| format!("invalid MCP port: {port}"))?,
+        );
+        self_server.auth_required = Some(prompt_bool(
+            "Require auth for self MCP server?",
+            self_server.auth_required.unwrap_or(true),
+        )?);
+    } else {
+        self_server.host = None;
+        self_server.port = None;
+        self_server.auth_required = Some(false);
+    }
+
+    let mcp = config.mcp.get_or_insert(McpConfig {
+        servers: Vec::new(),
+        self_server: None,
+    });
+    mcp.self_server = Some(self_server);
+    Ok(())
 }
 
 fn render_generated_setup(config: &SetupConfig) -> Result<String> {

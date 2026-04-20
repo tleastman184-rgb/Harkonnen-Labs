@@ -19,6 +19,7 @@ mod locomo;
 mod livecodebench;
 mod longmemeval;
 mod memory;
+mod mcp_server;
 mod models;
 mod operator_model;
 mod orchestrator;
@@ -72,6 +73,10 @@ async fn main() -> Result<()> {
             // setup check doesn't need the DB — just path + config discovery
             let paths = config::Paths::discover()?;
             cli::handle_setup(command, &paths).await?
+        }
+        Commands::Mcp { command } => {
+            let app = AppContext::bootstrap().await?;
+            cli::handle_mcp(command, app).await?
         }
         Commands::Soul { command } => {
             let paths = config::Paths::discover()?;

@@ -439,6 +439,15 @@ struct SetupCheckMcpStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct SetupCheckMcpSelfStatus {
+    enabled: bool,
+    transport: String,
+    host: Option<String>,
+    port: Option<u16>,
+    auth_required: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
 struct SetupCheckResponse {
     setup_name: String,
     platform: String,
@@ -446,6 +455,7 @@ struct SetupCheckResponse {
     providers: Vec<SetupCheckProviderStatus>,
     agent_routes: HashMap<String, String>,
     mcp_servers: Vec<SetupCheckMcpStatus>,
+    mcp_self: Option<SetupCheckMcpSelfStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4317,6 +4327,18 @@ async fn get_setup_check(State(app): State<AppContext>) -> impl IntoResponse {
         })
         .unwrap_or_default();
 
+    let mcp_self = setup
+        .mcp
+        .as_ref()
+        .and_then(|mcp| mcp.self_server.as_ref())
+        .map(|self_server| SetupCheckMcpSelfStatus {
+            enabled: self_server.enabled,
+            transport: self_server.transport.clone(),
+            host: self_server.host.clone(),
+            port: self_server.port,
+            auth_required: self_server.auth_required,
+        });
+
     (
         StatusCode::OK,
         Json(SetupCheckResponse {
@@ -4326,6 +4348,7 @@ async fn get_setup_check(State(app): State<AppContext>) -> impl IntoResponse {
             providers,
             agent_routes,
             mcp_servers,
+            mcp_self,
         }),
     )
         .into_response()

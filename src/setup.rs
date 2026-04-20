@@ -95,7 +95,10 @@ pub struct RoutingConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
+    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    #[serde(rename = "self", default)]
+    pub self_server: Option<McpSelfConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -106,6 +109,19 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub tool_aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpSelfConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub transport: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub auth_required: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
