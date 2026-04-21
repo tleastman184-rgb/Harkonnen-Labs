@@ -49,3 +49,6 @@ development_datasets/
 # Per-run artifacts in project-memory — same category as factory/artifacts/
 .harkonnen/project-memory/run-*.md
 .harkonnen/project-memory/causal-sample-*.md
+
+# Managed-repo stamp tracking — machine-specific absolute path, never portable
+.harkonnen/repo.toml
