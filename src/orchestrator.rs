@@ -134,6 +134,53 @@ struct CommandOutcome {
     stderr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandTrialRecord {
+    raw_command: String,
+    passed: bool,
+    exit_code: Option<i32>,
+    classification: String,
+    summary: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandTrialReport {
+    run_id: String,
+    spec_id: String,
+    #[serde(default)]
+    product: String,
+    phase: String,
+    agent: String,
+    generated_at: String,
+    passed: bool,
+    summary: String,
+    commands: Vec<CommandTrialRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionTrialSnapshot {
+    agent: String,
+    phase: String,
+    decision_kind: String,
+    chose: String,
+    alternatives: Vec<String>,
+    justification: String,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointTrialSnapshot {
+    phase: String,
+    agent: String,
+    checkpoint_type: String,
+    prompt: String,
+    answered_by: String,
+    answer_text: String,
+    decision_json: Option<serde_json::Value>,
+    intent: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct MemoryContextBundle {
     memory_hits: Vec<String>,
@@ -558,6 +605,7 @@ struct PiperBuildResult {
     succeeded: bool,
     /// True when no build commands were detected and execution was skipped.
     skipped: bool,
+    command_trials: Vec<CommandTrialRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2617,6 +2665,21 @@ next_actions={}",
                 )
                 .await?;
                 push_unique(&mut blackboard.artifact_refs, "build_output.txt");
+                if !build_result.command_trials.is_empty() {
+                    let report = build_command_trial_report(
+                        run_id,
+                        &spec_obj.id,
+                        &target_source.label,
+                        "build",
+                        "piper",
+                        build_result.succeeded,
+                        &build_result.command_trials,
+                    );
+                    self.write_command_trial_report(&run_dir, "build_command_trials", &report)
+                        .await?;
+                    push_unique(&mut blackboard.artifact_refs, "build_command_trials.json");
+                    push_unique(&mut blackboard.artifact_refs, "build_command_trials.md");
+                }
 
                 let post_build_snap = snapshot_workspace_state(&staged_product);
                 let _ = self
@@ -7274,11 +7337,13 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 exit_code: 0,
                 succeeded: true,
                 skipped: true,
+                command_trials: Vec::new(),
             });
         }
 
         let mut combined_output = String::new();
         let mut final_exit = 0i32;
+        let mut command_trials = Vec::new();
 
         for cmd_str in &commands {
             self.record_event(
@@ -7311,6 +7376,8 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
             let mut done_out = false;
             let mut done_err = false;
+            let mut stdout_buf = String::new();
+            let mut stderr_buf = String::new();
 
             loop {
                 tokio::select! {
@@ -7319,6 +7386,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             Some(l) => {
                                 combined_output.push_str(&l);
                                 combined_output.push('\n');
+                                if !stdout_buf.is_empty() {
+                                    stdout_buf.push('\n');
+                                }
+                                stdout_buf.push_str(&l);
                                 let _ = self.event_tx.send(LiveEvent::BuildOutput {
                                     run_id: run_id.to_string(),
                                     phase: "build".to_string(),
@@ -7336,6 +7407,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             Some(l) => {
                                 combined_output.push_str(&l);
                                 combined_output.push('\n');
+                                if !stderr_buf.is_empty() {
+                                    stderr_buf.push('\n');
+                                }
+                                stderr_buf.push_str(&l);
                                 let _ = self.event_tx.send(LiveEvent::BuildOutput {
                                     run_id: run_id.to_string(),
                                     phase: "build".to_string(),
@@ -7356,6 +7431,13 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
 
             let exit_status = child.wait().await?;
             final_exit = exit_status.code().unwrap_or(-1);
+            let outcome = CommandOutcome {
+                success: exit_status.success(),
+                code: exit_status.code(),
+                stdout: stdout_buf.trim().to_string(),
+                stderr: stderr_buf.trim().to_string(),
+            };
+            let trial = build_command_trial_record(cmd_str, &outcome);
 
             let verdict = if exit_status.success() {
                 "complete"
@@ -7368,10 +7450,11 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 "build",
                 "piper",
                 verdict,
-                &format!("exit {}", final_exit),
+                &format!("exit {} ({})", final_exit, trial.classification),
                 log_path,
             )
             .await?;
+            command_trials.push(trial);
 
             if !exit_status.success() {
                 break; // stop on first failing command
@@ -7385,6 +7468,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             exit_code: final_exit,
             succeeded,
             skipped: false,
+            command_trials,
         })
     }
 
@@ -8093,6 +8177,11 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
     ) -> Result<ValidationSummary> {
         let mut results = Vec::new();
         let run_dir = workspace_root.join("run");
+        let product = self
+            .get_run(run_id)
+            .await?
+            .map(|run| run.product)
+            .unwrap_or_default();
         let workspace_ok = staged_product.exists() && run_dir.exists();
         results.push(ScenarioResult {
             scenario_id: "workspace_layout".to_string(),
@@ -8123,6 +8212,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
 
         let validation_log_path = run_dir.join("validation_output.log");
         let mut output_chunks = Vec::new();
+        let mut command_trials = Vec::new();
 
         let cargo_manifest = staged_product.join("Cargo.toml");
         let package_json = staged_product.join("package.json");
@@ -8142,6 +8232,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                     staged_product,
                 )
                 .await?;
+            command_trials.push(build_command_trial_record(
+                "cargo check --quiet",
+                &check_outcome,
+            ));
             output_chunks.push(format_command_output("cargo check --quiet", &check_outcome));
             results.push(ScenarioResult {
                 scenario_id: "cargo_check".to_string(),
@@ -8162,6 +8256,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record(
+                    "cargo test --quiet",
+                    &test_outcome,
+                ));
                 output_chunks.push(format_command_output("cargo test --quiet", &test_outcome));
                 results.push(ScenarioResult {
                     scenario_id: "cargo_test".to_string(),
@@ -8182,6 +8280,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record(&label, &outcome));
                 output_chunks.push(format_command_output(&label, &outcome));
                 results.push(ScenarioResult {
                     scenario_id: "node_bootstrap".to_string(),
@@ -8195,6 +8294,23 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             .with_context(|| {
                                 format!("writing validation log {}", validation_log_path.display())
                             })?;
+                    }
+                    if !command_trials.is_empty() {
+                        let report = build_command_trial_report(
+                            run_id,
+                            &spec_obj.id,
+                            &product,
+                            "validation",
+                            "bramble",
+                            false,
+                            &command_trials,
+                        );
+                        self.write_command_trial_report(
+                            &run_dir,
+                            "validation_command_trials",
+                            &report,
+                        )
+                        .await?;
                     }
                     return Ok(build_validation_summary(results));
                 }
@@ -8232,6 +8348,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(label, &outcome));
                     output_chunks.push(format_command_output(label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: scenario_id.to_string(),
@@ -8259,6 +8376,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(label, &outcome));
                     output_chunks.push(format_command_output(label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: scenario_id.to_string(),
@@ -8293,6 +8411,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record("go test ./...", &outcome));
                 output_chunks.push(format_command_output("go test ./...", &outcome));
                 results.push(ScenarioResult {
                     scenario_id: "go_test".to_string(),
@@ -8331,6 +8450,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(command_label, &outcome));
                     output_chunks.push(format_command_output(command_label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: "python_tests".to_string(),
@@ -8348,6 +8468,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(
+                        "python -m compileall .",
+                        &outcome,
+                    ));
                     output_chunks.push(format_command_output("python -m compileall .", &outcome));
                     results.push(ScenarioResult {
                         scenario_id: "python_compile".to_string(),
@@ -8395,6 +8519,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 if !outcome.success {
                     all_passed = false;
                 }
+                command_trials.push(build_command_trial_record(raw_cmd, &outcome));
                 output_chunks.push(format_command_output(raw_cmd, &outcome));
                 results.push(ScenarioResult {
                     scenario_id: format!("test_command_{}", command_results.len() + 1),
@@ -8423,6 +8548,19 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 .with_context(|| {
                     format!("writing validation log {}", validation_log_path.display())
                 })?;
+        }
+        if !command_trials.is_empty() {
+            let report = build_command_trial_report(
+                run_id,
+                &spec_obj.id,
+                &product,
+                "validation",
+                "bramble",
+                command_trials.iter().all(|trial| trial.passed),
+                &command_trials,
+            );
+            self.write_command_trial_report(&run_dir, "validation_command_trials", &report)
+                .await?;
         }
 
         Ok(build_validation_summary(results))
@@ -8549,6 +8687,22 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             stdout: stdout_buf.trim().to_string(),
             stderr: stderr_buf.trim().to_string(),
         })
+    }
+
+    async fn write_command_trial_report(
+        &self,
+        run_dir: &Path,
+        base_name: &str,
+        report: &CommandTrialReport,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join(format!("{base_name}.json")), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join(format!("{base_name}.md")),
+            render_command_trial_report_markdown(report),
+        )
+        .await?;
+        Ok(())
     }
 
     fn agent_prompt_support(
@@ -13325,6 +13479,22 @@ Observed pattern: {}",
             &mut new_lessons,
         )
         .await?;
+        self.consolidate_command_trial_lessons(
+            run_id,
+            spec_obj,
+            target_source.as_ref(),
+            &mut known_lesson_ids,
+            &mut new_lessons,
+        )
+        .await?;
+        self.consolidate_reasoning_trial_lessons(
+            run_id,
+            spec_obj,
+            target_source.as_ref(),
+            &mut known_lesson_ids,
+            &mut new_lessons,
+        )
+        .await?;
 
         // Populate cross-phase causal links so Coobie can trace failure chains
         // across the full episode sequence.
@@ -13920,6 +14090,469 @@ Run ids: {}",
         }
 
         Ok(())
+    }
+
+    async fn consolidate_command_trial_lessons(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: Option<&TargetSourceMetadata>,
+        known_lesson_ids: &mut HashSet<String>,
+        new_lessons: &mut Vec<LessonRecord>,
+    ) -> Result<()> {
+        let Some(current_run) = self.get_run(run_id).await? else {
+            return Ok(());
+        };
+        let current_trials = self.load_run_command_trials(run_id).await?;
+        if current_trials.is_empty() {
+            return Ok(());
+        }
+
+        let peer_runs = self
+            .list_runs(40)
+            .await?
+            .into_iter()
+            .filter(|run| run.run_id != run_id && run.product == current_run.product)
+            .collect::<Vec<_>>();
+        let mut support_map = HashMap::<String, Vec<String>>::new();
+        for peer_run in peer_runs {
+            let peer_trials = self.load_run_command_trials(&peer_run.run_id).await?;
+            let mut seen_keys = HashSet::new();
+            for (phase, trial) in peer_trials {
+                let key =
+                    command_trial_pattern_key(&phase, &trial.raw_command, &trial.classification);
+                if seen_keys.insert(key.clone()) {
+                    support_map
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+        }
+
+        for (phase, trial) in current_trials {
+            let key = command_trial_pattern_key(&phase, &trial.raw_command, &trial.classification);
+            let Some(supporting_runs) = support_map.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-command-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "command-trial".to_string(),
+                "project-memory".to_string(),
+                phase.clone(),
+                trial.classification.clone(),
+            ];
+            if trial.passed {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let pattern = if trial.passed {
+                format!(
+                    "Repeatable command success in {}: '{}' usually completes as {}",
+                    phase, trial.raw_command, trial.classification
+                )
+            } else {
+                format!(
+                    "Repeatable command failure in {}: '{}' usually ends as {}",
+                    phase, trial.raw_command, trial.classification
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(command_trial_intervention(
+                    &trial.classification,
+                    trial.passed,
+                )),
+                tags,
+                strength: if trial.passed {
+                    (0.7 + supporting_runs.len() as f64 * 0.1).min(1.4)
+                } else {
+                    (1.0 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nCommand: {}\nExit code: {}\nClassification: {}\nSummary: {}\nstdout excerpt: {}\nstderr excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                phase,
+                trial.raw_command,
+                trial
+                    .exit_code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                trial.classification,
+                trial.summary,
+                truncate_text(&trial.stdout, 200),
+                truncate_text(&trial.stderr, 200),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn consolidate_reasoning_trial_lessons(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: Option<&TargetSourceMetadata>,
+        known_lesson_ids: &mut HashSet<String>,
+        new_lessons: &mut Vec<LessonRecord>,
+    ) -> Result<()> {
+        let Some(current_run) = self.get_run(run_id).await? else {
+            return Ok(());
+        };
+        let current_success = self.run_behavioural_success(run_id).await?;
+        let current_decisions = self.load_run_decision_trials(run_id).await?;
+        let current_checkpoints = self.load_run_checkpoint_trials(run_id).await?;
+        if current_decisions.is_empty() && current_checkpoints.is_empty() {
+            return Ok(());
+        }
+
+        let peer_runs = self
+            .list_runs(40)
+            .await?
+            .into_iter()
+            .filter(|run| run.run_id != run_id && run.product == current_run.product)
+            .collect::<Vec<_>>();
+
+        let mut decision_support = HashMap::<String, Vec<String>>::new();
+        let mut checkpoint_support = HashMap::<String, Vec<String>>::new();
+        for peer_run in peer_runs {
+            let peer_success = self.run_behavioural_success(&peer_run.run_id).await?;
+
+            let mut seen_decisions = HashSet::new();
+            for decision in self.load_run_decision_trials(&peer_run.run_id).await? {
+                let key = decision_trial_pattern_key(&decision, peer_success);
+                if seen_decisions.insert(key.clone()) {
+                    decision_support
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+
+            let mut seen_checkpoints = HashSet::new();
+            for checkpoint in self.load_run_checkpoint_trials(&peer_run.run_id).await? {
+                let key = checkpoint_trial_pattern_key(&checkpoint, peer_success);
+                if seen_checkpoints.insert(key.clone()) {
+                    checkpoint_support
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+        }
+
+        for decision in current_decisions {
+            let key = decision_trial_pattern_key(&decision, current_success);
+            let Some(supporting_runs) = decision_support.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-decision-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "decision-trial".to_string(),
+                "project-memory".to_string(),
+                decision.phase.clone(),
+                decision.agent.clone(),
+                decision.decision_kind.clone(),
+            ];
+            if current_success {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let pattern = if current_success {
+                format!(
+                    "Repeatable successful decision in {} / {}: {} -> {}",
+                    decision.phase, decision.agent, decision.decision_kind, decision.chose
+                )
+            } else {
+                format!(
+                    "Repeatable degraded decision in {} / {}: {} -> {}",
+                    decision.phase, decision.agent, decision.decision_kind, decision.chose
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(decision_trial_intervention(&decision, current_success)),
+                tags,
+                strength: if current_success {
+                    (0.8 + supporting_runs.len() as f64 * 0.1).min(1.5)
+                } else {
+                    (1.0 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nAgent: {}\nDecision kind: {}\nChose: {}\nAlternatives: {}\nJustification excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                decision.phase,
+                decision.agent,
+                decision.decision_kind,
+                decision.chose,
+                if decision.alternatives.is_empty() {
+                    "none".to_string()
+                } else {
+                    decision.alternatives.join(" | ")
+                },
+                truncate_text(&decision.justification, 240),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        for checkpoint in current_checkpoints {
+            let key = checkpoint_trial_pattern_key(&checkpoint, current_success);
+            let Some(supporting_runs) = checkpoint_support.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-checkpoint-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "checkpoint-trial".to_string(),
+                "project-memory".to_string(),
+                checkpoint.phase.clone(),
+                checkpoint.checkpoint_type.clone(),
+                checkpoint.intent.clone(),
+            ];
+            if current_success {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let decision_shape = decision_json_shape(&checkpoint.decision_json);
+            let pattern = if current_success {
+                format!(
+                    "Repeatable successful checkpoint reply in {} / {}: {} with intent {}",
+                    checkpoint.phase,
+                    checkpoint.agent,
+                    checkpoint.checkpoint_type,
+                    checkpoint.intent
+                )
+            } else {
+                format!(
+                    "Repeatable degraded checkpoint reply in {} / {}: {} with intent {}",
+                    checkpoint.phase,
+                    checkpoint.agent,
+                    checkpoint.checkpoint_type,
+                    checkpoint.intent
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(checkpoint_trial_intervention(&checkpoint, current_success)),
+                tags,
+                strength: if current_success {
+                    (0.75 + supporting_runs.len() as f64 * 0.1).min(1.4)
+                } else {
+                    (0.95 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nAgent: {}\nCheckpoint type: {}\nPrompt excerpt: {}\nAnswered by: {}\nIntent: {}\nDecision shape: {}\nAnswer excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                checkpoint.phase,
+                checkpoint.agent,
+                checkpoint.checkpoint_type,
+                truncate_text(&checkpoint.prompt, 200),
+                checkpoint.answered_by,
+                checkpoint.intent,
+                decision_shape,
+                truncate_text(&checkpoint.answer_text, 220),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn load_run_command_trials(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<(String, CommandTrialRecord)>> {
+        let run_dir = self.run_dir(run_id);
+        let mut trials = Vec::new();
+
+        for name in [
+            "build_command_trials.json",
+            "validation_command_trials.json",
+        ] {
+            let path = run_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<CommandTrialReport>(&raw) {
+                Ok(report) => report,
+                Err(_) => continue,
+            };
+            for command in report.commands {
+                trials.push((report.phase.clone(), command));
+            }
+        }
+
+        let retriever_path = run_dir.join("retriever_execution_report.json");
+        if retriever_path.exists() {
+            let raw = tokio::fs::read_to_string(&retriever_path).await?;
+            if let Ok(report) = serde_json::from_str::<RetrieverExecutionArtifact>(&raw) {
+                for command in report.executed_commands {
+                    let outcome = CommandOutcome {
+                        success: command.passed,
+                        code: command.exit_code,
+                        stdout: command.stdout.clone(),
+                        stderr: command.stderr.clone(),
+                    };
+                    trials.push((
+                        "retriever_forge".to_string(),
+                        build_command_trial_record(&command.raw_command, &outcome),
+                    ));
+                }
+            }
+        }
+
+        Ok(trials)
+    }
+
+    async fn load_run_decision_trials(&self, run_id: &str) -> Result<Vec<DecisionTrialSnapshot>> {
+        Ok(self
+            .list_run_decisions(run_id)
+            .await?
+            .into_iter()
+            .map(|decision| DecisionTrialSnapshot {
+                agent: decision.agent,
+                phase: decision.phase,
+                decision_kind: decision.decision_kind,
+                chose: decision.chose,
+                alternatives: decision.alternatives,
+                justification: decision.justification,
+            })
+            .collect())
+    }
+
+    async fn load_run_checkpoint_trials(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<CheckpointTrialSnapshot>> {
+        let checkpoints = self.list_run_checkpoints(run_id).await?;
+        let mut snapshots = Vec::new();
+        for checkpoint in checkpoints {
+            let phase = checkpoint
+                .phase
+                .clone()
+                .unwrap_or_else(|| "interaction".to_string());
+            let agent = checkpoint
+                .agent
+                .clone()
+                .unwrap_or_else(|| "operator".to_string());
+            for answer in checkpoint.answers {
+                let intent = checkpoint_answer_intent(&answer.answer_text, &answer.decision_json);
+                snapshots.push(CheckpointTrialSnapshot {
+                    phase: phase.clone(),
+                    agent: agent.clone(),
+                    checkpoint_type: checkpoint.checkpoint_type.clone(),
+                    prompt: checkpoint.prompt.clone(),
+                    answered_by: answer.answered_by,
+                    answer_text: answer.answer_text,
+                    decision_json: answer.decision_json,
+                    intent,
+                });
+            }
+        }
+        Ok(snapshots)
+    }
+
+    async fn run_behavioural_success(&self, run_id: &str) -> Result<bool> {
+        let attributions = self.list_phase_attributions_for_run(run_id).await?;
+        if attributions.is_empty() {
+            return Ok(self
+                .get_run(run_id)
+                .await?
+                .map(|run| run.status == "completed")
+                .unwrap_or(false));
+        }
+
+        Ok(attributions
+            .iter()
+            .any(|record| record.phase == "validation" && record.outcome == "success")
+            && attributions
+                .iter()
+                .any(|record| record.phase == "hidden_scenarios" && record.outcome == "success"))
     }
 
     async fn count_prior_matching_failed_episodes(
@@ -14620,6 +15253,24 @@ fn build_recommended_guardrails(
     }) {
         guardrails.push("Record each serious attempt with strategy, failure constraint, surviving structure, and reformulation so Coobie can compare retries structurally.".to_string());
     }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command-trial"))
+    {
+        guardrails.push("Treat tool calls as experiments with memory: record the exact command, exit code, stdout, stderr, and correction path so Coobie can distinguish syntax, tooling, and runtime failures.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "decision-trial"))
+    {
+        guardrails.push("Treat planning choices as experiments too: record what was chosen, what alternatives were available, and why, so Coobie can compare reasoning paths across runs.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "checkpoint-trial"))
+    {
+        guardrails.push("When the operator or pack resolves a blocker, preserve the unblock rationale and any decision JSON so future runs can reuse the successful intervention pattern instead of improvising again.".to_string());
+    }
 
     guardrails.dedup();
     guardrails
@@ -14707,6 +15358,54 @@ fn build_required_checks(
             .any(|tag| tag == "dead-end" || tag == "strategy-register")
     }) {
         checks.push("When retrying a recorded dead-end, emit evidence showing what changed relative to the last failed strategy before claiming parity or recovery.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command-trial"))
+    {
+        checks.push("Capture each meaningful command attempt with its exact command text, exit code, stdout, stderr, and whether the next correction changed syntax, tooling, or code-under-test.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "usage_error"))
+    {
+        checks.push("When a command fails with usage-like output or exit code 2, verify flags, argument order, and shell syntax before treating it as a model or product failure.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command_not_found"))
+    {
+        checks.push("Verify required CLIs are installed and visible on PATH inside the active execution surface before planning retries around them.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "not_executable"))
+    {
+        checks.push("Check execute permissions, shebangs, and interpreter availability before rerunning commands marked not executable.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "decision-trial"))
+    {
+        checks.push("Log each major planning choice with the chosen path, rejected alternatives, and justification so Coobie can compare reasoning trajectories across runs.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "checkpoint-trial"))
+    {
+        checks.push("When resolving blockers, record the checkpoint intent, answer text, and decision-json shape so future runs can distinguish a retry instruction from a scope clarification or risk acceptance.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "retry"))
+    {
+        checks.push("If a blocker is being answered with a retry instruction, capture exactly what changed before unblocking the agent.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "accept_risk"))
+    {
+        checks.push("If the operator is accepting risk to unblock progress, emit an explicit evidence note describing the waived concern and surviving mitigation.".to_string());
     }
 
     checks.dedup();
@@ -19233,7 +19932,313 @@ fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
     }
 }
 
+fn command_outcome_classification(
+    raw_command: &str,
+    outcome: &CommandOutcome,
+) -> (&'static str, String) {
+    if outcome.success {
+        return ("success", "Command completed successfully.".to_string());
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        outcome.stderr.to_ascii_lowercase(),
+        outcome.stdout.to_ascii_lowercase()
+    );
+    let usage_like = combined.contains("unknown option")
+        || combined.contains("unrecognized option")
+        || combined.contains("invalid option")
+        || combined.contains("unexpected argument")
+        || combined.contains("usage:")
+        || combined.contains("syntax error");
+
+    match outcome.code {
+        None => (
+            "terminated_by_signal",
+            format!("Command '{}' ended without an exit code, likely due to a signal.", raw_command),
+        ),
+        Some(126) => (
+            "not_executable",
+            format!("Command '{}' was found but could not be executed.", raw_command),
+        ),
+        Some(127) => (
+            "command_not_found",
+            format!("Command '{}' could not be found on PATH.", raw_command),
+        ),
+        Some(130) => (
+            "interrupted",
+            format!("Command '{}' was interrupted before completion.", raw_command),
+        ),
+        Some(2) => (
+            "usage_error",
+            format!(
+                "Command '{}' returned exit 2, which usually points to shell syntax or CLI usage issues.",
+                raw_command
+            ),
+        ),
+        Some(code) if usage_like => (
+            "usage_error",
+            format!(
+                "Command '{}' returned exit {} with usage-like output, so flags or syntax are likely wrong.",
+                raw_command, code
+            ),
+        ),
+        Some(code) => (
+            "runtime_failure",
+            format!(
+                "Command '{}' returned non-zero exit status {} after executing.",
+                raw_command, code
+            ),
+        ),
+    }
+}
+
+fn build_command_trial_record(raw_command: &str, outcome: &CommandOutcome) -> CommandTrialRecord {
+    let (classification, summary) = command_outcome_classification(raw_command, outcome);
+    CommandTrialRecord {
+        raw_command: raw_command.to_string(),
+        passed: outcome.success,
+        exit_code: outcome.code,
+        classification: classification.to_string(),
+        summary,
+        stdout: outcome.stdout.clone(),
+        stderr: outcome.stderr.clone(),
+    }
+}
+
+fn build_command_trial_report(
+    run_id: &str,
+    spec_id: &str,
+    product: &str,
+    phase: &str,
+    agent: &str,
+    passed: bool,
+    commands: &[CommandTrialRecord],
+) -> CommandTrialReport {
+    let summary = if commands.is_empty() {
+        format!("No command trials were recorded for {} / {}.", phase, agent)
+    } else {
+        format!(
+            "{} command trial(s) recorded for {} / {}; {} passed, {} failed.",
+            commands.len(),
+            phase,
+            agent,
+            commands.iter().filter(|trial| trial.passed).count(),
+            commands.iter().filter(|trial| !trial.passed).count(),
+        )
+    };
+    CommandTrialReport {
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        product: product.to_string(),
+        phase: phase.to_string(),
+        agent: agent.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        passed,
+        summary,
+        commands: commands.to_vec(),
+    }
+}
+
+fn render_command_trial_report_markdown(report: &CommandTrialReport) -> String {
+    let commands = if report.commands.is_empty() {
+        "No command trials recorded.".to_string()
+    } else {
+        report
+            .commands
+            .iter()
+            .map(|trial| {
+                format!(
+                    "### {}\n\n- passed: {}\n- exit_code: {}\n- classification: {}\n- summary: {}\n\nstdout:\n{}\n\nstderr:\n{}",
+                    trial.raw_command,
+                    if trial.passed { "true" } else { "false" },
+                    trial
+                        .exit_code
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "signal".to_string()),
+                    trial.classification,
+                    trial.summary,
+                    if trial.stdout.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        trial.stdout.clone()
+                    },
+                    if trial.stderr.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        trial.stderr.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    format!(
+        "# Command Trial Report\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Phase: {}\n- Agent: {}\n- Generated at: {}\n- Passed: {}\n\n## Summary\n{}\n\n## Commands\n{}",
+        report.run_id,
+        report.spec_id,
+        if report.product.is_empty() {
+            "<unknown>"
+        } else {
+            report.product.as_str()
+        },
+        report.phase,
+        report.agent,
+        report.generated_at,
+        if report.passed { "true" } else { "false" },
+        report.summary,
+        commands,
+    )
+}
+
+fn command_trial_pattern_key(phase: &str, raw_command: &str, classification: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        phase.to_ascii_lowercase(),
+        normalize_memory_text(raw_command),
+        classification.to_ascii_lowercase()
+    )
+}
+
+fn command_trial_intervention(classification: &str, passed: bool) -> String {
+    if passed {
+        return "Prefer this command shape again when repo tooling matches, but still verify stdout, stderr, and downstream artifacts.".to_string();
+    }
+
+    match classification {
+        "usage_error" => "Treat this as a command-shape problem first: verify flags, argument order, and shell syntax before blaming the model or product code.".to_string(),
+        "command_not_found" => "Verify the required binary is installed and on PATH inside the current execution surface before retrying.".to_string(),
+        "not_executable" => "Check execute permissions, shebangs, and interpreter wiring before retrying.".to_string(),
+        "terminated_by_signal" | "interrupted" => "Inspect operator interrupts, resource limits, or supervisor kills before treating this as a normal runtime failure.".to_string(),
+        _ => "Inspect stdout/stderr and only retry after changing the command, environment, or code-under-test in a traceable way.".to_string(),
+    }
+}
+
+fn decision_trial_pattern_key(decision: &DecisionTrialSnapshot, passed: bool) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        decision.phase.to_ascii_lowercase(),
+        decision.agent.to_ascii_lowercase(),
+        decision.decision_kind.to_ascii_lowercase(),
+        normalize_memory_text(&decision.chose),
+        if passed { "success" } else { "failure" }
+    )
+}
+
+fn decision_trial_intervention(decision: &DecisionTrialSnapshot, passed: bool) -> String {
+    if passed {
+        format!(
+            "Reuse the '{}' choice for '{}' when the same constraints recur, but keep recording the alternatives and justification so the precedent stays inspectable.",
+            decision.chose, decision.decision_kind
+        )
+    } else {
+        format!(
+            "Before repeating '{}' for '{}', reopen the alternatives and challenge the prior justification against the current evidence.",
+            decision.chose, decision.decision_kind
+        )
+    }
+}
+
+fn checkpoint_trial_pattern_key(checkpoint: &CheckpointTrialSnapshot, passed: bool) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        checkpoint.phase.to_ascii_lowercase(),
+        checkpoint.agent.to_ascii_lowercase(),
+        checkpoint.checkpoint_type.to_ascii_lowercase(),
+        checkpoint.intent.to_ascii_lowercase(),
+        decision_json_shape(&checkpoint.decision_json),
+        if passed { "success" } else { "failure" }
+    )
+}
+
+fn checkpoint_trial_intervention(checkpoint: &CheckpointTrialSnapshot, passed: bool) -> String {
+    if passed {
+        format!(
+            "When '{}' blockers recur for {}, start from the '{}' reply pattern and preserve the operator rationale in structured form.",
+            checkpoint.checkpoint_type, checkpoint.agent, checkpoint.intent
+        )
+    } else {
+        format!(
+            "Do not reuse the '{}' reply pattern for '{}' blockers without changing the rationale, scope, or decision payload first.",
+            checkpoint.intent, checkpoint.checkpoint_type
+        )
+    }
+}
+
+fn decision_json_shape(decision_json: &Option<serde_json::Value>) -> String {
+    match decision_json {
+        None => "none".to_string(),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => "empty_object".to_string(),
+        Some(serde_json::Value::Object(map)) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            format!("keys:{}", keys.join("+"))
+        }
+        Some(value) => format!("non_object:{}", value_type_label(value)),
+    }
+}
+
+fn checkpoint_answer_intent(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> String {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if mentions_decision_keyword(decision_json, &["retry", "rerun"]) || lower.contains("retry") {
+        return "retry".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["risk", "waive", "accept"])
+        || lower.contains("accept risk")
+        || lower.contains("waive")
+    {
+        return "accept_risk".to_string();
+    }
+    if lower.contains("clarify")
+        || lower.contains("scope")
+        || lower.contains("narrow")
+        || lower.contains("reframe")
+    {
+        return "clarify_scope".to_string();
+    }
+    if lower.starts_with("operator unblocked agent") || lower.starts_with("unblock ") {
+        return "unblock_ack".to_string();
+    }
+    if lower.contains("continue") || lower.contains("proceed") {
+        return "continue".to_string();
+    }
+    if trimmed.is_empty() && decision_json.is_some() {
+        return "decision_only".to_string();
+    }
+    if !trimmed.is_empty() && decision_json.is_some() {
+        return "direction_plus_decision".to_string();
+    }
+    if !trimmed.is_empty() {
+        return "direction".to_string();
+    }
+    "acknowledge".to_string()
+}
+
+fn mentions_decision_keyword(decision_json: &Option<serde_json::Value>, needles: &[&str]) -> bool {
+    let Some(value) = decision_json else {
+        return false;
+    };
+    let haystack = value.to_string().to_ascii_lowercase();
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn value_type_label(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn command_detail(command: &str, outcome: &CommandOutcome) -> String {
+    let (classification, _) = command_outcome_classification(command, outcome);
     let output = if !outcome.stderr.is_empty() {
         outcome.stderr.as_str()
     } else {
@@ -19241,13 +20246,16 @@ fn command_detail(command: &str, outcome: &CommandOutcome) -> String {
     };
     let excerpt = truncate_text(output, 220);
     format!(
-        "{} -> success={} code={:?} {}",
-        command, outcome.success, outcome.code, excerpt
+        "{} -> success={} code={:?} classification={} {}",
+        command, outcome.success, outcome.code, classification, excerpt
     )
 }
 
 fn format_command_output(command: &str, outcome: &CommandOutcome) -> String {
+    let (classification, summary) = command_outcome_classification(command, outcome);
     let mut sections = vec![format!("$ {}", command)];
+    sections.push(format!("classification: {}", classification));
+    sections.push(format!("summary: {}", summary));
     if !outcome.stdout.is_empty() {
         sections.push(format!("stdout:\n{}", outcome.stdout));
     }
@@ -21384,5 +22392,69 @@ mod tests {
         assert_eq!(report.validation_duration_ms, 3_000);
         assert_eq!(report.other_duration_ms, 1_000);
         assert_eq!(report.phase_durations.len(), 7);
+    }
+
+    #[test]
+    fn command_outcome_classifies_success() {
+        let outcome = CommandOutcome {
+            success: true,
+            code: Some(0),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+        };
+        let (classification, _) = command_outcome_classification("cargo test", &outcome);
+        assert_eq!(classification, "success");
+    }
+
+    #[test]
+    fn command_outcome_classifies_usage_error_from_exit_two() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(2),
+            stdout: String::new(),
+            stderr: "sh: syntax error near unexpected token".to_string(),
+        };
+        let (classification, _) = command_outcome_classification("sh -lc bad(", &outcome);
+        assert_eq!(classification, "usage_error");
+    }
+
+    #[test]
+    fn command_outcome_classifies_usage_error_from_cli_output() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "error: unknown option '--project-context'".to_string(),
+        };
+        let (classification, _) =
+            command_outcome_classification("claude --project-context", &outcome);
+        assert_eq!(classification, "usage_error");
+    }
+
+    #[test]
+    fn checkpoint_answer_intent_detects_retry() {
+        let intent = checkpoint_answer_intent(
+            "Please retry after fixing the command flags",
+            &Some(serde_json::json!({"action": "retry"})),
+        );
+        assert_eq!(intent, "retry");
+    }
+
+    #[test]
+    fn checkpoint_answer_intent_detects_direction_plus_decision() {
+        let intent = checkpoint_answer_intent(
+            "Proceed, but keep the scope narrow.",
+            &Some(serde_json::json!({"approved": true, "scope": "narrow"})),
+        );
+        assert_eq!(intent, "clarify_scope");
+    }
+
+    #[test]
+    fn decision_json_shape_sorts_keys() {
+        let shape = decision_json_shape(&Some(serde_json::json!({
+            "scope": "narrow",
+            "approved": true
+        })));
+        assert_eq!(shape, "keys:approved+scope");
     }
 }

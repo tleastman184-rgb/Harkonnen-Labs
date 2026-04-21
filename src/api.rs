@@ -27,7 +27,7 @@ use crate::{
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
         AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing,
-        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
+        DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
         EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
         MetricAttack, OperatorModelContext, OperatorModelProfile, OperatorModelScope,
         OperatorModelSession, OptimizationProgram, PhaseAttributionRecord, PriorCauseSignal,
@@ -69,10 +69,14 @@ struct MemoryBoardResponse {
     run_id: String,
     current_phase: Option<String>,
     active_recalled_lessons: Vec<MemoryBoardLessonView>,
+    active_reasoning_lessons: Vec<MemoryBoardLessonView>,
     phase_memory_usage: Vec<MemoryBoardPhaseUsage>,
     causal_precedents: Vec<PriorCauseSignal>,
     policy_reminders: Vec<String>,
     project_memory_root: Option<String>,
+    reasoning_summary: MemoryBoardReasoningSummary,
+    recent_decisions: Vec<DecisionRecord>,
+    recent_checkpoint_answers: Vec<ReasoningCheckpointAnswerView>,
     stale_risk_summary: MemoryBoardRiskSummary,
     stale_memory_entries: Vec<MemoryBoardRiskView>,
     memory_updates: Vec<MemoryBoardUpdateView>,
@@ -120,7 +124,7 @@ struct EvidenceBoardResponse {
     recent_evidence_events: Vec<RunEvent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MemoryBoardLessonView {
     lesson: LessonRecord,
     used_in_phases: Vec<String>,
@@ -173,6 +177,39 @@ struct MemoryBoardUpdateView {
     stale_summary: String,
     fresh_memory_id: String,
     fresh_summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryBoardReasoningSummary {
+    decision_count: usize,
+    checkpoint_answer_count: usize,
+    active_reasoning_lesson_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReasoningCheckpointAnswerView {
+    checkpoint_id: String,
+    phase: Option<String>,
+    agent: Option<String>,
+    checkpoint_type: String,
+    checkpoint_status: String,
+    prompt: String,
+    answered_by: String,
+    answer_text: String,
+    decision_json: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunReasoningSnapshotResponse {
+    pub run_id: String,
+    pub run_status: String,
+    pub current_phase: Option<String>,
+    pub decision_count: usize,
+    pub checkpoint_answer_count: usize,
+    pub open_checkpoint_count: usize,
+    pub recent_decisions: Vec<DecisionRecord>,
+    pub recent_checkpoint_answers: Vec<ReasoningCheckpointAnswerView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2882,6 +2919,72 @@ async fn build_evidence_board(
     }))
 }
 
+fn flatten_checkpoint_answers(
+    checkpoints: &[RunCheckpointRecord],
+) -> Vec<ReasoningCheckpointAnswerView> {
+    let mut answers = checkpoints
+        .iter()
+        .flat_map(|checkpoint| {
+            checkpoint.answers.iter().map(|answer| ReasoningCheckpointAnswerView {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                phase: checkpoint.phase.clone(),
+                agent: checkpoint.agent.clone(),
+                checkpoint_type: checkpoint.checkpoint_type.clone(),
+                checkpoint_status: checkpoint.status.clone(),
+                prompt: checkpoint.prompt.clone(),
+                answered_by: answer.answered_by.clone(),
+                answer_text: answer.answer_text.clone(),
+                decision_json: answer.decision_json.clone(),
+                created_at: answer.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    answers.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    answers
+}
+
+pub async fn build_run_reasoning_snapshot(
+    app: &AppContext,
+    id: &str,
+) -> anyhow::Result<Option<RunReasoningSnapshotResponse>> {
+    let Some(run) = app.get_run(id).await? else {
+        return Ok(None);
+    };
+
+    let run_dir = app.paths.workspaces.join(id).join("run");
+    let blackboard =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?;
+    let decisions = app.list_run_decisions(id).await?;
+    let checkpoints = app.list_run_checkpoints(id).await?;
+    let open_checkpoint_count = checkpoints
+        .iter()
+        .filter(|checkpoint| matches!(checkpoint.status.as_str(), "open" | "answered"))
+        .count();
+    let checkpoint_answers = flatten_checkpoint_answers(&checkpoints);
+
+    let recent_decisions = if decisions.len() > 8 {
+        decisions[decisions.len() - 8..].to_vec()
+    } else {
+        decisions.clone()
+    };
+    let recent_checkpoint_answers = if checkpoint_answers.len() > 8 {
+        checkpoint_answers[checkpoint_answers.len() - 8..].to_vec()
+    } else {
+        checkpoint_answers.clone()
+    };
+
+    Ok(Some(RunReasoningSnapshotResponse {
+        run_id: id.to_string(),
+        run_status: run.status,
+        current_phase: blackboard.as_ref().map(|board| board.current_phase.clone()),
+        decision_count: decisions.len(),
+        checkpoint_answer_count: checkpoint_answers.len(),
+        open_checkpoint_count,
+        recent_decisions,
+        recent_checkpoint_answers,
+    }))
+}
+
 async fn build_memory_board(
     app: &AppContext,
     id: &str,
@@ -2903,8 +3006,10 @@ async fn build_memory_board(
         &run_dir.join("stale_memory_mitigation_status.json"),
     )
     .await?;
+    let reasoning = build_run_reasoning_snapshot(app, id).await?;
 
     let mut active_lessons = Vec::new();
+    let mut active_reasoning_lessons = Vec::new();
     let mut policy_reminders = Vec::new();
     let mut causal_precedents = Vec::new();
     let mut project_memory_root = None;
@@ -2964,12 +3069,21 @@ async fn build_memory_board(
                 push_unique_string(&mut outcomes, &attribution.outcome);
             }
 
-            active_lessons.push(MemoryBoardLessonView {
+            let lesson_view = MemoryBoardLessonView {
                 lesson: lesson.clone(),
                 used_in_phases,
                 used_by_agents,
                 outcomes,
-            });
+            };
+            if lesson.tags.iter().any(|tag| {
+                matches!(
+                    tag.as_str(),
+                    "command-trial" | "decision-trial" | "checkpoint-trial"
+                )
+            }) {
+                active_reasoning_lessons.push(lesson_view.clone());
+            }
+            active_lessons.push(lesson_view);
         }
 
         let mut stale_status_by_id = HashMap::new();
@@ -3089,10 +3203,30 @@ async fn build_memory_board(
         run_id: id.to_string(),
         current_phase: blackboard.as_ref().map(|board| board.current_phase.clone()),
         active_recalled_lessons: active_lessons,
+        active_reasoning_lessons,
         phase_memory_usage,
         causal_precedents,
         policy_reminders,
         project_memory_root,
+        reasoning_summary: MemoryBoardReasoningSummary {
+            decision_count: reasoning
+                .as_ref()
+                .map(|snapshot| snapshot.decision_count)
+                .unwrap_or(0),
+            checkpoint_answer_count: reasoning
+                .as_ref()
+                .map(|snapshot| snapshot.checkpoint_answer_count)
+                .unwrap_or(0),
+            active_reasoning_lesson_count: active_reasoning_lessons.len(),
+        },
+        recent_decisions: reasoning
+            .as_ref()
+            .map(|snapshot| snapshot.recent_decisions.clone())
+            .unwrap_or_default(),
+        recent_checkpoint_answers: reasoning
+            .as_ref()
+            .map(|snapshot| snapshot.recent_checkpoint_answers.clone())
+            .unwrap_or_default(),
         stale_risk_summary: MemoryBoardRiskSummary {
             stale_risk_count: stale_entries.len(),
             satisfied_count,
