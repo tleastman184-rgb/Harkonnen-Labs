@@ -1,8 +1,8 @@
 ---
 name: harkonnen
-description: "Operate Harkonnen through the repo-local MCP server and CLI. TRIGGER: user asks about run history, PackChat threads or messages, checkpoints, board snapshots, benchmark suites or reports, wants to diagnose a failure, wants a run report, or wants to start, queue, or watch a run. Preferred over raw shell commands for Harkonnen interactions."
+description: "Operate Harkonnen through the repo-local MCP server and CLI. TRIGGER: user asks about run history, PackChat threads or messages, checkpoints, board snapshots, reasoning trails, benchmark suites or reports, wants to diagnose a failure, wants a run report, or wants to start, queue, or watch a run. Preferred over raw shell commands for Harkonnen interactions."
 user-invocable: true
-argument-hint: "[recent-runs | report <run-id> | diagnose <run-id> | queue <spec> <product-or-path> | watch <run-id> | boards <run-id> | start <spec> <product-or-path> | thread-open <title> | thread-list | say <thread-id> <message> | checkpoints <run-id> | answer-checkpoint <run-id> <checkpoint-id> | unblock <run-id> <agent> | benchmark-suites | benchmark-recent | benchmark-report <id-or-latest> | benchmark-smoke <suite-id...>]"
+argument-hint: "[recent-runs | report <run-id> | diagnose <run-id> | queue <spec> <product-or-path> | watch <run-id> | boards <run-id> | reasoning <run-id> | start <spec> <product-or-path> | thread-open <title> | thread-list | say <thread-id> <message> | checkpoints <run-id> | answer-checkpoint <run-id> <checkpoint-id> | unblock <run-id> <agent> | benchmark-suites | benchmark-recent | benchmark-report <id-or-latest> | benchmark-smoke <suite-id...>]"
 allowed-tools:
   - Read
   - Bash(claude mcp list)
@@ -60,6 +60,13 @@ Prefer this when the user wants a holistic “what’s going on right now?” vi
 instead of a narrow event stream. Use the summary view by default for quick
 answers, and only ask for the full board payload when the user explicitly wants
 deep detail.
+
+### `reasoning <run-id>`
+Call `mcp__harkonnen__get_run_reasoning_snapshot`. Use this when the user wants
+to inspect how the pack is thinking in practice: recent decisions, checkpoint
+answers, unblock patterns, and live reasoning counts. Prefer the summary view
+for quick diagnostics and the full view when the user wants the exact recent
+decision trail or checkpoint-answer history.
 
 ### `start <spec> <product-or-path>`
 If the second argument looks like a path (contains `/` or starts with `.`),
@@ -130,6 +137,8 @@ or much more time.
   commissioning through Claude or Codex
 - Prefer `boards` when the user wants the UI-style Mission / Action / Evidence /
   Memory overview instead of raw event or status output
+- Prefer `reasoning` when the user wants to inspect the live decision trail,
+  checkpoint-answer history, or unblock behavior rather than only phase status
 - Prefer PackChat thread open/list/message and checkpoint reply/unblock through
   MCP instead of telling the user to use the web UI or raw API routes
 - Start the run first; inspect report + decision log before dropping to shell-level

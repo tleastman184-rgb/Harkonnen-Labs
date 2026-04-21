@@ -1,0 +1,12 @@
+name = "memory"
+description = "Entity-style memory server for fast recall across sessions."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+requires_config = []
+requires_env = []
+extra_permissions = ["mcp__memory__*"]
+settings_target = "settings.json"
+
+[[triggers]]
+kind = "always"
+value = "true"

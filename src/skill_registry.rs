@@ -51,8 +51,8 @@ pub(crate) fn load_registry(registry_root: &Path) -> Result<Vec<SkillEntry>> {
             }
             let raw = fs::read_to_string(&toml_path)
                 .with_context(|| format!("reading {}", toml_path.display()))?;
-            let toml: SkillToml = toml::from_str(&raw)
-                .with_context(|| format!("parsing {}", toml_path.display()))?;
+            let toml: SkillToml =
+                toml::from_str(&raw).with_context(|| format!("parsing {}", toml_path.display()))?;
             entries.push(SkillEntry {
                 toml,
                 source_dir: skill_dir,
@@ -78,9 +78,10 @@ fn any_trigger_fires(triggers: &[SkillTrigger], platform: &str, stack_signals: &
     for trigger in triggers {
         let fires = match trigger.kind.as_str() {
             "platform" => platform.eq_ignore_ascii_case(&trigger.value),
-            "file" => stack_signals
-                .iter()
-                .any(|s| s.to_ascii_lowercase().contains(&trigger.value.to_ascii_lowercase())),
+            "file" => stack_signals.iter().any(|s| {
+                s.to_ascii_lowercase()
+                    .contains(&trigger.value.to_ascii_lowercase())
+            }),
             "env_var" => std::env::var(&trigger.value).is_ok(),
             _ => false,
         };

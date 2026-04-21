@@ -1,0 +1,16 @@
+name = "sqlite"
+description = "SQLite database access for local .db files."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sqlite", "{{db_path}}"]
+requires_config = ["db_path"]
+requires_env = []
+extra_permissions = ["mcp__sqlite__*"]
+settings_target = "settings.json"
+
+[[triggers]]
+kind = "skill"
+value = "sql"
+
+[[triggers]]
+kind = "file"
+value = ".db"

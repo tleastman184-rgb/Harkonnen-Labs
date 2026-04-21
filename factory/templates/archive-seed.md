@@ -13,7 +13,9 @@ Generated: {{generated_at}}
 
 Environment: {{environment}}
 Domains: {{domains}}
+Vertical: {{vertical}}
 Detected stack: {{stack_signals}}
+Skill sources: {{skill_sources}}
 
 {{episteme}}
 
@@ -40,6 +42,7 @@ Detected stack: {{stack_signals}}
 ## Chamber VI — Praxis (Operating Instructions)
 
 Skills deployed: {{deployed_skills}}
+MCP servers: {{mcp_servers}}
 Validation commands: {{validation_commands}}
 
 ---

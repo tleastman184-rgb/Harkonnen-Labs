@@ -1,0 +1,12 @@
+name = "filesystem"
+description = "Filesystem access for repo roots, workspaces, and local artifacts."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "{{paths}}"]
+requires_config = ["paths"]
+requires_env = []
+extra_permissions = ["mcp__filesystem__*"]
+settings_target = "settings.json"
+
+[[triggers]]
+kind = "always"
+value = "true"

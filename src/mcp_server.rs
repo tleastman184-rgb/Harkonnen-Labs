@@ -287,6 +287,38 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
                 .map_err(internal_error)?;
             json!(decisions)
         }
+        "get_run_reasoning_snapshot" => {
+            let run_id = required_string(&arguments, "run_id")?;
+            let snapshot = crate::api::build_run_reasoning_snapshot(&state.app, &run_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| (-32004, format!("run not found: {run_id}")))?;
+            let view = arguments
+                .get("view")
+                .and_then(Value::as_str)
+                .unwrap_or("summary");
+            match view {
+                "full" => json!(snapshot),
+                "summary" => json!({
+                    "run_id": snapshot.run_id,
+                    "run_status": snapshot.run_status,
+                    "current_phase": snapshot.current_phase,
+                    "decision_count": snapshot.decision_count,
+                    "checkpoint_answer_count": snapshot.checkpoint_answer_count,
+                    "open_checkpoint_count": snapshot.open_checkpoint_count,
+                    "recent_decision_count": snapshot.recent_decisions.len(),
+                    "recent_checkpoint_answer_count": snapshot.recent_checkpoint_answers.len(),
+                }),
+                other => {
+                    return Err((
+                        -32602,
+                        format!(
+                        "unsupported reasoning snapshot view: {other} (expected summary or full)"
+                    ),
+                    ))
+                }
+            }
+        }
         "start_run" => {
             let spec = required_string(&arguments, "spec")?;
             let product = optional_string(&arguments, "product");
@@ -675,6 +707,15 @@ async fn read_resource(
             "application/json",
             serde_json::to_string_pretty(&payload).map_err(internal_error)?,
         )
+    } else if let Some(run_id) = uri.strip_prefix("harkonnen://reasoning/") {
+        let payload = crate::api::build_run_reasoning_snapshot(&state.app, run_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| (-32004, format!("run not found: {run_id}")))?;
+        (
+            "application/json",
+            serde_json::to_string_pretty(&payload).map_err(internal_error)?,
+        )
     } else if uri == "harkonnen://chat/threads" {
         let threads = state
             .app
@@ -930,10 +971,12 @@ async fn run_watch_payload(state: &McpState, run_id: &str, event_limit: usize) -
         Ok(raw) => serde_json::from_str::<Value>(&raw).ok(),
         Err(_) => None,
     };
+    let reasoning = crate::api::build_run_reasoning_snapshot(&state.app, run_id).await?;
     Ok(json!({
         "run": run,
         "recent_events": events,
         "active_checkpoints": active_checkpoints,
+        "reasoning": reasoning,
         "run_timing": run_timing,
     }))
 }
@@ -985,6 +1028,23 @@ fn summarize_board_snapshot(snapshot: &Value) -> Value {
             .and_then(Value::as_array)
             .map(|items| items.len())
             .unwrap_or(0),
+        "active_reasoning_lesson_count": memory
+            .and_then(|board| board.get("active_reasoning_lessons"))
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0),
+        "decision_count": memory
+            .and_then(|board| board.get("reasoning_summary"))
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("decision_count"))
+            .cloned()
+            .unwrap_or(Value::from(0)),
+        "checkpoint_answer_count": memory
+            .and_then(|board| board.get("reasoning_summary"))
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("checkpoint_answer_count"))
+            .cloned()
+            .unwrap_or(Value::from(0)),
         "policy_reminder_count": memory
             .and_then(|board| board.get("policy_reminders"))
             .and_then(Value::as_array)
@@ -1098,6 +1158,21 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_run_reasoning_snapshot",
+            "description": "Return live reasoning trails for a run, including recent decisions and checkpoint answers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["run_id"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "view": {
+                        "type": "string",
+                        "enum": ["summary", "full"]
+                    }
+                }
+            }
+        }),
+        json!({
             "name": "start_run",
             "description": "Start a new Harkonnen run from a spec path and product target.",
             "inputSchema": {
@@ -1129,7 +1204,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "watch_run",
-            "description": "Return a compact progress snapshot for a run, including recent events and active checkpoints.",
+            "description": "Return a compact progress snapshot for a run, including recent events, active checkpoints, and live reasoning counts.",
             "inputSchema": {
                 "type": "object",
                 "required": ["run_id"],
@@ -1340,13 +1415,19 @@ fn resource_descriptors() -> Vec<Value> {
         json!({
             "uriTemplate": "harkonnen://watch/{run_id}",
             "name": "Run Watch",
-            "description": "Compact run progress snapshot with recent events and active checkpoints.",
+            "description": "Compact run progress snapshot with recent events, active checkpoints, and live reasoning trails.",
             "mimeType": "application/json"
         }),
         json!({
             "uriTemplate": "harkonnen://boards/{run_id}",
             "name": "Run Boards",
             "description": "Mission, Action, Evidence, and Memory board snapshot for a run.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uriTemplate": "harkonnen://reasoning/{run_id}",
+            "name": "Run Reasoning",
+            "description": "Live reasoning trails for a run, including decisions and checkpoint answers.",
             "mimeType": "application/json"
         }),
         json!({

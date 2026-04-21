@@ -1,0 +1,12 @@
+name = "github"
+description = "GitHub repo and issue access for docs, code, and release metadata."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+requires_config = []
+requires_env = ["GITHUB_TOKEN"]
+extra_permissions = ["WebFetch(github.com)"]
+settings_target = "settings.local.json"
+
+[[triggers]]
+kind = "always"
+value = "true"

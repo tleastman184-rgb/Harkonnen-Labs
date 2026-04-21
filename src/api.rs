@@ -26,8 +26,8 @@ use crate::{
     llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing,
-        DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
+        AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing, DecisionRecord,
+        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
         EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
         MetricAttack, OperatorModelContext, OperatorModelProfile, OperatorModelScope,
         OperatorModelSession, OptimizationProgram, PhaseAttributionRecord, PriorCauseSignal,
@@ -187,7 +187,7 @@ struct MemoryBoardReasoningSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ReasoningCheckpointAnswerView {
+pub struct ReasoningCheckpointAnswerView {
     checkpoint_id: String,
     phase: Option<String>,
     agent: Option<String>,
@@ -2925,18 +2925,21 @@ fn flatten_checkpoint_answers(
     let mut answers = checkpoints
         .iter()
         .flat_map(|checkpoint| {
-            checkpoint.answers.iter().map(|answer| ReasoningCheckpointAnswerView {
-                checkpoint_id: checkpoint.checkpoint_id.clone(),
-                phase: checkpoint.phase.clone(),
-                agent: checkpoint.agent.clone(),
-                checkpoint_type: checkpoint.checkpoint_type.clone(),
-                checkpoint_status: checkpoint.status.clone(),
-                prompt: checkpoint.prompt.clone(),
-                answered_by: answer.answered_by.clone(),
-                answer_text: answer.answer_text.clone(),
-                decision_json: answer.decision_json.clone(),
-                created_at: answer.created_at,
-            })
+            checkpoint
+                .answers
+                .iter()
+                .map(|answer| ReasoningCheckpointAnswerView {
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    phase: checkpoint.phase.clone(),
+                    agent: checkpoint.agent.clone(),
+                    checkpoint_type: checkpoint.checkpoint_type.clone(),
+                    checkpoint_status: checkpoint.status.clone(),
+                    prompt: checkpoint.prompt.clone(),
+                    answered_by: answer.answered_by.clone(),
+                    answer_text: answer.answer_text.clone(),
+                    decision_json: answer.decision_json.clone(),
+                    created_at: answer.created_at.to_owned(),
+                })
         })
         .collect::<Vec<_>>();
     answers.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -3198,6 +3201,7 @@ async fn build_memory_board(
         .filter(|entry| entry.mitigation_status.as_deref() != Some("satisfied"))
         .map(|entry| entry.severity_score)
         .sum();
+    let active_reasoning_lesson_count = active_reasoning_lessons.len();
 
     Ok(Some(MemoryBoardResponse {
         run_id: id.to_string(),
@@ -3217,7 +3221,7 @@ async fn build_memory_board(
                 .as_ref()
                 .map(|snapshot| snapshot.checkpoint_answer_count)
                 .unwrap_or(0),
-            active_reasoning_lesson_count: active_reasoning_lessons.len(),
+            active_reasoning_lesson_count,
         },
         recent_decisions: reasoning
             .as_ref()
