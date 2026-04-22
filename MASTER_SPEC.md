@@ -656,7 +656,7 @@ Mason workspace lease claim/check/release is now live, with DB-backed lease mirr
 - `GET /api/memory/updates` endpoint
 - Memory Board UI: distinguish invalidated entries from current
 
-**Done when:** Ingesting a new fact that contradicts an older one persists a supersession record, the old entry is flagged, and `GET /api/memory/updates` returns the history.
+**Status:** Core path is now live and smoke-tested on the main ingest flow. Re-ingesting changed content from the same source path persists a supersession record, flags the older note via provenance, and returns the history through `GET /api/memory/updates`. The bundled StreamingQA smoke fixture has also been rerun against that persisted history under `lm-studio-local`, producing `1.0000` accuracy and updated-fact accuracy. Operator adjudication remains follow-on work.
 
 ---
 
@@ -845,7 +845,7 @@ EI-1 should land before any hosted or team surface. ENT-1 is the foundation for 
 | LongMemEval | Long-term assistant memory, temporal reasoning, belief updates | Native adapter live |
 | LoCoMo | Long-horizon dialogue memory | Native adapter live |
 | FRAMES | Multi-hop factual recall (Mem0 publishes here) | Native adapter live; Qdrant needed for best results |
-| StreamingQA | Belief-update accuracy when facts change | Native adapter live; persistence layer completing in v1-B |
+| StreamingQA | Belief-update accuracy when facts change | Native adapter live; persisted-history smoke published on `lm-studio-local` |
 | HELMET | Retrieval precision/recall | Native adapter live |
 
 **Coding loop (vs OpenCode / Aider / SWE-agent):**

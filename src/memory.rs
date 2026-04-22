@@ -1843,35 +1843,96 @@ fn format_memory_hit_note(hit: &MemoryRetrievalHit) -> String {
 }
 
 fn memory_matches(entry: &MemoryEntry, query: &str) -> bool {
-    entry.summary.to_lowercase().contains(query)
+    let summary = entry.summary.to_lowercase();
+    let content = entry.content.to_lowercase();
+    let query = query.to_lowercase();
+    if summary.contains(&query)
         || entry
             .tags
             .iter()
-            .any(|tag| tag.to_lowercase().contains(query))
-        || entry.content.to_lowercase().contains(query)
+            .any(|tag| tag.to_lowercase().contains(&query))
+        || content.contains(&query)
+    {
+        return true;
+    }
+
+    let terms = keyword_query_terms(&query);
+    if terms.is_empty() {
+        return false;
+    }
+    let matched_terms = terms
+        .iter()
+        .filter(|term| {
+            summary.contains(term.as_str())
+                || entry
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(term.as_str()))
+                || content.contains(term.as_str())
+        })
+        .count();
+    let required_matches = if terms.len() <= 2 { 1 } else { 2 };
+    matched_terms >= required_matches
 }
 
 fn memory_match_score(entry: &MemoryEntry, query: &str) -> i64 {
     let mut score = 0_i64;
     let summary = entry.summary.to_lowercase();
     let content = entry.content.to_lowercase();
-    if summary.contains(query) {
+    let query = query.to_lowercase();
+    if summary.contains(&query) {
         score += 40;
     }
     if entry
         .tags
         .iter()
-        .any(|tag| tag.to_lowercase().contains(query))
+        .any(|tag| tag.to_lowercase().contains(&query))
     {
         score += 25;
     }
-    if content.contains(query) {
+    if content.contains(&query) {
         score += 15;
+    }
+    for term in keyword_query_terms(&query) {
+        if summary.contains(&term) {
+            score += 12;
+        } else if entry
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(&term))
+        {
+            score += 8;
+        } else if content.contains(&term) {
+            score += 4;
+        }
     }
     score += entry.contributed_to_success_count * 10;
     score -= entry.contributed_to_failure_count * 4;
     score += entry.recall_count.min(20);
     score
+}
+
+fn keyword_query_terms(query: &str) -> Vec<String> {
+    let stopwords = [
+        "about", "after", "before", "could", "does", "from", "have", "into", "only", "that",
+        "their", "there", "they", "this", "were", "what", "when", "where", "which", "while",
+        "with", "would",
+    ];
+    let mut terms = Vec::new();
+    for token in query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+    {
+        let useful = token.len() >= 4 || token.chars().all(|ch| ch.is_ascii_digit());
+        if !useful || stopwords.contains(&token.as_str()) {
+            continue;
+        }
+        if !terms.iter().any(|existing| existing == &token) {
+            terms.push(token);
+        }
+    }
+    terms
 }
 
 fn adjust_retrieval_score_for_provenance(base_score: f32, entry: &MemoryEntry) -> f32 {
@@ -2177,10 +2238,12 @@ fn asset_path_for(imports_dir: &Path, id: &str, ext: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        extracted_text_sidecar_path, shell_escape_arg, should_write_extracted_text_sidecar,
-        ExtractedMemorySource,
+        extracted_text_sidecar_path, memory_match_score, memory_matches,
+        shell_escape_arg, should_write_extracted_text_sidecar, ExtractedMemorySource,
+        MemoryEntry, MemoryProvenance, MemoryStore,
     };
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn extracted_text_sidecar_uses_asset_stem() {
@@ -2224,6 +2287,70 @@ mod tests {
     fn shell_escape_contains_wrapped_argument() {
         let escaped = shell_escape_arg("/tmp/with spaces/file.pdf");
         assert!(escaped.starts_with('\'') || escaped.starts_with('"'));
+    }
+
+    #[test]
+    fn keyword_memory_match_handles_streamingqa_style_questions() {
+        let entry = MemoryEntry {
+            id: "oakview-mayor-2024-01".to_string(),
+            tags: vec!["streamingqa".to_string(), "year:2024".to_string()],
+            summary: "Oakview elects Alice Hart".to_string(),
+            content:
+                "On January 1, 2024, Oakview elected Alice Hart as mayor after a close city race."
+                    .to_string(),
+            created_at: "2026-04-22T00:00:00Z".to_string(),
+            provenance: MemoryProvenance::default(),
+            recall_count: 0,
+            last_recalled: None,
+            loaded_for_run_count: 0,
+            contributed_to_success_count: 0,
+            contributed_to_failure_count: 0,
+        };
+
+        let query = "Who was the mayor of Oakview in February 2024?";
+        assert!(memory_matches(&entry, query));
+        assert!(memory_match_score(&entry, query) > 0);
+    }
+
+    #[tokio::test]
+    async fn detect_supersession_candidates_marks_same_source_path_changes() {
+        let temp = tempdir().unwrap();
+        let store = MemoryStore::new(temp.path().to_path_buf());
+        let provenance = MemoryProvenance {
+            source_path: Some("/tmp/harkonnen-memory-supersession.txt".to_string()),
+            source_label: Some("harkonnen-memory-supersession".to_string()),
+            ..MemoryProvenance::default()
+        };
+
+        store
+            .store_with_metadata(
+                "deployment-target-aws",
+                vec!["deploy".to_string()],
+                "deployment target",
+                "Deployment target is AWS us-west-2.",
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .store_with_metadata(
+                "deployment-target-onprem",
+                vec!["deploy".to_string()],
+                "deployment target",
+                "Deployment target is on-premises only.",
+                provenance,
+            )
+            .await
+            .unwrap();
+
+        let candidates = store
+            .detect_supersession_candidates("deployment-target-onprem", None)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].stale_memory_id, "deployment-target-aws");
+        assert!(candidates[0].reason.contains("same source path"));
     }
 }
 

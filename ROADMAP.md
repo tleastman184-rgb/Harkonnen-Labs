@@ -103,18 +103,21 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 ### v1-B — Memory Invalidation Persistence (Phase 4b completion)
 
-**Why:** The invalidation layer is computed at query time only — there is no `memory_updates` table, no `invalidated_by` column on memory records, and no `GET /api/memory/updates` endpoint. The StreamingQA adapter cannot score belief-update accuracy against a persistence layer that does not exist.
+**Why:** The core persistence path is now live on the main ingest flow, and the benchmark-facing smoke has now been rerun against that stored history. The remaining close-out work is operator adjudication for supersession events.
 
-**What to build:**
+**Shipped on the current path:**
 
 - `memory_updates` table in `src/db.rs`: `(update_id, old_memory_id, new_memory_id, reason, created_at)`
 - `invalidated_by: Option<String>` on the memory record schema (references `update_id`)
 - Coobie ingest pipeline: before writing a new memory entry, check for semantic near-duplicates with conflicting claims via cosine similarity on the embedding store. If found above threshold, write a supersession record and set `invalidated_by` on the old entry.
 - `GET /api/memory/updates` endpoint returning supersession history
-- Memory Board UI panel: distinguish invalidated entries from current entries; allow operator to confirm or reject a supersession
-- **StreamingQA native adapter** — streams fact-update events to Coobie's memory, then queries whether the updated belief is correctly recalled. Scores belief-update accuracy separately from static recall.
+- Memory Board UI panel showing supersession history alongside the rest of Coobie's recalled state
 
-**Done when:** Ingesting a new fact that contradicts an older one persists a supersession record, the old entry is flagged in the DB, `GET /api/memory/updates` returns the history, and StreamingQA has a baseline score.
+**Remaining close-out:**
+
+- Memory Board operator action to confirm or reject a supersession when human review is needed
+
+**Status:** Core path verified on the current code line. A repeated ingest from the same source path now writes `memory_updates` rows, marks stale notes with `superseded_by`, and surfaces the history through `GET /api/memory/updates` and the Pack Board Memory panel. The bundled StreamingQA smoke fixture has also been rerun under `lm-studio-local`, producing `1.0000` accuracy, exact match, evidence hit rate, and updated-fact accuracy while persisting the benchmark-local supersession row.
 
 ---
 
@@ -821,7 +824,7 @@ Every reportable benchmark claim should include:
 - Native LongMemEval adapter + paired raw-LLM vs Harkonnen comparison mode
 - Native LoCoMo QA adapter + paired raw-LLM vs Harkonnen comparison mode
 - Native FRAMES adapter + paired raw-LLM vs Harkonnen comparison mode
-- Native StreamingQA adapter (query-time invalidation reasons; persistence layer completing in v1-B)
+- Native StreamingQA adapter (query-time invalidation reasons plus persisted-history smoke published on `lm-studio-local`)
 - LM Studio / OpenAI-compatible benchmark routing for chat and embedding backends
 
 **Phase 4 — Episodic Layer Enrichment + Causal Graph + Benchmarks:**
@@ -835,11 +838,11 @@ Every reportable benchmark claim should include:
 - Native CLADDER adapter — Pearl hierarchy causal benchmark, paired Harkonnen vs raw-LLM mode
 - Native HELMET adapter — retrieval precision/recall benchmark
 
-**Phase 4b — Memory Invalidation (query-time layer, shipped; persistence layer completing in v1-B):**
+**Phase 4b — Memory Invalidation (query-time layer shipped; persistence layer now live on the main ingest path):**
 
 - `invalidation_reasons` field on `MemoryRetrievalHit` — computed at retrieval time from `superseded_by` / `challenged_by` provenance fields
 - `memory_invalidation_reasons()` helper in orchestrator surfaces reasons per hit
-- Persistence layer (`memory_updates` table, `invalidated_by` column, `GET /api/memory/updates`, Memory Board panel, StreamingQA adapter) completing in v1-B above
+- Persistence layer (`memory_updates` table, `invalidated_by` / `superseded_by` provenance, `GET /api/memory/updates`, Memory Board panel) is live; StreamingQA persisted-history smoke is published, and operator adjudication remains follow-on work
 
 **Phase 5 — Consolidation Workbench:**
 

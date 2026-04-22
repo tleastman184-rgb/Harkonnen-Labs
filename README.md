@@ -163,7 +163,7 @@ The OpenAI/Codex provider path also supports optional OpenAI-compatible BYO endp
 
 Status legend: **wired** = adapter integrated and runnable; **planned** = adapter not yet built; **internal** = Harkonnen-native, no external suite.
 
-All scores are pending first runs. The comparison targets listed are the systems each benchmark is designed to compare against.
+Most scores are still pending first runs. StreamingQA now has a first local Harkonnen smoke on the bundled fixture under `lm-studio-local`, including a persisted supersession row and a clean updated-fact trace.
 
 #### Memory and retrieval — vs Mem0 / MindPalace / Zep
 
@@ -171,7 +171,7 @@ All scores are pending first runs. The comparison targets listed are the systems
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | LongMemEval-S | Coobie | Accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 1 done |
 | FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 4 done |
-| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | wired | Phase 4b done |
+| StreamingQA | Coobie | Belief-update accuracy | 1.0000 (smoke) | pending | raw LLM | wired | Phase 4b done |
 | LoCoMo QA | Coobie | QA score | pending | pending | raw LLM | wired | Phase 1 done |
 | HELMET | Coobie | Retrieval precision / recall | pending | pending | raw LLM | wired | Phase 4 done |
 
@@ -489,7 +489,7 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and v1 (
 | Core factory pipeline (Scout → Mason → Piper → Bramble → Sable → Ash → Flint) | Live |
 | Mason fix loop with FailureKind classification (compile / test / wrong-answer / timeout) | Live |
 | Mason workspace lease enforcement — blocks competing agent writes | Live |
-| Memory invalidation persistence (`memory_updates` table, supersession tracking) | Live |
+| Memory invalidation persistence (`memory_updates` table, supersession tracking, Memory Board updates panel) | Live |
 | PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow, auto-created run coordination threads |
 | Operator Model two-layer interview (operating rhythms → recurring decisions) | Live — MVP shipped (v1-D) |
 | Commissioning brief (`commissioning-brief.json`) — consumed by Scout + Coobie preflight | Live |
