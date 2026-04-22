@@ -124,6 +124,8 @@ PackChat shifts the factory from pure autonomous orchestration to **supervised a
 * **Blocking checkpoint flow** — when an agent needs an answer before proceeding, it surfaces a structured reply card in the thread; you answer there, the run continues
 * **Unblock flow** — `POST /api/agents/:id/unblock` releases a stalled run after you reply
 * **Default to Coobie** for unaddressed messages — memory and context retrieval without `@mention`
+* **Run-scoped coordination threads** — every run now gets an automatic PackChat coordination thread so the pack has a durable shared conversation surface even before the operator opens a chat manually
+* **Canonical dog runtimes** — PackChat now distinguishes canonical dog role (`mason`) from live runtime instance (`mason#codex`, `mason#claude`) so multiple workers can coordinate as the same dog rather than as disconnected provider personas
 
 ---
 
@@ -488,7 +490,7 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and v1 (
 | Mason fix loop with FailureKind classification (compile / test / wrong-answer / timeout) | Live |
 | Mason workspace lease enforcement — blocks competing agent writes | Live |
 | Memory invalidation persistence (`memory_updates` table, supersession tracking) | Live |
-| PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow |
+| PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow, auto-created run coordination threads |
 | Operator Model two-layer interview (operating rhythms → recurring decisions) | Live — MVP shipped (v1-D) |
 | Commissioning brief (`commissioning-brief.json`) — consumed by Scout + Coobie preflight | Live |
 | Coobie layered memory (episodic, semantic, causal) | Live |
@@ -501,7 +503,9 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and v1 (
 | Consolidation Workbench | Live |
 | Hybrid semantic + keyword retrieval (fastembed / OpenAI-compatible) | Live |
 | Pack Board React UI (PackChat, Attribution Board, Factory Floor, Memory Board, Workbench) | Live |
-| Keeper coordination API (claims, heartbeats, conflict detection) | Live |
+| Keeper coordination API (claims, heartbeats, conflict detection, lease mirror in SQLite) | Live |
+| Canonical dog runtime registry (`agent_runtime_state` + PackChat runtime roster) | Live |
+| Run decision log API (`GET /api/runs/:id/decisions`) | Live |
 | Benchmark toolchain (LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, CLADDER native adapters) | Live |
 | Bramble real test execution | Phase 2 — next |
 | Ash live twin provisioning (Docker stubs) | Phase 3 |

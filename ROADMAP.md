@@ -1,13 +1,16 @@
 # Harkonnen Labs — Execution Roadmap
 
-**Primary goal: Calvin Archive as the backing for Coobie's memory.**
-The fastest reasonable path: Phase v1 (structural gaps) → Phase 2 (testable harness)
-→ Phase 5-C (context gating, no new infra) → Phase 5b (Qdrant, memory refactor)
-→ Phase 6 (TypeDB) → Phase 7 (causal corpus) → Phase 8 (Calvin Archive).
-Phase 3 (docs, DevBench, benchmark suites) follows the archive path rather than
-interrupting it. Live twin provisioning is permanently deferred unless a product
-explicitly requires running service virtualization. Phase 2's real test execution
-IS the testable harness.
+**Primary goal: structural coordination and trustworthy run governance on the hot path.**
+The fastest reasonable path: v1-A (Keeper-backed lease enforcement) → v1-B
+(memory invalidation persistence) → v1-D (operator context MVP) → Phase 2
+(testable harness) → Phase 5-C (context gating, no new infra) → Phase 5b
+(Qdrant, memory refactor) → Phase 6 (TypeDB) → Phase 7 (causal corpus) →
+Phase 8 (Calvin Archive).
+Phase 3 (docs, DevBench, benchmark suites) follows the coordination path rather
+than interrupting it. Live twin provisioning is permanently deferred unless a
+product explicitly requires running service virtualization. Phase 2's real test
+execution IS the testable harness. The Calvin Archive is now a working sidecar
+continuity layer, but it is not the current critical-path blocker.
 
 ---
 
@@ -26,10 +29,10 @@ A structured gap analysis identified seven practical gaps. Gap-closure phases A�
 
 | Gap | Gap-closure status |
 | --- | --- |
-| Enforced authority and guardrail boundaries | **Open** — `check_lease` API exists but is never called pre-write; guardrails are advisory only |
+| Enforced authority and guardrail boundaries | **Partial** — pre-write lease denial exists in orchestrator, but Mason still needs a Keeper-backed claim/check/release lifecycle and write-path enforcement must depend on an active lease rather than advisory state |
 | Live world-state modeling | Deferred — twin is still a manifest; live provisioning is permanently deferred unless a product needs it |
 | Closed-loop outcome verification | Partial — observation endpoint deferred to Phase E (TypeDB dependency) |
-| Structural multi-agent coordination | Mostly closed — blackboard, heartbeat, claim eviction are real |
+| Structural multi-agent coordination | Mostly closed — blackboard, heartbeat, claim eviction, DB-backed lease mirrors, and PackChat-linked dog runtime rosters are real; remaining work is richer inter-dog patch/brief exchange and conflict synthesis |
 | Economic and cost awareness | Closed — A1 trace spine + cost events |
 | Explicit intent → plan → execution separation | Closed — B, C (OptimizationProgram) |
 | External system interfaces | Open — Phase v1 External Integrations track |
@@ -38,8 +41,8 @@ A structured gap analysis identified seven practical gaps. Gap-closure phases A�
 
 - `.harkonnen/gap-closure-progress.md` tracks strategic bridge work phases A–D (all shipped)
 - Phase v1 (below) is the structural gate before the factory can be called Tier 4
-- After v1, the roadmap drives straight toward the Calvin Archive (Phases 5-C → 5b → 6 → 7 → 8)
-- Phase 3 benchmarks and docs follow the archive path
+- After v1, the roadmap drives through grounded execution and scoped context before deeper memory infrastructure
+- Phase 3 benchmarks and docs follow the coordination path
 - Operator Model and External Integrations are parallel product tracks
 
 ---
@@ -54,18 +57,24 @@ If a specific product built on Harkonnen requires live service virtualization fo
 
 ## Why this order
 
-The factory needs a clear line to the Calvin Archive. That line runs through:
+The factory needs a clear line from coordination authority to durable continuity. That line runs through:
 
-1. **v1** — closes structural gaps that make the foundation advisory rather than enforced: guardrails, memory invalidation persistence, failure classification, operator model MVP.
-2. **Phase 2** — Bramble real test execution. This is the testable harness. `validation_passed` means nothing until it reflects real test output rather than stubs. The fix loop's wrong-answer path depends on real exit codes. Everything downstream depends on this being grounded.
-3. **Phase 5-C** — per-phase context gating requires no new infrastructure. It can be done while the codebase is still pre-refactor. The Sable isolation constraint is a correctness issue that gets harder to retrofit as the memory module grows.
-4. **Phase 5b** — Qdrant, OCR, and the memory module refactor prepare the semantic layer for TypeDB. TypeDB pattern queries are only as good as the retrieval they sit on top of. The module refactor also needs to happen before Phase 5-C's `BriefingScope` work lands in a coherent location.
-5. **Phase 6** — TypeDB is the Calvin Archive's prerequisite. No TypeDB, no typed chamber schema, no cross-run causal queries.
-6. **Phase 7** — build the causal attribution corpus while the TypeDB layer is fresh. This populates the archive with real, labeled evidence before the governance layer opens.
-7. **Phase 8** — the Calvin Archive: persisted identity, governed integration, D*/SSA streaming. This is the destination.
-8. **Phase 3** — documentation, DevBench, benchmark suites. Important for external claims and usability but not on the Calvin Archive critical path. Ships after the archive is live so benchmarks run against the real system.
+1. **v1-A** — Keeper-backed lease enforcement. Coordination must be structural, not advisory. No write without an active lease.
+2. **v1-B** — memory invalidation persistence. Superseded coordination facts are almost as dangerous as missing ones.
+3. **v1-D** — operator context MVP. Runs should stop starting from scratch when operator posture is already known.
+4. **Phase 2** — Bramble real test execution. This is the testable harness. `validation_passed` means nothing until it reflects real test output rather than stubs.
+5. **Phase 5-C** — per-phase context gating. Once roles and leases are real, irrelevant context becomes the next quality drag.
+6. **Phase 5b** — Qdrant, OCR, and memory refactor. This prepares the semantic layer without displacing the hot-path coordination authority.
+7. **Phase 6** — TypeDB semantic layer for cross-run typed causal queries.
+8. **Phase 7** — causal attribution corpus so the deeper continuity layer opens with real evidence.
+9. **Phase 8** — the Calvin Archive: persisted identity, governed integration, D*/SSA streaming. This remains the long-horizon destination, but no longer blocks coordination-first engineering.
+10. **Phase 3** — documentation, DevBench, benchmark suites. Important for external claims and usability but not on the current critical path.
 
-Parallel tracks (External Integrations, Operator Model, Hosted/Team, Calvin Archive Visualizer) advance independently of the above sequence and do not block it.
+Parallel tracks (Compiled State Synthesis, External Integrations, Operator Model, Hosted/Team, Calvin Archive Visualizer) advance independently of the above sequence and do not block it.
+
+### Synthesis Stance
+
+Harkonnen needs a first-class synthesis function, but not necessarily a tenth Labrador yet. For now, synthesis is treated as a pipeline phase that compiles accepted state into durable operator-readable artifacts using inputs from Coobie, Keeper, Flint, the decision log, the coordination registry, and the operator model. If this work later develops its own trust boundary, benchmark surface, or sustained bottleneck, it can be promoted into a dedicated Labrador with a narrow role. Until then, add synthesis as an explicit phase and artifact family rather than a new generalist agent.
 
 Benchmark wiring advances in lockstep with implementation phases. Each phase ships with at least one measurable gate. The benchmark philosophy remains explicitly agentic-engineering shaped: measure how quickly and safely software moves through the delivery system, not just how quickly code is emitted.
 
@@ -77,16 +86,18 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 ### v1-A — Guardrail Enforcement (hard blocker for Tier 4)
 
-**Why it's a blocker:** Tier 4 requires agents to operate *inside* explicit guardrails, not just record them. Currently `check_lease` exists in `src/api.rs` but is never called from `src/orchestrator.rs`. Every Mason file write bypasses the lease system. Decision records are written *after* the fact, not enforced *before* the act.
+**Why it's a blocker:** Tier 4 requires agents to operate *inside* explicit guardrails, not just record them. Harkonnen now has a Keeper-backed workspace lease claim/check/release lifecycle with DB-backed lease mirrors, PackChat-linked dog runtime rosters, decision-log coverage for lease and planning outcomes, and Pack Board decision-log surfacing in the run detail drawer.
 
 **What to build:**
 
-- Call `POST /api/coordination/check-lease` inside `mason_generate_and_apply_edits` before writing any file — pass `resource_kind: "workspace"`, the staged path prefix, and the run's guardrails from the Coobie briefing. If the response is denied or returns violations, return an error rather than proceeding and write a decision record explaining why the write was blocked.
-- Wire the same check in the Mason plan generation path: claim `resource_kind: "workspace"` at plan start with `ttl_secs` derived from the spec's time budget
-- Add at least three more `record_decision` call sites: Mason plan selection, Scout optimization program derivation, Sable attack generation. Currently only Coobie critique and consolidation promotion are wired.
-- Add `GET /api/runs/:id/decisions` to the Pack Board run detail drawer so operators can inspect the decision audit trail per run
+- Keeper-backed workspace lease lifecycle is live: Mason claims `resource_kind: "workspace"` before implementation, writes depend on an active lease, and release happens at run completion or failure.
+- The write-path guardrail check in `mason_generate_and_apply_edits` now depends on an active Mason workspace lease rather than treating missing coordination state as an automatic allow.
+- Policy events are mirrored into SQLite, and decision records now cover Keeper lease outcomes plus the key planning choices (Scout optimization program, Mason plan selection, Sable metric attacks) so the audit trail reflects authority decisions rather than only blackboard intent.
+- A canonical dog runtime registry now sits alongside leases: one identity per Labrador role, with support for multiple live worker instances (`mason#1`, `mason#codex`, `mason#claude`, etc.) carrying `thread_id`, ownership, and status through the same coordination surface.
+- PackChat run threads now act as the shared conversation surface for those live dog instances so two Masons can coordinate as Mason rather than as disconnected provider personas.
+- This slice is now effectively shipped on the current backend and Pack Board path; follow-on work moves from basic guardrail authority into broader coordination synthesis and operator ergonomics.
 
-**Done when:** A Mason edit attempt against a path that has no active workspace lease is blocked at the orchestrator level, a decision record is written explaining the block, and the Pack Board surfaces the decision log per run.
+**Done when:** Mason claims a Keeper-backed workspace lease before implementation begins, a Mason edit attempt against a path that has no active workspace lease is blocked at the orchestrator level, lease and planning outcomes are written into the decision log, and the Pack Board surfaces the decision log per run.
 
 ---
 
@@ -466,6 +477,30 @@ New builtin benchmark module — Harkonnen-native, no external dataset.
 - Spec draft quality and spec adherence compared with and without the operator model
 
 **Done when:** A user can complete the five-layer interview with approvals, generate operating artifacts, and see those artifacts materially influence Scout draft quality and Coobie preflight behavior.
+
+---
+
+## Parallel Product Track — Compiled State Synthesis
+
+**Unlocks:** A durable human-readable state surface that compiles accepted run state, coordination outcomes, and memory changes into something an operator can browse without manually reconstructing the story from raw logs and tables.
+
+**Current stance:** build this as a pipeline phase first, not a new Labrador. Coobie provides semantic and causal summaries, Keeper provides authoritative coordination state, and Flint renders the artifact surface. Promote synthesis into its own Labrador only if it becomes a durable bottleneck or needs its own trust boundary.
+
+**What to build:**
+
+- `factory/compiled_docs/` artifact family with at least `run/`, `project/`, and `daily/` outputs
+- synthesis job that reads `decision_log`, `phase_attributions`, coordination registry tables, operator model tables, and memory invalidation history
+- conflict headers in compiled docs when coordination events or decision records show unresolved tension rather than smoothing it away
+- compiled summaries that distinguish current accepted state, superseded state, and open questions
+- explicit input provenance so a compiled document can point back to the run, decision, or coordination event that produced each major conclusion
+
+**Benchmark / product gate:**
+
+- A completed run produces a compiled state artifact without manual intervention
+- Operators can inspect run/project state from compiled docs without opening SQLite or raw JSON logs
+- Contradictions surface as explicit unresolved sections rather than disappearing in prose
+
+**Done when:** a completed run produces a compiled state artifact that summarizes what changed, what was decided, which coordination conflicts occurred, what memory was superseded, and what remains unresolved.
 
 ---
 

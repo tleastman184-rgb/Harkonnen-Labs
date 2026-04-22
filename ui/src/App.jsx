@@ -146,6 +146,7 @@ function App() {
   const [runs, setRuns] = useState([]);
   const [activeRunId, setActiveRunId] = useState('');
   const [runState, setRunState] = useState(null);
+  const [memoryUpdates, setMemoryUpdates] = useState([]);
   const [selectedRole, setSelectedRole] = useState('mason');
   const [roleBoard, setRoleBoard] = useState(null);
   const [coordination, setCoordination] = useState(null);
@@ -298,6 +299,30 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadMemoryUpdates = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/memory/updates`);
+        if (!cancelled) {
+          setMemoryUpdates(Array.isArray(data) ? data : []);
+        }
+      } catch {
+        if (!cancelled) {
+          setMemoryUpdates([]);
+        }
+      }
+    };
+
+    loadMemoryUpdates();
+    const interval = setInterval(loadMemoryUpdates, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
   // Fetch causal report for active run (used by workbench)
   useEffect(() => {
     if (!activeRunId) { setCausalReport(null); return undefined; }
@@ -331,6 +356,7 @@ function App() {
   const staleClaims = coordinationClaims.filter(([, claim]) => claim.status === 'stale');
   const healthyClaims = coordinationClaims.filter(([, claim]) => claim.status !== 'stale');
   const recentPolicyEvents = [...policyEvents].slice(-6).reverse();
+  const recentMemoryUpdates = [...memoryUpdates].slice(0, 6);
 
   return (
     <div className="pack-board-shell">
@@ -448,9 +474,28 @@ function App() {
               <div className="info-row"><span>Promoted lessons</span><strong>{lessons.length}</strong></div>
               <div className="info-row"><span>Recent recalls</span><strong>{agentExecutions.length}</strong></div>
               <div className="info-row"><span>Live pidgin signals</span><strong>{coobieTranslations.reduce((sum, item) => sum + (item.signals?.length || 0), 0)}</strong></div>
+              <div className="info-row"><span>Supersessions</span><strong>{memoryUpdates.length}</strong></div>
             </div>
             <div className="top-gap">
               <CoobieSignalPanel translations={coobieTranslations} compact />
+            </div>
+            <div className="list-block top-gap">
+              <div className="list-section-title">Memory updates</div>
+              {recentMemoryUpdates.length === 0 ? (
+                <div className="empty-state">No supersessions recorded yet.</div>
+              ) : (
+                recentMemoryUpdates.map((update) => (
+                  <div key={update.update_id} className="list-item">
+                    <div className="list-item-title">
+                      {update.old_memory_id} → {update.new_memory_id}
+                    </div>
+                    <div className="list-item-subtle">{update.reason}</div>
+                    <div className="list-item-subtle">
+                      {(update.memory_root || 'memory root unavailable')} · {new Date(update.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
             <div className="list-block top-gap">
               {(lessons || []).length === 0 ? (

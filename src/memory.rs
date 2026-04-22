@@ -10,6 +10,12 @@ use uuid::Uuid;
 
 use crate::setup::{command_available, SetupConfig};
 
+#[derive(Debug, Clone)]
+pub struct MemorySupersessionCandidate {
+    pub stale_memory_id: String,
+    pub reason: String,
+}
+
 // ── Stored entry ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -187,6 +193,10 @@ struct MemoryRetrievalCandidate<'a> {
 impl MemoryStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Create the memory directory, write seed documents, and build the index.
@@ -522,6 +532,133 @@ impl MemoryStore {
         Ok(read_memory_index(&index_path).await?.entries)
     }
 
+    pub async fn detect_supersession_candidates(
+        &self,
+        new_entry_id: &str,
+        embedding_store: Option<&crate::embeddings::EmbeddingStore>,
+    ) -> Result<Vec<MemorySupersessionCandidate>> {
+        let entries = self.list_entries().await?;
+        let Some(new_entry) = entries.iter().find(|entry| entry.id == new_entry_id) else {
+            return Ok(Vec::new());
+        };
+        let new_entry_tags = new_entry.tags.clone();
+        let new_entry_summary = new_entry.summary.clone();
+        let new_entry_content = new_entry.content.clone();
+
+        let memory_root = self.root.display().to_string();
+        let mut semantic_scores = HashMap::new();
+        if let Some(embedding_store) = embedding_store {
+            if embedding_store
+                .ensure_embedded(&entries, &memory_root)
+                .await
+                .is_ok()
+            {
+                let query = format!(
+                    "{}\n{}\n{}",
+                    new_entry_summary,
+                    new_entry_tags.join(", "),
+                    new_entry_content.chars().take(240).collect::<String>()
+                );
+                if let Ok(hits) = embedding_store
+                    .query_semantic(&query, &memory_root, 12)
+                    .await
+                {
+                    for (score, id) in hits {
+                        semantic_scores.insert(id, score);
+                    }
+                }
+            }
+        }
+
+        let new_summary_key = normalize_memory_text(&new_entry_summary);
+        let new_content_key =
+            normalize_memory_text(&new_entry_content.chars().take(400).collect::<String>());
+        let new_source_path = new_entry
+            .provenance
+            .source_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let new_source_label = new_entry
+            .provenance
+            .source_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.id == new_entry_id {
+                continue;
+            }
+            if entry.provenance.superseded_by.is_some()
+                || entry
+                    .provenance
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status == "superseded")
+            {
+                continue;
+            }
+
+            let same_source_path = new_source_path.is_some()
+                && entry.provenance.source_path.as_deref().map(str::trim)
+                    == new_source_path.as_deref();
+            let same_source_label = new_source_label.is_some()
+                && entry.provenance.source_label.as_deref().map(str::trim)
+                    == new_source_label.as_deref();
+            let summary_key = normalize_memory_text(&entry.summary);
+            let content_key =
+                normalize_memory_text(&entry.content.chars().take(400).collect::<String>());
+            let same_summary = !summary_key.is_empty() && summary_key == new_summary_key;
+            let materially_different = !content_key.is_empty()
+                && !new_content_key.is_empty()
+                && content_key != new_content_key;
+            let semantic_score = semantic_scores.get(&entry.id).copied().unwrap_or(0.0);
+            let shared_tags = shared_tag_count(&entry.tags, &new_entry_tags);
+            let negation_flip = has_negation_terms(&entry.summary, &entry.content)
+                != has_negation_terms(&new_entry_summary, &new_entry_content);
+
+            let should_supersede = if same_source_path || same_source_label {
+                materially_different && (same_summary || semantic_score >= 0.86 || negation_flip)
+            } else {
+                same_summary && materially_different && semantic_score >= 0.93 && shared_tags >= 1
+            };
+
+            if !should_supersede {
+                continue;
+            }
+
+            let reason = if same_source_path {
+                format!(
+                    "new ingest supersedes prior fact from the same source path (semantic score {:.2})",
+                    semantic_score
+                )
+            } else if same_source_label {
+                format!(
+                    "new ingest supersedes prior fact from the same source label (semantic score {:.2})",
+                    semantic_score
+                )
+            } else {
+                format!(
+                    "new ingest supersedes a near-duplicate prior fact (semantic score {:.2})",
+                    semantic_score
+                )
+            };
+
+            candidates.push(MemorySupersessionCandidate {
+                stale_memory_id: entry.id,
+                reason,
+            });
+        }
+
+        candidates.sort_by(|left, right| left.stale_memory_id.cmp(&right.stale_memory_id));
+        candidates.truncate(3);
+        Ok(candidates)
+    }
+
     pub async fn annotate_entry_status(
         &self,
         id: &str,
@@ -844,6 +981,46 @@ fn append_unique_tag(tags: &mut Vec<String>, tag: String) {
     if !tags.iter().any(|existing| existing == normalized) {
         tags.push(normalized.to_string());
     }
+}
+
+fn normalize_memory_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shared_tag_count(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .filter(|tag| {
+            let trimmed = tag.trim();
+            !trimmed.is_empty() && right.iter().any(|candidate| candidate.trim() == trimmed)
+        })
+        .count()
+}
+
+fn has_negation_terms(summary: &str, content: &str) -> bool {
+    let corpus = format!("{} {}", summary, content).to_ascii_lowercase();
+    [
+        " no ",
+        " not ",
+        " never ",
+        " disabled ",
+        " disable ",
+        " false ",
+        " deprecated ",
+    ]
+    .iter()
+    .any(|needle| corpus.contains(needle))
 }
 
 fn next_available_memory_id(root: &Path, raw: &str) -> String {

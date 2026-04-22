@@ -706,6 +706,28 @@ pub struct SoulIdentityContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentRuntimeState {
+    pub runtime_id: String,
+    pub canonical_role: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub ownership: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub last_heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlackboardState {
     pub run_id: String,
     pub current_phase: String,
@@ -715,7 +737,11 @@ pub struct BlackboardState {
     pub artifact_refs: Vec<String>,
     pub lesson_refs: Vec<String>,
     pub policy_flags: Vec<String>,
+    #[serde(default)]
+    pub packchat_thread_id: Option<String>,
     pub agent_claims: HashMap<String, String>,
+    #[serde(default)]
+    pub agent_instances: Vec<AgentRuntimeState>,
 }
 
 impl BlackboardState {
@@ -732,12 +758,16 @@ impl BlackboardState {
         match role.as_str() {
             "coobie" => {
                 view.agent_claims.clear();
+                view.agent_instances.clear();
             }
             "sable" => {
                 view.agent_claims.clear();
+                view.agent_instances.clear();
             }
             "scout" => {
                 view.agent_claims.retain(|agent, _| agent == "scout");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "scout");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -750,6 +780,8 @@ impl BlackboardState {
             }
             "mason" => {
                 view.agent_claims.retain(|agent, _| agent == "mason");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "mason");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -764,6 +796,8 @@ impl BlackboardState {
             }
             "bramble" => {
                 view.agent_claims.retain(|agent, _| agent == "bramble");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "bramble");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -776,6 +810,8 @@ impl BlackboardState {
             }
             "ash" => {
                 view.agent_claims.retain(|agent, _| agent == "ash");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "ash");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -788,9 +824,13 @@ impl BlackboardState {
             }
             "flint" => {
                 view.agent_claims.retain(|agent, _| agent == "flint");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "flint");
             }
             _ => {
                 view.agent_claims.retain(|agent, _| agent == &role);
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == role);
             }
         }
 
@@ -1167,6 +1207,8 @@ pub struct MemoryUpdateRecord {
     pub update_id: String,
     pub old_memory_id: String,
     pub new_memory_id: String,
+    #[serde(default)]
+    pub memory_root: Option<String>,
     pub reason: String,
     pub created_at: String,
 }

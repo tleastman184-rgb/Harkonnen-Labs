@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -20,17 +20,18 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode, CheckpointAnswerRecord,
-        CommissioningBrief, ConsolidationCandidate, CoobieBriefing, CoobieEvidenceCitation,
-        EpisodeCausalState, EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation,
-        EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment,
-        EvidenceMatchReport, EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch,
-        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
-        LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
-        PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
-        RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
-        SoulIdentityContext, Spec, StakeholderAlignmentSummary, TwinEnvironment, TwinFailureMode,
-        TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
+        AgentExecution, AgentRuntimeState, BlackboardState, CausalEventEdge, CausalEventNode,
+        CheckpointAnswerRecord, CommissioningBrief, ConsolidationCandidate, CoobieBriefing,
+        CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord, EpisodeStateDiff,
+        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
+        EvidenceMatchAssessment, EvidenceMatchReport, EvidenceSource, EvidenceTimeRange,
+        EvidenceWindowMatch, HiddenScenarioCheckResult, HiddenScenarioEvaluation,
+        HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent, OperatorModelContext,
+        PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal, ProjectInterviewContext,
+        ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
+        RunTimingReport, ScenarioResult, SoulIdentityContext, Spec, StakeholderAlignmentSummary,
+        TwinEnvironment, TwinFailureMode, TwinService, TwinServiceSpec, ValidationSummary,
+        WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
@@ -779,7 +780,8 @@ impl AppContext {
         let normalized_scope = scope.trim().to_lowercase();
         match normalized_scope.as_str() {
             "core" => {
-                self.memory_store
+                let result = self
+                    .memory_store
                     .ingest_source(
                         source,
                         MemoryIngestOptions {
@@ -792,7 +794,10 @@ impl AppContext {
                             scope_tag: Some("core-memory".to_string()),
                         },
                     )
-                    .await
+                    .await?;
+                self.reconcile_ingested_memory_supersessions(&self.memory_store, &result)
+                    .await?;
+                Ok(result)
             }
             "project" => {
                 let project_root = project_root
@@ -823,6 +828,8 @@ impl AppContext {
                             scope_tag: Some("project-memory".to_string()),
                         },
                     )
+                    .await?;
+                self.reconcile_ingested_memory_supersessions(&store, &result)
                     .await?;
                 self.refresh_project_resume_packet(&target_source, &store)
                     .await?;
@@ -1820,6 +1827,10 @@ impl AppContext {
             }
         }
 
+        if let Err(error) = self.release_mason_workspace_lease(run_id).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Mason workspace lease release failed");
+        }
+
         Ok(())
     }
 
@@ -1849,6 +1860,8 @@ impl AppContext {
             active_goal: spec_obj.title.clone(),
             ..Default::default()
         };
+        let packchat_thread = self.ensure_packchat_run_thread(run_id, spec_obj).await?;
+        blackboard.packchat_thread_id = Some(packchat_thread.thread_id.clone());
         push_unique(&mut blackboard.artifact_refs, "target_source.json");
         push_unique(&mut blackboard.artifact_refs, "phase_attributions.json");
         push_unique(&mut blackboard.artifact_refs, "phase_attributions.md");
@@ -2234,6 +2247,19 @@ impl AppContext {
         )
         .await?;
         release_agent(&mut blackboard, "keeper");
+        let workspace_prefix = staged_product.to_string_lossy().to_string();
+        self.claim_mason_workspace_lease(
+            run_id,
+            &workspace_prefix,
+            &briefing.recommended_guardrails,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "claiming Keeper-managed Mason workspace lease for {}",
+                workspace_prefix
+            )
+        })?;
         claim_agent(&mut blackboard, "mason", "owns staged product workspace");
         push_unique(&mut blackboard.resolved_items, "workspace");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
@@ -6581,6 +6607,23 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
             }
         }
 
+        self.record_decision(
+            run_id,
+            "scout",
+            "intake",
+            "optimization_program",
+            &program.objective_metric,
+            &["acceptance_criteria_pass_rate".to_string()],
+            &format!(
+                "Scout selected objective metric '{}' with {} editable surface(s) and {} evaluation step(s) for spec '{}'.",
+                program.objective_metric,
+                program.editable_surface.len(),
+                program.evaluation_plan.len(),
+                spec_obj.id
+            ),
+        )
+        .await;
+
         let _ = self
             .write_json_file(&run_dir.join("optimization_program.json"), &program)
             .await;
@@ -6699,6 +6742,25 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                 }
             }
         }
+
+        self.record_decision(
+            run_id,
+            "sable",
+            "intake",
+            "metric_attack_generation",
+            &if attacks.is_empty() {
+                "no_metric_attacks_generated".to_string()
+            } else {
+                format!("generated_{}_metric_attacks", attacks.len())
+            },
+            &["skip_metric_attack_generation".to_string()],
+            &format!(
+                "Sable evaluated objective metric '{}' and produced {} metric attack probe(s).",
+                program.objective_metric,
+                attacks.len()
+            ),
+        )
+        .await;
 
         let _ = self
             .write_json_file(&run_dir.join("metric_attacks.json"), &attacks)
@@ -11159,82 +11221,65 @@ Return JSON only.",
         &self,
         workspace_prefix: &str,
     ) -> (bool, Vec<String>, String) {
-        let coord_path = self
-            .paths
-            .factory
-            .join("coordination")
-            .join("assignments.json");
-
-        let raw = match tokio::fs::read_to_string(&coord_path).await {
-            Ok(r) => r,
-            // No coordination file means no active claims — allow.
-            Err(_) => {
-                return (
-                    true,
-                    vec![],
-                    "No active coordination state — write allowed.".to_string(),
-                )
-            }
-        };
-
-        let state: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    true,
-                    vec![],
-                    "Coordination state unreadable — write allowed.".to_string(),
-                )
+        let state = match crate::api::ensure_assignments_state(self).await {
+            Ok(state) => state,
+            Err(error) => {
+                let msg = format!("Coordination state unavailable — denying write: {error}");
+                return (false, vec![msg.clone()], msg);
             }
         };
 
         let now = Utc::now();
-        let active = match state.get("active").and_then(|v| v.as_object()) {
-            Some(map) => map,
-            None => {
-                return (
-                    true,
-                    vec![],
-                    "No active claims — write allowed.".to_string(),
-                )
-            }
+        let overlaps = |files: &[String]| {
+            files
+                .iter()
+                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f))
         };
 
-        for (owner, assignment) in active {
-            if owner == "mason" {
-                continue; // Mason's own claim is fine.
-            }
-            // Check TTL: if expired, skip.
-            if let Some(expires_at) = assignment.get("expires_at").and_then(|v| v.as_str()) {
-                if !expires_at.is_empty() {
-                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                        if exp.with_timezone(&Utc) < now {
-                            continue;
-                        }
-                    }
+        let Some(mason_assignment) = state.active.get("mason") else {
+            let msg = format!(
+                "Cannot write to '{}': Mason does not hold an active workspace lease",
+                workspace_prefix
+            );
+            return (false, vec![msg.clone()], msg);
+        };
+
+        if mason_assignment.status == "stale" || !overlaps(&mason_assignment.files) {
+            let msg = format!(
+                "Cannot write to '{}': Mason workspace lease is stale or does not cover this path",
+                workspace_prefix
+            );
+            return (false, vec![msg.clone()], msg);
+        };
+
+        if !mason_assignment.expires_at.is_empty() {
+            if let Ok(expires_at) =
+                chrono::DateTime::parse_from_rfc3339(&mason_assignment.expires_at)
+            {
+                if expires_at.with_timezone(&Utc) < now {
+                    let msg = format!(
+                        "Cannot write to '{}': Mason workspace lease has expired",
+                        workspace_prefix
+                    );
+                    return (false, vec![msg.clone()], msg);
                 }
             }
-            // Check if the files overlap with workspace_prefix.
-            let files = assignment
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
+        }
 
-            let overlaps = files
-                .iter()
-                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f));
-            if !overlaps && !files.is_empty() {
+        for (owner, assignment) in &state.active {
+            if owner == "mason" {
                 continue;
             }
-
-            // Another agent holds an active, non-expired, overlapping claim.
-            let status = assignment
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("active");
-            if status == "stale" {
+            if assignment.status == "stale" || !overlaps(&assignment.files) {
                 continue;
+            }
+            if !assignment.expires_at.is_empty() {
+                if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(&assignment.expires_at)
+                {
+                    if expires_at.with_timezone(&Utc) < now {
+                        continue;
+                    }
+                }
             }
 
             let msg = format!(
@@ -11247,55 +11292,300 @@ Return JSON only.",
         (true, vec![], "Workspace lease check passed.".to_string())
     }
 
+    pub async fn claim_mason_workspace_lease(
+        &self,
+        run_id: &str,
+        workspace_prefix: &str,
+        guardrails: &[String],
+    ) -> Result<()> {
+        let mut state = crate::api::ensure_assignments_state(self)
+            .await
+            .context("loading coordination state for Mason workspace claim")?;
+        let now = Utc::now();
+        let overlaps = |files: &[String]| {
+            files
+                .iter()
+                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f))
+        };
+
+        if let Some(existing) = state.active.get("mason") {
+            if existing.status != "stale" && overlaps(&existing.files) {
+                return Ok(());
+            }
+            if existing.status != "stale" && !existing.files.is_empty() {
+                anyhow::bail!(
+                    "Mason already holds an active workspace lease on {}",
+                    existing.files.join(", ")
+                );
+            }
+        }
+
+        for (owner, assignment) in &state.active {
+            if owner == "mason" || assignment.status == "stale" {
+                continue;
+            }
+            if !overlaps(&assignment.files) {
+                continue;
+            }
+            if !assignment.expires_at.is_empty() {
+                if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(&assignment.expires_at)
+                {
+                    if expires_at.with_timezone(&Utc) < now {
+                        continue;
+                    }
+                }
+            }
+
+            let message = format!(
+                "Keeper blocked Mason workspace claim: {} already owns {}",
+                owner, workspace_prefix
+            );
+            self.record_decision(
+                run_id,
+                "keeper",
+                "coordination",
+                "workspace_claim",
+                "deny_workspace_claim",
+                &[
+                    "grant_workspace_claim".to_string(),
+                    "wait_for_conflicting_lease".to_string(),
+                ],
+                &message,
+            )
+            .await;
+            crate::api::append_policy_event(
+                self,
+                crate::api::CoordinationPolicyEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    managed_by: state.managed_by.clone(),
+                    event_type: "workspace_claim_conflict".to_string(),
+                    status: "blocked".to_string(),
+                    agent: Some("mason".to_string()),
+                    conflicting_agent: Some(owner.clone()),
+                    files: assignment.files.clone(),
+                    message: message.clone(),
+                    created_at: now.to_rfc3339(),
+                },
+            )
+            .await
+            .ok();
+            anyhow::bail!(message);
+        }
+
+        let ttl_secs = if state.stale_after_seconds > 0 {
+            state.stale_after_seconds
+        } else {
+            600
+        };
+        let claimed_at = now.to_rfc3339();
+        state.active.insert(
+            "mason".to_string(),
+            crate::api::Assignment {
+                agent: "mason".to_string(),
+                task: "owns staged product workspace".to_string(),
+                files: vec![workspace_prefix.to_string()],
+                claimed_at: claimed_at.clone(),
+                last_heartbeat_at: claimed_at,
+                status: "active".to_string(),
+                resource_kind: "workspace".to_string(),
+                ttl_secs,
+                guardrails: guardrails.to_vec(),
+                expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            },
+        );
+        state.updated_at = now.to_rfc3339();
+
+        crate::api::append_policy_event(
+            self,
+            crate::api::CoordinationPolicyEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                managed_by: state.managed_by.clone(),
+                event_type: "workspace_claim_granted".to_string(),
+                status: "granted".to_string(),
+                agent: Some("mason".to_string()),
+                conflicting_agent: None,
+                files: vec![workspace_prefix.to_string()],
+                message: format!(
+                    "Keeper granted Mason workspace lease for {}",
+                    workspace_prefix
+                ),
+                created_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .ok();
+        self.record_decision(
+            run_id,
+            "keeper",
+            "coordination",
+            "workspace_claim",
+            "grant_workspace_claim",
+            &[
+                "deny_workspace_claim".to_string(),
+                "wait_for_conflicting_lease".to_string(),
+            ],
+            &format!(
+                "Keeper granted Mason workspace lease for {} with {} guardrail(s).",
+                workspace_prefix,
+                guardrails.len()
+            ),
+        )
+        .await;
+
+        crate::api::save_assignments(self, &state)
+            .await
+            .context("saving Mason workspace claim")
+    }
+
+    pub async fn release_mason_workspace_lease(&self, run_id: &str) -> Result<()> {
+        let mut state = crate::api::ensure_assignments_state(self)
+            .await
+            .context("loading coordination state for Mason workspace release")?;
+        let Some(assignment) = state.active.remove("mason") else {
+            return Ok(());
+        };
+        state.updated_at = Utc::now().to_rfc3339();
+
+        crate::api::append_policy_event(
+            self,
+            crate::api::CoordinationPolicyEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                managed_by: state.managed_by.clone(),
+                event_type: "workspace_claim_released".to_string(),
+                status: "released".to_string(),
+                agent: Some("mason".to_string()),
+                conflicting_agent: None,
+                files: assignment.files.clone(),
+                message: "Keeper released Mason workspace lease".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .ok();
+        self.record_decision(
+            run_id,
+            "keeper",
+            "coordination",
+            "workspace_release",
+            "release_workspace_claim",
+            &["retain_workspace_claim".to_string()],
+            &format!(
+                "Keeper released Mason workspace lease covering {}.",
+                assignment.files.join(", ")
+            ),
+        )
+        .await;
+
+        crate::api::save_assignments(self, &state)
+            .await
+            .context("saving Mason workspace release")
+    }
+
     // ── v1-B: Memory supersession persistence ────────────────────────────────
 
     /// Persist a memory supersession event: old_id was invalidated by new_id.
     ///
     /// Also updates the old entry's provenance.superseded_by on disk (via
     /// MemoryStore) so retrieval hits include the invalidation reason.
-    pub async fn record_memory_supersession(
+    pub async fn record_memory_supersession_in_store(
         &self,
+        store: &MemoryStore,
         old_memory_id: &str,
         new_memory_id: &str,
         reason: &str,
-    ) {
+    ) -> Result<()> {
+        let memory_root = store.root().display().to_string();
+        let existing = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(1)
+            FROM memory_updates
+            WHERE old_memory_id = ?1 AND new_memory_id = ?2 AND memory_root = ?3
+            "#,
+        )
+        .bind(old_memory_id)
+        .bind(new_memory_id)
+        .bind(&memory_root)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+        if existing > 0 {
+            return Ok(());
+        }
+
         let update_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        if let Err(e) = sqlx::query(
+        sqlx::query(
             r#"
-            INSERT INTO memory_updates (update_id, old_memory_id, new_memory_id, reason, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO memory_updates (update_id, old_memory_id, new_memory_id, memory_root, reason, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
         )
         .bind(&update_id)
         .bind(old_memory_id)
         .bind(new_memory_id)
+        .bind(&memory_root)
         .bind(reason)
         .bind(&now)
         .execute(&self.pool)
-        .await
-        {
-            tracing::warn!("record_memory_supersession db write failed: {e}");
-        }
+        .await?;
 
         // Mark the old entry on disk as superseded so retrieval surfaces the flag.
-        if let Err(e) = self
-            .memory_store
+        store
             .annotate_entry_status(old_memory_id, "superseded", Some(new_memory_id))
-            .await
-        {
-            tracing::warn!(
-                "record_memory_supersession file annotation failed for {old_memory_id}: {e}"
-            );
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_memory_supersession(
+        &self,
+        old_memory_id: &str,
+        new_memory_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.record_memory_supersession_in_store(
+            &self.memory_store,
+            old_memory_id,
+            new_memory_id,
+            reason,
+        )
+        .await
+    }
+
+    async fn reconcile_ingested_memory_supersessions(
+        &self,
+        store: &MemoryStore,
+        result: &MemoryIngestResult,
+    ) -> Result<()> {
+        let Some(new_memory_id) = result
+            .note_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+        else {
+            return Ok(());
+        };
+
+        let candidates = store
+            .detect_supersession_candidates(&new_memory_id, self.embedding_store.as_ref())
+            .await?;
+        for candidate in candidates {
+            self.record_memory_supersession_in_store(
+                store,
+                &candidate.stale_memory_id,
+                &new_memory_id,
+                &candidate.reason,
+            )
+            .await?;
         }
+        Ok(())
     }
 
     /// Return the full supersession history, most recent first.
     pub async fn list_memory_updates(&self) -> Result<Vec<crate::models::MemoryUpdateRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT update_id, old_memory_id, new_memory_id, reason, created_at
+            SELECT update_id, old_memory_id, new_memory_id, memory_root, reason, created_at
             FROM memory_updates
             ORDER BY created_at DESC
             "#,
@@ -11309,6 +11599,9 @@ Return JSON only.",
                     update_id: row.get("update_id"),
                     old_memory_id: row.get("old_memory_id"),
                     new_memory_id: row.get("new_memory_id"),
+                    memory_root: row
+                        .get::<Option<String>, _>("memory_root")
+                        .filter(|value| !value.trim().is_empty()),
                     reason: row.get("reason"),
                     created_at: row.get("created_at"),
                 })
@@ -12341,6 +12634,10 @@ Return JSON only.",
             let mut guard = self.blackboard.write().await;
             *guard = board.clone();
         }
+        if !board.run_id.trim().is_empty() {
+            db::sync_agent_runtime_state(&self.pool, &board.run_id, &board.agent_instances).await?;
+            self.sync_packchat_runtime_rosters(board).await?;
+        }
         if let Some(run_dir) = run_dir {
             self.write_json_file(&run_dir.join("blackboard.json"), board)
                 .await?;
@@ -12357,15 +12654,10 @@ Return JSON only.",
         board.current_phase = "complete".to_string();
         board.active_goal = format!("Run finished with status {final_status}");
         board.agent_claims.clear();
+        board.agent_instances.clear();
         let snapshot = board.clone();
         drop(board);
-        self.write_json_file(&run_dir.join("blackboard.json"), &snapshot)
-            .await?;
-        if !snapshot.run_id.trim().is_empty() {
-            self.sync_checkpoints_for_board(&snapshot.run_id, &snapshot)
-                .await?;
-        }
-        Ok(())
+        self.sync_blackboard(&snapshot, Some(run_dir)).await
     }
 
     async fn mark_blackboard_failed(&self, message: &str, run_dir: &Path) -> Result<()> {
@@ -12374,17 +12666,42 @@ Return JSON only.",
         board.active_goal = "Run failed".to_string();
         push_unique(&mut board.open_blockers, message);
         board.agent_claims.clear();
+        board.agent_instances.clear();
         let snapshot = board.clone();
         drop(board);
         if run_dir.exists() {
-            self.write_json_file(&run_dir.join("blackboard.json"), &snapshot)
-                .await?;
-            if !snapshot.run_id.trim().is_empty() {
-                self.sync_checkpoints_for_board(&snapshot.run_id, &snapshot)
-                    .await?;
-            }
+            self.sync_blackboard(&snapshot, Some(run_dir)).await?;
         }
         Ok(())
+    }
+
+    async fn sync_packchat_runtime_rosters(&self, board: &BlackboardState) -> Result<()> {
+        let mut by_thread: BTreeMap<String, Vec<AgentRuntimeState>> = BTreeMap::new();
+        for runtime in &board.agent_instances {
+            if let Some(thread_id) = runtime.thread_id.as_ref() {
+                by_thread
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .push(runtime.clone());
+            }
+        }
+        if let Some(thread_id) = board.packchat_thread_id.as_ref() {
+            by_thread.entry(thread_id.clone()).or_default();
+        }
+        for (thread_id, runtimes) in by_thread {
+            self.chat.sync_runtime_roster(&thread_id, &runtimes).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_packchat_run_thread(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+    ) -> Result<crate::chat::ChatThread> {
+        self.chat
+            .ensure_run_thread(run_id, &format!("Pack Coordination — {}", spec_obj.title))
+            .await
     }
 
     async fn attach_lessons_to_blackboard(
@@ -14146,9 +14463,13 @@ Query terms: {}",
                 && !lesson_intervention.is_empty()
                 && !entry.content.to_lowercase().contains(&lesson_intervention)
             {
-                store
-                    .annotate_entry_status(&entry.id, "superseded", Some(&lesson.lesson_id))
-                    .await?;
+                self.record_memory_supersession_in_store(
+                    &store,
+                    &entry.id,
+                    &lesson.lesson_id,
+                    "new project lesson superseded an older lesson with the same normalized pattern",
+                )
+                .await?;
             } else if overlap >= 2 && entry_key != lesson_key {
                 store
                     .annotate_entry_status(&entry.id, "challenged", Some(&lesson.lesson_id))
@@ -21341,10 +21662,71 @@ fn claim_agent(board: &mut BlackboardState, agent: &str, ownership: &str) {
     board
         .agent_claims
         .insert(agent.to_string(), ownership.to_string());
+    claim_agent_instance(board, agent, agent, ownership, None, None, "phase_claim");
 }
 
 fn release_agent(board: &mut BlackboardState, agent: &str) {
     board.agent_claims.remove(agent);
+    board
+        .agent_instances
+        .retain(|instance| instance.runtime_id != agent);
+}
+
+#[allow(dead_code)]
+fn claim_agent_instance(
+    board: &mut BlackboardState,
+    runtime_id: &str,
+    canonical_role: &str,
+    ownership: &str,
+    provider: Option<&str>,
+    surface: Option<&str>,
+    source: &str,
+) {
+    let now = Utc::now().to_rfc3339();
+    let display_name = dog_display_name(canonical_role).to_string();
+    if let Some(existing) = board
+        .agent_instances
+        .iter_mut()
+        .find(|instance| instance.runtime_id == runtime_id)
+    {
+        existing.canonical_role = canonical_role.to_string();
+        existing.display_name = display_name;
+        existing.ownership = ownership.to_string();
+        existing.status = "active".to_string();
+        existing.provider = provider.map(str::to_string);
+        existing.surface = surface.map(str::to_string);
+        existing.thread_id = board.packchat_thread_id.clone();
+        existing.source = source.to_string();
+        existing.last_heartbeat_at = now;
+        return;
+    }
+
+    board.agent_instances.push(AgentRuntimeState {
+        runtime_id: runtime_id.to_string(),
+        canonical_role: canonical_role.to_string(),
+        display_name,
+        ownership: ownership.to_string(),
+        status: "active".to_string(),
+        provider: provider.map(str::to_string),
+        surface: surface.map(str::to_string),
+        thread_id: board.packchat_thread_id.clone(),
+        source: source.to_string(),
+        last_heartbeat_at: now,
+    });
+}
+
+fn dog_display_name(agent: &str) -> &'static str {
+    match agent {
+        "scout" => "Scout",
+        "mason" => "Mason",
+        "piper" => "Storm",
+        "bramble" => "Bramble",
+        "sable" => "Sable",
+        "ash" => "Ash",
+        "flint" => "Flint",
+        "keeper" => "Bear",
+        _ => "Coobie",
+    }
 }
 
 fn normalize_message_pattern(message: &str) -> String {

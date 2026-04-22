@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::{
     config::Paths,
     llm::{self, LlmRequest, Message},
-    models::{CheckpointAnswerRecord, RunCheckpointRecord},
+    models::{AgentRuntimeState, CheckpointAnswerRecord, RunCheckpointRecord},
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -83,6 +83,9 @@ pub struct ChatMessage {
     pub role: String,
     /// Which agent sent or is addressed by this message.
     pub agent: Option<String>,
+    /// Stable dog instance identifier when a canonical role has multiple lives.
+    #[serde(default)]
+    pub agent_runtime_id: Option<String>,
     pub content: String,
     /// Set when this message resolved a checkpoint.
     pub checkpoint_id: Option<String>,
@@ -259,6 +262,75 @@ impl ChatStore {
         rows.into_iter().map(parse_chat_thread).collect()
     }
 
+    pub async fn ensure_run_thread(&self, run_id: &str, title: &str) -> Result<ChatThread> {
+        if let Some(thread) = self
+            .list_threads(Some(run_id), Some(&ChatThreadKind::Run), 1)
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(thread);
+        }
+
+        let thread = self
+            .open_thread(&OpenThreadRequest {
+                run_id: Some(run_id.to_string()),
+                spec_id: None,
+                title: Some(title.to_string()),
+                thread_kind: ChatThreadKind::Run,
+                metadata_json: Some(serde_json::json!({
+                    "surface": "pack_coordination",
+                    "active_dogs": [],
+                })),
+            })
+            .await?;
+
+        self.append_message(
+            &thread.thread_id,
+            "system",
+            None,
+            None,
+            "Pack coordination thread opened. Canonical dogs may have multiple live runtime instances here (for example `mason#codex` and `mason#claude`) while still coordinating as Mason.",
+            None,
+        )
+        .await?;
+
+        Ok(thread)
+    }
+
+    pub async fn sync_runtime_roster(
+        &self,
+        thread_id: &str,
+        runtimes: &[AgentRuntimeState],
+    ) -> Result<()> {
+        let Some(thread) = self.get_thread(thread_id).await? else {
+            return Ok(());
+        };
+
+        let mut metadata = match thread.metadata_json {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "surface".to_string(),
+            Value::String("pack_coordination".to_string()),
+        );
+        metadata.insert("active_dogs".to_string(), serde_json::to_value(runtimes)?);
+
+        let updated_at = Utc::now();
+        sqlx::query(
+            "UPDATE chat_threads SET metadata_json = ?1, updated_at = ?2 WHERE thread_id = ?3",
+        )
+        .bind(serde_json::to_string(&Value::Object(metadata))?)
+        .bind(updated_at.to_rfc3339())
+        .bind(thread_id)
+        .execute(&self.pool)
+        .await
+        .context("update chat_thread metadata")?;
+
+        Ok(())
+    }
+
     // ── Messages ──────────────────────────────────────────────────────────────
 
     pub async fn append_message(
@@ -266,6 +338,7 @@ impl ChatStore {
         thread_id: &str,
         role: &str,
         agent: Option<&str>,
+        agent_runtime_id: Option<&str>,
         content: &str,
         checkpoint_id: Option<&str>,
     ) -> Result<ChatMessage> {
@@ -274,14 +347,15 @@ impl ChatStore {
 
         sqlx::query(
             r#"
-            INSERT INTO chat_messages (message_id, thread_id, role, agent, content, checkpoint_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO chat_messages (message_id, thread_id, role, agent, agent_runtime_id, content, checkpoint_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
         )
         .bind(&message_id)
         .bind(thread_id)
         .bind(role)
         .bind(agent)
+        .bind(agent_runtime_id)
         .bind(content)
         .bind(checkpoint_id)
         .bind(now.to_rfc3339())
@@ -301,6 +375,7 @@ impl ChatStore {
             thread_id: thread_id.to_string(),
             role: role.to_string(),
             agent: agent.map(|s| s.to_string()),
+            agent_runtime_id: agent_runtime_id.map(|s| s.to_string()),
             content: content.to_string(),
             checkpoint_id: checkpoint_id.map(|s| s.to_string()),
             created_at: now,
@@ -309,7 +384,7 @@ impl ChatStore {
 
     pub async fn list_messages(&self, thread_id: &str) -> Result<Vec<ChatMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, thread_id, role, agent, content, checkpoint_id, created_at
+            "SELECT message_id, thread_id, role, agent, agent_runtime_id, content, checkpoint_id, created_at
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at ASC",
         )
         .bind(thread_id)
@@ -323,6 +398,7 @@ impl ChatStore {
                 thread_id: r.get("thread_id"),
                 role: r.get("role"),
                 agent: r.get("agent"),
+                agent_runtime_id: r.get("agent_runtime_id"),
                 content: r.get("content"),
                 checkpoint_id: r.get("checkpoint_id"),
                 created_at: parse_dt(r.get("created_at")),
@@ -608,6 +684,7 @@ pub async fn dispatch_message(
             &thread.thread_id,
             "operator",
             Some(agent),
+            None,
             &req.content,
             None,
         )
@@ -625,6 +702,7 @@ pub async fn dispatch_message(
                     &thread.thread_id,
                     "agent",
                     Some(agent),
+                    None,
                     &reply_content,
                     None,
                 )
@@ -1138,6 +1216,7 @@ mod tests {
             thread_id: "thread-1".to_string(),
             role: role.to_string(),
             agent: Some("coobie".to_string()),
+            agent_runtime_id: None,
             content: content.to_string(),
             checkpoint_id: None,
             created_at: Utc::now(),

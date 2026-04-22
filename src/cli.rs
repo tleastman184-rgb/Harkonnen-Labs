@@ -2367,7 +2367,7 @@ pub async fn handle_archive(
         }
         ArchiveCommands::Start => {
             println!("Starting Calvin Archive stack...");
-            let status = build_docker_compose_command(["up", "-d"])?
+            let status = build_docker_compose_command(["up", "--build", "-d"])?
                 .status()
                 .context("running docker compose")?;
             if status.success() {

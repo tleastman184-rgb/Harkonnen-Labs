@@ -76,6 +76,10 @@ impl ArchiveStore {
     }
 
     pub(crate) async fn seed_coobie_kernel(&self) -> Result<()> {
+        if self.coobie_kernel_seeded().await? {
+            tracing::info!("Coobie kernel already seeded; skipping baseline seed");
+            return Ok(());
+        }
         let tx = self
             .driver
             .transaction(&self.db_name, TransactionType::Write)
@@ -84,6 +88,29 @@ impl ArchiveStore {
         tx.query(SEED_TQL).await.context("seeding Coobie kernel")?;
         tx.commit().await.context("committing seed")?;
         Ok(())
+    }
+
+    async fn coobie_kernel_seeded(&self) -> Result<bool> {
+        let tx = self
+            .driver
+            .transaction(&self.db_name, TransactionType::Read)
+            .await
+            .context("opening read transaction for Coobie kernel check")?;
+        let answer = tx
+            .query(
+                r#"match
+                    $coobie isa agent_self, has uuid "agent-self-coobie";
+                   select $coobie;
+                   limit 1;"#,
+            )
+            .await
+            .context("checking for existing Coobie kernel")?;
+        let mut rows = answer.into_rows();
+        while let Some(row_result) = rows.next().await {
+            row_result?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) async fn open_run(
@@ -320,19 +347,16 @@ impl ArchiveStore {
                 .driver
                 .transaction(&self.db_name, TransactionType::Read)
                 .await?;
-            let tql = format!("match $x isa {entity}; select $x; count;");
+            let tql = format!("match $x isa {entity}; select $x;");
             let count: i64 = match tx.query(&tql).await {
                 Ok(answer) => {
                     let mut stream = answer.into_rows();
-                    if let Some(Ok(row)) = stream.next().await {
-                        row.get("_count")
-                            .ok()
-                            .flatten()
-                            .and_then(|c| c.try_get_integer())
-                            .unwrap_or(0)
-                    } else {
-                        0
+                    let mut count = 0_i64;
+                    while let Some(row_result) = stream.next().await {
+                        row_result?;
+                        count += 1;
                     }
+                    count
                 }
                 Err(_) => 0,
             };

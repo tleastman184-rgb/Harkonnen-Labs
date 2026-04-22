@@ -26,12 +26,12 @@ use crate::{
     llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, ConsolidationCandidate, CoobieBriefing, DecisionRecord,
-        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
-        EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary, InterventionPlan, LessonRecord,
-        MetricAttack, OperatorModelContext, OperatorModelProfile, OperatorModelScope,
-        OperatorModelSession, OptimizationProgram, PhaseAttributionRecord, PriorCauseSignal,
-        RunCheckpointRecord, RunEvent, RunRecord, Spec, ValidationSummary,
+        AgentExecution, AgentRuntimeState, BlackboardState, ConsolidationCandidate, CoobieBriefing,
+        DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle,
+        EvidenceAnnotationHistoryEvent, EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary,
+        InterventionPlan, LessonRecord, MetricAttack, OperatorModelContext, OperatorModelProfile,
+        OperatorModelScope, OperatorModelSession, OptimizationProgram, PhaseAttributionRecord,
+        PriorCauseSignal, RunCheckpointRecord, RunEvent, RunRecord, Spec, ValidationSummary,
     },
     orchestrator::{AppContext, RunRequest},
     pidgin::{self, PidginTranslation},
@@ -107,6 +107,7 @@ struct ActionBoardResponse {
     current_phase: Option<String>,
     active_goal: Option<String>,
     agent_claims: HashMap<String, String>,
+    agent_instances: Vec<AgentRuntimeState>,
     open_blockers: Vec<String>,
     open_checkpoints: Vec<RunCheckpointRecord>,
     recent_events: Vec<RunEvent>,
@@ -2863,6 +2864,10 @@ async fn build_action_board(
             .as_ref()
             .map(|board| board.agent_claims.clone())
             .unwrap_or_default(),
+        agent_instances: blackboard
+            .as_ref()
+            .map(|board| board.agent_instances.clone())
+            .unwrap_or_default(),
         open_blockers: blackboard
             .as_ref()
             .map(|board| board.open_blockers.clone())
@@ -3480,16 +3485,21 @@ async fn save_policy_events(
     Ok(())
 }
 
-async fn append_policy_event(
+pub(crate) async fn append_policy_event(
     app: &AppContext,
     event: CoordinationPolicyEvent,
 ) -> anyhow::Result<()> {
     let mut events = load_policy_events(app).await?;
-    events.push(event);
-    save_policy_events(app, &events).await
+    events.push(event.clone());
+    save_policy_events(app, &events).await?;
+    crate::db::insert_coordination_policy_event(&app.pool, &event).await?;
+    Ok(())
 }
 
-async fn save_assignments(app: &AppContext, state: &AssignmentsState) -> anyhow::Result<()> {
+pub(crate) async fn save_assignments(
+    app: &AppContext,
+    state: &AssignmentsState,
+) -> anyhow::Result<()> {
     let json_path = coordination_json_path(app);
     if let Some(parent) = json_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -3501,6 +3511,7 @@ async fn save_assignments(app: &AppContext, state: &AssignmentsState) -> anyhow:
         render_assignments_markdown(state),
     )
     .await?;
+    crate::db::sync_coordination_leases(&app.pool, state).await?;
     Ok(())
 }
 
@@ -3601,7 +3612,7 @@ async fn normalize_assignments(
     Ok(state)
 }
 
-async fn ensure_assignments_state(app: &AppContext) -> anyhow::Result<AssignmentsState> {
+pub(crate) async fn ensure_assignments_state(app: &AppContext) -> anyhow::Result<AssignmentsState> {
     let state = load_assignments(app).await?;
     normalize_assignments(app, state).await
 }
@@ -5299,7 +5310,14 @@ async fn post_start_operator_model_session(
         );
         if let Err(e) = app
             .chat
-            .append_message(&thread.thread_id, "agent", Some("coobie"), &kickoff, None)
+            .append_message(
+                &thread.thread_id,
+                "agent",
+                Some("coobie"),
+                None,
+                &kickoff,
+                None,
+            )
             .await
         {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -5379,7 +5397,14 @@ async fn post_approve_operator_model_layer(
             let next_prompt = layer_transition_prompt(next);
             let _ = app
                 .chat
-                .append_message(&req.thread_id, "agent", Some("coobie"), &next_prompt, None)
+                .append_message(
+                    &req.thread_id,
+                    "agent",
+                    Some("coobie"),
+                    None,
+                    &next_prompt,
+                    None,
+                )
                 .await;
         }
     }

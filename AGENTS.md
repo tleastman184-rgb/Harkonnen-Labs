@@ -108,6 +108,8 @@ While the API server is running, the live coordination source is:
 
 ```sh
 GET /api/coordination/assignments
+GET /api/coordination/policy-events
+POST /api/coordination/check-lease
 POST /api/coordination/claim
 POST /api/coordination/heartbeat
 POST /api/coordination/release
@@ -125,7 +127,8 @@ Release example:
 { "agent": "claude" }
 ```
 
-Keeper is the policy owner of file-claim coordination. While the API server is running, claim conflicts, stale claims, heartbeats, and releases should be treated as Keeper-managed policy events.
+Keeper is the policy owner of file-claim coordination. While the API server is running, claim conflicts, stale claims, heartbeats, releases, and workspace lease outcomes should be treated as Keeper-managed policy events.
+Workspace writes are lease-gated: Mason must hold an active `resource_kind: "workspace"` lease before edits are applied, and Keeper-managed policy events are mirrored into SQLite.
 
 Agents holding files should send a heartbeat about once per minute with:
 
@@ -134,6 +137,8 @@ Agents holding files should send a heartbeat about once per minute with:
 ```
 
 Keeper marks claims stale after 600 seconds without a heartbeat and may reap stale conflicting claims when another agent needs the same files.
+
+Per-run coordination is also reflected into PackChat. Each run auto-creates a PackChat coordination thread, and dogs may have multiple live runtime instances where it makes sense. Treat `mason`, `mason#codex`, and `mason#claude` as the same canonical dog with different active working lives; Coobie and Keeper remain singleton dogs.
 
 If the API server is not running yet, use repo-root `assignments.md` as the coordination document and paste only the relevant claim section into each AI's context.
 
@@ -165,6 +170,7 @@ Agent profiles live in `factory/agents/profiles/<name>.yaml`.
 - Sable **cannot** write implementation code
 - Only Keeper has `policy_engine` access
 - Keeper owns file-claim coordination and conflict policy through the coordination API
+- PackChat run threads are the shared conversation surface for live dog instances of the same canonical role
 - All agents share the labrador personality: loyal, honest, persistent, never bluffs
 
 ---
@@ -461,6 +467,7 @@ Long-term roadmap work remains Phase 5b
 - **Native FRAMES, StreamingQA, HELMET, and CLADDER adapters** — benchmarked retrieval and causal-reasoning surfaces wired into the Rust runner
 - **First-class benchmark toolchain** — `benchmark list/run/report`; manifest-driven suites in `factory/benchmarks/suites.yaml`; CI workflow; LM Studio local routing
 - Keeper coordination API with claims, heartbeats, conflict detection, and release flow
+- Keeper workspace lease enforcement and DB-backed coordination mirrors
 - Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, Memory Board, and Consolidation Workbench
 - Bootstrap scripts for home-linux and work-windows
 

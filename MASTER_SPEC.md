@@ -245,7 +245,7 @@ POST /api/coordination/release
 POST /api/coordination/check-lease     # guardrail gate — must be called before writes
 ```
 
-Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record.
+Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record. Active leases and Keeper policy events are mirrored into SQLite, and run-scoped PackChat coordination threads provide the shared conversation surface for live dog runtimes.
 
 ---
 
@@ -262,6 +262,7 @@ Coobie manages six distinct layers — not one undifferentiated note pile:
 | Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | fastembed + SQLite vector store | Live |
 | Causal Memory | Intervention-aware cause/effect with streak detection and cross-run patterns | SQLite causal_links + petgraph | Live |
 | Team Blackboard | Four named slices (Mission, Action, Evidence, Memory) for pack coordination | SQLite + per-run board.json | Live |
+| Dog Runtime Registry | Canonical dog role plus live runtime instances (`mason#codex`, `mason#claude`, etc.) linked to PackChat threads | SQLite + blackboard sync | Live |
 | Consolidation | Operator-reviewed promotion, pruning, and abstraction of high-value episodes | SQLite consolidation_candidates | Live |
 
 ### Coobie Palace
@@ -641,9 +642,9 @@ The Pack Board is the primary interaction surface. It is not a read-only dashboa
 
 **v1-A — Guardrail Enforcement** *(hard blocker)*
 
-Call `POST /api/coordination/check-lease` inside `mason_generate_and_apply_edits` before writing any file. If denied, return an error and write a decision record. Wire the same check in Mason plan generation. Add `record_decision` call sites at Mason plan selection, Scout optimization derivation, and Sable attack generation. Add `GET /api/runs/:id/decisions` to the Pack Board run detail drawer.
+Mason workspace lease claim/check/release is now live, with DB-backed lease mirrors and PackChat-linked dog runtime rosters. Keeper lease outcomes, Scout optimization programs, Sable metric attacks, and Mason plan selection now all write decision records, and the Pack Board run detail drawer now surfaces the decision log from `GET /api/runs/:id/decisions`.
 
-**Done when:** A Mason edit attempt against a path with no active workspace lease is blocked at the orchestrator level with a decision record, and the Pack Board surfaces the decision log per run.
+**Done when:** Keeper-backed workspace lease claim/check/release is authoritative, planning and lease outcomes write decision records, and the Pack Board surfaces the decision log per run. This slice is now effectively shipped on the current code path.
 
 ---
 
