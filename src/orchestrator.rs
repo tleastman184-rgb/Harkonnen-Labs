@@ -29,8 +29,8 @@ use crate::{
         LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
         PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
         RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
-        SoulIdentityContext, Spec, TwinEnvironment, TwinFailureMode, TwinService, TwinServiceSpec,
-        ValidationSummary, WorkerHarnessConfig,
+        SoulIdentityContext, Spec, StakeholderAlignmentSummary, TwinEnvironment, TwinFailureMode,
+        TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
@@ -56,6 +56,8 @@ pub struct AppContext {
     #[allow(dead_code)]
     pub operator_models: crate::operator_model::OperatorModelStore,
     pub started_at: std::time::Instant,
+    /// Calvin Archive HTTP client — None when disabled or harmony not running.
+    pub calvin: Option<crate::calvin_client::CalvinClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,6 +749,7 @@ impl AppContext {
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
         let chat = crate::chat::ChatStore::new(pool.clone());
         let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
+        let calvin = crate::calvin_client::try_connect(&paths.setup.calvin_archive).await;
         Ok(Self {
             paths,
             pool,
@@ -758,6 +761,7 @@ impl AppContext {
             chat,
             operator_models,
             started_at: std::time::Instant::now(),
+            calvin,
         })
     }
 
@@ -1612,6 +1616,7 @@ impl AppContext {
                 &log_path,
             )
             .await?;
+        self.try_open_calvin_run(&run_id, &spec_obj.id).await;
 
         Ok(PreparedRunLaunch {
             run_id,
@@ -1724,6 +1729,7 @@ impl AppContext {
                         &prepared.log_path,
                     )
                     .await?;
+                self.try_close_calvin_run(run_id, final_status).await;
                 self.finalize_blackboard(final_status, &output.run_dir)
                     .await?;
                 self.write_run_timing_artifact(run_id, &output.run_dir)
@@ -1744,6 +1750,7 @@ impl AppContext {
                         &prepared.log_path,
                     )
                     .await?;
+                self.try_close_calvin_run(run_id, "failed").await;
                 let run_dir = self.run_dir(run_id);
                 self.mark_blackboard_failed(&message, &run_dir).await?;
                 let lessons = match self.consolidate_run(run_id, &prepared.spec_obj).await {
@@ -10539,6 +10546,128 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn try_open_calvin_run(&self, run_id: &str, spec_id: &str) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let provider = self.paths.setup.resolve_provider_name("default");
+        let model = self
+            .paths
+            .setup
+            .resolve_provider("default")
+            .map(|config| config.model.clone())
+            .unwrap_or_else(|| "mixed-pack".to_string());
+        if let Err(error) = calvin.open_run(run_id, spec_id, &provider, &model).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin open_run failed");
+        }
+    }
+
+    async fn try_close_calvin_run(&self, run_id: &str, outcome: &str) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        if let Err(error) = calvin.close_run(run_id, outcome).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin close_run failed");
+        }
+    }
+
+    async fn try_write_calvin_event(
+        &self,
+        run_id: &str,
+        phase: Option<&str>,
+        agent: &str,
+        action_type: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        outcome: &str,
+        latency_ms: Option<i32>,
+        tokens_in: Option<i32>,
+        tokens_out: Option<i32>,
+    ) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let evt = crate::calvin_client::TelemetryEvent {
+            agent_id: agent.to_string(),
+            run_id: run_id.to_string(),
+            phase: phase.map(|value| value.to_string()),
+            action_type: action_type.to_string(),
+            provider: provider.map(|value| value.to_string()),
+            model: model.map(|value| value.to_string()),
+            outcome: outcome.to_string(),
+            latency_ms,
+            tokens_in,
+            tokens_out,
+            drift_score: None,
+            lab_ness_score: None,
+        };
+        if let Err(error) = calvin.write_event(&evt).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin telemetry write failed");
+        }
+    }
+
+    async fn try_record_calvin_experience(
+        &self,
+        record: &PhaseAttributionRecord,
+        execution: Option<&AgentExecution>,
+    ) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let provider = execution
+            .map(|value| value.provider.clone())
+            .or_else(|| record.prompt_bundle_provider.clone())
+            .unwrap_or_else(|| "mixed-pack".to_string());
+        let model = execution
+            .map(|value| value.model.clone())
+            .unwrap_or_else(|| "unspecified".to_string());
+        let mut narrative = format!(
+            "{} / {} ended with outcome '{}' and confidence {}.",
+            record.phase,
+            record.agent_name,
+            record.outcome,
+            record
+                .confidence
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "unspecified".to_string())
+        );
+        if let Some(summary) = record.stakeholder_alignment.as_ref() {
+            narrative.push_str(&format!(
+                " Stamped posture: purpose='{}'; stakes='{}'; attitudes={}; constraints={}; mcp_servers={}.",
+                if summary.repo_purpose.is_empty() {
+                    "unspecified"
+                } else {
+                    summary.repo_purpose.as_str()
+                },
+                if summary.operator_intent.is_empty() {
+                    "unspecified"
+                } else {
+                    summary.operator_intent.as_str()
+                },
+                summary.attitudes_recorded,
+                summary.constraints_recorded,
+                summary.mcp_servers_recorded
+            ));
+        }
+        let exp = crate::calvin_client::ArchiveExperience {
+            run_id: record.run_id.clone(),
+            episode_id: Some(record.episode_id.clone()),
+            provider,
+            model,
+            narrative_summary: narrative,
+            scope: record.phase.clone(),
+            chamber: phase_to_calvin_chamber(&record.phase),
+        };
+        if let Err(error) = calvin.record_experience(&record.run_id, &exp).await {
+            tracing::warn!(
+                run_id = %record.run_id,
+                episode_id = %record.episode_id,
+                error = %error,
+                "Calvin record_experience failed"
+            );
+        }
+    }
+
     async fn set_episode_state_before(
         &self,
         episode_id: &str,
@@ -10585,6 +10714,7 @@ Return JSON only.",
             .iter()
             .find(|execution| execution.episode_id.as_deref() == Some(episode_id));
         let created_at = Utc::now();
+        let stakeholder_alignment = build_stakeholder_alignment_summary(briefing);
         let record = PhaseAttributionRecord {
             attribution_id: format!("phase-attribution-{}", episode_id),
             run_id: run_id.to_string(),
@@ -10613,10 +10743,12 @@ Return JSON only.",
             required_checks: briefing.required_checks.clone(),
             guardrails: briefing.recommended_guardrails.clone(),
             query_terms: briefing.query_terms.clone(),
+            stakeholder_alignment,
             created_at,
         };
         self.upsert_phase_attribution(&record).await?;
 
+        self.try_record_calvin_experience(&record, execution).await;
         phase_attributions.retain(|existing| existing.episode_id != episode_id);
         phase_attributions.push(record);
         phase_attributions.sort_by(|left, right| {
@@ -10672,11 +10804,12 @@ Return JSON only.",
                 required_checks,
                 guardrails,
                 query_terms,
+                stakeholder_alignment_json,
                 created_at
             )
             VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
             )
             ON CONFLICT(episode_id) DO UPDATE SET
                 attribution_id = excluded.attribution_id,
@@ -10696,6 +10829,7 @@ Return JSON only.",
                 required_checks = excluded.required_checks,
                 guardrails = excluded.guardrails,
                 query_terms = excluded.query_terms,
+                stakeholder_alignment_json = excluded.stakeholder_alignment_json,
                 created_at = excluded.created_at
             "#,
         )
@@ -10717,6 +10851,7 @@ Return JSON only.",
         .bind(serde_json::to_string(&record.required_checks)?)
         .bind(serde_json::to_string(&record.guardrails)?)
         .bind(serde_json::to_string(&record.query_terms)?)
+        .bind(serde_json::to_string(&record.stakeholder_alignment)?)
         .bind(record.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -10815,6 +10950,19 @@ Return JSON only.",
         let _ = self
             .event_tx
             .send(crate::models::LiveEvent::RunEvent(live.clone()));
+        self.try_write_calvin_event(
+            run_id,
+            Some(phase),
+            agent,
+            "run_event",
+            None,
+            None,
+            status,
+            None,
+            None,
+            None,
+        )
+        .await;
         Ok(live)
     }
 
@@ -10854,7 +11002,21 @@ Return JSON only.",
         .await
         {
             tracing::warn!("record_llm_cost_event failed: {e}");
+            return;
         }
+        self.try_write_calvin_event(
+            run_id,
+            Some(phase),
+            agent,
+            "llm_call",
+            Some(provider),
+            Some(model),
+            "success",
+            Some(usage.latency_ms as i32),
+            Some(usage.input_tokens as i32),
+            Some(usage.output_tokens as i32),
+        )
+        .await;
     }
 
     /// Aggregate all cost events for a run into a summary.
@@ -12540,7 +12702,8 @@ Return JSON only.",
             SELECT attribution_id, run_id, episode_id, phase, agent_name, outcome, confidence,
                    prompt_bundle_fingerprint, prompt_bundle_provider, prompt_bundle_artifact,
                    pinned_skill_ids, memory_hits, core_memory_ids, project_memory_ids,
-                   relevant_lesson_ids, required_checks, guardrails, query_terms, created_at
+                   relevant_lesson_ids, required_checks, guardrails, query_terms,
+                   stakeholder_alignment_json, created_at
             FROM phase_attributions
             WHERE run_id = ?1
             ORDER BY created_at ASC
@@ -12590,6 +12753,10 @@ Return JSON only.",
                     .with_context(|| "parsing phase attribution guardrails")?,
                 query_terms: serde_json::from_str(row.get::<String, _>("query_terms").as_str())
                     .with_context(|| "parsing phase attribution query_terms")?,
+                stakeholder_alignment: serde_json::from_str(
+                    row.get::<String, _>("stakeholder_alignment_json").as_str(),
+                )
+                .with_context(|| "parsing phase attribution stakeholder_alignment_json")?,
                 created_at: chrono::DateTime::parse_from_rfc3339(
                     row.get::<String, _>("created_at").as_str(),
                 )?
@@ -19576,6 +19743,31 @@ fn render_phase_attributions_markdown(records: &[PhaseAttributionRecord]) -> Str
                 record.required_checks.join(" | ")
             }
         ));
+        if let Some(alignment) = record.stakeholder_alignment.as_ref() {
+            lines.push(format!(
+                "- Stakeholder alignment: stamped_context={} attitudes={} constraints={} mcp_servers={}",
+                alignment.stamped_context_present,
+                alignment.attitudes_recorded,
+                alignment.constraints_recorded,
+                alignment.mcp_servers_recorded
+            ));
+            lines.push(format!(
+                "- Alignment guardrails: {}",
+                if alignment.alignment_guardrails.is_empty() {
+                    "none".to_string()
+                } else {
+                    alignment.alignment_guardrails.join(" | ")
+                }
+            ));
+            lines.push(format!(
+                "- Alignment checks: {}",
+                if alignment.alignment_checks.is_empty() {
+                    "none".to_string()
+                } else {
+                    alignment.alignment_checks.join(" | ")
+                }
+            ));
+        }
         lines.push(String::new());
     }
     lines.join("\n")
@@ -21709,6 +21901,68 @@ fn apply_project_interview_preflight_guidance(
     recommended_guardrails.dedup();
     required_checks.dedup();
     open_questions.dedup();
+}
+
+fn select_alignment_lines(values: &[String], prefixes: &[&str]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+        .cloned()
+        .collect()
+}
+
+fn build_stakeholder_alignment_summary(
+    briefing: &CoobieBriefing,
+) -> Option<StakeholderAlignmentSummary> {
+    let context = briefing.project_interview_context.as_ref()?;
+
+    Some(StakeholderAlignmentSummary {
+        stamped_context_present: true,
+        repo_purpose: context.repo_purpose.trim().to_string(),
+        operator_intent: context.operator_intent.trim().to_string(),
+        environment: context.environment.trim().to_string(),
+        vertical: context.vertical.trim().to_string(),
+        attitudes_recorded: context.attitudes.len(),
+        constraints_recorded: context.constraints.len(),
+        skill_sources_recorded: context.skill_sources.len(),
+        mcp_servers_recorded: context.mcp_servers.len(),
+        alignment_guardrails: select_alignment_lines(
+            &briefing.recommended_guardrails,
+            &[
+                "Stamped project purpose",
+                "Stamped environment context",
+                "Stamped project vertical",
+                "Stamped project domains",
+                "Stamped skill sources exist",
+            ],
+        ),
+        alignment_checks: select_alignment_lines(
+            &briefing.required_checks,
+            &[
+                "Stamped project stakes",
+                "Stamped repo prohibition",
+                "Stakeholder alignment check",
+                "Stamped MCP surface check",
+            ],
+        ),
+        alignment_open_questions: select_alignment_lines(
+            &briefing.open_questions,
+            &["Project posture question"],
+        ),
+    })
+}
+
+fn phase_to_calvin_chamber(phase: &str) -> crate::calvin_client::Chamber {
+    match phase {
+        "memory" => crate::calvin_client::Chamber::Episteme,
+        "intake" => crate::calvin_client::Chamber::Mythos,
+        "workspace" | "implementation" | "tools" | "retriever_forge" | "artifacts" => {
+            crate::calvin_client::Chamber::Praxis
+        }
+        "validation" | "hidden_scenarios" => crate::calvin_client::Chamber::Logos,
+        "twin" => crate::calvin_client::Chamber::Ethos,
+        _ => crate::calvin_client::Chamber::Episteme,
+    }
 }
 
 fn build_coobie_soul_identity_context() -> SoulIdentityContext {

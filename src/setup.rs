@@ -11,6 +11,8 @@ pub struct SetupConfig {
     pub providers: ProvidersConfig,
     pub routing: Option<RoutingConfig>,
     pub mcp: Option<McpConfig>,
+    #[serde(default)]
+    pub calvin_archive: CalvinConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,6 +93,18 @@ fn default_true() -> bool {
 pub struct RoutingConfig {
     #[serde(default)]
     pub agents: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CalvinConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_calvin_url")]
+    pub harmony_url: String,
+}
+
+fn default_calvin_url() -> String {
+    "http://localhost:7171".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,6 +209,7 @@ impl SetupConfig {
             },
             routing: None,
             mcp: None,
+            calvin_archive: CalvinConfig::default(),
         }
     }
 

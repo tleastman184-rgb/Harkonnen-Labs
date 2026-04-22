@@ -8,7 +8,10 @@ use std::time::Instant;
 use tokio::process::Command;
 
 use crate::{
-    aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval,
+    aider_polyglot, cladder,
+    config::Paths,
+    frames, helmet, livecodebench, locomo, longmemeval,
+    models::{BenchmarkStakeholderAlignmentSnapshot, PhaseAttributionRecord},
     scenario_delta, spec_adherence, streamingqa, twin_fidelity,
 };
 
@@ -149,6 +152,8 @@ pub struct BenchmarkRunReport {
     pub repo_root: String,
     pub selected_suites: Vec<String>,
     pub summary: BenchmarkRunSummary,
+    #[serde(default)]
+    pub stakeholder_alignment: Option<BenchmarkStakeholderAlignmentSnapshot>,
     pub suites: Vec<BenchmarkSuiteResult>,
 }
 
@@ -261,6 +266,7 @@ pub async fn run_benchmarks(
         repo_root: paths.root.display().to_string(),
         selected_suites: selected_ids,
         summary,
+        stakeholder_alignment: build_benchmark_alignment_snapshot(paths),
         suites: results,
     };
 
@@ -328,6 +334,57 @@ pub fn render_report_markdown(report: &BenchmarkRunReport) -> String {
         "| Suite | Subsystem | Tier | Status | Duration ms |".to_string(),
         "| --- | --- | --- | --- | ---: |".to_string(),
     ];
+
+    if let Some(alignment) = report.stakeholder_alignment.as_ref() {
+        lines.push(String::new());
+        lines.push("## Stakeholder Alignment Snapshot".to_string());
+        lines.push(String::new());
+        lines.push(format!("- Runs considered: {}", alignment.run_ids.len()));
+        lines.push(format!(
+            "- Phases considered: {}",
+            alignment.phases_considered
+        ));
+        lines.push(format!(
+            "- Phases with stamped context: {}",
+            alignment.phases_with_stamped_context
+        ));
+        lines.push(format!(
+            "- Phases with alignment guardrails: {}",
+            alignment.phases_with_alignment_guardrails
+        ));
+        lines.push(format!(
+            "- Phases with alignment checks: {}",
+            alignment.phases_with_alignment_checks
+        ));
+        lines.push(format!(
+            "- Phases with alignment questions: {}",
+            alignment.phases_with_alignment_questions
+        ));
+        lines.push(format!(
+            "- Phases with stakeholder attitudes recorded: {}",
+            alignment.phases_with_attitude_signals
+        ));
+        lines.push(format!(
+            "- Phases with constraints recorded: {}",
+            alignment.phases_with_constraint_signals
+        ));
+        lines.push(format!(
+            "- Phases with MCP posture recorded: {}",
+            alignment.phases_with_mcp_signals
+        ));
+        if !alignment.latest_repo_purpose.trim().is_empty() {
+            lines.push(format!(
+                "- Latest recorded purpose: {}",
+                alignment.latest_repo_purpose
+            ));
+        }
+        if !alignment.latest_operator_intent.trim().is_empty() {
+            lines.push(format!(
+                "- Latest recorded stakes: {}",
+                alignment.latest_operator_intent
+            ));
+        }
+    }
 
     for suite in &report.suites {
         lines.push(format!(
@@ -410,6 +467,83 @@ fn render_correct_answer_sections(report: &BenchmarkRunReport) -> Vec<Vec<String
         .iter()
         .filter_map(render_correct_answer_section)
         .collect()
+}
+
+fn build_benchmark_alignment_snapshot(
+    paths: &Paths,
+) -> Option<BenchmarkStakeholderAlignmentSnapshot> {
+    let mut candidates = std::fs::read_dir(&paths.workspaces)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let run_id = entry.file_name().to_string_lossy().to_string();
+            let attribution_path = entry.path().join("run").join("phase_attributions.json");
+            if !attribution_path.exists() {
+                return None;
+            }
+            let modified = attribution_path.metadata().ok()?.modified().ok()?;
+            Some((modified, run_id, attribution_path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+
+    let mut snapshot = BenchmarkStakeholderAlignmentSnapshot::default();
+    for (_, run_id, path) in candidates.into_iter().take(5) {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let records = match serde_json::from_str::<Vec<PhaseAttributionRecord>>(&raw) {
+            Ok(records) => records,
+            Err(_) => continue,
+        };
+        if records.is_empty() {
+            continue;
+        }
+        snapshot.run_ids.push(run_id);
+        snapshot.phases_considered += records.len();
+        for record in records {
+            if let Some(alignment) = record.stakeholder_alignment {
+                if alignment.stamped_context_present {
+                    snapshot.phases_with_stamped_context += 1;
+                }
+                if !alignment.alignment_guardrails.is_empty() {
+                    snapshot.phases_with_alignment_guardrails += 1;
+                }
+                if !alignment.alignment_checks.is_empty() {
+                    snapshot.phases_with_alignment_checks += 1;
+                }
+                if !alignment.alignment_open_questions.is_empty() {
+                    snapshot.phases_with_alignment_questions += 1;
+                }
+                if alignment.attitudes_recorded > 0 {
+                    snapshot.phases_with_attitude_signals += 1;
+                }
+                if alignment.constraints_recorded > 0 {
+                    snapshot.phases_with_constraint_signals += 1;
+                }
+                if alignment.mcp_servers_recorded > 0 {
+                    snapshot.phases_with_mcp_signals += 1;
+                }
+                if snapshot.latest_repo_purpose.is_empty()
+                    && !alignment.repo_purpose.trim().is_empty()
+                {
+                    snapshot.latest_repo_purpose = alignment.repo_purpose;
+                }
+                if snapshot.latest_operator_intent.is_empty()
+                    && !alignment.operator_intent.trim().is_empty()
+                {
+                    snapshot.latest_operator_intent = alignment.operator_intent;
+                }
+            }
+        }
+    }
+
+    if snapshot.phases_considered == 0 {
+        None
+    } else {
+        Some(snapshot)
+    }
 }
 
 fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<String>> {
@@ -1108,6 +1242,19 @@ mod tests {
                 failed: 0,
                 skipped: 0,
             },
+            stakeholder_alignment: Some(BenchmarkStakeholderAlignmentSnapshot {
+                run_ids: vec!["run-123".to_string()],
+                phases_considered: 3,
+                phases_with_stamped_context: 3,
+                phases_with_alignment_guardrails: 3,
+                phases_with_alignment_checks: 2,
+                phases_with_alignment_questions: 1,
+                phases_with_attitude_signals: 2,
+                phases_with_constraint_signals: 2,
+                phases_with_mcp_signals: 1,
+                latest_repo_purpose: "Protect benchmark trust".to_string(),
+                latest_operator_intent: "Keep the system honest under evaluation".to_string(),
+            }),
             suites: vec![BenchmarkSuiteResult {
                 id: "local_regression".to_string(),
                 title: "Local Regression Gate".to_string(),
@@ -1142,6 +1289,8 @@ mod tests {
 
         let markdown = render_report_markdown(&report);
         assert!(markdown.contains("# Benchmark Report"));
+        assert!(markdown.contains("## Stakeholder Alignment Snapshot"));
+        assert!(markdown.contains("Protect benchmark trust"));
         assert!(markdown.contains("local_regression"));
         assert!(markdown.contains("Local Regression Gate"));
     }

@@ -111,12 +111,21 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             required_checks TEXT NOT NULL DEFAULT '[]',
             guardrails TEXT NOT NULL DEFAULT '[]',
             query_terms TEXT NOT NULL DEFAULT '[]',
+            stakeholder_alignment_json TEXT NOT NULL DEFAULT 'null',
             created_at TEXT NOT NULL,
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "stakeholder_alignment_json",
+        "ALTER TABLE phase_attributions ADD COLUMN stakeholder_alignment_json TEXT NOT NULL DEFAULT 'null'",
+    )
     .await?;
 
     sqlx::query(

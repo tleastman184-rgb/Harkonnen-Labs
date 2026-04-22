@@ -78,6 +78,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: SubagentCommands,
     },
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2306,6 +2310,115 @@ pub async fn handle_subagent(command: SubagentCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Archive ───────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum ArchiveCommands {
+    /// Show Calvin Archive status (TypeDB entity counts + D* snapshot).
+    Status,
+    /// Start the Calvin Archive container stack.
+    Start,
+    /// Stop the Calvin Archive container stack.
+    Stop,
+    /// Show identity metrics for an agent.
+    Metrics(ArchiveMetricsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ArchiveMetricsArgs {
+    /// Agent name (e.g. coobie).
+    #[arg(long, default_value = "coobie")]
+    pub agent: String,
+}
+
+pub async fn handle_archive(
+    command: ArchiveCommands,
+    app: crate::orchestrator::AppContext,
+) -> Result<()> {
+    match command {
+        ArchiveCommands::Status => {
+            if !app.paths.setup.calvin_archive.enabled {
+                println!(
+                    "Calvin Archive: disabled (set calvin_archive.enabled = true in setup.toml)"
+                );
+            } else {
+                match &app.calvin {
+                    None => {
+                        println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                    }
+                    Some(client) => {
+                        if client.health_check().await {
+                            match client.status().await {
+                                Ok(status) => {
+                                    println!("{}", serde_json::to_string_pretty(&status)?)
+                                }
+                                Err(e) => {
+                                    println!("Calvin Archive: reachable but status failed — {e}")
+                                }
+                            }
+                        } else {
+                            println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                        }
+                    }
+                }
+            }
+        }
+        ArchiveCommands::Start => {
+            println!("Starting Calvin Archive stack...");
+            let status = build_docker_compose_command(["up", "-d"])?
+                .status()
+                .context("running docker compose")?;
+            if status.success() {
+                println!("Calvin Archive stack started.");
+            } else {
+                anyhow::bail!("docker compose exited with {status}");
+            }
+        }
+        ArchiveCommands::Stop => {
+            println!("Stopping Calvin Archive stack...");
+            let status = build_docker_compose_command(["down"])?
+                .status()
+                .context("running docker compose")?;
+            if status.success() {
+                println!("Calvin Archive stack stopped.");
+            } else {
+                anyhow::bail!("docker compose exited with {status}");
+            }
+        }
+        ArchiveCommands::Metrics(args) => match &app.calvin {
+            None => println!("Calvin Archive: disabled"),
+            Some(client) => match client.get_metrics(&args.agent).await {
+                Ok(snap) => {
+                    println!("Agent:     {}", snap.agent_id);
+                    println!("D*:        {:.3}", snap.d_star);
+                    println!("SSA:       {:.3}", snap.ssa);
+                    println!("Stress:    {:.3}", snap.stress);
+                    if let Some(h) = snap.hysteresis {
+                        println!("Hysteresis:{:.3}", h);
+                    }
+                }
+                Err(e) => println!("metrics unavailable: {e}"),
+            },
+        },
+    }
+    Ok(())
+}
+
+fn build_docker_compose_command<const N: usize>(args: [&str; N]) -> Result<std::process::Command> {
+    let mut cmd = if command_available("docker") {
+        std::process::Command::new("docker")
+    } else if command_available("flatpak-spawn") {
+        let mut command = std::process::Command::new("flatpak-spawn");
+        command.args(["--host", "docker"]);
+        command
+    } else {
+        anyhow::bail!("docker is not available in the sandbox or via flatpak-spawn --host");
+    };
+    cmd.args(["compose", "-f", "docker-compose.calvin.yml"]);
+    cmd.args(args);
+    Ok(cmd)
 }
 
 fn print_template_preview(template: &str) {

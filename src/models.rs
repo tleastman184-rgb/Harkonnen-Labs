@@ -493,7 +493,63 @@ pub struct PhaseAttributionRecord {
     pub guardrails: Vec<String>,
     #[serde(default)]
     pub query_terms: Vec<String>,
+    #[serde(default)]
+    pub stakeholder_alignment: Option<StakeholderAlignmentSummary>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StakeholderAlignmentSummary {
+    #[serde(default)]
+    pub stamped_context_present: bool,
+    #[serde(default)]
+    pub repo_purpose: String,
+    #[serde(default)]
+    pub operator_intent: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub vertical: String,
+    #[serde(default)]
+    pub attitudes_recorded: usize,
+    #[serde(default)]
+    pub constraints_recorded: usize,
+    #[serde(default)]
+    pub skill_sources_recorded: usize,
+    #[serde(default)]
+    pub mcp_servers_recorded: usize,
+    #[serde(default)]
+    pub alignment_guardrails: Vec<String>,
+    #[serde(default)]
+    pub alignment_checks: Vec<String>,
+    #[serde(default)]
+    pub alignment_open_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkStakeholderAlignmentSnapshot {
+    #[serde(default)]
+    pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub phases_considered: usize,
+    #[serde(default)]
+    pub phases_with_stamped_context: usize,
+    #[serde(default)]
+    pub phases_with_alignment_guardrails: usize,
+    #[serde(default)]
+    pub phases_with_alignment_checks: usize,
+    #[serde(default)]
+    pub phases_with_alignment_questions: usize,
+    #[serde(default)]
+    pub phases_with_attitude_signals: usize,
+    #[serde(default)]
+    pub phases_with_constraint_signals: usize,
+    #[serde(default)]
+    pub phases_with_mcp_signals: usize,
+    #[serde(default)]
+    pub latest_repo_purpose: String,
+    #[serde(default)]
+    pub latest_operator_intent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

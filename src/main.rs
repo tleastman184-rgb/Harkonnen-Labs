@@ -3,6 +3,7 @@ mod aider_polyglot;
 mod api;
 mod benchmark;
 mod calvin_archive;
+mod calvin_client;
 mod capacity;
 mod chat;
 mod cladder;
@@ -107,6 +108,10 @@ async fn main() -> Result<()> {
             cli::handle_stamp(command, &paths).await?
         }
         Commands::Subagent { command } => cli::handle_subagent(command).await?,
+        Commands::Archive { command } => {
+            let app = AppContext::bootstrap().await?;
+            cli::handle_archive(command, app).await?
+        }
     }
 
     Ok(())

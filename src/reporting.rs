@@ -6,8 +6,8 @@ use crate::{
     coobie::CausalReport,
     models::{
         AgentExecution, BlackboardState, CoobieBriefing, CoobieEvidenceCitation,
-        HiddenScenarioSummary, LessonRecord, ProjectComponent, ProjectResumeRisk, RunTimingReport,
-        ScenarioBlueprint, TwinEnvironment, ValidationSummary,
+        HiddenScenarioSummary, LessonRecord, ProjectComponent, ProjectInterviewContext,
+        ProjectResumeRisk, RunTimingReport, ScenarioBlueprint, TwinEnvironment, ValidationSummary,
     },
     orchestrator::AppContext,
 };
@@ -144,6 +144,81 @@ fn fallback_value(value: &str) -> &str {
     } else {
         trimmed
     }
+}
+
+fn render_joined(values: &[String], empty: &str) -> String {
+    if values.is_empty() {
+        empty.to_string()
+    } else {
+        values.join(" | ")
+    }
+}
+
+fn select_prefixed_lines(values: &[String], prefixes: &[&str]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+        .cloned()
+        .collect()
+}
+
+fn render_project_posture_summary(context: &ProjectInterviewContext) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if !context.repo_name.trim().is_empty() {
+        lines.push(format!("Repo: {}", context.repo_name.trim()));
+    }
+    if !context.repo_purpose.trim().is_empty() {
+        lines.push(format!("Purpose: {}", context.repo_purpose.trim()));
+    }
+    if !context.operator_intent.trim().is_empty() {
+        lines.push(format!("Stakes: {}", context.operator_intent.trim()));
+    }
+    if !context.environment.trim().is_empty() {
+        lines.push(format!("Environment: {}", context.environment.trim()));
+    }
+    if !context.vertical.trim().is_empty() {
+        lines.push(format!("Vertical: {}", context.vertical.trim()));
+    }
+    if !context.domains.is_empty() {
+        lines.push(format!("Domains: {}", context.domains.join(" | ")));
+    }
+    if !context.constraints.is_empty() {
+        lines.push(format!("Constraints: {}", context.constraints.join(" | ")));
+    }
+    if !context.attitudes.is_empty() {
+        lines.push(format!(
+            "Recorded attitudes: {}",
+            context.attitudes.join(" | ")
+        ));
+    }
+    if !context.skill_sources.is_empty() {
+        lines.push(format!(
+            "External skill sources: {}",
+            context.skill_sources.join(" | ")
+        ));
+    }
+    if !context.mcp_servers.is_empty() {
+        lines.push(format!(
+            "Configured MCP servers: {}",
+            context.mcp_servers.join(" | ")
+        ));
+    }
+    if !context.interview_context_path.trim().is_empty() {
+        lines.push(format!(
+            "Interview context artifact: {}",
+            context.interview_context_path.trim()
+        ));
+    }
+
+    if lines.is_empty() {
+        lines.push(
+            "Stamped interview context was attached, but it did not yet contain reusable posture details."
+                .to_string(),
+        );
+    }
+
+    lines
 }
 
 pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
@@ -384,6 +459,28 @@ Coobie Preflight
 ",
     );
     if let Some(briefing) = coobie_briefing {
+        let alignment_guardrails = select_prefixed_lines(
+            &briefing.recommended_guardrails,
+            &[
+                "Stamped project purpose",
+                "Stamped environment context",
+                "Stamped project vertical",
+                "Stamped project domains",
+                "Stamped skill sources exist",
+            ],
+        );
+        let alignment_checks = select_prefixed_lines(
+            &briefing.required_checks,
+            &[
+                "Stamped project stakes",
+                "Stamped repo prohibition",
+                "Stakeholder alignment check",
+                "Stamped MCP surface check",
+            ],
+        );
+        let alignment_questions =
+            select_prefixed_lines(&briefing.open_questions, &["Project posture question"]);
+
         report.push_str(&format!(
             "Generated: {}
 ",
@@ -454,11 +551,7 @@ Coobie Preflight
         report.push_str(&format!(
             "Required checks: {}
 ",
-            if briefing.required_checks.is_empty() {
-                "none".to_string()
-            } else {
-                briefing.required_checks.join(" | ")
-            }
+            render_joined(&briefing.required_checks, "none")
         ));
         report.push_str(&format!(
             "Exploration citations: {}
@@ -553,20 +646,12 @@ Coobie Preflight
         report.push_str(&format!(
             "Preferred retriever forge commands: {}
 ",
-            if briefing.preferred_forge_commands.is_empty() {
-                "none".to_string()
-            } else {
-                briefing.preferred_forge_commands.join(" | ")
-            }
+            render_joined(&briefing.preferred_forge_commands, "none")
         ));
         report.push_str(&format!(
             "Regulatory considerations: {}
 ",
-            if briefing.regulatory_considerations.is_empty() {
-                "none".to_string()
-            } else {
-                briefing.regulatory_considerations.join(" | ")
-            }
+            render_joined(&briefing.regulatory_considerations, "none")
         ));
         report.push_str(
             "Project components:
@@ -578,6 +663,29 @@ Coobie Preflight
 ",
                 line
             ));
+        }
+        report.push_str(
+            "Stakeholder alignment:
+",
+        );
+        if let Some(context) = briefing.project_interview_context.as_ref() {
+            for line in render_project_posture_summary(context) {
+                report.push_str(&format!("- {}\n", line));
+            }
+            report.push_str(&format!(
+                "Alignment-derived guardrails: {}\n",
+                render_joined(&alignment_guardrails, "none")
+            ));
+            report.push_str(&format!(
+                "Alignment-derived checks: {}\n",
+                render_joined(&alignment_checks, "none")
+            ));
+            report.push_str(&format!(
+                "Alignment-derived open questions: {}\n",
+                render_joined(&alignment_questions, "none")
+            ));
+        } else {
+            report.push_str("No stamped project interview context was attached to this run.\n");
         }
         report.push_str(
             "Scenario blueprint:
