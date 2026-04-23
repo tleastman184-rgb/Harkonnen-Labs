@@ -1,0 +1,127 @@
+id: mason-wrong-answer-loop
+title: Mason Wrong-Answer Fix Loop
+purpose: >
+  Verify the Phase 2 online-judge feedback loop: when Bramble reports
+  FailureKind::WrongAnswer (tests ran, output was wrong), Mason receives a
+  diff-focused fix prompt rather than a generic retry. The implementation task
+  produces output that can be mechanically compared to expected values, making
+  WrongAnswer failures unambiguous and diff-parseable.
+  This spec gates the Mason fix-loop milestone in Phase 2: a run showing
+  failure_kind=WrongAnswer in the validation summary and Mason's subsequent
+  fix attempt using the diff-focused prompt.
+scope:
+  - implement a Rust function: fizzbuzz(n: u32) -> Vec<String>
+  - returns a Vec where each element i (1-indexed) is
+    "FizzBuzz" if divisible by 15, "Fizz" if by 3, "Buzz" if by 5, else the number as string
+  - run cargo test; a deliberately seeded wrong implementation is provided as Mason's
+    starting point to guarantee a WrongAnswer failure on the first attempt
+  - Mason must read the diff, understand the wrong-answer, and fix the logic
+constraints:
+  - the seeded wrong implementation is the starting point (not a blank file)
+  - do not modify the test file
+  - fix loop is bounded to 3 iterations
+  - failure_kind must be WrongAnswer on the first validation failure (not CompileError)
+inputs:
+  - seeded wrong implementation (provided inline)
+  - test suite (provided inline)
+outputs:
+  - fixed implementation after diff-focused Mason fix pass
+  - ValidationSummary showing failure_kind=WrongAnswer on first failure
+  - ValidationSummary showing validation_passed=true after successful fix
+  - run report showing the fix loop iteration count
+acceptance_criteria:
+  - first validation attempt produces failure_kind=WrongAnswer (not CompileError or Unknown)
+  - Mason's fix attempt uses the wrong-answer diff prompt (visible in agent trace)
+  - final validation produces validation_passed=true
+  - fix_iteration_count <= 3 in the run summary
+  - no test fixture was modified
+forbidden_behaviors:
+  - classifying a wrong-answer failure as CompileError or Unknown
+  - Mason modifying the test file to produce passing output
+  - silently retrying with the same implementation after a WrongAnswer
+  - reporting validation_passed=true while tests are still failing
+rollback_requirements:
+  - staged workspace cleaned on final failure; no production files touched
+dependencies:
+  - rust
+  - cargo
+performance_expectations:
+  - each cargo test invocation completes in under 30 seconds
+security_expectations:
+  - no network calls
+test_commands:
+  - cargo test --manifest-path {{workspace_path}}/Cargo.toml -- fizzbuzz
+project_components:
+  - name: implementation_target
+    role: code_under_test
+    kind: source_file
+    path: src/fizzbuzz.rs
+    notes:
+      - seeded wrong implementation provided below
+      - Mason reads the diff and fixes the logic after WrongAnswer
+  - name: test_suite
+    role: test_fixture
+    kind: source_file
+    path: tests/fizzbuzz_test.rs
+    notes:
+      - read-only; Mason must not modify this file
+seeded_wrong_implementation:
+  path: src/fizzbuzz.rs
+  content: |
+    // Intentionally wrong: FizzBuzz check is missing; Buzz range is off by one
+    pub fn fizzbuzz(n: u32) -> Vec<String> {
+        (1..=n).map(|i| {
+            if i % 3 == 0 {
+                "Fizz".to_string()
+            } else if i % 5 == 0 {
+                "Buzz".to_string()
+            } else {
+                i.to_string()
+            }
+        }).collect()
+    }
+test_fixture_inline:
+  path: tests/fizzbuzz_test.rs
+  content: |
+    use harkonnen_smoke::fizzbuzz::fizzbuzz;
+
+    #[test]
+    fn classic_fizzbuzz_first_20() {
+        let result = fizzbuzz(20);
+        let expected = vec![
+            "1", "2", "Fizz", "4", "Buzz",
+            "Fizz", "7", "8", "Fizz", "Buzz",
+            "11", "Fizz", "13", "14", "FizzBuzz",
+            "16", "17", "Fizz", "19", "Buzz",
+        ];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn multiples_of_15_are_fizzbuzz() {
+        let result = fizzbuzz(30);
+        assert_eq!(result[14], "FizzBuzz");
+        assert_eq!(result[29], "FizzBuzz");
+    }
+
+    #[test]
+    fn single_element() {
+        assert_eq!(fizzbuzz(1), vec!["1"]);
+        assert_eq!(fizzbuzz(3), vec!["1", "2", "Fizz"]);
+    }
+scenario_blueprint:
+  pattern: mason_wrong_answer_fix_loop
+  objective: >
+    Verify that a WrongAnswer failure on iteration 1 causes Mason to receive
+    the diff-focused fix prompt and produce a correct implementation on retry.
+    The seeded wrong implementation guarantees the failure is WrongAnswer, not
+    CompileError, so the classification path is unambiguous.
+  code_under_test:
+    - src/fizzbuzz.rs
+  test_commands:
+    - cargo test --manifest-path {{workspace_path}}/Cargo.toml -- fizzbuzz
+  required_artifacts:
+    - validation.json
+  required_decision_records:
+    - kind: wrong_answer_retry
+      description: Mason fix loop triggered by WrongAnswer failure

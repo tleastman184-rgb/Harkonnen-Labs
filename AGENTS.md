@@ -41,7 +41,6 @@ src/                    Rust CLI (cargo run -- <command>)
   db.rs                 SQLite init and schema migrations
   embeddings.rs         fastembed + OpenAI-compatible vector store, hybrid retrieval
   llm.rs                LLM request/response types and provider routing
-  longmemeval.rs        LongMemEval native adapter (Harkonnen vs raw-LLM paired mode)
   memory.rs             File-backed memory store, init, reindex, retrieve
   models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
   orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
@@ -51,8 +50,29 @@ src/                    Rust CLI (cargo run -- <command>)
   scenarios.rs          Hidden scenario loading and evaluation (Sable)
   setup.rs              SetupConfig structs, provider resolution, routing
   spec.rs               YAML spec loader and validation
+  stamp.rs              Repo stamp interview and .harkonnen/repo.toml generation
+  subagent.rs           Sub-agent dispatch and provider handoff
   tesseract.rs          Workspace isolation and file-write permission model
   workspace.rs          Per-run workspace creation
+
+  # Benchmark adapters (one file per external benchmark suite)
+  aider_polyglot.rs     Aider Polyglot multi-language benchmark adapter
+  calvin_client.rs      Calvin Archive TypeDB client (Phase 8 stub)
+  cladder.rs            CLADDER Pearl-hierarchy causal benchmark adapter
+  frames.rs             FRAMES multi-hop factual recall benchmark adapter
+  helmet.rs             HELMET retrieval precision/recall benchmark adapter
+  livecodebench.rs      LiveCodeBench competitive programming adapter
+  locomo.rs             LoCoMo long-horizon dialogue memory adapter
+  longmemeval.rs        LongMemEval long-term assistant memory adapter
+  mcp_registry.rs       MCP server registry — loading and routing
+  mcp_server.rs         Harkonnen self-hosted MCP server (ENT-1)
+  operator_model.rs     Operator model interview, layers, and artifact generation
+  scenario_delta.rs     Hidden Scenario Delta benchmark (visible vs hidden gap)
+  skill_fetcher.rs      Skill/slash-command fetching and resolution
+  skill_registry.rs     Skill registry — loading and dispatch
+  spec_adherence.rs     Spec Adherence Rate benchmark adapter
+  streamingqa.rs        StreamingQA belief-update accuracy benchmark adapter
+  twin_fidelity.rs      Twin fidelity telemetry benchmark adapter
 
 factory/
   agents/profiles/      Nine agent YAML profiles (one per agent)

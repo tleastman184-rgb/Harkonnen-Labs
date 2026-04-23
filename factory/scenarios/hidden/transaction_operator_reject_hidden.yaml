@@ -1,0 +1,44 @@
+id: transaction-operator-reject
+spec_id: sample-feature
+title: Operator rejects transaction — run aborts cleanly with no Mason edits applied
+description: >
+  Verifies the operator-reject path of v1-E (remaining work): when the operator
+  rejects a needs_transaction_approval checkpoint, the orchestrator must set
+  approval_state=operator_rejected, abort the run without applying Mason edits,
+  and write a final transaction artifact capturing what was attempted, what was
+  stopped, and what residual state remains. The workspace must be in the same
+  state as pre_action_snapshot. No transaction_commit record should exist.
+  This scenario gates the "true rollback from a named boundary" milestone.
+  It requires a run where (a) a blocker was raised, (b) the checkpoint was
+  replied to with a rejection, and (c) the run completed without edits.
+checks:
+  - kind: run_status
+    equals: aborted
+  - kind: artifact_exists
+    path: transaction_implementation.json
+  - kind: metric_eq
+    artifact: transaction_implementation.json
+    field: approval_state
+    value: operator_rejected
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: approval_decision
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: rollback_note
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: residual_risk
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: closed_at
+  # Workspace file state must match pre_action_snapshot (no edits applied)
+  - kind: workspace_state_matches_snapshot
+    snapshot_field: pre_action_snapshot
+  - kind: decision_record_present
+    kind_value: transaction_boundary
+  # No commit should have occurred
+  - kind: no_decision_record
+    kind_value: transaction_commit
+  # Mason edits artifact must not exist or must be empty
+  - kind: no_mason_edits_applied

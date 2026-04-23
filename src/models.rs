@@ -891,6 +891,7 @@ pub enum FailureKind {
     TestFailure,
     WrongAnswer,
     Timeout,
+    Blocked,
     Unknown,
 }
 

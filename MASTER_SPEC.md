@@ -3,7 +3,7 @@
 **This is the single canonical reference for Harkonnen Labs.**
 It collapses ARCHITECTURE.md, AGENTS.md, COOBIE_SPEC.md, OPERATOR_MODEL_ACTIVATION_PLAN.md, calvin_archive_codex_spec.md, BENCHMARKS.md, and ROADMAP.md into one coherent document.
 
-For source docs still referenced individually: [09-SOUL.md](the-soul-of-ai/09-SOUL.md) and [02-What-Is-An-AI-Soul.md](the-soul-of-ai/02-What-Is-An-AI-Soul.md) (identity + theory, in `the-soul-of-ai/`), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
+For source docs still referenced individually: [09-Identity-Continuity.md](the-soul-of-ai/09-Identity-Continuity.md) and [02-What-Is-An-AI-Soul.md](the-soul-of-ai/02-What-Is-An-AI-Soul.md) (identity + theory, in `the-soul-of-ai/`), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
 
 ---
 
@@ -94,37 +94,64 @@ src/                    Rust CLI (cargo run -- <command>)
   llm.rs                LLM request/response types and provider routing
   memory.rs             File-backed memory store, init, reindex, retrieve
   models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
+  operator_model.rs     Operator model interview, layers, and artifact generation
   orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
+  pidgin.rs             Inter-agent message format and handoff protocol
   policy.rs             Path boundary enforcement
   reporting.rs          Run report generation
   scenarios.rs          Hidden scenario loading and evaluation (Sable)
   setup.rs              SetupConfig structs, provider resolution, routing
   spec.rs               YAML spec loader and validation
+  stamp.rs              Repo stamp interview and .harkonnen/repo.toml generation
+  subagent.rs           Sub-agent dispatch and provider handoff
+  tesseract.rs          Workspace isolation and file-write permission model
   workspace.rs          Per-run workspace creation
+  mcp_registry.rs       MCP server registry — loading and routing
+  mcp_server.rs         Harkonnen self-hosted MCP server (ENT-1)
+  skill_fetcher.rs      Skill/slash-command fetching and resolution
+  skill_registry.rs     Skill registry — loading and dispatch
+
+  # Benchmark adapters
+  aider_polyglot.rs     Aider Polyglot multi-language adapter
+  calvin_client.rs      Calvin Archive TypeDB client (Phase 8 stub)
+  cladder.rs            CLADDER Pearl-hierarchy causal benchmark
+  frames.rs             FRAMES multi-hop factual recall benchmark
+  helmet.rs             HELMET retrieval precision/recall benchmark
+  livecodebench.rs      LiveCodeBench competitive programming adapter
+  locomo.rs             LoCoMo long-horizon dialogue memory adapter
+  longmemeval.rs        LongMemEval long-term assistant memory adapter
+  scenario_delta.rs     Hidden Scenario Delta (visible vs hidden gap)
+  spec_adherence.rs     Spec Adherence Rate benchmark adapter
+  streamingqa.rs        StreamingQA belief-update accuracy adapter
+  twin_fidelity.rs      Twin fidelity telemetry adapter
 
   calvin_archive/       (Phase 8 — not yet built)
     mod.rs
     schema.rs           TypeDB schema bootstrap and migrations
     types.rs            Rust domain structs and DTOs
     ingest.rs           Write-paths for experiences, beliefs, reflections
+    governor.rs         Meta-Governor integration adjudication
     queries.rs          Typed query helpers
     continuity.rs       Continuity snapshot computation
     drift.rs            Drift detection, overgeneralization heuristics, lab-ness scoring
     kernel.rs           Identity kernel constraints and preservation checks
     projections.rs      Summary views, narrative rendering, graph projections
+    reflection.rs       Pattern-level reflection and schema revision
     typedb.rs           TypeDB driver abstraction
 
 factory/
   agents/profiles/      Nine agent YAML profiles
-  agents/personality/   labrador.md — shared personality for all agents
+  agents/personality/   labrador.md + per-agent addendum for each Labrador role
+  agents/contracts/     Behavioral contracts C=(P,I,G,R) for all 9 agents + base
+  context/              Machine-parseable YAML/MD design context for agents
   memory/               Coobie's durable memory store (md files + index.json)
   mcp/                  MCP server documentation YAMLs
-  context/              Machine-parseable YAML context for agent consumption
   specs/                Factory input specs (YAML)
   scenarios/            Hidden behavioral scenarios (Sable + Keeper only)
   workspaces/           Per-run isolated workspaces
   artifacts/            Packaged run outputs
-  benchmarks/           Benchmark suite manifests
+  benchmarks/           Benchmark suite manifests and fixtures
+  calvin_archive/       Calvin Archive TypeQL schema, seed data, projections
   state.db              SQLite run metadata
 
 setups/                 Named environment TOML files
@@ -396,7 +423,7 @@ surface over the Calvin Archive, not the canonical source of continuity.
 
 | File | Purpose |
 | --- | --- |
-| `soul.json` | Manifest, versioning, integrity hashes, compatibility, threshold configuration |
+| `soul.json` | Manifest, versioning, integrity hashes, compatibility, threshold configuration — schema at `factory/calvin_archive/soul-json.schema.json`, reference example at `factory/calvin_archive/soul.example.json` |
 | `SOUL.md` | Core identity kernel, worldview, teleology, uncrossable boundaries |
 | `IDENTITY.md` | External persona and presentation layer |
 | `AGENTS.md` | Coordination, routing, escalation, and operating procedures |
@@ -517,6 +544,8 @@ A first-class pre-commissioning workflow that interviews the operator about how 
 3. Dependencies
 4. Institutional knowledge
 5. Friction
+
+Full question sets, checkpoint formats, artifact field mappings, and the post-run update loop are specified in `factory/context/operator-model-interview.yaml`.
 
 Each layer produces a checkpoint for operator approval, canonical structured entries, and a summary memory write to repo-local project memory.
 
@@ -691,14 +720,17 @@ Mason workspace lease claim/check/release is now live, with DB-backed lease mirr
 
 **v1-E — Transactional Execution And Approval Boundaries**
 
-- Transaction envelope for high-impact phases: pre-action snapshot, planned mutation set, approval state, rollback note
-- Human-interrupt checkpoint for guarded transitions that Keeper or Coobie flag as privileged or policy-sensitive
-- Rollback artifact written per guarded transition
-- Decision-log records for approval, commit, rollback, and abort outcomes
+- Transaction envelope for high-impact phases: pre-action snapshot, planned mutation set, approval state, rollback note. The shipped envelope guards implementation-phase Mason LLM edits and writes `transaction_implementation.json`, `transaction_implementation.md`, and a run-local `transaction_backups/implementation_pre_action` restore point.
+- Human-interrupt checkpoint for guarded transitions that Keeper or Coobie flag as privileged or policy-sensitive. The shipped checkpoint is `transaction_approval_required`, created before Mason edits are applied when Coobie identifies implementation blockers.
+- Operator checkpoint resolution for implementation transactions. Approve rehydrates the stored run artifacts, applies the Mason edit lane to the staged workspace, and resumes Bramble visible validation; reject aborts without mutation; revise stores operator guidance and leaves the run revision-requested.
+- Rollback execution and artifact written per guarded transition. Rollback restores the staged `product/` workspace from the transaction backup, verifies it against the pre-action snapshot, and records `rolled_back` or `rolled_back_with_drift`.
+- Privileged MCP/tool transaction envelope at the tool-surface boundary. The tools phase writes `tool_transaction.json` and `tool_transaction.md`, classifies configured MCP servers and relevant host commands, auto-approves read-only/local surfaces, and opens `tool_transaction_approval_required` when write, network, secret-bearing, or external-process surfaces are present.
+- Decision-log records for approval, commit, rollback, and abort outcomes. Implementation transaction boundary, operator approve/reject/revise/rollback, transaction commit, transaction rollback, tool transaction boundary, and tool approve/reject/revise outcomes are now recorded.
+- Remaining work: continue hidden-scenario/artifact/causal-report phases after approved transactions and move from tool-surface approval to invocation-level MCP gateway enforcement.
 
 **Done when:** A guarded run can pause before a privileged transition, record an approval or rejection, and either commit or roll back from a named boundary with an auditable artifact.
 
-**Status:** Next narrow v1 slice.
+**Status:** Implementation transaction approval, visible-validation continuation, rollback execution, and privileged tool-surface transaction envelopes shipped; hidden-scenario continuation and invocation-level MCP gateway enforcement remain planned.
 
 ---
 
@@ -775,7 +807,7 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 **Phase 8-A — Storage layer bootstrap:**
 
 - **TimescaleDB hypertable** for episodic behavioral telemetry: agent events, drift samples, SSA snapshots, stress accumulations. Compression policy (7-day chunks), retention policy (30-day window). This is the time-series foundation for `D*` estimation and the stress-estimator.
-- **TypeDB Calvin Archive schema** (see TypeQL skeleton in Part 5): Rust TypeDB adapter (`src/calvin_archive/typedb.rs`), insert/query support for soul, agent-self, experience, belief, evidence, trait, value-commitment, integration-candidate, quarantine-entry, integration-policy, basic revision graph (`revised-into` relation)
+- **TypeDB Calvin Archive schema** — full Phase 8 TypeQL schema at `factory/calvin_archive/typedb/schema_phase8.tql`; Rust TypeDB adapter (`src/calvin_archive/typedb.rs`), insert/query support for all six chambers, integration-candidate, quarantine-entry, integration-policy, revision graphs (`revised-into`, `schema-revised-into`, `policy-revised-into`)
 - **Materialize streaming SQL views**: `D*` drift alert view (sliding window over TimescaleDB via SUBSCRIBE), SSA tracking view, live Meta-Governor signal surface. `D*` and SSA are the two always-on continuous signals.
 - File-first soul package projection support for `soul.json`, `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `STYLE.md`, `MEMORY.md`, `HEARTBEAT.md`
 - Integrity-hash verification for the projected soul package at boot and during heartbeat audits

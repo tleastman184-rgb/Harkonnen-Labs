@@ -25,7 +25,7 @@ use crate::{
         CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord, EpisodeStateDiff,
         EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
         EvidenceMatchAssessment, EvidenceMatchReport, EvidenceSource, EvidenceTimeRange,
-        EvidenceWindowMatch, HiddenScenarioCheckResult, HiddenScenarioEvaluation,
+        EvidenceWindowMatch, FailureKind, HiddenScenarioCheckResult, HiddenScenarioEvaluation,
         HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent, OperatorModelContext,
         PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal, ProjectInterviewContext,
         ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
@@ -128,6 +128,7 @@ struct ExecutionOutput {
     run_dir: PathBuf,
     memory_context: MemoryContextBundle,
     briefing: CoobieBriefing,
+    blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,8 +184,67 @@ struct TransactionBoundaryArtifact {
     pre_action_snapshot: WorkspaceStateSnapshot,
     #[serde(default)]
     post_action_snapshot: Option<WorkspaceStateSnapshot>,
+    #[serde(default)]
+    rollback_backup_path: Option<String>,
+    #[serde(default)]
+    approval_decision: Option<String>,
+    #[serde(default)]
+    operator_guidance: Option<String>,
+    #[serde(default)]
+    approved_by: Option<String>,
+    #[serde(default)]
+    approved_at: Option<String>,
     rollback_note: String,
     residual_risk: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionCheckpointDecision {
+    Approve,
+    Reject,
+    Revise,
+    Rollback,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolTransactionArtifact {
+    transaction_id: String,
+    run_id: String,
+    spec_id: String,
+    phase: String,
+    agent: String,
+    status: String,
+    approval_state: String,
+    #[serde(default)]
+    checkpoint_id: Option<String>,
+    opened_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    requested_surfaces: Vec<ToolSurfaceAssessment>,
+    guardrails: Vec<String>,
+    approval_blockers: Vec<String>,
+    rollback_note: String,
+    residual_risk: String,
+    #[serde(default)]
+    approval_decision: Option<String>,
+    #[serde(default)]
+    operator_guidance: Option<String>,
+    #[serde(default)]
+    approved_by: Option<String>,
+    #[serde(default)]
+    approved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolSurfaceAssessment {
+    name: String,
+    surface_type: String,
+    command: String,
+    aliases: Vec<String>,
+    risk: String,
+    approval_required: bool,
+    reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1674,7 +1734,9 @@ impl AppContext {
             .await
         {
             Ok(output) => {
-                let final_status = if output.validation.passed && output.hidden_scenarios.passed {
+                let final_status = if output.blocked {
+                    "blocked"
+                } else if output.validation.passed && output.hidden_scenarios.passed {
                     "completed"
                 } else {
                     "completed_with_issues"
@@ -2326,6 +2388,8 @@ impl AppContext {
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
 
+        let mut implementation_approval_blockers: Vec<String> = Vec::new();
+
         // ── Coobie plan critique ──────────────────────────────────────────────
         // Runs for every spec — not just worker_harness specs.
         // Checks the plan against dead-end registry + escalated guardrails before
@@ -2377,6 +2441,8 @@ impl AppContext {
                     .await;
                 }
                 if !critique.passed {
+                    implementation_approval_blockers
+                        .extend(critique.blocking_concerns.iter().cloned());
                     push_unique(&mut blackboard.open_blockers, "coobie_plan_critique_failed");
                     tracing::warn!(
                         blocking = critique.blocking_concerns.len(),
@@ -2468,59 +2534,194 @@ next_actions={}",
                 let _ = self
                     .set_episode_state_before(&implementation_episode, &pre_impl_snap)
                     .await;
-                let mason_edit_application = self
-                    .mason_generate_and_apply_edits(
-                        run_id,
-                        spec_obj,
-                        &intent,
-                        &briefing,
-                        &implementation_plan,
-                        target_source,
-                        &staged_product,
-                        &run_dir,
-                    )
-                    .await?;
-                push_unique(&mut blackboard.artifact_refs, "mason_edit_application.json");
-                push_unique(&mut blackboard.artifact_refs, "mason_edit_application.md");
-                if mason_edit_application.proposal_generated {
-                    push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.json");
-                    push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.md");
-                }
-                if mason_edit_application.status == "applied" {
-                    if let Some(context_bundle) = retriever_context_bundle.as_ref() {
-                        let drift_guard = build_trail_drift_guard(
-                            run_id,
-                            spec_obj,
-                            target_source,
-                            &staged_product,
-                            context_bundle,
-                        )?;
-                        self.write_json_file(&run_dir.join("trail_drift_guard.json"), &drift_guard)
-                            .await?;
-                        tokio::fs::write(
-                            run_dir.join("trail_drift_guard.md"),
-                            render_trail_drift_guard_markdown(&drift_guard),
-                        )
-                        .await?;
-                    }
-                }
-                self.write_agent_execution(
-                    &profiles,
-                    "mason",
-                    &format!(
-                        "Generate and apply bounded LLM-authored edits for target '{}' inside the staged workspace.",
-                        target_source.label
-                    ),
-                    &mason_edit_application.summary,
-                    &serde_json::to_string_pretty(&mason_edit_application)?,
-                    "implementation",
-                    &implementation_episode,
-                    spec_obj,
-                    target_source,
+                let editable_paths =
+                    collect_staged_code_under_test_paths(spec_obj, target_source, &self.paths.root);
+                let mut transaction_boundary = build_implementation_transaction_boundary(
+                    run_id,
+                    &spec_obj.id,
+                    editable_paths,
+                    briefing.recommended_guardrails.clone(),
+                    implementation_approval_blockers.clone(),
+                    pre_impl_snap.clone(),
+                );
+                self.capture_transaction_rollback_backup(
                     &run_dir,
-                    &mut agent_executions,
+                    &staged_product,
+                    &mut transaction_boundary,
                 )
                 .await?;
+                self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                    .await?;
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "transaction_implementation.json",
+                );
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "transaction_implementation.md",
+                );
+
+                if transaction_boundary.approval_state == "operator_review_required" {
+                    push_unique(
+                        &mut blackboard.open_blockers,
+                        "transaction_approval_required",
+                    );
+                    self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+                    self.materialize_run_checkpoints(run_id).await?;
+                    transaction_boundary.checkpoint_id =
+                        Some(format!("checkpoint-{run_id}-transaction-approval-required"));
+                    transaction_boundary.status = "paused_before_mutation".to_string();
+                    transaction_boundary.residual_risk =
+                        "Mason LLM-authored edits were not applied because Coobie identified approval blockers before the mutation boundary.".to_string();
+                    self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_boundary",
+                        "pause_for_operator_approval",
+                        &[
+                            "auto_approve_mutation".to_string(),
+                            "abort_transaction".to_string(),
+                        ],
+                        &format!(
+                            "Implementation transaction paused before Mason edits because {} approval blocker(s) were present: {}",
+                            transaction_boundary.approval_blockers.len(),
+                            transaction_boundary.approval_blockers.join("; ")
+                        ),
+                    )
+                    .await;
+                    self.record_event(
+                        run_id,
+                        Some(&implementation_episode),
+                        "implementation",
+                        "keeper",
+                        "blocked",
+                        "Implementation transaction paused before Mason edits pending operator approval",
+                        log_path,
+                    )
+                    .await?;
+                    let post_impl_snap = snapshot_workspace_state(&staged_product);
+                    let _ = self
+                        .set_episode_state_after(&implementation_episode, &post_impl_snap)
+                        .await;
+                    self.finish_episode(&implementation_episode, "blocked", Some(0.0))
+                        .await?;
+                    let blocked_validation = ValidationSummary {
+                        passed: false,
+                        scored_checks: 0,
+                        passed_scored_checks: 0,
+                        results: Vec::new(),
+                        failure_kind: Some(FailureKind::Blocked),
+                    };
+                    let blocked_hidden = HiddenScenarioSummary {
+                        passed: false,
+                        results: Vec::new(),
+                    };
+                    return Ok(ExecutionOutput {
+                        validation: blocked_validation,
+                        hidden_scenarios: blocked_hidden,
+                        run_dir,
+                        memory_context,
+                        briefing,
+                        blocked: true,
+                    });
+                } else {
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_boundary",
+                        "auto_approve_mutation",
+                        &[
+                            "pause_for_operator_approval".to_string(),
+                            "abort_transaction".to_string(),
+                        ],
+                        "No Coobie approval blockers were present, so the implementation mutation boundary was auto-approved.",
+                    )
+                    .await;
+                    let mason_edit_application = self
+                        .mason_generate_and_apply_edits(
+                            run_id,
+                            spec_obj,
+                            &intent,
+                            &briefing,
+                            &implementation_plan,
+                            target_source,
+                            &staged_product,
+                            &run_dir,
+                        )
+                        .await?;
+                    push_unique(&mut blackboard.artifact_refs, "mason_edit_application.json");
+                    push_unique(&mut blackboard.artifact_refs, "mason_edit_application.md");
+                    if mason_edit_application.proposal_generated {
+                        push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.json");
+                        push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.md");
+                    }
+                    if mason_edit_application.status == "applied" {
+                        if let Some(context_bundle) = retriever_context_bundle.as_ref() {
+                            let drift_guard = build_trail_drift_guard(
+                                run_id,
+                                spec_obj,
+                                target_source,
+                                &staged_product,
+                                context_bundle,
+                            )?;
+                            self.write_json_file(
+                                &run_dir.join("trail_drift_guard.json"),
+                                &drift_guard,
+                            )
+                            .await?;
+                            tokio::fs::write(
+                                run_dir.join("trail_drift_guard.md"),
+                                render_trail_drift_guard_markdown(&drift_guard),
+                            )
+                            .await?;
+                        }
+                    }
+                    let post_transaction_snap = snapshot_workspace_state(&staged_product);
+                    finalize_transaction_boundary(
+                        &mut transaction_boundary,
+                        &mason_edit_application.status,
+                        post_transaction_snap,
+                    );
+                    self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_commit",
+                        &transaction_boundary.status,
+                        &[
+                            "rollback_transaction".to_string(),
+                            "leave_transaction_open".to_string(),
+                        ],
+                        &format!(
+                            "{} Residual risk: {}",
+                            transaction_boundary.rollback_note, transaction_boundary.residual_risk
+                        ),
+                    )
+                    .await;
+                    self.write_agent_execution(
+                        &profiles,
+                        "mason",
+                        &format!(
+                            "Generate and apply bounded LLM-authored edits for target '{}' inside the staged workspace.",
+                            target_source.label
+                        ),
+                        &mason_edit_application.summary,
+                        &serde_json::to_string_pretty(&mason_edit_application)?,
+                        "implementation",
+                        &implementation_episode,
+                        spec_obj,
+                        target_source,
+                        &run_dir,
+                        &mut agent_executions,
+                    )
+                    .await?;
+                }
             }
         }
         self.write_agent_execution(
@@ -2786,6 +2987,95 @@ next_actions={}",
             .await;
         tokio::fs::write(run_dir.join("tool_plan.md"), &tool_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "tool_plan.md");
+        let mut tool_transaction = build_tool_transaction_artifact(
+            run_id,
+            &spec_obj.id,
+            &self.paths.setup,
+            &staged_product,
+            &briefing,
+        );
+        self.write_tool_transaction_artifacts(&run_dir, &tool_transaction)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.json");
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.md");
+        if tool_transaction.approval_state == "operator_review_required" {
+            push_unique(
+                &mut blackboard.open_blockers,
+                "tool_transaction_approval_required",
+            );
+            self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+            self.materialize_run_checkpoints(run_id).await?;
+            tool_transaction.checkpoint_id = Some(format!(
+                "checkpoint-{run_id}-tool-transaction-approval-required"
+            ));
+            tool_transaction.status = "paused_before_privileged_tool_use".to_string();
+            tool_transaction.residual_risk =
+                "Privileged tool/MCP surfaces were identified. Later tool-bearing phases were not executed until Keeper receives operator approval."
+                    .to_string();
+            self.write_tool_transaction_artifacts(&run_dir, &tool_transaction)
+                .await?;
+            self.record_decision(
+                run_id,
+                "keeper",
+                "tools",
+                "tool_transaction_boundary",
+                "pause_for_operator_approval",
+                &[
+                    "auto_approve_read_only_tools".to_string(),
+                    "reject_privileged_tool_surface".to_string(),
+                ],
+                &format!(
+                    "Tool transaction paused because {} privileged surface(s) require approval: {}",
+                    tool_transaction.approval_blockers.len(),
+                    tool_transaction.approval_blockers.join("; ")
+                ),
+            )
+            .await;
+            self.record_event(
+                run_id,
+                Some(&tools_episode),
+                "tools",
+                "keeper",
+                "blocked",
+                "Tool transaction paused pending operator approval for privileged MCP/tool surfaces",
+                log_path,
+            )
+            .await?;
+            self.finish_episode(&tools_episode, "blocked", Some(0.0))
+                .await?;
+            release_agent(&mut blackboard, "piper");
+            return Ok(ExecutionOutput {
+                validation: ValidationSummary {
+                    passed: false,
+                    scored_checks: 0,
+                    passed_scored_checks: 0,
+                    results: Vec::new(),
+                    failure_kind: Some(FailureKind::Blocked),
+                },
+                hidden_scenarios: HiddenScenarioSummary {
+                    passed: false,
+                    results: Vec::new(),
+                },
+                run_dir,
+                memory_context,
+                briefing,
+                blocked: true,
+            });
+        } else {
+            self.record_decision(
+                run_id,
+                "keeper",
+                "tools",
+                "tool_transaction_boundary",
+                "auto_approve_read_only_tools",
+                &[
+                    "pause_for_operator_approval".to_string(),
+                    "reject_privileged_tool_surface".to_string(),
+                ],
+                "No privileged MCP/tool surfaces were identified, so the tool transaction boundary was auto-approved.",
+            )
+            .await;
+        }
         self.write_agent_execution(
             &profiles,
             "piper",
@@ -3791,6 +4081,7 @@ Top memory hits:
             run_dir,
             memory_context,
             briefing,
+            blocked: false,
         })
     }
 
@@ -10881,6 +11172,888 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn write_transaction_boundary_artifacts(
+        &self,
+        run_dir: &Path,
+        boundary: &TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("transaction_implementation.json"), boundary)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("transaction_implementation.md"),
+            render_transaction_boundary_markdown(boundary),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_tool_transaction_artifacts(
+        &self,
+        run_dir: &Path,
+        transaction: &ToolTransactionArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("tool_transaction.json"), transaction)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("tool_transaction.md"),
+            render_tool_transaction_markdown(transaction),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn load_tool_transaction_artifact(
+        &self,
+        run_dir: &Path,
+    ) -> Result<ToolTransactionArtifact> {
+        let path = run_dir.join("tool_transaction.json");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn load_transaction_boundary_artifact(
+        &self,
+        run_dir: &Path,
+    ) -> Result<TransactionBoundaryArtifact> {
+        let path = run_dir.join("transaction_implementation.json");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn capture_transaction_rollback_backup(
+        &self,
+        run_dir: &Path,
+        staged_product: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        let backup_dir = run_dir
+            .join("transaction_backups")
+            .join("implementation_pre_action");
+        if backup_dir.exists() {
+            tokio::fs::remove_dir_all(&backup_dir)
+                .await
+                .with_context(|| format!("clearing rollback backup {}", backup_dir.display()))?;
+        }
+        copy_dir_recursive(staged_product, &backup_dir)?;
+        boundary.rollback_backup_path = Some(
+            backup_dir
+                .strip_prefix(run_dir)
+                .unwrap_or(backup_dir.as_path())
+                .to_string_lossy()
+                .trim_start_matches(std::path::MAIN_SEPARATOR)
+                .to_string(),
+        );
+        boundary.rollback_note = format!(
+            "Rollback boundary opened before Mason LLM-authored edits; restore the staged workspace from `{}` if the mutation is rejected or later rolled back.",
+            boundary
+                .rollback_backup_path
+                .as_deref()
+                .unwrap_or("transaction_backups/implementation_pre_action")
+        );
+        Ok(())
+    }
+
+    async fn handle_tool_transaction_checkpoint_resolution(
+        &self,
+        run_id: &str,
+        checkpoint: &RunCheckpointRecord,
+        answered_by: &str,
+        answer_text: &str,
+        decision_json: &Option<serde_json::Value>,
+    ) -> Result<()> {
+        if checkpoint.checkpoint_type != "needs_tool_transaction_approval" {
+            return Ok(());
+        }
+
+        let decision = transaction_checkpoint_decision(answer_text, decision_json);
+        let run_dir = self.run_dir(run_id);
+        let mut transaction = self.load_tool_transaction_artifact(&run_dir).await?;
+        transaction.checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+        transaction.approval_decision =
+            Some(transaction_checkpoint_decision_label(decision).into());
+        transaction.operator_guidance = transaction_operator_guidance(answer_text, decision_json);
+        transaction.approved_by = Some(answered_by.to_string());
+        transaction.approved_at = Some(Utc::now().to_rfc3339());
+
+        match decision {
+            TransactionCheckpointDecision::Approve => {
+                transaction.approval_state = "operator_approved".to_string();
+                transaction.status = "approved".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Privileged MCP/tool surfaces were approved for this run. Re-run or resume the blocked run to use them under this approval context."
+                        .to_string();
+                transaction.rollback_note =
+                    "Tool transactions are authorization boundaries; no filesystem rollback is available for mere approval. Revoke by rejecting a later checkpoint or disabling the surface in setup.".to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_approved")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_approved",
+                    &[
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator approved privileged MCP/tool surfaces for this run.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Reject => {
+                transaction.approval_state = "operator_rejected".to_string();
+                transaction.status = "rejected".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Privileged MCP/tool surfaces were rejected; later tool-bearing phases remain blocked until the plan or setup changes."
+                        .to_string();
+                transaction.rollback_note =
+                    "No tool call was executed from this transaction boundary, so no rollback was required."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_rejected")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_rejected",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator rejected privileged MCP/tool surfaces for this run.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Revise => {
+                transaction.approval_state = "operator_revision_requested".to_string();
+                transaction.status = "revision_requested".to_string();
+                transaction.residual_risk =
+                    "Operator requested a revised tool plan; privileged MCP/tool surfaces remain blocked."
+                        .to_string();
+                transaction.rollback_note =
+                    "Revise the tool plan or setup before opening another privileged tool boundary."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_revision_requested")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_requested_revision",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                    ],
+                    "Operator requested revision of the privileged MCP/tool plan.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Rollback => {
+                transaction.approval_state = "rollback_not_applicable".to_string();
+                transaction.status = "rollback_not_applicable".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Rollback was requested, but this tool transaction had not executed a reversible tool call."
+                        .to_string();
+                transaction.rollback_note =
+                    "Tool transaction rollback is only meaningful after a concrete tool invocation. This boundary only governed access approval."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_rollback",
+                    "rollback_not_applicable",
+                    &[
+                        "operator_rejected".to_string(),
+                        "disable_tool_surface".to_string(),
+                    ],
+                    &transaction.residual_risk,
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Unknown => {
+                transaction.approval_state = "operator_response_unclassified".to_string();
+                transaction.status = "approval_response_recorded".to_string();
+                transaction.residual_risk =
+                    "Operator response did not clearly approve, reject, or request revision; privileged MCP/tool surfaces remain blocked."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_response_unclassified",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator resolved the tool transaction checkpoint without an unambiguous approve/reject/revise decision.",
+                )
+                .await;
+            }
+        }
+
+        let _ = self.package_artifacts(run_id).await;
+        Ok(())
+    }
+
+    async fn handle_transaction_checkpoint_resolution(
+        &self,
+        run_id: &str,
+        checkpoint: &RunCheckpointRecord,
+        answered_by: &str,
+        answer_text: &str,
+        decision_json: &Option<serde_json::Value>,
+    ) -> Result<()> {
+        if checkpoint.checkpoint_type != "needs_transaction_approval" {
+            return Ok(());
+        }
+
+        let decision = transaction_checkpoint_decision(answer_text, decision_json);
+        let run_dir = self.run_dir(run_id);
+        let mut boundary = self.load_transaction_boundary_artifact(&run_dir).await?;
+        boundary.checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+        boundary.approval_decision = Some(transaction_checkpoint_decision_label(decision).into());
+        boundary.operator_guidance = transaction_operator_guidance(answer_text, decision_json);
+        boundary.approved_by = Some(answered_by.to_string());
+        boundary.approved_at = Some(Utc::now().to_rfc3339());
+
+        match decision {
+            TransactionCheckpointDecision::Approve => {
+                self.approve_implementation_transaction(
+                    run_id,
+                    &run_dir,
+                    &mut boundary,
+                    answered_by,
+                )
+                .await?;
+            }
+            TransactionCheckpointDecision::Rollback => {
+                self.rollback_implementation_transaction(run_id, &run_dir, &mut boundary)
+                    .await?;
+            }
+            TransactionCheckpointDecision::Reject => {
+                boundary.approval_state = "operator_rejected".to_string();
+                boundary.status = "aborted_by_operator".to_string();
+                boundary.closed_at = Some(Utc::now().to_rfc3339());
+                boundary.rollback_note =
+                    "Operator rejected the implementation transaction before Mason edits were applied; no rollback execution was required."
+                        .to_string();
+                boundary.residual_risk =
+                    "No Mason LLM-authored mutation was applied from this transaction boundary."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_rejected")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_rejected",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_requested_revision".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator rejected the implementation transaction checkpoint; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Revise => {
+                boundary.approval_state = "operator_revision_requested".to_string();
+                boundary.status = "revision_requested".to_string();
+                boundary.residual_risk =
+                    "Operator requested a revised implementation plan; no Mason LLM-authored mutation was applied from this boundary."
+                        .to_string();
+                boundary.rollback_note =
+                    "Revision request recorded before mutation; regenerate or edit the Mason plan before opening a new commit boundary."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_revision_requested")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_requested_revision",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator requested revision of the implementation transaction; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Unknown => {
+                boundary.approval_state = "operator_response_unclassified".to_string();
+                boundary.status = "approval_response_recorded".to_string();
+                boundary.residual_risk =
+                    "Operator response did not clearly approve, reject, or request revision; Mason edits remain unapplied."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_response_unclassified",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator resolved the transaction checkpoint without an unambiguous approve/reject/revise decision; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+        }
+
+        let _ = self.package_artifacts(run_id).await;
+        Ok(())
+    }
+
+    async fn rollback_implementation_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        boundary.approval_state = "rollback_requested".to_string();
+        boundary.status = "rollback_restoring".to_string();
+        self.write_transaction_boundary_artifacts(run_dir, boundary)
+            .await?;
+
+        let backup_rel = boundary
+            .rollback_backup_path
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("transaction_backups/implementation_pre_action");
+        let backup_dir = run_dir.join(backup_rel);
+        let staged_product = self.paths.workspaces.join(run_id).join("product");
+
+        match restore_dir_from_backup(&backup_dir, &staged_product) {
+            Ok(()) => {
+                let restored_snapshot = snapshot_workspace_state(&staged_product);
+                let restored_matches = workspace_snapshots_equivalent(
+                    &boundary.pre_action_snapshot,
+                    &restored_snapshot,
+                );
+                boundary.approval_state = "rollback_executed".to_string();
+                boundary.status = if restored_matches {
+                    "rolled_back".to_string()
+                } else {
+                    "rolled_back_with_drift".to_string()
+                };
+                boundary.closed_at = Some(Utc::now().to_rfc3339());
+                boundary.post_action_snapshot = Some(restored_snapshot);
+                boundary.rollback_note = format!(
+                    "Rollback executed from `{backup_rel}` into `{}`.",
+                    staged_product.display()
+                );
+                boundary.residual_risk = if restored_matches {
+                    "Restored staged workspace matches the pre-action transaction snapshot."
+                        .to_string()
+                } else {
+                    "Restored staged workspace does not exactly match the pre-action transaction snapshot; inspect the transaction artifact before promotion."
+                        .to_string()
+                };
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(
+                    run_id,
+                    if restored_matches {
+                        "transaction_rolled_back"
+                    } else {
+                        "transaction_rolled_back_with_drift"
+                    },
+                )
+                .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_rollback",
+                    &boundary.status,
+                    &[
+                        "leave_transaction_committed".to_string(),
+                        "retry_transaction_rollback".to_string(),
+                    ],
+                    &format!(
+                        "{} Residual risk: {}",
+                        boundary.rollback_note, boundary.residual_risk
+                    ),
+                )
+                .await;
+                self.mark_transaction_rollback_on_blackboard(run_id, restored_matches)
+                    .await?;
+                self.audit_checkpoint_activity(
+                    run_id,
+                    "implementation",
+                    "keeper",
+                    if restored_matches {
+                        "complete"
+                    } else {
+                        "warning"
+                    },
+                    &format!(
+                        "Implementation transaction rollback finished as {}.",
+                        boundary.status
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                boundary.approval_state = "rollback_failed".to_string();
+                boundary.status = "rollback_failed".to_string();
+                boundary.residual_risk = format!(
+                    "Rollback failed while restoring `{}` into `{}`: {error}",
+                    backup_dir.display(),
+                    staged_product.display()
+                );
+                boundary.rollback_note =
+                    "Rollback was requested but could not be executed; inspect the staged workspace and backup path before retrying."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_rollback_failed")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_rollback",
+                    "rollback_failed",
+                    &[
+                        "retry_transaction_rollback".to_string(),
+                        "manual_restore".to_string(),
+                    ],
+                    &boundary.residual_risk,
+                )
+                .await;
+            }
+        }
+
+        self.write_run_timing_artifact(run_id, run_dir).await?;
+        self.package_artifacts(run_id).await?;
+        Ok(())
+    }
+
+    async fn approve_implementation_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+        answered_by: &str,
+    ) -> Result<()> {
+        boundary.approval_state = "operator_approved".to_string();
+        boundary.status = "approved_applying".to_string();
+        self.write_transaction_boundary_artifacts(run_dir, boundary)
+            .await?;
+        self.record_decision(
+            run_id,
+            "keeper",
+            "implementation",
+            "transaction_approval",
+            "operator_approved",
+            &[
+                "operator_rejected".to_string(),
+                "operator_requested_revision".to_string(),
+                "rollback_transaction".to_string(),
+            ],
+            &format!("{answered_by} approved the implementation transaction checkpoint."),
+        )
+        .await;
+
+        let spec_path = run_dir.join("spec.yaml");
+        let spec_obj = spec::load_spec(&spec_path.to_string_lossy())?;
+        let target_source = self
+            .target_source_for_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target_source.json missing for run {run_id}"))?;
+        let briefing = self
+            .load_run_briefing(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("coobie_briefing.json missing for run {run_id}"))?;
+        let intent_path = run_dir.join("intent.json");
+        let intent_raw = tokio::fs::read_to_string(&intent_path)
+            .await
+            .with_context(|| format!("reading {}", intent_path.display()))?;
+        let intent: IntentPackage = serde_json::from_str(&intent_raw)
+            .with_context(|| format!("parsing {}", intent_path.display()))?;
+        let implementation_plan_path = run_dir.join("implementation_plan.md");
+        let implementation_plan = tokio::fs::read_to_string(&implementation_plan_path)
+            .await
+            .with_context(|| format!("reading {}", implementation_plan_path.display()))?;
+        let staged_product = self.paths.workspaces.join(run_id).join("product");
+        if !staged_product.exists() {
+            bail!(
+                "staged product workspace missing for approved transaction: {}",
+                staged_product.display()
+            );
+        }
+
+        match self
+            .mason_generate_and_apply_edits(
+                run_id,
+                &spec_obj,
+                &intent,
+                &briefing,
+                &implementation_plan,
+                &target_source,
+                &staged_product,
+                run_dir,
+            )
+            .await
+        {
+            Ok(application) => {
+                let post_transaction_snap = snapshot_workspace_state(&staged_product);
+                finalize_transaction_boundary(boundary, &application.status, post_transaction_snap);
+                boundary.approval_state = "operator_approved".to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_commit",
+                    &boundary.status,
+                    &[
+                        "rollback_transaction".to_string(),
+                        "leave_transaction_open".to_string(),
+                    ],
+                    &format!(
+                        "Approved transaction applied through Mason with status '{}'. {} Residual risk: {}",
+                        application.status, boundary.rollback_note, boundary.residual_risk
+                    ),
+                )
+                .await;
+                self.attach_transaction_artifacts_to_blackboard(run_id)
+                    .await?;
+                if let Err(error) = self
+                    .resume_visible_validation_after_transaction(
+                        run_id,
+                        run_dir,
+                        &spec_obj,
+                        &target_source,
+                        &briefing,
+                        &staged_product,
+                    )
+                    .await
+                {
+                    self.update_run_status(run_id, "transaction_validation_error")
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "validation",
+                        "transaction_validation",
+                        "validation_error",
+                        &[
+                            "validation_passed_after_transaction".to_string(),
+                            "validation_failed_after_transaction".to_string(),
+                        ],
+                        &format!(
+                            "Approved implementation transaction committed, but validation continuation failed: {error}"
+                        ),
+                    )
+                    .await;
+                    self.audit_checkpoint_activity(
+                        run_id,
+                        "validation",
+                        "keeper",
+                        "warning",
+                        &format!(
+                            "Approved implementation transaction applied; validation continuation failed: {error}"
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            Err(error) => {
+                boundary.status = "resume_failed".to_string();
+                boundary.residual_risk = format!(
+                    "Operator approved the transaction, but Mason edit application failed: {error}"
+                );
+                boundary.rollback_note =
+                    "Resume failed while applying Mason edits; inspect the staged workspace before retrying or rolling back."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_resume_failed")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_commit",
+                    "resume_failed",
+                    &[
+                        "retry_transaction_resume".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    &boundary.residual_risk,
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resume_visible_validation_after_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        briefing: &CoobieBriefing,
+        staged_product: &Path,
+    ) -> Result<ValidationSummary> {
+        let workspace_root = self.paths.workspaces.join(run_id);
+        let log_path = self.run_log_path(run_id);
+        let validation_episode = self
+            .start_episode(
+                run_id,
+                "validation",
+                "Resume visible validation after transaction approval",
+            )
+            .await?;
+
+        let mut blackboard =
+            self.load_run_blackboard(run_id)
+                .await?
+                .unwrap_or_else(|| BlackboardState {
+                    run_id: run_id.to_string(),
+                    current_phase: "validation".to_string(),
+                    active_goal: "Resume visible validation after transaction approval".to_string(),
+                    ..Default::default()
+                });
+        blackboard.current_phase = "validation".to_string();
+        blackboard.active_goal = "Resume visible validation after transaction approval".to_string();
+        claim_agent(
+            &mut blackboard,
+            "bramble",
+            "resume visible validation after transaction",
+        );
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.update_run_status(run_id, "validation").await?;
+        let validation_start = self
+            .record_event(
+                run_id,
+                Some(&validation_episode),
+                "validation",
+                "bramble",
+                "running",
+                "Running visible validation after approved implementation transaction",
+                &log_path,
+            )
+            .await?;
+
+        let pre_validation_snap = snapshot_workspace_state(staged_product);
+        let _ = self
+            .set_episode_state_before(&validation_episode, &pre_validation_snap)
+            .await;
+        let validation = self
+            .run_visible_validation(run_id, &workspace_root, staged_product, spec_obj)
+            .await?;
+        self.write_json_file(&run_dir.join("validation.json"), &validation)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "validation.json");
+        if run_dir.join("validation_command_trials.json").exists() {
+            push_unique(
+                &mut blackboard.artifact_refs,
+                "validation_command_trials.json",
+            );
+            push_unique(
+                &mut blackboard.artifact_refs,
+                "validation_command_trials.md",
+            );
+        }
+        if run_dir.join("corpus_results.json").exists() {
+            push_unique(&mut blackboard.artifact_refs, "corpus_results.json");
+        }
+        if let Some(analysis) = self
+            .bramble_interpret_validation(spec_obj, target_source, &validation, briefing)
+            .await
+        {
+            let _ = tokio::fs::write(run_dir.join("validation_analysis.md"), &analysis).await;
+            push_unique(&mut blackboard.artifact_refs, "validation_analysis.md");
+        }
+
+        let validation_outcome = if validation.passed {
+            "success"
+        } else {
+            "failure"
+        };
+        let validation_end = self
+            .record_event(
+                run_id,
+                Some(&validation_episode),
+                "validation",
+                "bramble",
+                if validation.passed {
+                    "complete"
+                } else {
+                    "warning"
+                },
+                &format!(
+                    "Transaction validation finished: {} checks, {} passed",
+                    validation.results.len(),
+                    validation
+                        .results
+                        .iter()
+                        .filter(|result| result.passed)
+                        .count()
+                ),
+                &log_path,
+            )
+            .await?;
+        let post_validation_snap = snapshot_workspace_state(staged_product);
+        let _ = self
+            .set_episode_state_after(&validation_episode, &post_validation_snap)
+            .await;
+        self.finish_episode(
+            &validation_episode,
+            validation_outcome,
+            Some(if validation.passed { 1.0 } else { 0.5 }),
+        )
+        .await?;
+        self.link_events(
+            validation_start.event_id,
+            validation_end.event_id,
+            "contributed_to",
+            if validation.passed { 1.0 } else { 0.5 },
+        )
+        .await?;
+
+        release_agent(&mut blackboard, "bramble");
+        if validation.passed {
+            push_unique(&mut blackboard.resolved_items, "validation");
+            remove_blocker(&mut blackboard, "visible_validation_failed");
+            self.update_run_status(run_id, "validation_passed_after_transaction")
+                .await?;
+        } else {
+            push_unique(&mut blackboard.open_blockers, "visible_validation_failed");
+            self.update_run_status(run_id, "validation_failed_after_transaction")
+                .await?;
+        }
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.materialize_run_checkpoints(run_id).await?;
+
+        let mut phase_attributions = self.list_phase_attributions_for_run(run_id).await?;
+        let memory_context = MemoryContextBundle::default();
+        self.record_phase_attribution(
+            run_id,
+            &validation_episode,
+            "validation",
+            "bramble",
+            validation_outcome,
+            Some(if validation.passed { 1.0 } else { 0.5 }),
+            &memory_context,
+            briefing,
+            &[],
+            &mut phase_attributions,
+            run_dir,
+        )
+        .await?;
+        self.write_run_timing_artifact(run_id, run_dir).await?;
+        self.package_artifacts(run_id).await?;
+        self.record_decision(
+            run_id,
+            "keeper",
+            "validation",
+            "transaction_validation",
+            if validation.passed {
+                "validation_passed_after_transaction"
+            } else {
+                "validation_failed_after_transaction"
+            },
+            &[
+                "skip_validation_after_transaction".to_string(),
+                "retry_validation_after_transaction".to_string(),
+            ],
+            &format!(
+                "Visible validation resumed after approved implementation transaction: {} check(s), {} passed.",
+                validation.results.len(),
+                validation
+                    .results
+                    .iter()
+                    .filter(|result| result.passed)
+                    .count()
+            ),
+        )
+        .await;
+
+        Ok(validation)
+    }
+
+    async fn attach_transaction_artifacts_to_blackboard(&self, run_id: &str) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let blackboard_path = run_dir.join("blackboard.json");
+        if !blackboard_path.exists() {
+            return Ok(());
+        }
+        let raw = tokio::fs::read_to_string(&blackboard_path).await?;
+        let mut board = serde_json::from_str::<BlackboardState>(&raw)?;
+        push_unique(&mut board.artifact_refs, "transaction_implementation.json");
+        push_unique(&mut board.artifact_refs, "transaction_implementation.md");
+        push_unique(&mut board.artifact_refs, "mason_edit_application.json");
+        push_unique(&mut board.artifact_refs, "mason_edit_application.md");
+        self.sync_blackboard(&board, Some(&run_dir)).await
+    }
+
+    async fn mark_transaction_rollback_on_blackboard(
+        &self,
+        run_id: &str,
+        restored_matches: bool,
+    ) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let blackboard_path = run_dir.join("blackboard.json");
+        if !blackboard_path.exists() {
+            return Ok(());
+        }
+        let raw = tokio::fs::read_to_string(&blackboard_path).await?;
+        let mut board = serde_json::from_str::<BlackboardState>(&raw)?;
+        push_unique(&mut board.artifact_refs, "transaction_implementation.json");
+        push_unique(&mut board.artifact_refs, "transaction_implementation.md");
+        push_unique(&mut board.resolved_items, "transaction_rollback");
+        push_unique(
+            &mut board.open_blockers,
+            "validation_after_rollback_required",
+        );
+        if !restored_matches {
+            push_unique(&mut board.open_blockers, "transaction_rollback_drift");
+        }
+        self.sync_blackboard(&board, Some(&run_dir)).await
+    }
+
     async fn upsert_phase_attribution(&self, record: &PhaseAttributionRecord) -> Result<()> {
         sqlx::query(
             r#"
@@ -12854,6 +14027,19 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn load_run_blackboard(&self, run_id: &str) -> Result<Option<BlackboardState>> {
+        let path = self.run_dir(run_id).join("blackboard.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
     async fn finalize_blackboard(&self, final_status: &str, run_dir: &Path) -> Result<()> {
         let mut board = self.blackboard.write().await;
         board.current_phase = "complete".to_string();
@@ -13818,6 +15004,22 @@ Return JSON only.",
         if resolve {
             self.resolve_checkpoint_on_blackboard(run_id, checkpoint_id)
                 .await?;
+            self.handle_transaction_checkpoint_resolution(
+                run_id,
+                &checkpoint,
+                answered_by,
+                trimmed_answer,
+                &decision_json,
+            )
+            .await?;
+            self.handle_tool_transaction_checkpoint_resolution(
+                run_id,
+                &checkpoint,
+                answered_by,
+                trimmed_answer,
+                &decision_json,
+            )
+            .await?;
         }
 
         let phase = checkpoint.phase.as_deref().unwrap_or("interaction");
@@ -21050,6 +22252,35 @@ fn checkpoint_answer_intent(
     {
         return "clarify_scope".to_string();
     }
+    if mentions_decision_keyword(decision_json, &["approve", "approved"])
+        || lower.contains("approve")
+    {
+        return "approve".to_string();
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &["rollback", "roll back", "restore", "revert"],
+    ) || lower.contains("rollback")
+        || lower.contains("roll back")
+        || lower.contains("restore")
+        || lower.contains("revert")
+    {
+        return "rollback".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["reject", "deny", "denied", "abort"])
+        || lower.contains("reject")
+        || lower.contains("deny")
+        || lower.contains("abort")
+    {
+        return "reject".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["revise", "revision", "rework"])
+        || lower.contains("revise")
+        || lower.contains("revision")
+        || lower.contains("rework")
+    {
+        return "revise".to_string();
+    }
     if lower.starts_with("operator unblocked agent") || lower.starts_with("unblock ") {
         return "unblock_ack".to_string();
     }
@@ -21066,6 +22297,99 @@ fn checkpoint_answer_intent(
         return "direction".to_string();
     }
     "acknowledge".to_string()
+}
+
+fn transaction_checkpoint_decision(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> TransactionCheckpointDecision {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if mentions_decision_keyword(
+        decision_json,
+        &["rollback", "roll back", "restore", "revert"],
+    ) || lower.contains("rollback")
+        || lower.contains("roll back")
+        || lower.contains("restore")
+        || lower.contains("revert")
+    {
+        return TransactionCheckpointDecision::Rollback;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &["reject", "rejected", "deny", "denied", "abort", "decline"],
+    ) || lower.contains("reject")
+        || lower.contains("deny")
+        || lower.contains("abort")
+        || lower.contains("decline")
+        || lower.contains("do not apply")
+    {
+        return TransactionCheckpointDecision::Reject;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &[
+            "revise",
+            "revision",
+            "rework",
+            "regenerate",
+            "change",
+            "adjust",
+        ],
+    ) || lower.contains("revise")
+        || lower.contains("revision")
+        || lower.contains("rework")
+        || lower.contains("regenerate")
+        || lower.contains("change the plan")
+        || lower.contains("adjust the plan")
+    {
+        return TransactionCheckpointDecision::Revise;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &[
+            "approve", "approved", "accept", "accepted", "proceed", "continue", "apply",
+        ],
+    ) || lower.contains("approve")
+        || lower.contains("accept risk")
+        || lower.contains("proceed")
+        || lower.contains("continue")
+        || lower.contains("apply")
+    {
+        return TransactionCheckpointDecision::Approve;
+    }
+    TransactionCheckpointDecision::Unknown
+}
+
+fn transaction_checkpoint_decision_label(decision: TransactionCheckpointDecision) -> &'static str {
+    match decision {
+        TransactionCheckpointDecision::Approve => "approve",
+        TransactionCheckpointDecision::Reject => "reject",
+        TransactionCheckpointDecision::Revise => "revise",
+        TransactionCheckpointDecision::Rollback => "rollback",
+        TransactionCheckpointDecision::Unknown => "unknown",
+    }
+}
+
+fn transaction_operator_guidance(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let trimmed = answer_text.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+    if let Some(value) = decision_json {
+        if !value.is_null() && *value != serde_json::json!({}) {
+            parts.push(format!("decision_json={value}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
 }
 
 fn mentions_decision_keyword(decision_json: &Option<serde_json::Value>, needles: &[&str]) -> bool {
@@ -21388,6 +22712,78 @@ fn list_run_directory(run_dir: &Path) -> Result<Vec<String>> {
     let mut files = list_relative_files(run_dir, run_dir)?;
     files.insert(0, format!("run_dir={}", run_dir.display()));
     Ok(files)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() {
+        bail!("copy source not found: {}", source.display());
+    }
+    if !source.is_dir() {
+        bail!("copy source is not a directory: {}", source.display());
+    }
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("creating directory {}", destination.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("reading directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating directory {}", parent.display()))?;
+            }
+            std::fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copying rollback file {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_dir_from_backup(backup_dir: &Path, target_dir: &Path) -> Result<()> {
+    if !backup_dir.exists() {
+        bail!("rollback backup not found: {}", backup_dir.display());
+    }
+    if target_dir.exists() {
+        std::fs::remove_dir_all(target_dir)
+            .with_context(|| format!("removing target directory {}", target_dir.display()))?;
+    }
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating target parent {}", parent.display()))?;
+    }
+    copy_dir_recursive(backup_dir, target_dir)
+}
+
+fn workspace_snapshots_equivalent(
+    expected: &WorkspaceStateSnapshot,
+    actual: &WorkspaceStateSnapshot,
+) -> bool {
+    if expected.file_count != actual.file_count || expected.total_bytes != actual.total_bytes {
+        return false;
+    }
+    let mut expected_files = expected
+        .files
+        .iter()
+        .map(|entry| (&entry.path, entry.size, &entry.hash))
+        .collect::<Vec<_>>();
+    let mut actual_files = actual
+        .files
+        .iter()
+        .map(|entry| (&entry.path, entry.size, &entry.hash))
+        .collect::<Vec<_>>();
+    expected_files.sort();
+    actual_files.sort();
+    expected_files == actual_files
 }
 
 fn is_mason_context_candidate(path: &str) -> bool {
@@ -21823,6 +23219,10 @@ fn checkpoint_type_for_blocker(blocker: &str) -> &'static str {
         "visible_validation_failed" => "needs_validation_review",
         "hidden_scenarios_failed" => "needs_hidden_scenario_review",
         "retriever_forge_failed" => "needs_operator_answer",
+        "transaction_approval_required" => "needs_transaction_approval",
+        "tool_transaction_approval_required" => "needs_tool_transaction_approval",
+        "validation_after_rollback_required" => "needs_validation_review",
+        "transaction_rollback_drift" => "needs_transaction_review",
         _ => "needs_operator_answer",
     }
 }
@@ -21832,6 +23232,10 @@ fn checkpoint_phase_for_blocker(blocker: &str, current_phase: &str) -> Option<St
         "visible_validation_failed" => Some("validation".to_string()),
         "hidden_scenarios_failed" => Some("hidden_scenarios".to_string()),
         "retriever_forge_failed" => Some("retriever_forge".to_string()),
+        "transaction_approval_required" => Some("implementation".to_string()),
+        "tool_transaction_approval_required" => Some("tools".to_string()),
+        "validation_after_rollback_required" => Some("validation".to_string()),
+        "transaction_rollback_drift" => Some("implementation".to_string()),
         _ if current_phase.trim().is_empty() => None,
         _ => Some(current_phase.to_string()),
     }
@@ -21861,6 +23265,10 @@ fn checkpoint_prompt_for_blocker(
         "visible_validation_failed" => "Bramble reported a visible validation failure. Review the evidence and decide whether to rerun, adjust the plan, or explicitly accept the risk.".to_string(),
         "hidden_scenarios_failed" => "Sable found a hidden-scenario failure. Review the scenario evidence and provide an operator decision before treating the run as recovered.".to_string(),
         "retriever_forge_failed" => "Mason's retriever forge packet failed. Provide revised direction or an operator decision before treating this blocker as resolved.".to_string(),
+        "transaction_approval_required" => "Keeper paused the implementation transaction before Mason could apply LLM-authored edits. Review `transaction_implementation.md`, then approve, reject, revise, or roll back the mutation plan before treating this blocker as resolved.".to_string(),
+        "tool_transaction_approval_required" => "Keeper paused before privileged MCP/tool surfaces could be used. Review `tool_transaction.md`, then approve, reject, or revise the tool plan before treating this blocker as resolved.".to_string(),
+        "validation_after_rollback_required" => "Keeper rolled back the implementation transaction to its pre-action backup. Run or approve visible validation again before treating the staged workspace as safe.".to_string(),
+        "transaction_rollback_drift" => "Keeper restored the transaction backup, but the restored staged workspace did not exactly match the original pre-action snapshot. Inspect `transaction_implementation.md` before proceeding.".to_string(),
         _ => format!(
             "Operator review needed for blocker `{}`{}{}.",
             blocker,
@@ -22140,6 +23548,506 @@ fn summarize_episode_state_diff(
         bytes_before: before.total_bytes,
         bytes_after: after.total_bytes,
     })
+}
+
+fn build_implementation_transaction_boundary(
+    run_id: &str,
+    spec_id: &str,
+    planned_mutation_set: Vec<String>,
+    guardrails: Vec<String>,
+    approval_blockers: Vec<String>,
+    pre_action_snapshot: WorkspaceStateSnapshot,
+) -> TransactionBoundaryArtifact {
+    let approval_state = if approval_blockers.is_empty() {
+        "auto_approved"
+    } else {
+        "operator_review_required"
+    };
+    TransactionBoundaryArtifact {
+        boundary_id: format!("transaction-{run_id}-implementation"),
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        phase: "implementation".to_string(),
+        agent: "mason".to_string(),
+        status: if approval_state == "auto_approved" {
+            "auto_approved".to_string()
+        } else {
+            "open".to_string()
+        },
+        approval_state: approval_state.to_string(),
+        checkpoint_id: None,
+        opened_at: Utc::now().to_rfc3339(),
+        closed_at: None,
+        planned_mutation_set,
+        guardrails,
+        approval_blockers,
+        pre_action_snapshot,
+        post_action_snapshot: None,
+        rollback_backup_path: None,
+        approval_decision: None,
+        operator_guidance: None,
+        approved_by: None,
+        approved_at: None,
+        rollback_note:
+            "Rollback boundary opened before Mason LLM-authored edits; restore the staged workspace to the pre-action snapshot if the mutation is rejected."
+                .to_string(),
+        residual_risk: if approval_state == "auto_approved" {
+            "No approval blockers were present at the transaction boundary.".to_string()
+        } else {
+            "Mutation is paused until the operator resolves the transaction approval checkpoint."
+                .to_string()
+        },
+    }
+}
+
+fn build_tool_transaction_artifact(
+    run_id: &str,
+    spec_id: &str,
+    setup: &crate::setup::SetupConfig,
+    staged_product: &Path,
+    briefing: &CoobieBriefing,
+) -> ToolTransactionArtifact {
+    let mut requested_surfaces = Vec::new();
+
+    if let Some(mcp) = &setup.mcp {
+        for server in &mcp.servers {
+            requested_surfaces.push(assess_mcp_tool_surface(server));
+        }
+        if let Some(self_server) = &mcp.self_server {
+            if self_server.enabled {
+                requested_surfaces.push(ToolSurfaceAssessment {
+                    name: "harkonnen-self".to_string(),
+                    surface_type: "mcp_self".to_string(),
+                    command: format!("mcp serve ({})", self_server.transport),
+                    aliases: vec!["harkonnen_factory_control".to_string()],
+                    risk: if self_server.auth_required.unwrap_or(false) {
+                        "medium".to_string()
+                    } else {
+                        "low".to_string()
+                    },
+                    approval_required: false,
+                    reasons: vec!["local Harkonnen self-MCP transport is configured".to_string()],
+                });
+            }
+        }
+    }
+
+    for command in planned_host_command_surfaces(staged_product) {
+        if command_available(&command) {
+            requested_surfaces.push(ToolSurfaceAssessment {
+                name: command.clone(),
+                surface_type: "host_command".to_string(),
+                command: command.clone(),
+                aliases: vec!["external_process".to_string()],
+                risk: "medium".to_string(),
+                approval_required: true,
+                reasons: vec![
+                    "host command executes an external process outside the model context"
+                        .to_string(),
+                ],
+            });
+        }
+    }
+
+    let approval_blockers = requested_surfaces
+        .iter()
+        .filter(|surface| surface.approval_required)
+        .map(|surface| {
+            format!(
+                "{} ({}) risk={} reasons={}",
+                surface.name,
+                surface.surface_type,
+                surface.risk,
+                surface.reasons.join("; ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let approval_state = if approval_blockers.is_empty() {
+        "auto_approved"
+    } else {
+        "operator_review_required"
+    };
+
+    ToolTransactionArtifact {
+        transaction_id: format!("tool-transaction-{run_id}-tools"),
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        phase: "tools".to_string(),
+        agent: "keeper".to_string(),
+        status: if approval_state == "auto_approved" {
+            "auto_approved".to_string()
+        } else {
+            "open".to_string()
+        },
+        approval_state: approval_state.to_string(),
+        checkpoint_id: None,
+        opened_at: Utc::now().to_rfc3339(),
+        closed_at: None,
+        requested_surfaces,
+        guardrails: briefing.recommended_guardrails.clone(),
+        approval_blockers,
+        rollback_note:
+            "Tool transaction opened before privileged MCP/tool use. No tool invocation has been executed from this boundary yet."
+                .to_string(),
+        residual_risk: if approval_state == "auto_approved" {
+            "Only low-risk read-only/local tool surfaces were identified.".to_string()
+        } else {
+            "Privileged tool/MCP surfaces require operator approval before later tool-bearing phases proceed."
+                .to_string()
+        },
+        approval_decision: None,
+        operator_guidance: None,
+        approved_by: None,
+        approved_at: None,
+    }
+}
+
+fn assess_mcp_tool_surface(server: &crate::setup::McpServerConfig) -> ToolSurfaceAssessment {
+    let aliases = server.tool_aliases.clone().unwrap_or_default();
+    let mut reasons = Vec::new();
+    let mut approval_required = false;
+    let haystack = format!(
+        "{} {} {} {}",
+        server.name.to_ascii_lowercase(),
+        server.command.to_ascii_lowercase(),
+        server.args.join(" ").to_ascii_lowercase(),
+        aliases.join(" ").to_ascii_lowercase()
+    );
+
+    if aliases.iter().any(|alias| {
+        let alias = alias.to_ascii_lowercase();
+        alias.contains("write") || alias.contains("artifact_writer") || alias.contains("store")
+    }) {
+        approval_required = true;
+        reasons.push("surface can write or persist data".to_string());
+    }
+    if haystack.contains("github")
+        || haystack.contains("brave")
+        || haystack.contains("search")
+        || haystack.contains("fetch")
+        || haystack.contains("http")
+    {
+        approval_required = true;
+        reasons.push("surface can reach networked or external systems".to_string());
+    }
+    if server
+        .env
+        .as_ref()
+        .map(|env| !env.is_empty())
+        .unwrap_or(false)
+        || haystack.contains("token")
+        || haystack.contains("key")
+        || haystack.contains("secret")
+    {
+        approval_required = true;
+        reasons.push("surface may require secrets or environment credentials".to_string());
+    }
+    if server.command != "cargo" && server.command != "harkonnen" && server.command != "builtin" {
+        approval_required = true;
+        reasons.push(format!(
+            "surface launches external command `{}`",
+            server.command
+        ));
+    }
+    if reasons.is_empty() {
+        reasons.push("read-only local metadata surface".to_string());
+    }
+
+    let risk = if approval_required {
+        "high"
+    } else if server.command == "npx" || server.command == "node" {
+        "medium"
+    } else {
+        "low"
+    };
+
+    ToolSurfaceAssessment {
+        name: server.name.clone(),
+        surface_type: "mcp_server".to_string(),
+        command: format!("{} {}", server.command, server.args.join(" "))
+            .trim()
+            .to_string(),
+        aliases,
+        risk: risk.to_string(),
+        approval_required,
+        reasons,
+    }
+}
+
+fn planned_host_command_surfaces(staged_product: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if staged_product.join("Cargo.toml").exists() {
+        commands.push("cargo".to_string());
+    }
+    if staged_product.join("package.json").exists() {
+        commands.push("npm".to_string());
+        commands.push("node".to_string());
+    }
+    if staged_product.join("Dockerfile").exists()
+        || staged_product.join("docker-compose.yml").exists()
+    {
+        commands.push("docker".to_string());
+    }
+    if staged_product.join("pyproject.toml").exists()
+        || staged_product.join("requirements.txt").exists()
+    {
+        if command_available("python3") {
+            commands.push("python3".to_string());
+        } else {
+            commands.push("python".to_string());
+        }
+    }
+    if command_available("openclaw") {
+        commands.push("openclaw".to_string());
+    }
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn finalize_transaction_boundary(
+    boundary: &mut TransactionBoundaryArtifact,
+    mutation_status: &str,
+    post_action_snapshot: WorkspaceStateSnapshot,
+) {
+    let before = serde_json::to_string(&boundary.pre_action_snapshot).ok();
+    let after = serde_json::to_string(&post_action_snapshot).ok();
+    let diff = summarize_episode_state_diff(before.as_deref(), after.as_deref());
+    let diff_summary = diff
+        .as_ref()
+        .map(|value| value.summary.clone())
+        .unwrap_or_else(|| "workspace diff unavailable".to_string());
+
+    boundary.closed_at = Some(Utc::now().to_rfc3339());
+    boundary.post_action_snapshot = Some(post_action_snapshot);
+    boundary.status = match mutation_status {
+        "applied" => "committed".to_string(),
+        "no_changes" | "skipped" => "closed_without_changes".to_string(),
+        "blocked" | "failed" => "aborted".to_string(),
+        other => format!("closed_{other}"),
+    };
+    boundary.rollback_note = format!(
+        "Transaction closed with Mason edit status '{mutation_status}'. Workspace delta: {diff_summary}. To roll back, restore files listed in the pre-action snapshot or discard the staged workspace."
+    );
+    boundary.residual_risk = match diff {
+        Some(value)
+            if !value.added_files.is_empty()
+                || !value.modified_files.is_empty()
+                || !value.removed_files.is_empty() =>
+        {
+            format!(
+                "Review changed files before promotion: added={}, modified={}, removed={}.",
+                value.added_files.len(),
+                value.modified_files.len(),
+                value.removed_files.len()
+            )
+        }
+        Some(_) => "No staged workspace file changes were detected.".to_string(),
+        None => "Workspace diff could not be computed from transaction snapshots.".to_string(),
+    };
+}
+
+fn render_transaction_boundary_markdown(boundary: &TransactionBoundaryArtifact) -> String {
+    let planned = if boundary.planned_mutation_set.is_empty() {
+        "- <none declared>".to_string()
+    } else {
+        boundary
+            .planned_mutation_set
+            .iter()
+            .map(|path| format!("- {}", path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let blockers = if boundary.approval_blockers.is_empty() {
+        "- none".to_string()
+    } else {
+        boundary
+            .approval_blockers
+            .iter()
+            .map(|blocker| format!("- {}", blocker))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guardrails = if boundary.guardrails.is_empty() {
+        "- none".to_string()
+    } else {
+        boundary
+            .guardrails
+            .iter()
+            .take(12)
+            .map(|guardrail| format!("- {}", guardrail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let checkpoint = boundary.checkpoint_id.as_deref().unwrap_or("none");
+    let rollback_backup = boundary.rollback_backup_path.as_deref().unwrap_or("none");
+    let approval_decision = boundary.approval_decision.as_deref().unwrap_or("none");
+    let approved_by = boundary.approved_by.as_deref().unwrap_or("none");
+    let approved_at = boundary.approved_at.as_deref().unwrap_or("none");
+    let operator_guidance = boundary
+        .operator_guidance
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none");
+    let post_snapshot = boundary
+        .post_action_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            format!(
+                "{} file(s), {} bytes",
+                snapshot.file_count, snapshot.total_bytes
+            )
+        })
+        .unwrap_or_else(|| "not captured yet".to_string());
+
+    format!(
+        "# Transaction Boundary: Implementation\n\n\
+         - Boundary: {}\n\
+         - Run: {}\n\
+         - Spec: {}\n\
+         - Phase: {}\n\
+         - Agent: {}\n\
+         - Status: {}\n\
+         - Approval state: {}\n\
+         - Approval decision: {}\n\
+         - Approved by: {}\n\
+         - Approved at: {}\n\
+         - Rollback backup: {}\n\
+         - Checkpoint: {}\n\
+         - Opened: {}\n\
+         - Closed: {}\n\n\
+         ## Operator Guidance\n{}\n\n\
+         ## Planned Mutation Set\n{}\n\n\
+         ## Approval Blockers\n{}\n\n\
+         ## Guardrails\n{}\n\n\
+         ## Snapshots\n\
+         - Pre-action: {} file(s), {} bytes\n\
+         - Post-action: {}\n\n\
+         ## Rollback Note\n{}\n\n\
+         ## Residual Risk\n{}\n",
+        boundary.boundary_id,
+        boundary.run_id,
+        boundary.spec_id,
+        boundary.phase,
+        boundary.agent,
+        boundary.status,
+        boundary.approval_state,
+        approval_decision,
+        approved_by,
+        approved_at,
+        rollback_backup,
+        checkpoint,
+        boundary.opened_at,
+        boundary.closed_at.as_deref().unwrap_or("open"),
+        operator_guidance,
+        planned,
+        blockers,
+        guardrails,
+        boundary.pre_action_snapshot.file_count,
+        boundary.pre_action_snapshot.total_bytes,
+        post_snapshot,
+        boundary.rollback_note,
+        boundary.residual_risk,
+    )
+}
+
+fn render_tool_transaction_markdown(transaction: &ToolTransactionArtifact) -> String {
+    let checkpoint = transaction.checkpoint_id.as_deref().unwrap_or("none");
+    let approval_decision = transaction.approval_decision.as_deref().unwrap_or("none");
+    let approved_by = transaction.approved_by.as_deref().unwrap_or("none");
+    let approved_at = transaction.approved_at.as_deref().unwrap_or("none");
+    let operator_guidance = transaction
+        .operator_guidance
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none");
+    let surfaces = if transaction.requested_surfaces.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .requested_surfaces
+            .iter()
+            .map(|surface| {
+                format!(
+                    "- `{}` [{}] risk={} approval_required={} aliases={} reasons={}",
+                    surface.name,
+                    surface.surface_type,
+                    surface.risk,
+                    surface.approval_required,
+                    if surface.aliases.is_empty() {
+                        "none".to_string()
+                    } else {
+                        surface.aliases.join(", ")
+                    },
+                    surface.reasons.join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let blockers = if transaction.approval_blockers.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .approval_blockers
+            .iter()
+            .map(|blocker| format!("- {}", blocker))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guardrails = if transaction.guardrails.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .guardrails
+            .iter()
+            .take(12)
+            .map(|guardrail| format!("- {}", guardrail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "# Tool Transaction Boundary\n\n\
+         - Transaction: {}\n\
+         - Run: {}\n\
+         - Spec: {}\n\
+         - Phase: {}\n\
+         - Agent: {}\n\
+         - Status: {}\n\
+         - Approval state: {}\n\
+         - Approval decision: {}\n\
+         - Approved by: {}\n\
+         - Approved at: {}\n\
+         - Checkpoint: {}\n\
+         - Opened: {}\n\
+         - Closed: {}\n\n\
+         ## Operator Guidance\n{}\n\n\
+         ## Requested Surfaces\n{}\n\n\
+         ## Approval Blockers\n{}\n\n\
+         ## Guardrails\n{}\n\n\
+         ## Rollback Note\n{}\n\n\
+         ## Residual Risk\n{}\n",
+        transaction.transaction_id,
+        transaction.run_id,
+        transaction.spec_id,
+        transaction.phase,
+        transaction.agent,
+        transaction.status,
+        transaction.approval_state,
+        approval_decision,
+        approved_by,
+        approved_at,
+        checkpoint,
+        transaction.opened_at,
+        transaction.closed_at.as_deref().unwrap_or("open"),
+        operator_guidance,
+        surfaces,
+        blockers,
+        guardrails,
+        transaction.rollback_note,
+        transaction.residual_risk,
+    )
 }
 
 fn pearl_hierarchy_for_causal_link(link_type: &str) -> PearlHierarchyLevel {
@@ -23456,6 +25364,49 @@ mod tests {
         }
     }
 
+    fn sample_briefing() -> CoobieBriefing {
+        CoobieBriefing {
+            spec_id: "spec-1".to_string(),
+            product: "product".to_string(),
+            query_terms: Vec::new(),
+            domain_signals: Vec::new(),
+            prior_report_count: 0,
+            memory_hits: Vec::new(),
+            core_memory_hits: Vec::new(),
+            project_memory_hits: Vec::new(),
+            resume_packet_summary: Vec::new(),
+            resume_packet_risks: Vec::new(),
+            stale_memory_mitigation_plan: Vec::new(),
+            exploration_citations: Vec::new(),
+            strategy_register_citations: Vec::new(),
+            mitigation_history_citations: Vec::new(),
+            evidence_pattern_exemplar_citations: Vec::new(),
+            evidence_causal_exemplar_citations: Vec::new(),
+            nearest_evidence_window_citations: Vec::new(),
+            pattern_matching_focus: Vec::new(),
+            causal_chain_focus: Vec::new(),
+            forge_evidence_citations: Vec::new(),
+            preferred_forge_outcome_citations: Vec::new(),
+            preferred_forge_commands: Vec::new(),
+            relevant_lessons: Vec::new(),
+            prior_causes: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            project_memory_root: None,
+            application_risks: Vec::new(),
+            environment_risks: Vec::new(),
+            regulatory_considerations: Vec::new(),
+            operator_model_context: None,
+            project_interview_context: None,
+            soul_identity_context: None,
+            recommended_guardrails: Vec::new(),
+            required_checks: Vec::new(),
+            open_questions: Vec::new(),
+            coobie_response: String::new(),
+            generated_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn structured_benchmark_intent_recognizes_devbench_specs() {
         let spec = Spec {
@@ -23672,6 +25623,185 @@ mod tests {
         assert!(required_checks
             .iter()
             .any(|item| item.contains("replacing department-owned software")));
+    }
+
+    #[test]
+    fn implementation_transaction_boundary_requires_review_when_blocked() {
+        let boundary = build_implementation_transaction_boundary(
+            "run-1",
+            "spec-1",
+            vec!["src/lib.rs".to_string()],
+            vec!["Do not touch production config".to_string()],
+            vec!["Plan repeats known dead end".to_string()],
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 12,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 12,
+                    hash: "1111111111111111".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:00Z".to_string(),
+            },
+        );
+
+        assert_eq!(boundary.approval_state, "operator_review_required");
+        assert_eq!(boundary.status, "open");
+        assert!(
+            render_transaction_boundary_markdown(&boundary).contains("Plan repeats known dead end")
+        );
+    }
+
+    #[test]
+    fn implementation_transaction_boundary_finalizes_with_residual_risk() {
+        let mut boundary = build_implementation_transaction_boundary(
+            "run-1",
+            "spec-1",
+            vec!["src/lib.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 12,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 12,
+                    hash: "1111111111111111".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:00Z".to_string(),
+            },
+        );
+
+        finalize_transaction_boundary(
+            &mut boundary,
+            "applied",
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 18,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 18,
+                    hash: "2222222222222222".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:01Z".to_string(),
+            },
+        );
+
+        assert_eq!(boundary.status, "committed");
+        assert!(boundary.rollback_note.contains("Workspace delta"));
+        assert!(boundary.residual_risk.contains("modified=1"));
+    }
+
+    #[test]
+    fn transaction_checkpoint_decision_parses_operator_outcomes() {
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Approved, proceed with the Mason patch.",
+                &Some(serde_json::json!({"decision": "approve"})),
+            ),
+            TransactionCheckpointDecision::Approve
+        );
+        assert_eq!(
+            transaction_checkpoint_decision("Reject this mutation.", &None),
+            TransactionCheckpointDecision::Reject
+        );
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Revise the plan before applying.",
+                &Some(serde_json::json!({"decision": "revision_requested"})),
+            ),
+            TransactionCheckpointDecision::Revise
+        );
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Roll back to the pre-action snapshot.",
+                &Some(serde_json::json!({"decision": "rollback"})),
+            ),
+            TransactionCheckpointDecision::Rollback
+        );
+    }
+
+    #[test]
+    fn transaction_rollback_restore_replaces_target_from_backup() {
+        let base = std::env::temp_dir().join(format!("harkonnen-rollback-test-{}", Uuid::new_v4()));
+        let backup = base.join("backup");
+        let target = base.join("target");
+        std::fs::create_dir_all(backup.join("src")).expect("create backup");
+        std::fs::create_dir_all(target.join("src")).expect("create target");
+        std::fs::write(backup.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }\n")
+            .expect("write backup file");
+        std::fs::write(target.join("src/lib.rs"), "pub fn answer() -> i32 { 41 }\n")
+            .expect("write target file");
+        std::fs::write(target.join("src/extra.rs"), "// should disappear\n")
+            .expect("write extra file");
+
+        restore_dir_from_backup(&backup, &target).expect("restore backup");
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("src/lib.rs")).expect("read restored file"),
+            "pub fn answer() -> i32 { 42 }\n"
+        );
+        assert!(!target.join("src/extra.rs").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn tool_transaction_requires_review_for_write_or_network_surfaces() {
+        let setup = crate::setup::SetupConfig {
+            setup: crate::setup::SetupMeta {
+                name: "test".to_string(),
+                template: None,
+                role: None,
+                organization: None,
+                platform: "linux".to_string(),
+                anythingllm: None,
+                openclaw: None,
+            },
+            machine: None,
+            providers: crate::setup::ProvidersConfig {
+                default: "claude".to_string(),
+                claude: None,
+                gemini: None,
+                codex: None,
+                extras: std::collections::HashMap::new(),
+            },
+            routing: None,
+            mcp: Some(crate::setup::McpConfig {
+                servers: vec![
+                    crate::setup::McpServerConfig {
+                        name: "filesystem".to_string(),
+                        command: "npx".to_string(),
+                        args: vec!["@modelcontextprotocol/server-filesystem".to_string()],
+                        env: None,
+                        tool_aliases: Some(vec![
+                            "filesystem_read".to_string(),
+                            "workspace_write".to_string(),
+                        ]),
+                    },
+                    crate::setup::McpServerConfig {
+                        name: "sqlite".to_string(),
+                        command: "builtin".to_string(),
+                        args: Vec::new(),
+                        env: None,
+                        tool_aliases: Some(vec!["db_read".to_string()]),
+                    },
+                ],
+                self_server: None,
+            }),
+            calvin_archive: Default::default(),
+        };
+        let staged = std::env::temp_dir().join(format!("harkonnen-tool-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&staged).expect("create staged dir");
+        let artifact =
+            build_tool_transaction_artifact("run-1", "spec-1", &setup, &staged, &sample_briefing());
+
+        assert_eq!(artifact.approval_state, "operator_review_required");
+        assert!(artifact
+            .approval_blockers
+            .iter()
+            .any(|blocker| blocker.contains("filesystem")));
+        assert!(render_tool_transaction_markdown(&artifact).contains("workspace_write"));
+        let _ = std::fs::remove_dir_all(staged);
     }
 
     #[test]

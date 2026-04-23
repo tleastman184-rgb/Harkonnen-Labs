@@ -1,0 +1,390 @@
+# Operator Model — Full Five-Layer Interview Spec
+# Extends the shipped v1-D two-layer MVP.
+# This document specifies the remaining three layers (3–5), the checkpoint
+# format per layer, the artifact field mappings, and the post-run update loop.
+#
+# Shipped layers (v1-D): 1 (operating_rhythms), 2 (recurring_decisions)
+# Specified here: 3 (dependencies), 4 (institutional_knowledge), 5 (friction)
+# Plus: post-run update review loop and OB1-compatible export bundle.
+
+schema_version: "1.0"
+interview_layers:
+
+  # ─────────────────────────────────────────────────────
+  # LAYER 1 — Operating Rhythms (SHIPPED in v1-D)
+  # ─────────────────────────────────────────────────────
+  - layer_id: operating_rhythms
+    layer_number: 1
+    status: shipped
+    title: Operating Rhythms
+    purpose: >
+      Capture how the operator's work actually flows: sprint cadence, session
+      patterns, which tools anchor the day. Scout uses this to shape spec
+      drafting around realistic workflow constraints.
+    questions:
+      - id: OR-1
+        prompt: "How does your work week break down? (e.g. planning on Monday, heads-down Tue–Thu, review Friday)"
+        extracts: [weekly_pattern, planning_cadence]
+      - id: OR-2
+        prompt: "What's a typical session length when you're deep in a problem?"
+        extracts: [session_length, interruption_tolerance]
+      - id: OR-3
+        prompt: "Which tools do you reach for first when starting something new? (editor, terminal, docs, etc.)"
+        extracts: [preferred_tools, startup_ritual]
+      - id: OR-4
+        prompt: "Are there fixed times or events that hard-stop your work regardless of where you are?"
+        extracts: [hard_stops, calendar_constraints]
+    checkpoint_type: operator_model_layer
+    checkpoint_prompt_template: >
+      Here's what I've captured about your operating rhythms. Does this reflect
+      how you actually work, or would you adjust anything before I continue?
+    artifact_fields:
+      - weekly_pattern
+      - session_length_minutes
+      - interruption_tolerance
+      - preferred_tools
+      - hard_stops
+    commissioning_brief_contribution:
+      - top-3 preferred_tools → Scout intent package context
+      - session_length_minutes → run timeout recommendations
+
+  # ─────────────────────────────────────────────────────
+  # LAYER 2 — Recurring Decisions (SHIPPED in v1-D)
+  # ─────────────────────────────────────────────────────
+  - layer_id: recurring_decisions
+    layer_number: 2
+    status: shipped
+    title: Recurring Decisions
+    purpose: >
+      Surface the decisions the operator makes repeatedly so the factory can
+      apply known patterns without re-asking every run.
+    questions:
+      - id: RD-1
+        prompt: "What decisions come up in almost every build that you'd like me to handle consistently?"
+        extracts: [standing_decisions]
+      - id: RD-2
+        prompt: "What does 'good enough to ship' mean in your context? What would make you hold it back?"
+        extracts: [quality_threshold, ship_blockers]
+      - id: RD-3
+        prompt: "When you hit a tricky design fork, what factors usually tip the decision?"
+        extracts: [decision_heuristics]
+      - id: RD-4
+        prompt: "What's your risk tolerance for changes that touch auth, payments, or user data?"
+        extracts: [risk_tolerances]
+    checkpoint_type: operator_model_layer
+    artifact_fields:
+      - standing_decisions
+      - quality_threshold
+      - ship_blockers
+      - decision_heuristics
+      - risk_tolerances
+    commissioning_brief_contribution:
+      - risk_tolerances → Coobie preflight required_checks and guardrail text
+      - standing_decisions → Scout intent package notes
+      - ship_blockers → Keeper policy hints
+
+  # ─────────────────────────────────────────────────────
+  # LAYER 3 — Dependencies (NEW)
+  # ─────────────────────────────────────────────────────
+  - layer_id: dependencies
+    layer_number: 3
+    status: specified
+    title: Dependencies
+    purpose: >
+      Map the external systems, services, and people the operator's work
+      depends on. Coobie uses this to flag when a spec touches a known fragile
+      or slow dependency; Keeper uses it for policy boundary hints.
+    questions:
+      - id: DEP-1
+        prompt: >
+          What external services or APIs does this project depend on?
+          Which ones are fragile, rate-limited, or slow?
+        extracts: [external_services, fragile_dependencies]
+      - id: DEP-2
+        prompt: >
+          Are there internal services or shared databases that other teams
+          also write to? Where are the shared-state risks?
+        extracts: [shared_state_risks, cross_team_dependencies]
+      - id: DEP-3
+        prompt: >
+          Who are the people you need sign-off from before shipping?
+          Are there review steps that can't be skipped?
+        extracts: [required_approvers, review_gates]
+      - id: DEP-4
+        prompt: >
+          Are there dependency versions or library choices that are fixed
+          by org policy or compatibility constraints?
+        extracts: [pinned_dependencies, compatibility_constraints]
+      - id: DEP-5
+        prompt: >
+          Which dependencies are you most worried about breaking without
+          noticing? What would a silent failure look like?
+        extracts: [silent_failure_risks]
+    checkpoint_type: operator_model_layer
+    checkpoint_prompt_template: >
+      Here's what I've captured about your dependencies and the people and
+      systems you rely on. Does this match your actual landscape?
+    artifact_fields:
+      - external_services
+      - fragile_dependencies
+      - shared_state_risks
+      - cross_team_dependencies
+      - required_approvers
+      - review_gates
+      - pinned_dependencies
+      - compatibility_constraints
+      - silent_failure_risks
+    commissioning_brief_contribution:
+      - fragile_dependencies → Coobie preflight required_checks (flag when spec touches these)
+      - required_approvers → Keeper policy hints (checkpoint before changes need sign-off)
+      - pinned_dependencies → Mason workspace constraints
+      - silent_failure_risks → Sable scenario generation hints
+
+  # ─────────────────────────────────────────────────────
+  # LAYER 4 — Institutional Knowledge (NEW)
+  # ─────────────────────────────────────────────────────
+  - layer_id: institutional_knowledge
+    layer_number: 4
+    status: specified
+    title: Institutional Knowledge
+    purpose: >
+      Capture the tacit knowledge the operator carries that isn't in any doc.
+      This is the most valuable layer for long-horizon runs: the things that
+      cost a week the last time someone ignored them.
+    questions:
+      - id: IK-1
+        prompt: >
+          What's something about this codebase or team that new engineers
+          always get wrong until someone tells them?
+        extracts: [hidden_gotchas]
+      - id: IK-2
+        prompt: >
+          What past incident or failure has most shaped how you approach
+          changes in this area?
+        extracts: [formative_incidents]
+      - id: IK-3
+        prompt: >
+          Are there areas of the codebase where the docs are wrong or
+          misleading and you have to know the real behavior from experience?
+        extracts: [misleading_docs, tribal_knowledge_areas]
+      - id: IK-4
+        prompt: >
+          What do you wish the last AI tool had known before it started
+          that would have saved the most time or avoided the most damage?
+        extracts: [prior_ai_failures, what_to_know_first]
+      - id: IK-5
+        prompt: >
+          Are there decisions that were made for reasons that are no longer
+          obvious but must be preserved anyway?
+        extracts: [legacy_constraints, preserve_because]
+    checkpoint_type: operator_model_layer
+    checkpoint_prompt_template: >
+      Here's the institutional knowledge I've captured. Some of this is the
+      kind of thing that's expensive to learn the hard way. Does this match
+      what you've seen?
+    artifact_fields:
+      - hidden_gotchas
+      - formative_incidents
+      - misleading_docs
+      - tribal_knowledge_areas
+      - prior_ai_failures
+      - what_to_know_first
+      - legacy_constraints
+      - preserve_because
+    commissioning_brief_contribution:
+      - hidden_gotchas → Coobie preflight guardrails (explicit checks)
+      - prior_ai_failures → Coobie preflight causal guardrails
+      - legacy_constraints → Scout intent package constraints section
+      - misleading_docs → Coobie memory note (flag unreliable doc sources)
+    memory_write_on_approval:
+      # These fields are written directly to factory/memory/ as Coobie lessons
+      # after operator approves the layer checkpoint
+      - field: hidden_gotchas
+        memory_kind: causal_guardrail
+        scope: project
+      - field: formative_incidents
+        memory_kind: causal_precedent
+        scope: project
+      - field: prior_ai_failures
+        memory_kind: failure_pattern
+        scope: project
+      - field: legacy_constraints
+        memory_kind: constraint
+        scope: project
+
+  # ─────────────────────────────────────────────────────
+  # LAYER 5 — Friction (NEW)
+  # ─────────────────────────────────────────────────────
+  - layer_id: friction
+    layer_number: 5
+    status: specified
+    title: Friction
+    purpose: >
+      Map what slows the operator down so the factory can optimize around it.
+      Friction points are also the most common source of run abandonment and
+      mid-run frustration — capturing them makes checkpoint design more precise.
+    questions:
+      - id: FR-1
+        prompt: >
+          What part of your current workflow takes the most time but feels
+          like it shouldn't?
+        extracts: [time_sinks]
+      - id: FR-2
+        prompt: >
+          What do you find yourself doing manually that you wish was
+          automated or at least guided?
+        extracts: [manual_toil]
+      - id: FR-3
+        prompt: >
+          When a run or task fails, what's the most frustrating part of
+          figuring out why?
+        extracts: [debugging_friction, observability_gaps]
+      - id: FR-4
+        prompt: >
+          Are there things the factory does right now that feel wrong,
+          slow, or annoying? Be direct.
+        extracts: [factory_friction, direct_complaints]
+      - id: FR-5
+        prompt: >
+          What would make you trust the factory enough to let it run
+          longer without checking in?
+        extracts: [trust_conditions, autonomy_threshold]
+    checkpoint_type: operator_model_layer
+    checkpoint_prompt_template: >
+      Here's what I've captured about the friction in your current workflow.
+      Some of these the factory can help reduce directly; others are useful
+      context for how to surface questions and results without adding to the load.
+      Does this feel accurate?
+    artifact_fields:
+      - time_sinks
+      - manual_toil
+      - debugging_friction
+      - observability_gaps
+      - factory_friction
+      - direct_complaints
+      - trust_conditions
+      - autonomy_threshold
+    commissioning_brief_contribution:
+      - trust_conditions → operator context for when to auto-approve vs. checkpoint
+      - autonomy_threshold → Keeper checkpoint threshold hints
+      - observability_gaps → Pack Board surfacing priorities
+      - factory_friction → internal backlog signal (not surfaced to agents)
+
+# ─────────────────────────────────────────────────────
+# OUTPUT ARTIFACTS (full five-layer set)
+# ─────────────────────────────────────────────────────
+output_artifacts:
+  - file: commissioning-brief.json
+    status: shipped
+    purpose: >
+      Bridge artifact consumed by Scout (top-3 patterns) and Coobie preflight
+      (risk tolerances, required checks). Compact; only the most actionable
+      fields from layers 1–2 and the highest-priority entries from 3–5.
+    fields:
+      - primary_work_patterns        # from layer 1
+      - preferred_tools              # from layer 1
+      - risk_tolerances              # from layer 2
+      - standing_decisions           # from layer 2
+      - ship_blockers                # from layer 2
+      - fragile_dependencies         # from layer 3 (new)
+      - required_approvers           # from layer 3 (new)
+      - top_hidden_gotchas           # from layer 4, top 3 (new)
+      - trust_conditions             # from layer 5 (new)
+
+  - file: operating-model.json
+    status: specified
+    purpose: >
+      Full structured record of all five layers. Machine-readable; used by
+      Keeper policy hints and Coobie memory writes on promotion.
+    fields: all artifact_fields from all five layers
+
+  - file: USER.md
+    status: specified
+    purpose: >
+      Human-readable narrative of who this operator is and how they work.
+      Used as context injection for agents and as a document an operator can
+      inspect and correct.
+    sections:
+      - Work Rhythms
+      - Recurring Decisions
+      - Key Dependencies
+      - Things Worth Knowing
+      - What Slows Things Down
+
+  - file: HEARTBEAT.md
+    status: specified
+    purpose: >
+      Scheduled integrity checks and reflection triggers derived from the
+      operator's patterns. Cadence-aware: heartbeat frequency tuned to the
+      operator's stated session length and interruption tolerance.
+    sections:
+      - Session Start Checks
+      - Mid-Run Reflection Triggers
+      - End-of-Session Review Items
+      - Staleness Conditions (when to prompt an operator-model refresh)
+
+  - file: schedule-recommendations.json
+    status: specified
+    purpose: >
+      Recommended run scheduling based on operating rhythms and dependency
+      fragility. When to run heavy specs (long session windows), when to
+      avoid them (hard stops, fragile dep maintenance windows).
+    fields:
+      - recommended_run_windows
+      - avoid_windows
+      - auto_schedule_conditions
+
+# ─────────────────────────────────────────────────────
+# POST-RUN UPDATE REVIEW LOOP
+# ─────────────────────────────────────────────────────
+post_run_update_loop:
+  description: >
+    After each run, the consolidation workbench can emit
+    operator_model_update_candidates when run evidence contradicts or extends
+    the current operator model. The operator reviews and either promotes
+    (updates the model version) or discards. This keeps the model current
+    without re-running the full interview.
+  trigger_conditions:
+    - run discovers a fragile dependency not listed in layer 3
+    - Mason hits a hidden_gotcha not captured in layer 4
+    - a recurring decision was overridden by the operator mid-run (new standing decision)
+    - trust_conditions from layer 5 were met or violated explicitly
+  update_candidate_fields:
+    - layer_id         # which layer the update targets
+    - field            # which specific field to update
+    - proposed_value   # the new or additional value
+    - evidence_run_id  # the run that produced this evidence
+    - confidence       # how strongly the run evidence supports this update
+  review_flow:
+    - update candidate surfaced in Consolidation Workbench
+    - operator keeps / discards / edits
+    - kept candidates increment the operator model profile version
+    - memory writes from layer 4 fields are re-executed for new institutional_knowledge entries
+  version_tracking:
+    - each approval increments operator_model_profiles.version
+    - operator_model_layer_checkpoints stores a new row per updated layer version
+    - operator_model_exports records the artifact bundle for each version
+
+# ─────────────────────────────────────────────────────
+# OB1-COMPATIBLE EXPORT BUNDLE
+# ─────────────────────────────────────────────────────
+ob1_export:
+  description: >
+    Import/export compatibility with OB1-style operating artifacts.
+    No direct code dependency on OB1 — the mapping is field-level only.
+  export_format: json
+  mapped_fields:
+    operating_rhythms:
+      ob1_field: work_patterns
+      harkonnen_field: weekly_pattern
+    recurring_decisions:
+      ob1_field: decision_heuristics
+      harkonnen_field: decision_heuristics
+    risk_tolerances:
+      ob1_field: risk_profile
+      harkonnen_field: risk_tolerances
+  import_notes: >
+    When importing an OB1 bundle, map fields as above and mark all imported
+    entries with source=ob1_import in operator_model_entries. Run the
+    operator-model interview for any layers with no OB1 coverage (typically
+    layers 4 and 5).

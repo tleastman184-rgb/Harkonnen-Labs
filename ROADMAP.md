@@ -162,12 +162,17 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 **What to build:**
 
-- Transaction envelope for high-impact phases: capture an explicit pre-action snapshot, planned mutation set, approval state, and rollback note before execution proceeds
-- Human-interrupt checkpoint for guarded transitions: if Keeper or Coobie flags a privileged step, the run pauses at a reversible boundary rather than drifting forward and apologizing later
-- Rollback artifact written per guarded transition: what was attempted, what state changed, what was restored, and what residual risk remains
-- Decision-log integration: approval, commit, rollback, and abort outcomes become explicit decision records rather than only phase logs
+- Transaction envelope for high-impact phases: capture an explicit pre-action snapshot, planned mutation set, approval state, and rollback note before execution proceeds. **Shipped for implementation-phase Mason LLM edits** via `transaction_implementation.json`, `transaction_implementation.md`, and a run-local `transaction_backups/implementation_pre_action` restore point.
+- Human-interrupt checkpoint for guarded transitions: if Keeper or Coobie flags a privileged step, the run pauses at a reversible boundary rather than drifting forward and apologizing later. **Shipped:** Coobie implementation blockers now create a `transaction_approval_required` checkpoint before Mason edits are applied.
+- Operator checkpoint resolution: **shipped for implementation transactions.** Resolving the checkpoint with approve rehydrates `spec.yaml`, `target_source.json`, `intent.json`, `coobie_briefing.json`, and `implementation_plan.md`, applies the Mason edit lane to the staged workspace, finalizes the transaction artifact, and resumes Bramble visible validation. Reject aborts without mutation. Revise records operator guidance and leaves the run in a revision-requested state.
+- Rollback execution and artifact written per guarded transition: what was attempted, what state changed, what was restored, and what residual risk remains. **Shipped:** rollback restores the staged `product/` workspace from the transaction backup, verifies it against the pre-action snapshot, and records `rolled_back` or `rolled_back_with_drift`.
+- Privileged MCP/tool transaction envelope: **shipped at the tool-surface boundary.** The tools phase now writes `tool_transaction.json` and `tool_transaction.md`, classifies configured MCP servers and relevant host commands, auto-approves read-only/local surfaces, and opens `tool_transaction_approval_required` when write, network, secret-bearing, or external-process surfaces are present.
+- Decision-log integration: approval, commit, rollback, and abort outcomes become explicit decision records rather than only phase logs. **Shipped:** implementation transaction boundary, operator approval/reject/revise/rollback, transaction commit, transaction rollback, tool transaction boundary, and tool approval/reject/revise outcomes are recorded in the run decision log.
+- Remaining work: continue hidden-scenario/artifact/causal-report phases after approved transactions and move from tool-surface approval to invocation-level MCP gateway enforcement.
 
 **Done when:** A guarded run can pause before a privileged transition, record an approval or rejection, and either commit or roll back from a named boundary with an auditable artifact.
+
+**Status:** Implementation transaction approval, visible-validation continuation, rollback execution, and privileged tool-surface transaction envelopes shipped. Harkonnen now opens auditable boundaries around Mason LLM edits and privileged MCP/tool surfaces. Hidden-scenario continuation and invocation-level MCP gateway enforcement remain.
 
 ---
 
