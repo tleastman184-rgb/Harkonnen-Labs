@@ -134,3 +134,58 @@ command = "npx"
 args    = ["-y", "@modelcontextprotocol/server-brave-search"]
 env     = { BRAVE_API_KEY = "BRAVE_API_KEY" }
 tool_aliases = ["web_search"]
+
+# ── Sub-Agent Dispatch ─────────────────────────────────────────────────────────
+# Controls which backend handles each high-context task. DirectLlm is the
+# no-op fallback (current behavior). ClaudeCodeAgent / CodexPlanAgent provide
+# isolated context windows so exploration never lingers in the orchestrator.
+#
+# Resolution order per task:
+#   1. Agent profile dispatch.<task> (most specific)
+#   2. [sub_agents.<task_name>] here
+#   3. [sub_agents] default_mode
+#
+# See factory/context/sub-agent-dispatch-design.md for full spec.
+
+[sub_agents]
+default_mode = "direct_llm"
+
+# Coobie briefing construction — loads memory index + N .md files; biggest
+# context win. Dispatched first in Phase 5-C.
+[sub_agents.coobie_briefing]
+task         = "briefing_construction"
+backend      = "claude_code_agent"
+model        = "claude-sonnet-4-6"
+isolation    = true
+memory_write = false
+
+# Sable scenario evaluation — isolation is a correctness requirement, not
+# just a size optimisation: leaking Mason context contaminates the score.
+[sub_agents.sable_evaluation]
+task         = "scenario_evaluation"
+backend      = "claude_code_agent"
+model        = "claude-opus-4-6"
+isolation    = true
+memory_write = false
+
+# Mason failure diagnosis — Codex plan mode traces implementation failures
+# well; added in Phase 2 after the Bramble real-test harness is live.
+[sub_agents.mason_diagnosis]
+task          = "failure_diagnosis"
+backend       = "codex_plan_agent"
+model         = "gpt-4o"
+context_paths = ["src/", "tests/"]
+isolation     = true
+memory_write  = false
+
+# Scout spec intake — low context; isolation optional. Direct LLM default.
+[sub_agents.scout_intake]
+task         = "spec_intake"
+backend      = "direct_llm"
+memory_write = false
+
+# Keeper policy check — fast, low context; no isolation needed.
+[sub_agents.keeper_policy]
+task         = "policy_check"
+backend      = "direct_llm"
+memory_write = false

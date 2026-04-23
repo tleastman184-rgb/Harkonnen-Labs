@@ -15,4 +15,16 @@ allowed_tools:
   - mcp:filesystem
 disallowed_tools:
   - implementation_write
+  - memory_write
+  - db_write
 personality_file: ../personality/labrador.md
+
+# Sub-agent dispatch preferences. Isolation is a correctness requirement for
+# Sable: leaking Mason implementation context contaminates hidden-scenario scores.
+dispatch:
+  scenario_evaluation:
+    backend: claude_code_agent
+    model: claude-opus-4-6
+    isolation: true
+    memory_write: false
+    disallowed_tools: [memory_write, db_write, implementation_write]

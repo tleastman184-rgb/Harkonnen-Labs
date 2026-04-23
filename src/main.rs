@@ -16,6 +16,7 @@ mod db;
 mod embeddings;
 mod frames;
 mod helmet;
+mod hook;
 mod livecodebench;
 mod llm;
 mod locomo;
@@ -107,6 +108,7 @@ async fn main() -> Result<()> {
             let paths = config::Paths::discover()?;
             cli::handle_stamp(command, &paths).await?
         }
+        Commands::Hook { command } => cli::handle_hook(command)?,
         Commands::Subagent { command } => cli::handle_subagent(command).await?,
         Commands::Archive { command } => {
             let app = AppContext::bootstrap().await?;

@@ -213,11 +213,13 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 ---
 
-## Phase 5-C — Per-Phase Context Gating for Coobie Briefings
+## Phase 5-C — Per-Phase Context Gating + Sub-Agent Dispatch
 
-**Why:** Every agent currently receives the same Coobie preflight briefing regardless of role or phase. Scout, Mason, and Sable have fundamentally different information needs: Scout needs spec history and prior ambiguities; Mason needs failure patterns and workspace guardrails; Sable needs scenario patterns and what Mason changed. Giving each agent the full undifferentiated corpus wastes context window and, more importantly, risks priming agents with information they should not see at their phase — most critically, Sable should not see Mason's implementation reasoning before scoring hidden scenarios.
+**Why:** Two compounding problems hit the orchestrator at this phase. First, every agent receives the same Coobie preflight briefing regardless of role — Scout, Mason, and Sable have fundamentally different information needs, and the undifferentiated corpus wastes context window and risks priming Sable with Mason's implementation reasoning before hidden-scenario scoring. Second, briefing construction, Sable evaluation, and Mason failure diagnosis each inflate the orchestrator's main context window with exploration that never needs to cross back: the orchestrator only needs the finished output, not the retrieval trace. Both problems share the same solution phase: scope the briefings and isolate the high-context work in sub-agents.
 
-This is a retrieval-shaping capability, not a storage change. It does not require TypeDB or Qdrant. It is placed here — before the memory module refactor — because the `BriefingScope` enum and filter logic can land in `src/coobie.rs` now and move cleanly into `src/memory/briefing.rs` during Phase 5b's refactor.
+This is a retrieval-shaping and isolation capability, not a storage change. It does not require TypeDB or Qdrant. It is placed here — before the memory module refactor — because the `BriefingScope` enum and filter logic can land in `src/coobie.rs` now and move cleanly into `src/memory/briefing.rs` during Phase 5b's refactor. The `SubAgentDispatcher` lands in `src/subagent.rs`; orchestrator call sites are thin wrappers.
+
+Full design: `factory/context/briefing-scope-design.md` (BriefingScope) and `factory/context/sub-agent-dispatch-design.md` (SubAgentDispatcher).
 
 **What to build:**
 
@@ -227,10 +229,22 @@ This is a retrieval-shaping capability, not a storage change. It does not requir
 - **Stamped project interview context as first-class preflight input** — the repo-stamp interview's Mythos/Pathos/Ethos/Episteme/Praxis material (purpose, stakes, stakeholder attitudes, prohibitions, vertical, skill sources, MCP posture) should be loaded from `.harkonnen/repo.toml` and injected into Scout + Coobie briefing shaping. This keeps project posture inspectable and continuity-aligned rather than leaving it trapped in generated markdown artifacts.
 - Wire in orchestrator: pass the correct `BriefingScope` at each phase entry point (Scout, Mason, Sable are the critical three; others can default to `OperatorQuery` for now).
 - Coobie episode record: add `briefing_scope` field so causal analysis can distinguish whether a lesson was visible at the relevant phase or not.
+- **`SubAgentDispatcher`** in `src/subagent.rs` with `dispatch(task, input) -> SubAgentResult`. Backends: `DirectLlm` (current behavior, no isolation), `ClaudeCodeAgent { model, max_turns }`, `CodexPlanAgent { model, context_paths }`, `GeminiAgent { model }`, `ExternalMcp { server, tool }`. Sub-agents read only; all memory and SQLite writes remain in the orchestrator.
+- **`[sub_agents]` config section** in `harkonnen.toml`: `default_mode = "direct_llm"` plus named task entries (`coobie_briefing`, `sable_evaluation`). Per-environment overrides via `setups/` follow the existing named-setup pattern.
+- **Agent profile `dispatch:` block** — coobie and sable profiles declare per-task backend preferences that take priority over the global TOML config. Resolution order: profile `dispatch.<task>` > `[sub_agents.<name>]` > `[sub_agents] default_mode`.
+- Wire Phase 5-C orchestrator call sites: `BriefingConstruction` dispatches to `ClaudeCodeAgent`; `ScenarioEvaluation` dispatches to `ClaudeCodeAgent` (isolation-critical). `DirectLlm` is the fallback for all other tasks.
+- `SubAgentResult` fields (`backend_used`, `tokens_used`, `duration_ms`) appended to `agent_traces` table for cost and performance observability.
 
-**Sable isolation constraint (non-negotiable):** `SablePreflight` scope must never include retrieved hits tagged `implementation_notes`, `mason_plan`, or `edit_rationale`. This is the hidden-scenario firewall. If a hit's tag set intersects these, it is dropped regardless of relevance score.
+**Sable isolation constraint (non-negotiable):** `SablePreflight` scope must never include retrieved hits tagged `implementation_notes`, `mason_plan`, or `edit_rationale`. This is the hidden-scenario firewall. If a hit's tag set intersects these, it is dropped regardless of relevance score. The `ClaudeCodeAgent` backend for `ScenarioEvaluation` enforces this at the sub-agent system prompt level in addition to the scope filter.
 
-**Done when:** Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; a log entry confirms which scope was used per phase; and Sable's briefing verifiably contains no Mason implementation content.
+**Memory write discipline:** Sub-agents dispatched via `SubAgentDispatcher` may not write to memory, SQLite, or the Calvin Archive. Their system prompts list these as `disallowed_tools`. The orchestrator receives `SubAgentResult.output` and decides what to persist.
+
+**Done when:**
+
+- Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; a log entry confirms which scope was used per phase; and Sable's briefing verifiably contains no Mason implementation content.
+- `SubAgentDispatcher` struct in `src/subagent.rs` with `dispatch()` method; `[sub_agents]` section parsed from `harkonnen.toml` into `SetupConfig`; `coobie_briefing` and `sable_evaluation` tasks dispatch to `ClaudeCodeAgent` backend.
+- Agent profile `dispatch:` blocks parsed for coobie and sable; resolution order enforced.
+- All existing tests pass (`DirectLlm` backend is a behavioral no-op vs. current calls).
 
 ---
 

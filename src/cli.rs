@@ -78,6 +78,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: SubagentCommands,
     },
+    /// Deterministic enforcement hooks for Claude Code PreToolUse / PostToolUse events.
+    /// Reads JSON from stdin; exits 0 (allow) or 2 (block).
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
     Archive {
         #[command(subcommand)]
         command: ArchiveCommands,
@@ -2251,6 +2257,33 @@ pub async fn handle_stamp(command: StampCommands, paths: &Paths) -> Result<()> {
                 .unwrap_or_else(|| paths.root.clone());
             crate::stamp::stamp_interview(&repo_path, &harkonnen_root, args.force).await?;
         }
+    }
+    Ok(())
+}
+
+// ── Hook ─────────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum HookCommands {
+    /// PreToolUse guard for Edit/Write: sable isolation + memory gate.
+    PreWrite,
+    /// PreToolUse guard for Bash: blocks destructive command patterns.
+    PreBash,
+    /// PostToolUse formatter: runs rustfmt on .rs files.
+    PostFormat,
+    /// PostToolUse audit: appends a structured entry to tool-audit.jsonl.
+    PostAudit,
+}
+
+/// Handle hook subcommands. Intentionally sync and lightweight — no AppContext.
+pub fn handle_hook(command: HookCommands) -> Result<()> {
+    let input = crate::hook::read_stdin_input();
+    let project_dir = crate::hook::resolve_project_dir();
+    match command {
+        HookCommands::PreWrite => crate::hook::run_pre_write(&input, &project_dir)?,
+        HookCommands::PreBash => crate::hook::run_pre_bash(&input)?,
+        HookCommands::PostFormat => crate::hook::run_post_format(&input)?,
+        HookCommands::PostAudit => crate::hook::run_post_audit(&input, &project_dir)?,
     }
     Ok(())
 }
