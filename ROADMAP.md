@@ -215,7 +215,7 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 ## Phase 5-C — Per-Phase Context Gating + Sub-Agent Dispatch
 
-**Why:** Two compounding problems hit the orchestrator at this phase. First, every agent receives the same Coobie preflight briefing regardless of role — Scout, Mason, and Sable have fundamentally different information needs, and the undifferentiated corpus wastes context window and risks priming Sable with Mason's implementation reasoning before hidden-scenario scoring. Second, briefing construction, Sable evaluation, and Mason failure diagnosis each inflate the orchestrator's main context window with exploration that never needs to cross back: the orchestrator only needs the finished output, not the retrieval trace. Both problems share the same solution phase: scope the briefings and isolate the high-context work in sub-agents.
+**Why:** Three compounding problems hit the orchestrator at this phase. First, every agent receives the same Coobie preflight briefing regardless of role — Scout, Mason, and Sable have fundamentally different information needs, and the undifferentiated corpus wastes context window and risks priming Sable with Mason's implementation reasoning before hidden-scenario scoring. Second, briefing construction, Sable evaluation, and Mason failure diagnosis each inflate the orchestrator's main context window with exploration that never needs to cross back: the orchestrator only needs the finished output, not the retrieval trace. Third — and most subtly — even a correctly scoped briefing can be wrong-sized: too many hits dilutes the relevant signal just as much as wrong categories. The ideal briefing has scope (right categories), relevance (right entries within those categories re-ranked against the specific task), and volume (right total token count). All three must hold simultaneously. Both the scoping and volume problems share the same solution phase: replace the flat `BriefingScope` parameter with a `ContextTarget` that carries all three dimensions, and isolate the high-context work in sub-agents.
 
 This is a retrieval-shaping and isolation capability, not a storage change. It does not require TypeDB or Qdrant. It is placed here — before the memory module refactor — because the `BriefingScope` enum and filter logic can land in `src/coobie.rs` now and move cleanly into `src/memory/briefing.rs` during Phase 5b's refactor. The `SubAgentDispatcher` lands in `src/subagent.rs`; orchestrator call sites are thin wrappers.
 
@@ -223,12 +223,25 @@ Full design: `factory/context/briefing-scope-design.md` (BriefingScope) and `fac
 
 **What to build:**
 
-- `BriefingScope` enum in `src/coobie.rs` (migrates to `src/memory/briefing.rs` in Phase 5b): `ScoutPreflight`, `MasonPreflight`, `PiperPreflight`, `SablePreflight`, `CoobiConsolidation`, `OperatorQuery`. Each variant carries a `phase_id` and a `role` tag.
+- `BriefingScope` enum in `src/coobie.rs` (migrates to `src/memory/briefing.rs` in Phase 5b): `ScoutPreflight`, `MasonPreflight`, `PiperPreflight`, `SablePreflight`, `CoobiConsolidation`, `OperatorQuery`. Each variant carries a `phase_id` and a `role` tag. `BriefingScope` defines the *category filter only* — it remains the clean enum it is now.
 - Scope-keyed retrieval filter: each scope defines an `allow_categories` list (e.g. Scout: `spec_history, prior_ambiguities, operator_model`; Mason: `failure_patterns, fix_patterns, workspace_guardrails, causal_links`; Sable: `scenario_patterns, hidden_scenario_outcomes` — explicitly excludes Mason implementation notes).
-- `build_scoped_briefing(scope: BriefingScope, run_id, spec_id) -> BriefingPackage` replaces the current single-path `build_preflight_briefing`. Internally calls the same multi-hop retrieval chain but filters retrieved hits against the scope's `allow_categories` before assembling the briefing text.
-- **Stamped project interview context as first-class preflight input** — the repo-stamp interview's Mythos/Pathos/Ethos/Episteme/Praxis material (purpose, stakes, stakeholder attitudes, prohibitions, vertical, skill sources, MCP posture) should be loaded from `.harkonnen/repo.toml` and injected into Scout + Coobie briefing shaping. This keeps project posture inspectable and continuity-aligned rather than leaving it trapped in generated markdown artifacts.
-- Wire in orchestrator: pass the correct `BriefingScope` at each phase entry point (Scout, Mason, Sable are the critical three; others can default to `OperatorQuery` for now).
-- Coobie episode record: add `briefing_scope` field so causal analysis can distinguish whether a lesson was visible at the relevant phase or not.
+- **`ContextTarget`** struct wrapping `BriefingScope` with the two missing dimensions:
+
+  ```rust
+  pub struct ContextTarget {
+      pub scope: BriefingScope,
+      pub task_description: String,  // re-ranks hits by similarity to THIS task, not a generic query
+      pub token_budget: u32,         // hard cap; hits truncated in relevance order after scope filter
+      pub min_hits: u32,             // always include at least N hits regardless of score
+      pub required_sections: Vec<ContextSection>, // injected first, outside the token budget
+  }
+  ```
+
+  `build_targeted_briefing(target: ContextTarget, run_id, spec_id) -> BriefingPackage` replaces the current `build_preflight_briefing`. Internally: scope filter → re-rank hits by `task_description` embedding similarity → inject `required_sections` → fill remaining budget with top-ranked hits. The orchestrator constructs a `ContextTarget` per phase entry point using a `phase_defaults()` function that provides sane budgets and required sections per scope.
+
+- **Stamped project interview context as first-class preflight input** — the repo-stamp interview's Mythos/Pathos/Ethos/Episteme/Praxis material (purpose, stakes, stakeholder attitudes, prohibitions, vertical, skill sources, MCP posture) should be loaded from `.harkonnen/repo.toml` and injected into Scout + Coobie briefing shaping as a `required_sections` entry (always present, outside the ranked budget). This keeps project posture inspectable and continuity-aligned rather than leaving it trapped in generated markdown artifacts.
+- Wire in orchestrator: construct a `ContextTarget` at each phase entry point (Scout, Mason, Sable are the critical three; others can default to `OperatorQuery` scope with a conservative `token_budget`). The `task_description` is the spec title + active task for that phase.
+- Coobie episode record: add `briefing_scope`, `briefing_tokens_used`, and `briefing_hits_provided` fields so causal analysis can distinguish whether a lesson was visible at the relevant phase and whether the briefing was over- or under-loaded.
 - **`SubAgentDispatcher`** in `src/subagent.rs` with `dispatch(task, input) -> SubAgentResult`. Backends: `DirectLlm` (current behavior, no isolation), `ClaudeCodeAgent { model, max_turns }`, `CodexPlanAgent { model, context_paths }`, `GeminiAgent { model }`, `ExternalMcp { server, tool }`. Sub-agents read only; all memory and SQLite writes remain in the orchestrator.
 - **`[sub_agents]` config section** in `harkonnen.toml`: `default_mode = "direct_llm"` plus named task entries (`coobie_briefing`, `sable_evaluation`). Per-environment overrides via `setups/` follow the existing named-setup pattern.
 - **Agent profile `dispatch:` block** — coobie and sable profiles declare per-task backend preferences that take priority over the global TOML config. Resolution order: profile `dispatch.<task>` > `[sub_agents.<name>]` > `[sub_agents] default_mode`.
@@ -241,7 +254,8 @@ Full design: `factory/context/briefing-scope-design.md` (BriefingScope) and `fac
 
 **Done when:**
 
-- Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; a log entry confirms which scope was used per phase; and Sable's briefing verifiably contains no Mason implementation content.
+- Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; a log entry confirms which scope and token budget were used per phase; and Sable's briefing verifiably contains no Mason implementation content.
+- `ContextTarget` struct in `src/coobie.rs`; `build_targeted_briefing()` replaces `build_preflight_briefing`; `phase_defaults()` provides sane per-scope budgets; episode record captures `briefing_tokens_used` and `briefing_hits_provided`.
 - `SubAgentDispatcher` struct in `src/subagent.rs` with `dispatch()` method; `[sub_agents]` section parsed from `harkonnen.toml` into `SetupConfig`; `coobie_briefing` and `sable_evaluation` tasks dispatch to `ClaudeCodeAgent` backend.
 - Agent profile `dispatch:` blocks parsed for coobie and sable; resolution order enforced.
 - All existing tests pass (`DirectLlm` backend is a behavioral no-op vs. current calls).
@@ -269,9 +283,10 @@ src/memory/
   causal.rs       # causal links, failure patterns
   consolidation.rs
   blackboard.rs
-  retrieval.rs    # build_scoped_briefing() migrates here from src/coobie.rs
+  retrieval.rs    # build_targeted_briefing() migrates here from src/coobie.rs
   extraction.rs
-  briefing.rs     # BriefingScope enum + scoped retrieval (migrated from Phase 5-C)
+  briefing.rs     # BriefingScope enum + ContextTarget struct (migrated from Phase 5-C)
+  context_budget.rs  # phase_defaults(), ContextSection, token counting utilities
 ```
 
 No behaviour change. This is the maintainability gate that lets TypeDB's `SemanticMemory` implementation slot in cleanly in Phase 6.
@@ -280,9 +295,30 @@ No behaviour change. This is the maintainability gate that lets TypeDB's `Semant
 
 Add `src/memory/semantic_qdrant.rs` implementing the `SemanticMemory` trait from COOBIE_SPEC against a Qdrant instance. Payload metadata fields: `org`, `role`, `product`, `spec_id`, `run_id`, `agent`, `memory_type`, `tags`, `created_at`. Qdrant replaces the SQLite vector store for long-term semantic memory; SQLite remains the short-term and episodic store. Bootstrap script at `scripts/bootstrap-coobie-memory-stack.sh` already exists.
 
-### OCR pipeline
+### Scanned document ingestion (`pdfium-render` + Claude vision)
 
-Add Tesseract-backed OCR for scanned PDFs and images. Current extractors handle text-forward formats but cannot read scanned documents. Wire through the existing `memory ingest` path: detect image-only PDFs, invoke `tesseract`, write extracted text sidecar alongside the imported asset. No new CLI surface; the existing `memory ingest` command gains silent OCR support.
+The existing `memory ingest` path already handles text-forward PDFs — files where the text layer is real and selectable. The gap is image-only PDFs: scanned documents where every page is a rasterized image with no extractable text. The fix is a two-stage pipeline wired into the existing `memory ingest` path:
+
+```text
+memory ingest <file.pdf>
+  │
+  ├─ pdfium-render → text layer present?
+  │     yes → extract directly (current behaviour, unchanged)
+  │
+  └─ no text layer (scanned)
+        │
+        ├─ pdfium-render → rasterize pages to images
+        │
+        ├─ Claude vision API → extract text per page
+        │     structured output: { page, text, confidence }
+        │
+        └─ fallback: tesseract-rs (if vision API unavailable /
+               rate-limited / cost-constrained)
+```
+
+Add `pdfium-render` to `Cargo.toml` as the rasterization layer (Rust bindings to Google's pdfium — the same engine Chrome uses). Claude vision extraction is substantially better than Tesseract on complex layouts, multi-column text, tables, and degraded scans. The existing `src/tesseract.rs` becomes the offline fallback rather than the primary path.
+
+No new CLI surface. The `memory ingest` command detects the absence of a text layer, runs the pipeline silently, and writes the extracted text sidecar alongside the imported asset. A `confidence` field in the sidecar records whether extraction came from the text layer, vision API, or Tesseract fallback, so downstream retrieval can weight hits accordingly.
 
 ### MCP prompts — live dynamic briefings from `mcp_server.rs`
 
@@ -292,14 +328,53 @@ Add a `prompts` handler to `src/mcp_server.rs` exposing:
 
 | Prompt name | Arguments | What it returns |
 | --- | --- | --- |
-| `coobie/briefing` | `run_id`, `phase`, `keywords` | Full `BriefingPackage` text from `build_scoped_briefing()` with live memory hits |
+| `coobie/briefing` | `run_id`, `phase`, `keywords`, `max_tokens?` | `BriefingPackage` from `build_targeted_briefing()` — scope + relevance + budget enforced |
 | `sable/eval-setup` | `run_id` | Sable-scoped context: scenario patterns, run artifacts, isolation confirmation — no Mason content |
 | `scout/preflight` | `spec_id`, `run_id` | Scout-scoped intent package: spec history, prior ambiguities, operator model posture |
 | `keeper/policy-check` | `action`, `context` | Policy decision context: relevant guardrails, prior decisions, risk tolerances |
 
-Each prompt handler calls the same `build_scoped_briefing()` function used by the orchestrator — same scoping rules, same isolation guarantees, same memory retrieval chain — but the output is returned to Claude Code's context window rather than passed to the orchestrator. This means an operator can invoke `/mcp coobie/briefing run_id=abc phase=mason` in any Claude Code session and get a live, correctly scoped briefing without starting a factory run.
+Each prompt handler constructs a `ContextTarget` using `phase_defaults(scope)` and calls `build_targeted_briefing()` — same scoping rules, same isolation guarantees, same relevance re-ranking and budget enforcement as the orchestrator path. The `coobie/briefing` prompt accepts an optional `max_tokens` argument to override the default budget when an operator explicitly wants a tighter or looser briefing. The output is returned to Claude Code's context window rather than passed to the orchestrator.
 
-The Sable prompt handler enforces the same `SablePreflight` scope filter as the orchestrator path: any retrieved hit tagged `implementation_notes`, `mason_plan`, `edit_rationale`, or `fix_patterns` is dropped before the prompt is returned.
+The Sable prompt handler enforces the same `SablePreflight` scope filter as the orchestrator path: any retrieved hit tagged `implementation_notes`, `mason_plan`, `edit_rationale`, or `fix_patterns` is dropped before the prompt is returned regardless of relevance score.
+
+### `memory_pull` — on-demand context retrieval mid-task
+
+Add a `memory_pull` MCP tool to `mcp_server.rs` alongside the existing tools:
+
+```text
+tool:    memory_pull
+args:    query (string), scope (BriefingScope variant), max_tokens (u32, default 500)
+returns: top-ranked memory hits relevant to query, within scope, under budget
+```
+
+This is the pull half of the context model. An agent running inside a Claude Code session that encounters uncertainty mid-task can call `memory_pull` to fetch targeted context without restarting with a new briefing. The orchestrator tracks each pull call in the episode record:
+
+```rust
+pub struct PullRecord {
+    pub query: String,
+    pub scope: String,
+    pub hits_returned: u32,
+    pub tokens_returned: u32,
+    pub phase: String,
+}
+```
+
+Over runs, the pull log reveals what the pre-run briefing consistently misses — those queries and their associated hit categories become automatic candidates for promotion into `phase_defaults()` for that scope. A `memory_pull` query that fires in the Mason phase three times in a row for the same pattern means the `MasonPreflight` budget or `allow_categories` is under-configured for that spec type.
+
+### Context utilization tracking
+
+The episode record gains a `ContextUtilization` section:
+
+```rust
+pub struct ContextUtilization {
+    pub briefing_hits_provided: u32,
+    pub briefing_tokens: u32,
+    pub mid_task_pulls: Vec<PullRecord>,
+    pub utilization_rate: f32,  // fraction of briefing hits referenced in agent output
+}
+```
+
+`utilization_rate` is computed post-run by Coobie: scan the agent's output for references to the content of each briefing hit (embedding similarity above a threshold). A briefing with `utilization_rate < 0.2` over multiple runs for the same scope is a signal that the budget is too high or the category filter is too loose. This data feeds the Phase 7 causal corpus and the Phase 8 Episteme chamber's slow-loop policy revision for scope configuration.
 
 ### Rust-native MCP server consolidation (`rmcp`)
 
@@ -334,13 +409,18 @@ Each variant is a typed `reqwest` call to the provider's REST API. `SubAgentBack
 - `LongMemEval` and `LoCoMo` re-run to confirm semantic recall quality does not regress
 - Re-run `StreamingQA` to confirm belief-update accuracy does not regress after the module refactor
 - MCP prompt round-trip test: `coobie/briefing` for a known run returns a briefing containing at least one memory hit and zero items tagged with Mason-scoped categories
+- Token budget enforcement test: `coobie/briefing` called with `max_tokens=500` returns ≤ 500 tokens of ranked content with required sections present regardless of budget
+- `memory_pull` latency: p95 round-trip under 200ms on home-linux against the live SQLite + Qdrant stack
+- Context utilization baseline: record `utilization_rate` for 10 runs across Scout, Mason, and Sable scopes; establish the floor before Phase 7 causal corpus work begins
 
 **Done when:**
 
-- `src/memory.rs` is split into the COOBIE_SPEC module tree with `BriefingScope` in `src/memory/briefing.rs`
+- `src/memory.rs` is split into the COOBIE_SPEC module tree; `BriefingScope` and `ContextTarget` live in `src/memory/briefing.rs`; `phase_defaults()` and token budget utilities in `src/memory/context_budget.rs`
+- `build_targeted_briefing()` is the sole briefing entry point; no call site uses the old `build_preflight_briefing` or `build_scoped_briefing`
 - Qdrant is serving semantic queries for long-term memory
 - OCR-scanned PDFs can be ingested via `memory ingest`
-- `mcp_server.rs` serves all four named prompts; `/mcp coobie/briefing` works in a live Claude Code session and returns a scoped, isolation-correct briefing
+- `mcp_server.rs` serves all four named prompts with `ContextTarget` budget enforcement; `memory_pull` tool is live; `/mcp coobie/briefing` works in a Claude Code session and respects `max_tokens`
+- Episode records include `ContextUtilization` with `utilization_rate`; 10-run baseline collected
 - The three `npx` MCP server entries are replaced by `harkonnen mcp serve` in `harkonnen.toml`; Node.js is no longer required at runtime
 - `llm.rs` exposes `ProviderBackend` with Anthropic, OpenAI, and Gemini variants; `SubAgentBackend::CodexPlanAgent` routes through `ProviderBackend::OpenAi` with no subprocess spawn
 
