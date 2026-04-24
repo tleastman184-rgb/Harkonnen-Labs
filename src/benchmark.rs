@@ -581,6 +581,10 @@ fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Str
 
 fn render_suite_metrics_section(suite: &BenchmarkSuiteResult) -> Option<Vec<String>> {
     let json = load_suite_summary_json(suite)?;
+    render_question_metrics_section(&json).or_else(|| render_livecodebench_metrics_section(&json))
+}
+
+fn render_question_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
     let metrics = json.get("metrics")?;
     let total_questions = metrics.get("total_questions")?.as_u64()?;
     let accuracy = metrics.get("accuracy")?.as_f64()?;
@@ -603,11 +607,7 @@ fn render_suite_metrics_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Stri
         format!("- Answered rate: {:.4}", answered_rate),
     ];
 
-    if let Some(provider_label) = json.get("provider_label").and_then(|value| value.as_str()) {
-        if !provider_label.trim().is_empty() {
-            lines.push(format!("- Provider path: {}", provider_label.trim()));
-        }
-    }
+    append_provider_path(json, &mut lines);
 
     if let Some(persistence) = json.get("persistence").and_then(|value| value.as_object()) {
         lines.push(String::new());
@@ -653,6 +653,67 @@ fn render_suite_metrics_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Stri
     }
 
     Some(lines)
+}
+
+fn render_livecodebench_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
+    let metrics = json.get("metrics")?;
+    let total_problems = metrics.get("total_problems")?.as_u64()?;
+    let pass_at_1 = metrics.get("pass_at_1")?.as_f64()?;
+
+    let mut lines = vec![
+        "### Observed Metrics".to_string(),
+        String::new(),
+        format!("- Problems: {}", total_problems),
+        format!("- Pass@1: {:.4}", pass_at_1),
+    ];
+
+    append_provider_path(json, &mut lines);
+    append_named_rate_breakdown(
+        metrics,
+        "by_difficulty",
+        "### Difficulty Breakdown",
+        &mut lines,
+    );
+    append_named_rate_breakdown(metrics, "by_platform", "### Platform Breakdown", &mut lines);
+
+    Some(lines)
+}
+
+fn append_provider_path(json: &serde_json::Value, lines: &mut Vec<String>) {
+    if let Some(provider_label) = json.get("provider_label").and_then(|value| value.as_str()) {
+        if !provider_label.trim().is_empty() {
+            lines.push(format!("- Provider path: {}", provider_label.trim()));
+        }
+    }
+}
+
+fn append_named_rate_breakdown(
+    metrics: &serde_json::Value,
+    field: &str,
+    heading: &str,
+    lines: &mut Vec<String>,
+) {
+    let Some(entries) = metrics.get(field).and_then(|value| value.as_object()) else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    lines.push(String::new());
+    lines.push(heading.to_string());
+    lines.push(String::new());
+    for (name, entry) in entries {
+        let total = entry.get("total").and_then(|value| value.as_u64());
+        let passed = entry.get("passed").and_then(|value| value.as_u64());
+        let pass_rate = entry.get("pass_rate").and_then(|value| value.as_f64());
+        if let (Some(total), Some(passed), Some(pass_rate)) = (total, passed, pass_rate) {
+            lines.push(format!(
+                "- {}: {}/{} ({:.4})",
+                name, passed, total, pass_rate
+            ));
+        }
+    }
 }
 
 fn load_suite_summary_json(suite: &BenchmarkSuiteResult) -> Option<serde_json::Value> {
@@ -1611,6 +1672,111 @@ mod tests {
         assert!(markdown.contains("### Persistence Metrics"));
         assert!(markdown.contains("- Persisted supersession events: 1"));
         assert!(markdown.contains("- Updated-fact accuracy: 1.0000"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn render_report_markdown_includes_livecodebench_metrics() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-livecodebench-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let summary_path = temp_dir.join("lcb_summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "provider_label": "direct-codex",
+                "metrics": {
+                    "total_problems": 3,
+                    "passed_problems": 2,
+                    "pass_at_1": 0.6667,
+                    "by_difficulty": {
+                        "easy": {
+                            "total": 2,
+                            "passed": 2,
+                            "pass_rate": 1.0
+                        },
+                        "medium": {
+                            "total": 1,
+                            "passed": 0,
+                            "pass_rate": 0.0
+                        }
+                    },
+                    "by_platform": {
+                        "leetcode": {
+                            "total": 1,
+                            "passed": 1,
+                            "pass_rate": 1.0
+                        },
+                        "codeforces": {
+                            "total": 1,
+                            "passed": 0,
+                            "pass_rate": 0.0
+                        }
+                    }
+                },
+                "results": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = BenchmarkRunReport {
+            version: 1,
+            generated_at: Utc::now(),
+            manifest_path: "factory/benchmarks/suites.yaml".to_string(),
+            repo_root: "/tmp/harkonnen".to_string(),
+            selected_suites: vec!["mason_livecodebench_direct".to_string()],
+            summary: BenchmarkRunSummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+            },
+            stakeholder_alignment: None,
+            suites: vec![BenchmarkSuiteResult {
+                id: "mason_livecodebench_direct".to_string(),
+                title: "Raw LLM Baseline on LiveCodeBench".to_string(),
+                subsystem: "baseline".to_string(),
+                category: "software_engineering".to_string(),
+                tier: "target".to_string(),
+                description: "LiveCodeBench smoke".to_string(),
+                benchmark_url: None,
+                leaderboard_url: None,
+                baseline_reference: None,
+                setup_notes: Vec::new(),
+                required_env: Vec::new(),
+                tags: Vec::new(),
+                status: BenchmarkStatus::Passed,
+                duration_ms: 1,
+                reason: None,
+                steps: vec![BenchmarkStepResult {
+                    id: "livecodebench_direct_adapter".to_string(),
+                    label: "LiveCodeBench raw-model adapter".to_string(),
+                    status: BenchmarkStatus::Passed,
+                    program: "builtin".to_string(),
+                    args: Vec::new(),
+                    cwd: temp_dir.display().to_string(),
+                    duration_ms: 1,
+                    exit_code: None,
+                    stdout: format!("Summary JSON: {}", summary_path.display()),
+                    stderr: String::new(),
+                    reason: None,
+                }],
+            }],
+        };
+
+        let markdown = render_report_markdown(&report);
+        assert!(markdown.contains("### Observed Metrics"));
+        assert!(markdown.contains("- Problems: 3"));
+        assert!(markdown.contains("- Pass@1: 0.6667"));
+        assert!(markdown.contains("- Provider path: direct-codex"));
+        assert!(markdown.contains("### Difficulty Breakdown"));
+        assert!(markdown.contains("- easy: 2/2 (1.0000)"));
+        assert!(markdown.contains("### Platform Breakdown"));
+        assert!(markdown.contains("- codeforces: 0/1 (0.0000)"));
 
         fs::remove_dir_all(temp_dir).unwrap();
     }

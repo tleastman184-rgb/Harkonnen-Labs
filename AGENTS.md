@@ -438,8 +438,12 @@ security_expectations: [auth, secrets, isolation]
 **[ROADMAP.md](ROADMAP.md) is the canonical phase-by-phase build order.**
 All agents and contributors must check it before starting new work.
 Phases 1, 4, 4b, and 5 are already shipped.
-The active numbered build phases are Phase 2 (Bramble real test execution) and
-Phase 3 (Flint docs, spec-grounded evaluation, and DevBench readiness, with
+The active numbered build phase is Phase 2 (Bramble real test execution), with
+Phase 5-C now explicitly split into `5-C1` (shipped: Coobie preflight
+`ContextTarget` budgeting + attribution telemetry), `5-C2` (shipped: Scout /
+Mason / Sable scope split plus scoped preflight artifacts and repo-local
+prompt filtering), and `5-C3` (next: sub-agent dispatch/isolation).
+Phase 10 (Flint docs, spec-grounded evaluation, and DevBench readiness, with
 live twin provisioning deferred unless a future product needs it), with
 Operator Model Activation running as a parallel product/control-plane track.
 Long-term roadmap work remains Phase 5b
@@ -495,7 +499,7 @@ Long-term roadmap work remains Phase 5b
 ### Planned (next build layer)
 
 - **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
-- **Phase 3** — Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter; twin provisioning remains deferred unless a future product needs running service virtualization
+- **Phase 10** — Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter; twin provisioning remains deferred unless a future product needs running service virtualization
 - **Operator Model full five-layer interview** — extend the v1-D MVP (two layers shipped) to cover dependencies, institutional knowledge, and friction; generate full artifact set
 - **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` refactor into a proper module tree
 - **Phase 6** — TypeDB 3.x semantic graph layer (see MASTER_SPEC.md Part 4); GAIA Level 3 and AgentBench adapters

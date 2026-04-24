@@ -20,18 +20,18 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, AgentRuntimeState, BlackboardState, CausalEventEdge, CausalEventNode,
-        CheckpointAnswerRecord, CommissioningBrief, ConsolidationCandidate, CoobieBriefing,
-        CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord, EpisodeStateDiff,
-        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
-        EvidenceMatchAssessment, EvidenceMatchReport, EvidenceSource, EvidenceTimeRange,
-        EvidenceWindowMatch, FailureKind, HiddenScenarioCheckResult, HiddenScenarioEvaluation,
-        HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent, OperatorModelContext,
-        PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal, ProjectInterviewContext,
-        ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
-        RunTimingReport, ScenarioResult, SoulIdentityContext, Spec, StakeholderAlignmentSummary,
-        TwinEnvironment, TwinFailureMode, TwinService, TwinServiceSpec, ValidationSummary,
-        WorkerHarnessConfig,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingScope, CausalEventEdge,
+        CausalEventNode, CheckpointAnswerRecord, CommissioningBrief, ConsolidationCandidate,
+        ContextSection, ContextTarget, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState,
+        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
+        EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, FailureKind,
+        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
+        LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
+        PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
+        RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
+        SoulIdentityContext, Spec, StakeholderAlignmentSummary, TwinEnvironment, TwinFailureMode,
+        TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
@@ -162,6 +162,49 @@ struct CommandTrialReport {
     passed: bool,
     summary: String,
     commands: Vec<CommandTrialRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidationRepairAttemptRecord {
+    iteration: u32,
+    proposal_summary: String,
+    #[serde(default)]
+    proposal_rationale: Vec<String>,
+    edits_applied: usize,
+    before_summary: String,
+    after_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_kind_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_kind_after: Option<String>,
+    #[serde(default)]
+    before_failing_checks: Vec<String>,
+    #[serde(default)]
+    after_failing_checks: Vec<String>,
+    outcome: String,
+    guidance_for_next_attempt: String,
+    passed_after: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidationRepairArtifact {
+    run_id: String,
+    spec_id: String,
+    #[serde(default)]
+    product: String,
+    generated_at: String,
+    #[serde(default)]
+    attempts: Vec<ValidationRepairAttemptRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct BrambleTestHarnessResult {
+    results: Vec<ScenarioResult>,
+    output_chunks: Vec<String>,
+    command_trials: Vec<CommandTrialRecord>,
+    wrong_answer_evidence: BTreeMap<String, crate::models::WrongAnswerEvidence>,
+    real_test_commands: usize,
+    passed_real_test_commands: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +374,15 @@ struct CollectedMemoryHits {
     ids: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct BriefingMemorySelection {
+    memory_hits: Vec<String>,
+    core_memory_hits: Vec<String>,
+    project_memory_hits: Vec<String>,
+    tokens_used: u32,
+    hits_provided: usize,
+}
+
 /// A causal cause that has fired on prior runs of a specific spec.
 /// Used to drive concrete preflight guidance in Coobie's briefing.
 #[derive(Debug, Clone)]
@@ -434,6 +486,7 @@ struct RetrieverContextBundleArtifact {
     product: String,
     generated_at: String,
     project_root: String,
+    briefing_scope: Option<BriefingScope>,
     context_entries: Vec<RepoLocalContextEntry>,
     skill_entries: Vec<RepoLocalContextEntry>,
     preload_notes: Vec<String>,
@@ -878,7 +931,13 @@ impl AppContext {
             None
         };
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
-        let chat = crate::chat::ChatStore::new(pool.clone());
+        let chat = crate::chat::ChatStore::with_bus(
+            pool.clone(),
+            Arc::new(crate::chat::LocalJsonlPackChatBus::new(
+                paths.logs.join("packchat-bus.jsonl"),
+                paths.setup.setup.name.clone(),
+            )),
+        );
         let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
         let calvin = crate::calvin_client::try_connect(&paths.setup.calvin_archive).await;
         Ok(Self {
@@ -1917,7 +1976,10 @@ impl AppContext {
                             passed: false,
                             scored_checks: 0,
                             passed_scored_checks: 0,
+                            real_test_commands: 0,
+                            passed_real_test_commands: 0,
                             results: Vec::new(),
+                            wrong_answer_evidence: BTreeMap::new(),
                             failure_kind: None,
                         };
                         let fallback_hidden = HiddenScenarioSummary {
@@ -2045,6 +2107,9 @@ impl AppContext {
                 &memory_context,
             )
             .await?;
+        let scout_briefing = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
+        let sable_briefing = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
         let evidence_match_report = self
             .build_evidence_match_report(spec_obj, target_source, &briefing)
             .await?;
@@ -2058,6 +2123,27 @@ impl AppContext {
         tokio::fs::write(
             run_dir.join("coobie_preflight_response.md"),
             &briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("scout_briefing.json"), &scout_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("scout_preflight_response.md"),
+            &scout_briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("mason_briefing.json"), &mason_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("mason_preflight_response.md"),
+            &mason_briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("sable_briefing.json"), &sable_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("sable_preflight_response.md"),
+            &sable_briefing.coobie_response,
         )
         .await?;
         self.write_json_file(
@@ -2076,6 +2162,12 @@ impl AppContext {
             &mut blackboard.artifact_refs,
             "coobie_preflight_response.md",
         );
+        push_unique(&mut blackboard.artifact_refs, "scout_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "scout_preflight_response.md");
+        push_unique(&mut blackboard.artifact_refs, "mason_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "mason_preflight_response.md");
+        push_unique(&mut blackboard.artifact_refs, "sable_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "sable_preflight_response.md");
         push_unique(&mut blackboard.artifact_refs, "evidence_match_report.json");
         push_unique(&mut blackboard.artifact_refs, "evidence_match_report.md");
         self.write_agent_execution(
@@ -2166,17 +2258,29 @@ impl AppContext {
             )
             .await?;
         let intent = self
-            .scout_intake(spec_obj, target_source, &briefing)
+            .scout_intake(spec_obj, target_source, &scout_briefing)
             .await?;
         self.write_json_file(&run_dir.join("intent.json"), &intent)
             .await?;
         push_unique(&mut blackboard.artifact_refs, "intent.json");
         let optimization_program = self
-            .scout_derive_optimization_program(run_id, spec_obj, target_source, &briefing, &run_dir)
+            .scout_derive_optimization_program(
+                run_id,
+                spec_obj,
+                target_source,
+                &scout_briefing,
+                &run_dir,
+            )
             .await;
         push_unique(&mut blackboard.artifact_refs, "optimization_program.json");
         let metric_attacks = self
-            .sable_generate_metric_attacks(run_id, spec_obj, &optimization_program, &run_dir)
+            .sable_generate_metric_attacks(
+                run_id,
+                spec_obj,
+                &optimization_program,
+                &sable_briefing,
+                &run_dir,
+            )
             .await;
         if !metric_attacks.is_empty() {
             push_unique(&mut blackboard.artifact_refs, "metric_attacks.json");
@@ -2222,7 +2326,7 @@ impl AppContext {
             "success",
             Some(1.0),
             &memory_context,
-            &briefing,
+            &scout_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -2289,6 +2393,7 @@ impl AppContext {
                 target_source,
                 &staged_product,
                 &query_terms,
+                BriefingScope::MasonPreflight,
             )?;
             self.write_json_file(
                 &run_dir.join("retriever_context_bundle.json"),
@@ -2326,7 +2431,7 @@ impl AppContext {
                 spec_obj,
                 target_source,
                 worker_harness,
-                &briefing,
+                &mason_briefing,
                 &self.paths.root,
                 &workspace_root,
                 &run_dir,
@@ -2383,7 +2488,7 @@ impl AppContext {
         self.claim_mason_workspace_lease(
             run_id,
             &workspace_prefix,
-            &briefing.recommended_guardrails,
+            &mason_briefing.recommended_guardrails,
         )
         .await
         .with_context(|| {
@@ -2419,7 +2524,13 @@ impl AppContext {
             )
             .await?;
         let implementation_plan = self
-            .mason_implementation_plan(spec_obj, &intent, &briefing, &staged_product, target_source)
+            .mason_implementation_plan(
+                spec_obj,
+                &intent,
+                &mason_briefing,
+                &staged_product,
+                target_source,
+            )
             .await;
         self.record_decision(
             run_id,
@@ -2446,7 +2557,7 @@ impl AppContext {
                 run_id,
                 spec_obj,
                 target_source,
-                &briefing,
+                &mason_briefing,
                 &implementation_plan,
                 Some(&optimization_program),
                 log_path,
@@ -2514,7 +2625,7 @@ impl AppContext {
                 spec_obj,
                 target_source,
                 &intent,
-                &briefing,
+                &mason_briefing,
                 &implementation_plan,
                 retriever_context_bundle.as_ref(),
             );
@@ -2658,7 +2769,10 @@ next_actions={}",
                         passed: false,
                         scored_checks: 0,
                         passed_scored_checks: 0,
+                        real_test_commands: 0,
+                        passed_real_test_commands: 0,
                         results: Vec::new(),
+                        wrong_answer_evidence: BTreeMap::new(),
                         failure_kind: Some(FailureKind::Blocked),
                     };
                     let blocked_hidden = HiddenScenarioSummary {
@@ -2692,7 +2806,7 @@ next_actions={}",
                             run_id,
                             spec_obj,
                             &intent,
-                            &briefing,
+                            &mason_briefing,
                             &implementation_plan,
                             target_source,
                             &staged_product,
@@ -2813,7 +2927,7 @@ next_actions={}",
             "success",
             Some(1.0),
             &memory_context,
-            &briefing,
+            &mason_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -2885,7 +2999,7 @@ next_actions={}",
                             .mason_fix_from_build_failure(
                                 run_id,
                                 spec_obj,
-                                &briefing,
+                                &mason_briefing,
                                 target_source,
                                 &staged_product,
                                 &build_result.combined_output,
@@ -3095,7 +3209,10 @@ next_actions={}",
                     passed: false,
                     scored_checks: 0,
                     passed_scored_checks: 0,
+                    real_test_commands: 0,
+                    passed_real_test_commands: 0,
                     results: Vec::new(),
+                    wrong_answer_evidence: BTreeMap::new(),
                     failure_kind: Some(FailureKind::Blocked),
                 },
                 hidden_scenarios: HiddenScenarioSummary {
@@ -3420,6 +3537,9 @@ next_actions={}",
             release_agent(&mut blackboard, "bramble");
             claim_agent(&mut blackboard, "mason", "fix test failures");
             self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+            let mut validation_repair_attempts = Vec::new();
+            let mut retry_guidance = None::<String>;
+            let mut consecutive_non_improving_attempts = 0usize;
 
             for iteration in 1u32..=3 {
                 let test_output = format_validation_failure_output(&validation);
@@ -3437,6 +3557,7 @@ next_actions={}",
                         &staged_product,
                         &test_output,
                         iteration,
+                        retry_guidance.as_deref(),
                         log_path,
                         &validation_episode,
                         fix_kind.clone(),
@@ -3444,6 +3565,7 @@ next_actions={}",
                     .await?
                 {
                     Some(proposal) if !proposal.edits.is_empty() => {
+                        let validation_before_fix = validation.clone();
                         let changed =
                             apply_mason_proposal_edits(&proposal, &staged_product).await?;
                         let _ = self
@@ -3473,7 +3595,52 @@ next_actions={}",
                             )
                             .await?;
 
+                        let assessment = assess_validation_repair_attempt(
+                            iteration,
+                            &proposal,
+                            changed.len(),
+                            &validation_before_fix,
+                            &validation,
+                        );
+                        let assessment_outcome = assessment.outcome.clone();
+                        let assessment_guidance = assessment.guidance_for_next_attempt.clone();
+                        let _ = self
+                            .record_event(
+                                run_id,
+                                Some(&validation_episode),
+                                "validation",
+                                "keeper",
+                                "running",
+                                &format!(
+                                    "Validation fix iteration {iteration}: outcome={} {}",
+                                    assessment.outcome, assessment.guidance_for_next_attempt
+                                ),
+                                log_path,
+                            )
+                            .await;
+                        validation_repair_attempts.push(assessment);
+
                         if validation.passed {
+                            break;
+                        }
+                        retry_guidance = Some(assessment_guidance);
+                        if matches!(assessment_outcome.as_str(), "stalled" | "regressed") {
+                            consecutive_non_improving_attempts += 1;
+                        } else {
+                            consecutive_non_improving_attempts = 0;
+                        }
+                        if consecutive_non_improving_attempts >= 2 {
+                            let _ = self
+                                .record_event(
+                                    run_id,
+                                    Some(&validation_episode),
+                                    "validation",
+                                    "keeper",
+                                    "warning",
+                                    "Validation fix loop stopped early after consecutive non-improving attempts",
+                                    log_path,
+                                )
+                                .await;
                             break;
                         }
                         release_agent(&mut blackboard, "bramble");
@@ -3482,6 +3649,24 @@ next_actions={}",
                     }
                     _ => break,
                 }
+            }
+            if !validation_repair_attempts.is_empty() {
+                let report = build_validation_repair_artifact(
+                    run_id,
+                    &spec_obj.id,
+                    &target_source.label,
+                    &validation_repair_attempts,
+                );
+                self.write_validation_repair_report(&run_dir, &report)
+                    .await?;
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "validation_repair_attempts.json",
+                );
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "validation_repair_attempts.md",
+                );
             }
             // Restore bramble as the active agent for the rest of the validation phase.
             release_agent(&mut blackboard, "mason");
@@ -3497,7 +3682,8 @@ next_actions={}",
                 passed: false,
                 details: message.to_string(),
             });
-            validation.failure_kind = classify_failure_kind(&validation.results);
+            validation.failure_kind =
+                classify_failure_kind(&validation.results, &validation.wrong_answer_evidence);
         }
         self.write_json_file(&run_dir.join("validation.json"), &validation)
             .await?;
@@ -3647,6 +3833,7 @@ next_actions={}",
                     &validation,
                     &twin,
                     &agent_executions,
+                    Some(&render_sable_context_summary(&sable_briefing)),
                     &run_dir,
                 )
                 .await
@@ -3822,7 +4009,7 @@ next_actions={}",
             hidden_outcome,
             Some(if hidden_scenarios.passed { 1.0 } else { 0.5 }),
             &memory_context,
-            &briefing,
+            &sable_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -6148,6 +6335,8 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         domain_signals: &[String],
         memory_context: &MemoryContextBundle,
     ) -> Result<CoobieBriefing> {
+        let context_target = build_coobie_preflight_context_target(spec_obj, target_source);
+        let memory_selection = select_budgeted_memory_hits(memory_context, &context_target);
         let project_interview_context = self
             .load_project_interview_context(Some(Path::new(&target_source.source_path)))
             .await
@@ -6215,7 +6404,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         let application_risks = build_application_risks(
             spec_obj,
             domain_signals,
-            &memory_context.memory_hits,
+            &memory_selection.memory_hits,
             &prior_causes,
         );
         let environment_risks = build_environment_risks(spec_obj, domain_signals);
@@ -6225,7 +6414,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         let mut recommended_guardrails = build_recommended_guardrails(
             spec_obj,
             domain_signals,
-            &memory_context.memory_hits,
+            &memory_selection.memory_hits,
             &prior_causes,
             &relevant_lessons,
         );
@@ -6307,6 +6496,21 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 &mut open_questions,
             );
         }
+        let mut required_sections_applied = Vec::new();
+        for section in &context_target.required_sections {
+            match section {
+                ContextSection::ProjectInterview if project_interview_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                ContextSection::OperatorModel if operator_model_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                ContextSection::SoulIdentity if soul_identity_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                _ => {}
+            }
+        }
 
         // ── Phase 3: causal priors influence preflight ────────────────────────
         // Query this spec's causal history and inject concrete, cause-specific
@@ -6363,9 +6567,9 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             query_terms: enriched_query_terms,
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
-            memory_hits: memory_context.memory_hits.clone(),
-            core_memory_hits: memory_context.core_memory_hits.clone(),
-            project_memory_hits: memory_context.project_memory_hits.clone(),
+            memory_hits: memory_selection.memory_hits,
+            core_memory_hits: memory_selection.core_memory_hits,
+            project_memory_hits: memory_selection.project_memory_hits,
             resume_packet_summary: resume_packet.summary.clone(),
             resume_packet_risks: resume_packet.stale_memory.clone(),
             stale_memory_mitigation_plan,
@@ -6385,6 +6589,12 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             project_components: spec_obj.project_components.clone(),
             scenario_blueprint: spec_obj.scenario_blueprint.clone(),
             project_memory_root: memory_context.project_memory_root.clone(),
+            briefing_scope: Some(context_target.scope),
+            briefing_task_description: context_target.task_description.clone(),
+            target_token_budget: context_target.token_budget,
+            briefing_tokens_used: memory_selection.tokens_used,
+            briefing_hits_provided: memory_selection.hits_provided,
+            required_sections_applied,
             application_risks,
             environment_risks,
             regulatory_considerations,
@@ -7004,6 +7214,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
         run_id: &str,
         spec_obj: &Spec,
         program: &crate::models::OptimizationProgram,
+        briefing: &CoobieBriefing,
         run_dir: &Path,
     ) -> Vec<crate::models::MetricAttack> {
         use crate::models::MetricAttack;
@@ -7022,6 +7233,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let sable_context = render_sable_context_summary(briefing);
             let req = LlmRequest::simple(
                 "You are Sable, an adversarial evaluator for a software factory. \
                  Given an objective metric and evaluation plan, generate 2-3 concrete ways \
@@ -7036,12 +7248,14 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     "SPEC: {} ({})\n\n\
                      OBJECTIVE METRIC: {}\n\
                      OBJECTIVE DESCRIPTION: {}\n\n\
+                     SABLE CONTEXT:\n{}\n\n\
                      EVALUATION PLAN:\n{eval_plan}\n\n\
                      Generate attacks against this metric.",
                     spec_obj.title,
                     spec_obj.id,
                     program.objective_metric,
                     program.objective_description,
+                    sable_context,
                 ),
             );
             if let Ok(resp) = provider.complete(req).await {
@@ -7978,6 +8192,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         staged_product: &Path,
         test_output: &str,
         iteration: u32,
+        retry_guidance: Option<&str>,
         log_path: &Path,
         episode_id: &str,
         failure_kind: crate::models::FailureKind,
@@ -8065,7 +8280,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                  EDITABLE PATHS: {editable_list}\n\n\
                  FILE CONTEXT:\n{context_block}\n\n\
                  TEST FAILURES (iteration {iteration}):\n```\n{test_output}\n```\n\n\
+                 PREVIOUS ATTEMPT FEEDBACK:\n{}\n\n\
                  {user_suffix}",
+                retry_guidance
+                    .unwrap_or("No previous validation-fix attempt feedback for this run."),
             ),
         );
 
@@ -8573,8 +8791,33 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         args: &[&str],
         cwd: &Path,
     ) -> Result<ToolInvocationRecord> {
-        let run_dir = self.run_dir(run_id);
         let assessment = assess_tool_invocation(program, args, cwd);
+        self.ensure_tool_invocation_assessment_allowed(run_id, phase, agent, cwd, assessment)
+            .await
+    }
+
+    async fn ensure_raw_shell_tool_invocation_allowed(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        raw_command: &str,
+        cwd: &Path,
+    ) -> Result<ToolInvocationRecord> {
+        let assessment = assess_raw_shell_invocation(raw_command, cwd);
+        self.ensure_tool_invocation_assessment_allowed(run_id, phase, agent, cwd, assessment)
+            .await
+    }
+
+    async fn ensure_tool_invocation_assessment_allowed(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        cwd: &Path,
+        assessment: ToolInvocationAssessment,
+    ) -> Result<ToolInvocationRecord> {
+        let run_dir = self.run_dir(run_id);
         let mut approval_state = if assessment.approval_required {
             "approval_pending".to_string()
         } else {
@@ -8728,6 +8971,121 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             .await
     }
 
+    async fn run_shell_command_capture_streaming(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        raw_command: &str,
+        cwd: &Path,
+    ) -> Result<CommandOutcome> {
+        let mut invocation = self
+            .ensure_raw_shell_tool_invocation_allowed(run_id, phase, agent, raw_command, cwd)
+            .await?;
+        if !invocation.allowed {
+            return Ok(CommandOutcome {
+                success: false,
+                code: None,
+                stdout: String::new(),
+                stderr: invocation.stderr_preview.clone().unwrap_or_else(|| {
+                    "Invocation blocked pending tool transaction approval.".to_string()
+                }),
+            });
+        }
+
+        #[cfg(target_os = "windows")]
+        let mut child = {
+            let mut command = Command::new("cmd");
+            command
+                .arg("/C")
+                .arg(raw_command)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("running '{}' in {}", raw_command, cwd.display()))?
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut child = {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-lc")
+                .arg(raw_command)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("running '{}' in {}", raw_command, cwd.display()))?
+        };
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+        let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        let mut done_out = false;
+        let mut done_err = false;
+
+        loop {
+            tokio::select! {
+                line = stdout_lines.next_line(), if !done_out => {
+                    match line? {
+                        Some(l) => {
+                            if !stdout_buf.is_empty() {
+                                stdout_buf.push('\n');
+                            }
+                            stdout_buf.push_str(&l);
+                            let _ = self.event_tx.send(LiveEvent::BuildOutput {
+                                run_id: run_id.to_string(),
+                                phase: phase.to_string(),
+                                agent: agent.to_string(),
+                                line: l,
+                                stream: "stdout".to_string(),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        None => done_out = true,
+                    }
+                }
+                line = stderr_lines.next_line(), if !done_err => {
+                    match line? {
+                        Some(l) => {
+                            if !stderr_buf.is_empty() {
+                                stderr_buf.push('\n');
+                            }
+                            stderr_buf.push_str(&l);
+                            let _ = self.event_tx.send(LiveEvent::BuildOutput {
+                                run_id: run_id.to_string(),
+                                phase: phase.to_string(),
+                                agent: agent.to_string(),
+                                line: l,
+                                stream: "stderr".to_string(),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        None => done_err = true,
+                    }
+                }
+            }
+            if done_out && done_err {
+                break;
+            }
+        }
+
+        let status = child.wait().await?;
+        let outcome = CommandOutcome {
+            success: status.success(),
+            code: status.code(),
+            stdout: stdout_buf.trim().to_string(),
+            stderr: stderr_buf.trim().to_string(),
+        };
+        self.finalize_tool_invocation_record(run_id, &mut invocation, &outcome)
+            .await?;
+        Ok(outcome)
+    }
+
     async fn run_visible_validation(
         &self,
         run_id: &str,
@@ -8736,6 +9094,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         spec_obj: &Spec,
     ) -> Result<ValidationSummary> {
         let mut results = Vec::new();
+        let mut wrong_answer_evidence = BTreeMap::new();
         let run_dir = workspace_root.join("run");
         let product = self
             .get_run(run_id)
@@ -8872,7 +9231,12 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         )
                         .await?;
                     }
-                    return Ok(build_validation_summary(results));
+                    return Ok(build_validation_summary(
+                        results,
+                        0,
+                        0,
+                        wrong_answer_evidence,
+                    ));
                 }
             }
 
@@ -9056,45 +9420,37 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             });
         }
 
-        // Run spec-driven test commands (e.g. corpus tests) and write corpus_results.json.
+        let mut real_test_commands = 0usize;
+        let mut passed_real_test_commands = 0usize;
+
+        // Run spec-driven test commands (e.g. corpus tests) through Bramble's
+        // explicit real-test harness so shell syntax and quoting survive intact.
         if !spec_obj.test_commands.is_empty() {
-            let mut command_results = Vec::new();
-            let mut all_passed = true;
-            for raw_cmd in &spec_obj.test_commands {
-                let parts: Vec<&str> = raw_cmd.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let (program, args) = (parts[0], &parts[1..]);
-                let outcome = self
-                    .run_command_capture_streaming(
-                        run_id,
-                        "validation",
-                        "bramble",
-                        program,
-                        args,
-                        staged_product,
-                    )
-                    .await?;
-                if !outcome.success {
-                    all_passed = false;
-                }
-                command_trials.push(build_command_trial_record(raw_cmd, &outcome));
-                output_chunks.push(format_command_output(raw_cmd, &outcome));
-                results.push(ScenarioResult {
-                    scenario_id: format!("test_command_{}", command_results.len() + 1),
-                    passed: outcome.success,
-                    details: command_detail(raw_cmd, &outcome),
-                });
-                command_results.push(serde_json::json!({
-                    "label": raw_cmd,
-                    "exit_code": outcome.code.unwrap_or(-1),
-                    "passed": outcome.success,
-                }));
-            }
+            let harness = self
+                .bramble_run_tests(run_id, staged_product, &spec_obj.test_commands)
+                .await?;
+            real_test_commands = harness.real_test_commands;
+            passed_real_test_commands = harness.passed_real_test_commands;
+            command_trials.extend(harness.command_trials.clone());
+            output_chunks.extend(harness.output_chunks.clone());
+            results.extend(harness.results.clone());
+            wrong_answer_evidence.extend(harness.wrong_answer_evidence.clone());
+
+            let command_results = harness
+                .results
+                .iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    serde_json::json!({
+                        "label": spec_obj.test_commands.get(idx).cloned().unwrap_or_default(),
+                        "exit_code": harness.command_trials.get(idx).and_then(|trial| trial.exit_code).unwrap_or(-1),
+                        "passed": result.passed,
+                    })
+                })
+                .collect::<Vec<_>>();
             let corpus_results = serde_json::json!({
                 "commands": command_results,
-                "all_passed": all_passed,
+                "all_passed": real_test_commands > 0 && real_test_commands == passed_real_test_commands,
             });
             let corpus_results_path = workspace_root.join("run").join("corpus_results.json");
             if let Ok(json_str) = serde_json::to_string_pretty(&corpus_results) {
@@ -9123,7 +9479,66 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 .await?;
         }
 
-        Ok(build_validation_summary(results))
+        Ok(build_validation_summary(
+            results,
+            real_test_commands,
+            passed_real_test_commands,
+            wrong_answer_evidence,
+        ))
+    }
+
+    async fn bramble_run_tests(
+        &self,
+        run_id: &str,
+        staged_product: &Path,
+        raw_commands: &[String],
+    ) -> Result<BrambleTestHarnessResult> {
+        let mut results = Vec::new();
+        let mut output_chunks = Vec::new();
+        let mut command_trials = Vec::new();
+        let mut wrong_answer_evidence = BTreeMap::new();
+        let mut real_test_commands = 0usize;
+        let mut passed_real_test_commands = 0usize;
+
+        for raw_cmd in raw_commands {
+            let trimmed = raw_cmd.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            real_test_commands += 1;
+            let outcome = self
+                .run_shell_command_capture_streaming(
+                    run_id,
+                    "validation",
+                    "bramble",
+                    trimmed,
+                    staged_product,
+                )
+                .await?;
+            if outcome.success {
+                passed_real_test_commands += 1;
+            }
+            command_trials.push(build_command_trial_record(trimmed, &outcome));
+            output_chunks.push(format_command_output(trimmed, &outcome));
+            let scenario_id = format!("test_command_{real_test_commands}");
+            if let Some(evidence) = extract_wrong_answer_evidence(&outcome) {
+                wrong_answer_evidence.insert(scenario_id.clone(), evidence);
+            }
+            results.push(ScenarioResult {
+                scenario_id,
+                passed: outcome.success,
+                details: command_detail(trimmed, &outcome),
+            });
+        }
+
+        Ok(BrambleTestHarnessResult {
+            results,
+            output_chunks,
+            command_trials,
+            wrong_answer_evidence,
+            real_test_commands,
+            passed_real_test_commands,
+        })
     }
 
     async fn run_command_capture(
@@ -9282,6 +9697,21 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         Ok(())
     }
 
+    async fn write_validation_repair_report(
+        &self,
+        run_dir: &Path,
+        report: &ValidationRepairArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("validation_repair_attempts.json"), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("validation_repair_attempts.md"),
+            render_validation_repair_markdown(report),
+        )
+        .await?;
+        Ok(())
+    }
+
     fn agent_prompt_support(
         &self,
         agent_name: &str,
@@ -9361,13 +9791,17 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             self.load_pinned_skill_excerpts(agent_name, &resolved_provider);
         let query_terms = build_coobie_query_terms(spec_obj, target_source);
         let harkonnen_dir = self.project_harkonnen_dir(target_source);
-        let (context_entries, skill_entries) = discover_repo_local_context_entries(
+        let (mut context_entries, mut skill_entries) = discover_repo_local_context_entries(
             &harkonnen_dir,
             Some(target_source),
             Some(spec_obj),
             &query_terms,
         )
         .unwrap_or_default();
+        if let Some(scope) = briefing_scope_for_agent(agent_name) {
+            (context_entries, skill_entries) =
+                filter_repo_local_entries_for_scope(&context_entries, &skill_entries, scope);
+        }
         let pinned_external_skill_block =
             format_resolved_pinned_skill_excerpts(&pinned_external_skills, &resolved_provider);
         let system_instruction = format!(
@@ -11303,6 +11737,10 @@ Return JSON only.",
             required_checks: briefing.required_checks.clone(),
             guardrails: briefing.recommended_guardrails.clone(),
             query_terms: briefing.query_terms.clone(),
+            briefing_scope: briefing.briefing_scope,
+            briefing_token_budget: briefing.target_token_budget,
+            briefing_tokens_used: briefing.briefing_tokens_used,
+            briefing_hits_provided: briefing.briefing_hits_provided,
             stakeholder_alignment,
             created_at,
         };
@@ -11971,6 +12409,7 @@ Return JSON only.",
             .load_run_briefing(run_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("coobie_briefing.json missing for run {run_id}"))?;
+        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
         let intent_path = run_dir.join("intent.json");
         let intent_raw = tokio::fs::read_to_string(&intent_path)
             .await
@@ -11994,7 +12433,7 @@ Return JSON only.",
                 run_id,
                 &spec_obj,
                 &intent,
-                &briefing,
+                &mason_briefing,
                 &implementation_plan,
                 &target_source,
                 &staged_product,
@@ -12032,7 +12471,7 @@ Return JSON only.",
                         run_dir,
                         &spec_obj,
                         &target_source,
-                        &briefing,
+                        &mason_briefing,
                         &staged_product,
                     )
                     .await
@@ -12448,6 +12887,7 @@ Return JSON only.",
         validation: &ValidationSummary,
     ) -> Result<()> {
         let profiles = agents::load_profiles(&self.paths.factory.join("agents").join("profiles"))?;
+        let sable_briefing = build_scoped_briefing(briefing, BriefingScope::SablePreflight);
         let mut agent_executions =
             read_optional_json_file::<Vec<AgentExecution>>(&run_dir.join("agent_executions.json"))?
                 .unwrap_or_default();
@@ -12668,7 +13108,7 @@ Return JSON only.",
             hidden_outcome,
             Some(if hidden_scenarios.passed { 1.0 } else { 0.5 }),
             &memory_context,
-            briefing,
+            &sable_briefing,
             &agent_executions,
             &mut phase_attributions,
             run_dir,
@@ -12918,12 +13358,17 @@ Return JSON only.",
                 required_checks,
                 guardrails,
                 query_terms,
+                briefing_scope,
+                briefing_token_budget,
+                briefing_tokens_used,
+                briefing_hits_provided,
                 stakeholder_alignment_json,
                 created_at
             )
             VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24
             )
             ON CONFLICT(episode_id) DO UPDATE SET
                 attribution_id = excluded.attribution_id,
@@ -12943,6 +13388,10 @@ Return JSON only.",
                 required_checks = excluded.required_checks,
                 guardrails = excluded.guardrails,
                 query_terms = excluded.query_terms,
+                briefing_scope = excluded.briefing_scope,
+                briefing_token_budget = excluded.briefing_token_budget,
+                briefing_tokens_used = excluded.briefing_tokens_used,
+                briefing_hits_provided = excluded.briefing_hits_provided,
                 stakeholder_alignment_json = excluded.stakeholder_alignment_json,
                 created_at = excluded.created_at
             "#,
@@ -12965,6 +13414,10 @@ Return JSON only.",
         .bind(serde_json::to_string(&record.required_checks)?)
         .bind(serde_json::to_string(&record.guardrails)?)
         .bind(serde_json::to_string(&record.query_terms)?)
+        .bind(record.briefing_scope.map(|scope| scope.to_string()))
+        .bind(i64::from(record.briefing_token_budget))
+        .bind(i64::from(record.briefing_tokens_used))
+        .bind(record.briefing_hits_provided as i64)
         .bind(serde_json::to_string(&record.stakeholder_alignment)?)
         .bind(record.created_at.to_rfc3339())
         .execute(&self.pool)
@@ -15253,6 +15706,8 @@ Return JSON only.",
                    prompt_bundle_fingerprint, prompt_bundle_provider, prompt_bundle_artifact,
                    pinned_skill_ids, memory_hits, core_memory_ids, project_memory_ids,
                    relevant_lesson_ids, required_checks, guardrails, query_terms,
+                   briefing_scope, briefing_token_budget, briefing_tokens_used,
+                   briefing_hits_provided,
                    stakeholder_alignment_json, created_at
             FROM phase_attributions
             WHERE run_id = ?1
@@ -15303,6 +15758,14 @@ Return JSON only.",
                     .with_context(|| "parsing phase attribution guardrails")?,
                 query_terms: serde_json::from_str(row.get::<String, _>("query_terms").as_str())
                     .with_context(|| "parsing phase attribution query_terms")?,
+                briefing_scope: row
+                    .get::<Option<String>, _>("briefing_scope")
+                    .map(|value| serde_json::from_str::<BriefingScope>(&format!("\"{value}\"")))
+                    .transpose()
+                    .with_context(|| "parsing phase attribution briefing_scope")?,
+                briefing_token_budget: row.get::<i64, _>("briefing_token_budget") as u32,
+                briefing_tokens_used: row.get::<i64, _>("briefing_tokens_used") as u32,
+                briefing_hits_provided: row.get::<i64, _>("briefing_hits_provided") as usize,
                 stakeholder_alignment: serde_json::from_str(
                     row.get::<String, _>("stakeholder_alignment_json").as_str(),
                 )
@@ -19654,6 +20117,7 @@ fn build_retriever_context_bundle(
     target_source: &TargetSourceMetadata,
     staged_product: &Path,
     query_terms: &[String],
+    scope: BriefingScope,
 ) -> Result<RetrieverContextBundleArtifact> {
     let harkonnen_dir = staged_product.join(".harkonnen");
     let (context_entries, skill_entries) = discover_repo_local_context_entries(
@@ -19662,6 +20126,8 @@ fn build_retriever_context_bundle(
         Some(spec_obj),
         query_terms,
     )?;
+    let (context_entries, skill_entries) =
+        filter_repo_local_entries_for_scope(&context_entries, &skill_entries, scope);
     let preload_notes =
         build_repo_local_preload_notes(&context_entries, &skill_entries, target_source);
     Ok(RetrieverContextBundleArtifact {
@@ -19670,6 +20136,7 @@ fn build_retriever_context_bundle(
         product: target_source.label.clone(),
         generated_at: Utc::now().to_rfc3339(),
         project_root: staged_product.display().to_string(),
+        briefing_scope: Some(scope),
         context_entries,
         skill_entries,
         preload_notes,
@@ -19931,6 +20398,7 @@ fn render_retriever_context_bundle_markdown(bundle: &RetrieverContextBundleArtif
 - Product: {}
 - Generated at: {}
 - Project root: {}
+- Scope: {}
 
 ## Preload Notes
 {}
@@ -19946,6 +20414,10 @@ fn render_retriever_context_bundle_markdown(bundle: &RetrieverContextBundleArtif
         bundle.product,
         bundle.generated_at,
         bundle.project_root,
+        bundle
+            .briefing_scope
+            .map(|scope| scope.to_string())
+            .unwrap_or_else(|| "unspecified".to_string()),
         render_list(&bundle.preload_notes, "No preload notes were generated."),
         render_list(
             &context_lines,
@@ -22314,6 +22786,19 @@ fn render_phase_attributions_markdown(records: &[PhaseAttributionRecord]) -> Str
             }
         ));
         lines.push(format!(
+            "- Briefing scope: {}",
+            record
+                .briefing_scope
+                .map(|scope| scope.to_string())
+                .unwrap_or_else(|| "unspecified".to_string())
+        ));
+        lines.push(format!(
+            "- Briefing budget: {} tokens, used {}, hits {}",
+            record.briefing_token_budget,
+            record.briefing_tokens_used,
+            record.briefing_hits_provided
+        ));
+        lines.push(format!(
             "- Required checks: {}",
             if record.required_checks.is_empty() {
                 "none".to_string()
@@ -22686,7 +23171,22 @@ fn format_validation_failure_output(validation: &ValidationSummary) -> String {
         .results
         .iter()
         .filter(|r| !r.passed)
-        .map(|r| format!("[FAILED] {}: {}", r.scenario_id, r.details))
+        .map(|r| {
+            let mut block = format!("[FAILED] {}: {}", r.scenario_id, r.details);
+            if let Some(evidence) = validation.wrong_answer_evidence.get(&r.scenario_id) {
+                if let Some(expected) = evidence.expected.as_ref().filter(|value| !value.is_empty())
+                {
+                    block.push_str(&format!("\nEXPECTED:\n{}", expected));
+                }
+                if let Some(actual) = evidence.actual.as_ref().filter(|value| !value.is_empty()) {
+                    block.push_str(&format!("\nACTUAL:\n{}", actual));
+                }
+                if !evidence.excerpt.trim().is_empty() {
+                    block.push_str(&format!("\nOBSERVED OUTPUT:\n{}", evidence.excerpt.trim()));
+                }
+            }
+            block
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -22711,7 +23211,10 @@ fn validation_result_counts_for_coverage(scenario_id: &str) -> bool {
     ) || scenario_id.starts_with("test_command_")
 }
 
-fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::FailureKind> {
+fn classify_failure_kind(
+    results: &[ScenarioResult],
+    wrong_answer_evidence: &BTreeMap<String, crate::models::WrongAnswerEvidence>,
+) -> Option<crate::models::FailureKind> {
     use crate::models::FailureKind;
     let failing: Vec<&ScenarioResult> = results.iter().filter(|r| !r.passed).collect();
     if failing.is_empty() {
@@ -22759,6 +23262,13 @@ fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::Fa
         return Some(FailureKind::CompileError);
     }
 
+    let has_structured_wrong_answer = failing
+        .iter()
+        .any(|result| wrong_answer_evidence.contains_key(&result.scenario_id));
+    if has_structured_wrong_answer {
+        return Some(FailureKind::WrongAnswer);
+    }
+
     // Wrong-answer: test ran but output didn't match expected
     // Detected by common assertion and expected/actual diff patterns.
     let is_wrong_answer = failure_texts.iter().any(|details| {
@@ -22799,7 +23309,12 @@ fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::Fa
     Some(FailureKind::Unknown)
 }
 
-fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
+fn build_validation_summary(
+    results: Vec<ScenarioResult>,
+    real_test_commands: usize,
+    passed_real_test_commands: usize,
+    wrong_answer_evidence: BTreeMap<String, crate::models::WrongAnswerEvidence>,
+) -> ValidationSummary {
     let scored_checks = results
         .iter()
         .filter(|result| validation_result_counts_for_coverage(&result.scenario_id))
@@ -22814,14 +23329,17 @@ fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
     let failure_kind = if all_passed {
         None
     } else {
-        classify_failure_kind(&results)
+        classify_failure_kind(&results, &wrong_answer_evidence)
     };
 
     ValidationSummary {
         passed: all_passed,
         scored_checks,
         passed_scored_checks,
+        real_test_commands,
+        passed_real_test_commands,
         results,
+        wrong_answer_evidence,
         failure_kind,
     }
 }
@@ -22982,6 +23500,73 @@ fn render_command_trial_report_markdown(report: &CommandTrialReport) -> String {
         if report.passed { "true" } else { "false" },
         report.summary,
         commands,
+    )
+}
+
+fn build_validation_repair_artifact(
+    run_id: &str,
+    spec_id: &str,
+    product: &str,
+    attempts: &[ValidationRepairAttemptRecord],
+) -> ValidationRepairArtifact {
+    ValidationRepairArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        product: product.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        attempts: attempts.to_vec(),
+    }
+}
+
+fn render_validation_repair_markdown(report: &ValidationRepairArtifact) -> String {
+    let attempts = if report.attempts.is_empty() {
+        "No validation repair attempts were recorded.".to_string()
+    } else {
+        report
+            .attempts
+            .iter()
+            .map(|attempt| {
+                format!(
+                    "## Iteration {}\n\n- Outcome: {}\n- Passed after: {}\n- Edits applied: {}\n- Failure kind before: {}\n- Failure kind after: {}\n- Proposal summary: {}\n- Guidance: {}\n\n### Before\n{}\n\n### After\n{}\n\n### Before failing checks\n{}\n\n### After failing checks\n{}\n\n### Proposal rationale\n{}",
+                    attempt.iteration,
+                    attempt.outcome,
+                    if attempt.passed_after { "true" } else { "false" },
+                    attempt.edits_applied,
+                    attempt.failure_kind_before.as_deref().unwrap_or("unknown"),
+                    attempt.failure_kind_after.as_deref().unwrap_or("unknown"),
+                    attempt.proposal_summary,
+                    attempt.guidance_for_next_attempt,
+                    attempt.before_summary,
+                    attempt.after_summary,
+                    render_list(
+                        &attempt.before_failing_checks,
+                        "- No failing checks were recorded before this attempt."
+                    ),
+                    render_list(
+                        &attempt.after_failing_checks,
+                        "- No failing checks were recorded after this attempt."
+                    ),
+                    render_list(
+                        &attempt.proposal_rationale,
+                        "- No rationale was recorded for this proposal."
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    format!(
+        "# Validation Repair Attempts\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Generated at: {}\n\n{}",
+        report.run_id,
+        report.spec_id,
+        if report.product.is_empty() {
+            "<unknown>"
+        } else {
+            report.product.as_str()
+        },
+        report.generated_at,
+        attempts,
     )
 }
 
@@ -23267,6 +23852,177 @@ fn command_detail(command: &str, outcome: &CommandOutcome) -> String {
     )
 }
 
+fn extract_wrong_answer_evidence(
+    outcome: &CommandOutcome,
+) -> Option<crate::models::WrongAnswerEvidence> {
+    if outcome.success {
+        return None;
+    }
+
+    let combined = match (outcome.stderr.trim(), outcome.stdout.trim()) {
+        ("", "") => return None,
+        ("", stdout) => stdout.to_string(),
+        (stderr, "") => stderr.to_string(),
+        (stderr, stdout) => format!("{stderr}\n{stdout}"),
+    };
+    let lower = combined.to_ascii_lowercase();
+    let judge_like = lower.contains("wrong answer")
+        || lower.contains("expected output")
+        || lower.contains("actual output")
+        || lower.contains("assertion failed")
+        || lower.contains("assertionerror")
+        || lower.contains("assert_eq")
+        || lower.contains("mismatch")
+        || (lower.contains("expected") && lower.contains("actual"))
+        || (lower.contains("expected") && lower.contains("got"))
+        || (lower.contains("expected") && lower.contains("received"))
+        || (lower.contains("left:") && lower.contains("right:"));
+    if !judge_like {
+        return None;
+    }
+
+    let (expected, actual) = extract_wrong_answer_pair(&combined);
+    Some(crate::models::WrongAnswerEvidence {
+        expected,
+        actual,
+        excerpt: truncate_text(&combined, 280),
+    })
+}
+
+fn extract_wrong_answer_pair(text: &str) -> (Option<String>, Option<String>) {
+    if let Some((expected, actual)) = extract_inline_expected_actual(text) {
+        return (Some(expected), Some(actual));
+    }
+
+    let all_labels = [
+        "expected output:",
+        "expected:",
+        "actual output:",
+        "actual:",
+        "got:",
+        "received:",
+        "left:",
+        "right:",
+    ];
+    let expected = extract_labeled_block(
+        text,
+        &["expected output:", "expected:", "right:"],
+        &all_labels,
+    );
+    let actual = extract_labeled_block(
+        text,
+        &["actual output:", "actual:", "got:", "received:", "left:"],
+        &all_labels,
+    );
+    (expected, actual)
+}
+
+fn extract_inline_expected_actual(text: &str) -> Option<(String, String)> {
+    let lower = text.to_ascii_lowercase();
+
+    for expected_marker in ["expected output:", "expected:"] {
+        let Some(expected_start) = lower.find(expected_marker) else {
+            continue;
+        };
+        let expected_value_start = expected_start + expected_marker.len();
+        if let Some((actual_start, actual_marker)) = find_any_marker_after(
+            &lower,
+            &["actual output:", "actual:", "got:", "received:"],
+            expected_value_start,
+        ) {
+            let expected = clean_wrong_answer_value(&text[expected_value_start..actual_start]);
+            let actual = clean_wrong_answer_value(&text[(actual_start + actual_marker.len())..]);
+            if !expected.is_empty() && !actual.is_empty() {
+                return Some((expected, actual));
+            }
+        }
+    }
+
+    if let Some((left_start, left_marker)) = find_any_marker_after(&lower, &["left:"], 0) {
+        if let Some((right_start, right_marker)) =
+            find_any_marker_after(&lower, &["right:"], left_start + left_marker.len())
+        {
+            let actual =
+                clean_wrong_answer_value(&text[(left_start + left_marker.len())..right_start]);
+            let expected = clean_wrong_answer_value(&text[(right_start + right_marker.len())..]);
+            if !expected.is_empty() && !actual.is_empty() {
+                return Some((expected, actual));
+            }
+        }
+    }
+
+    None
+}
+
+fn find_any_marker_after<'a>(
+    lower_text: &str,
+    markers: &'a [&'a str],
+    from: usize,
+) -> Option<(usize, &'a str)> {
+    markers
+        .iter()
+        .filter_map(|marker| {
+            lower_text[from..]
+                .find(marker)
+                .map(|offset| (from + offset, *marker))
+        })
+        .min_by_key(|(index, _)| *index)
+}
+
+fn extract_labeled_block(text: &str, labels: &[&str], all_labels: &[&str]) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let lower_trimmed = trimmed.to_ascii_lowercase();
+        for label in labels {
+            if !lower_trimmed.starts_with(label) {
+                continue;
+            }
+
+            let remainder = clean_wrong_answer_value(&trimmed[label.len()..]);
+            if !remainder.is_empty() {
+                return Some(remainder);
+            }
+
+            let mut block = Vec::new();
+            for next in lines.iter().skip(idx + 1) {
+                let next_trimmed = next.trim();
+                if next_trimmed.is_empty() {
+                    if block.is_empty() {
+                        continue;
+                    }
+                    break;
+                }
+                let next_lower = next_trimmed.to_ascii_lowercase();
+                if all_labels
+                    .iter()
+                    .any(|marker| next_lower.starts_with(marker))
+                {
+                    break;
+                }
+                block.push(next_trimmed.to_string());
+            }
+
+            let joined = clean_wrong_answer_value(&block.join("\n"));
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_wrong_answer_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
 fn format_command_output(command: &str, outcome: &CommandOutcome) -> String {
     let (classification, summary) = command_outcome_classification(command, outcome);
     let mut sections = vec![format!("$ {}", command)];
@@ -23280,6 +24036,360 @@ fn format_command_output(command: &str, outcome: &CommandOutcome) -> String {
     }
     sections.push(format!("exit_code: {:?}", outcome.code));
     sections.join("\n\n")
+}
+
+fn build_coobie_preflight_context_target(
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+) -> ContextTarget {
+    ContextTarget {
+        scope: BriefingScope::CoobiePreflight,
+        task_description: format!(
+            "Coobie preflight for spec '{}' targeting '{}': {}",
+            spec_obj.id, target_source.label, spec_obj.title
+        ),
+        token_budget: 900,
+        min_hits: 4,
+        required_sections: vec![
+            ContextSection::ProjectInterview,
+            ContextSection::OperatorModel,
+            ContextSection::SoulIdentity,
+        ],
+    }
+}
+
+fn briefing_scope_for_agent(agent_name: &str) -> Option<BriefingScope> {
+    match agent_name {
+        "coobie" => Some(BriefingScope::CoobiePreflight),
+        "scout" => Some(BriefingScope::ScoutPreflight),
+        "mason" => Some(BriefingScope::MasonPreflight),
+        "piper" => Some(BriefingScope::PiperPreflight),
+        "sable" => Some(BriefingScope::SablePreflight),
+        _ => None,
+    }
+}
+
+fn estimate_briefing_tokens(text: &str) -> u32 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    ((trimmed.chars().count() as u32) + 3) / 4
+}
+
+fn select_budgeted_memory_hits(
+    memory_context: &MemoryContextBundle,
+    target: &ContextTarget,
+) -> BriefingMemorySelection {
+    let mut project_memory_hits = Vec::new();
+    let mut core_memory_hits = Vec::new();
+    let mut memory_hits = Vec::new();
+    let mut tokens_used = 0_u32;
+    let mut hits_provided = 0_usize;
+    let min_hits = target.min_hits as usize;
+    let token_budget = target.token_budget.max(1);
+
+    for (is_project, hit) in memory_context
+        .project_memory_hits
+        .iter()
+        .map(|hit| (true, hit))
+        .chain(
+            memory_context
+                .core_memory_hits
+                .iter()
+                .map(|hit| (false, hit)),
+        )
+    {
+        if hits_provided >= 8 {
+            break;
+        }
+        let shaped_hit = truncate_text(hit, 900);
+        let hit_tokens = estimate_briefing_tokens(&shaped_hit).max(1);
+        let must_include = hits_provided < min_hits;
+        if !must_include && tokens_used.saturating_add(hit_tokens) > token_budget {
+            continue;
+        }
+        tokens_used = tokens_used.saturating_add(hit_tokens);
+        hits_provided += 1;
+        memory_hits.push(shaped_hit.clone());
+        if is_project {
+            project_memory_hits.push(shaped_hit);
+        } else {
+            core_memory_hits.push(shaped_hit);
+        }
+    }
+
+    if memory_hits.is_empty() {
+        let fallback = memory_context
+            .memory_hits
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "No relevant memory context was available.".to_string());
+        let shaped_fallback = truncate_text(&fallback, 900);
+        tokens_used = estimate_briefing_tokens(&shaped_fallback);
+        hits_provided = 1;
+        memory_hits.push(shaped_fallback.clone());
+        project_memory_hits.push(shaped_fallback);
+    }
+
+    BriefingMemorySelection {
+        memory_hits,
+        core_memory_hits,
+        project_memory_hits,
+        tokens_used,
+        hits_provided,
+    }
+}
+
+fn scope_denied_keywords(scope: BriefingScope) -> &'static [&'static str] {
+    match scope {
+        BriefingScope::ScoutPreflight => &[
+            "implementation",
+            "edit rationale",
+            "mason plan",
+            "wrong answer",
+            "validation repair",
+            "hidden scenario",
+            "scenario outcome",
+            "test result",
+        ],
+        BriefingScope::MasonPreflight => &[
+            "hidden scenario",
+            "scenario outcome",
+            "sable rationale",
+            "metric attack",
+        ],
+        BriefingScope::SablePreflight => &[
+            "implementation",
+            "edit rationale",
+            "mason plan",
+            "wrong answer",
+            "validation repair",
+            "build failure",
+            "compile failure",
+            "operator model",
+            "repo purpose",
+            "stakeholder",
+            "project interview",
+            "preferred forge command",
+        ],
+        _ => &[],
+    }
+}
+
+fn scope_preferred_keywords(scope: BriefingScope) -> &'static [&'static str] {
+    match scope {
+        BriefingScope::ScoutPreflight => &[
+            "project-context",
+            "project-scan",
+            "resume-packet",
+            "memory-status",
+            "instructions",
+            "launch-guide",
+            "constraint",
+            "open question",
+            "spec",
+        ],
+        BriefingScope::MasonPreflight => &[
+            "instructions",
+            "launch-guide",
+            "strategy-register",
+            "resume-packet",
+            "workspace",
+            "fix",
+            "build",
+            "implementation",
+        ],
+        BriefingScope::SablePreflight => &["scenario", "attack", "causal", "risk", "spec"],
+        _ => &[],
+    }
+}
+
+fn text_matches_scope_denials(text: &str, scope: BriefingScope) -> bool {
+    let lower = text.to_ascii_lowercase();
+    scope_denied_keywords(scope)
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn score_text_for_scope(text: &str, scope: BriefingScope) -> i32 {
+    let lower = text.to_ascii_lowercase();
+    scope_preferred_keywords(scope)
+        .iter()
+        .filter(|needle| lower.contains(**needle))
+        .count() as i32
+}
+
+fn filter_memory_hits_for_scope(
+    hits: &[String],
+    scope: BriefingScope,
+    limit: usize,
+) -> Vec<String> {
+    let mut scored = hits
+        .iter()
+        .filter(|hit| !text_matches_scope_denials(hit, scope))
+        .map(|hit| (score_text_for_scope(hit, scope), hit.clone()))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut filtered = scored
+        .into_iter()
+        .map(|(_, hit)| hit)
+        .take(limit)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        filtered = hits.iter().take(limit.max(1)).cloned().collect();
+    }
+    filtered
+}
+
+fn filter_repo_local_entries_for_scope(
+    context_entries: &[RepoLocalContextEntry],
+    skill_entries: &[RepoLocalContextEntry],
+    scope: BriefingScope,
+) -> (Vec<RepoLocalContextEntry>, Vec<RepoLocalContextEntry>) {
+    let filter_entries = |entries: &[RepoLocalContextEntry], limit: usize| {
+        let mut scored = entries
+            .iter()
+            .filter(|entry| {
+                let haystack = format!("{} {} {}", entry.path, entry.label, entry.summary);
+                !text_matches_scope_denials(&haystack, scope)
+            })
+            .map(|entry| {
+                let haystack = format!("{} {} {}", entry.path, entry.label, entry.summary);
+                (
+                    entry.relevance + score_text_for_scope(&haystack, scope) * 10,
+                    entry.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.path.cmp(&right.1.path))
+        });
+        let mut filtered = scored
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .take(limit)
+            .collect::<Vec<_>>();
+        if filtered.is_empty() && !entries.is_empty() && scope != BriefingScope::SablePreflight {
+            filtered = entries.iter().take(limit.max(1)).cloned().collect();
+        }
+        filtered
+    };
+
+    let (context_limit, skill_limit) = match scope {
+        BriefingScope::ScoutPreflight => (8, 4),
+        BriefingScope::MasonPreflight => (10, 6),
+        BriefingScope::SablePreflight => (0, 0),
+        _ => (12, 8),
+    };
+
+    (
+        filter_entries(context_entries, context_limit),
+        filter_entries(skill_entries, skill_limit),
+    )
+}
+
+fn build_scoped_briefing(base: &CoobieBriefing, scope: BriefingScope) -> CoobieBriefing {
+    let mut scoped = base.clone();
+    scoped.briefing_scope = Some(scope);
+    scoped.memory_hits = filter_memory_hits_for_scope(&base.memory_hits, scope, 8);
+    scoped.core_memory_hits = filter_memory_hits_for_scope(&base.core_memory_hits, scope, 4);
+    scoped.project_memory_hits = filter_memory_hits_for_scope(&base.project_memory_hits, scope, 4);
+    scoped.briefing_hits_provided = scoped.memory_hits.len();
+    scoped.briefing_tokens_used = scoped
+        .memory_hits
+        .iter()
+        .map(|hit| estimate_briefing_tokens(hit))
+        .sum();
+
+    match scope {
+        BriefingScope::ScoutPreflight => {
+            scoped.preferred_forge_commands.clear();
+            scoped.forge_evidence_citations.clear();
+            scoped.preferred_forge_outcome_citations.clear();
+            scoped.nearest_evidence_window_citations.clear();
+        }
+        BriefingScope::MasonPreflight => {
+            scoped.resume_packet_summary.truncate(4);
+            scoped.open_questions.truncate(6);
+        }
+        BriefingScope::SablePreflight => {
+            scoped.resume_packet_summary.clear();
+            scoped.resume_packet_risks.clear();
+            scoped.stale_memory_mitigation_plan.clear();
+            scoped.exploration_citations.clear();
+            scoped.strategy_register_citations.clear();
+            scoped.mitigation_history_citations.clear();
+            scoped.forge_evidence_citations.clear();
+            scoped.preferred_forge_outcome_citations.clear();
+            scoped.preferred_forge_commands.clear();
+            scoped.project_components.clear();
+            scoped.operator_model_context = None;
+            scoped.project_interview_context = None;
+            scoped.soul_identity_context = None;
+            scoped.recommended_guardrails.clear();
+            scoped.required_checks.clear();
+            scoped.open_questions.clear();
+        }
+        _ => {}
+    }
+
+    scoped.coobie_response = crate::coobie::render_coobie_briefing_response(&scoped);
+    scoped
+}
+
+fn render_sable_context_summary(briefing: &CoobieBriefing) -> String {
+    let mut lines = Vec::new();
+    if !briefing.prior_causes.is_empty() {
+        lines.push("Prior causes to pressure-test:".to_string());
+        lines.extend(briefing.prior_causes.iter().take(5).map(|cause| {
+            format!(
+                "- {}: {} occurrence(s), {:.0}% scenario pass rate",
+                cause.description,
+                cause.occurrences,
+                cause.scenario_pass_rate * 100.0
+            )
+        }));
+    }
+    if !briefing.pattern_matching_focus.is_empty() {
+        lines.push("Pattern focus:".to_string());
+        lines.extend(
+            briefing
+                .pattern_matching_focus
+                .iter()
+                .take(5)
+                .map(|item| format!("- {item}")),
+        );
+    }
+    if !briefing.causal_chain_focus.is_empty() {
+        lines.push("Causal chains to probe:".to_string());
+        lines.extend(
+            briefing
+                .causal_chain_focus
+                .iter()
+                .take(5)
+                .map(|item| format!("- {item}")),
+        );
+    }
+    if !briefing.application_risks.is_empty() {
+        lines.push("Spec-grounded risks:".to_string());
+        lines.extend(
+            briefing
+                .application_risks
+                .iter()
+                .take(5)
+                .map(|risk| format!("- {risk}")),
+        );
+    }
+    if lines.is_empty() {
+        "No scoped Sable context was available beyond the spec and visible run artifacts."
+            .to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn truncate_text(text: &str, max_len: usize) -> String {
@@ -23501,6 +24611,14 @@ fn summarize_validation(validation: &ValidationSummary) -> String {
             validation.passed_scored_checks, validation.scored_checks
         )
     };
+    let real_tests = if validation.real_test_commands == 0 {
+        "no explicit spec.test_commands recorded".to_string()
+    } else {
+        format!(
+            "{} of {} explicit test command(s) passed",
+            validation.passed_real_test_commands, validation.real_test_commands
+        )
+    };
     let failing_checks = validation
         .results
         .iter()
@@ -23520,13 +24638,95 @@ fn summarize_validation(validation: &ValidationSummary) -> String {
         .map(|kind| format!("{kind:?}"))
         .unwrap_or_else(|| "unknown".to_string());
     if failing_checks.is_empty() {
-        format!("{scored}; failure_kind={failure_kind}")
+        format!("{scored}; {real_tests}; failure_kind={failure_kind}")
     } else {
         format!(
-            "{scored}; failure_kind={failure_kind}; failing checks: {}",
+            "{scored}; {real_tests}; failure_kind={failure_kind}; failing checks: {}",
             failing_checks.join(", ")
         )
     }
+}
+
+fn assess_validation_repair_attempt(
+    iteration: u32,
+    proposal: &MasonEditProposal,
+    edits_applied: usize,
+    before: &ValidationSummary,
+    after: &ValidationSummary,
+) -> ValidationRepairAttemptRecord {
+    let before_failures = validation_failure_labels(before);
+    let after_failures = validation_failure_labels(after);
+    let before_failed = before_failures.len();
+    let after_failed = after_failures.len();
+    let outcome = if after.passed {
+        "resolved"
+    } else if after.passed_real_test_commands > before.passed_real_test_commands
+        || after_failed < before_failed
+    {
+        "improved"
+    } else if after.passed_real_test_commands < before.passed_real_test_commands
+        || after_failed > before_failed
+        || (before.failure_kind == Some(FailureKind::WrongAnswer)
+            && after.failure_kind == Some(FailureKind::CompileError))
+    {
+        "regressed"
+    } else {
+        "stalled"
+    };
+
+    let guidance_for_next_attempt = match outcome {
+        "resolved" => "Previous attempt resolved visible validation; no further retry is needed."
+            .to_string(),
+        "improved" => format!(
+            "Previous attempt improved visible validation from {} failing check(s) to {}. Preserve the working change and target only the remaining failures: {}.",
+            before_failed,
+            after_failed,
+            if after_failures.is_empty() {
+                "none remain".to_string()
+            } else {
+                after_failures.join(", ")
+            }
+        ),
+        "regressed" => format!(
+            "Previous attempt regressed validation from {} failing check(s) to {}. Avoid repeating that strategy and restore the prior passing behavior before chasing new failures.",
+            before_failed, after_failed
+        ),
+        _ => format!(
+            "Previous attempt did not change the failing signal (still {} failing check(s)). Choose a different implementation strategy and do not repeat the same edit pattern.",
+            after_failed
+        ),
+    };
+
+    ValidationRepairAttemptRecord {
+        iteration,
+        proposal_summary: proposal.summary.clone(),
+        proposal_rationale: proposal.rationale.clone(),
+        edits_applied,
+        before_summary: summarize_validation(before),
+        after_summary: summarize_validation(after),
+        failure_kind_before: before.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
+        failure_kind_after: after.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
+        before_failing_checks: before_failures,
+        after_failing_checks: after_failures,
+        outcome: outcome.to_string(),
+        guidance_for_next_attempt,
+        passed_after: after.passed,
+    }
+}
+
+fn validation_failure_labels(validation: &ValidationSummary) -> Vec<String> {
+    validation
+        .results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| {
+            format!(
+                "{} ({})",
+                result.scenario_id,
+                truncate_text(&result.details, 100)
+            )
+        })
+        .collect()
 }
 
 fn list_relative_files(root: &Path, current: &Path) -> Result<Vec<String>> {
@@ -24566,6 +25766,30 @@ fn assess_host_command_surface(command: &str) -> ToolSurfaceAssessment {
     }
 }
 
+fn assess_raw_shell_invocation(raw_command: &str, cwd: &Path) -> ToolInvocationAssessment {
+    let trimmed = raw_command.trim();
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    let first_non_env = tokens
+        .iter()
+        .copied()
+        .find(|token| {
+            !token.is_empty()
+                && !token.starts_with('|')
+                && !token.starts_with('&')
+                && !token.starts_with(';')
+                && !(token.contains('=') && !token.starts_with("./") && !token.starts_with('/'))
+        })
+        .unwrap_or("sh");
+    let idx = tokens
+        .iter()
+        .position(|token| *token == first_non_env)
+        .unwrap_or(0);
+    let args = tokens.iter().skip(idx + 1).copied().collect::<Vec<_>>();
+    let mut assessment = assess_tool_invocation(first_non_env, &args, cwd);
+    assessment.command = trimmed.to_string();
+    assessment
+}
+
 fn assess_tool_invocation(program: &str, args: &[&str], cwd: &Path) -> ToolInvocationAssessment {
     let program_lower = program.trim().to_ascii_lowercase();
     let args_joined = args.join(" ");
@@ -25103,6 +26327,12 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         project_components: Vec::new(),
         scenario_blueprint: None,
         project_memory_root: None,
+        briefing_scope: Some(BriefingScope::OperatorQuery),
+        briefing_task_description: "Invocation gateway fallback".to_string(),
+        target_token_budget: 0,
+        briefing_tokens_used: 0,
+        briefing_hits_provided: 0,
+        required_sections_applied: Vec::new(),
         application_risks: Vec::new(),
         environment_risks: Vec::new(),
         regulatory_considerations: Vec::new(),
@@ -26460,6 +27690,12 @@ mod tests {
             project_components: Vec::new(),
             scenario_blueprint: None,
             project_memory_root: None,
+            briefing_scope: Some(BriefingScope::CoobiePreflight),
+            briefing_task_description: "sample briefing".to_string(),
+            target_token_budget: 900,
+            briefing_tokens_used: 0,
+            briefing_hits_provided: 0,
+            required_sections_applied: Vec::new(),
             application_risks: Vec::new(),
             environment_risks: Vec::new(),
             regulatory_considerations: Vec::new(),
@@ -26472,6 +27708,112 @@ mod tests {
             coobie_response: String::new(),
             generated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn build_scoped_briefing_filters_scout_and_sable_context() {
+        let mut briefing = sample_briefing();
+        briefing.memory_hits = vec![
+            "Spec history: prior auth flow ambiguity".to_string(),
+            "Implementation note: Mason edited login handler".to_string(),
+            "Hidden scenario outcome: stale token replay".to_string(),
+        ];
+        briefing.core_memory_hits = briefing.memory_hits.clone();
+        briefing.project_memory_hits = briefing.memory_hits.clone();
+        briefing.preferred_forge_commands = vec!["cargo test -q".to_string()];
+        briefing.operator_model_context = Some(OperatorModelContext {
+            profile_id: "profile-1".to_string(),
+            scope: crate::models::OperatorModelScope::Project,
+            display_name: "Operator".to_string(),
+            project_root: None,
+            source_thread_id: None,
+            summary: "prefers careful rollouts".to_string(),
+            operating_rhythms: Vec::new(),
+            guardrails: Vec::new(),
+            escalation_rules: Vec::new(),
+            dependencies: Vec::new(),
+            preferred_tools: Vec::new(),
+            risk_tolerances: Vec::new(),
+            open_questions: Vec::new(),
+            transcript_excerpt: Vec::new(),
+        });
+        briefing.project_interview_context = Some(ProjectInterviewContext {
+            repo_name: "repo".to_string(),
+            repo_purpose: "replace incumbent platform".to_string(),
+            operator_intent: "reduce risk".to_string(),
+            ..Default::default()
+        });
+        briefing.recommended_guardrails = vec!["Guardrail".to_string()];
+        briefing.required_checks = vec!["Check".to_string()];
+
+        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let sable = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
+
+        assert_eq!(scout.briefing_scope, Some(BriefingScope::ScoutPreflight));
+        assert!(scout
+            .memory_hits
+            .iter()
+            .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+        assert!(scout.preferred_forge_commands.is_empty());
+
+        assert_eq!(sable.briefing_scope, Some(BriefingScope::SablePreflight));
+        assert!(sable.operator_model_context.is_none());
+        assert!(sable.project_interview_context.is_none());
+        assert!(sable.recommended_guardrails.is_empty());
+        assert!(sable.required_checks.is_empty());
+        assert!(sable
+            .memory_hits
+            .iter()
+            .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+    }
+
+    #[test]
+    fn filter_repo_local_entries_for_scope_hides_sable_context() {
+        let context_entries = vec![
+            RepoLocalContextEntry {
+                label: "project context".to_string(),
+                path: "/tmp/.harkonnen/project-context.md".to_string(),
+                category: "context".to_string(),
+                scope: "project".to_string(),
+                summary: "project interview and stakeholder attitudes".to_string(),
+                relevance: 30,
+            },
+            RepoLocalContextEntry {
+                label: "implementation notes".to_string(),
+                path: "/tmp/.harkonnen/contexts/implementation-notes.md".to_string(),
+                category: "context".to_string(),
+                scope: "contexts".to_string(),
+                summary: "implementation rationale and edit history".to_string(),
+                relevance: 40,
+            },
+        ];
+        let skill_entries = vec![RepoLocalContextEntry {
+            label: "forge".to_string(),
+            path: "/tmp/.harkonnen/skills/forge.md".to_string(),
+            category: "skill".to_string(),
+            scope: "skills".to_string(),
+            summary: "implementation helper".to_string(),
+            relevance: 20,
+        }];
+
+        let (scout_context, scout_skills) = filter_repo_local_entries_for_scope(
+            &context_entries,
+            &skill_entries,
+            BriefingScope::ScoutPreflight,
+        );
+        let (sable_context, sable_skills) = filter_repo_local_entries_for_scope(
+            &context_entries,
+            &skill_entries,
+            BriefingScope::SablePreflight,
+        );
+
+        assert!(!scout_context.is_empty());
+        assert!(scout_context
+            .iter()
+            .all(|entry| !entry.label.contains("implementation")));
+        assert!(!scout_skills.is_empty());
+        assert!(sable_context.is_empty());
+        assert!(sable_skills.is_empty());
     }
 
     #[test]
@@ -26588,11 +27930,16 @@ mod tests {
 
     #[test]
     fn validation_summary_classifies_wrong_answer_diff() {
-        let summary = build_validation_summary(vec![ScenarioResult {
-            scenario_id: "test_command_1".to_string(),
-            passed: false,
-            details: "Command failed (runtime_failure): expected: 42 actual: 41".to_string(),
-        }]);
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "Command failed (runtime_failure): expected: 42 actual: 41".to_string(),
+            }],
+            1,
+            0,
+            BTreeMap::new(),
+        );
 
         assert_eq!(
             summary.failure_kind,
@@ -26600,15 +27947,22 @@ mod tests {
         );
         assert!(has_real_test_failure(&summary));
         assert!(format_validation_failure_output(&summary).contains("[FAILED] test_command_1"));
+        assert_eq!(summary.real_test_commands, 1);
+        assert_eq!(summary.passed_real_test_commands, 0);
     }
 
     #[test]
     fn validation_summary_classifies_compile_error_from_output() {
-        let summary = build_validation_summary(vec![ScenarioResult {
-            scenario_id: "test_command_1".to_string(),
-            passed: false,
-            details: "SyntaxError: invalid syntax while importing module".to_string(),
-        }]);
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "SyntaxError: invalid syntax while importing module".to_string(),
+            }],
+            1,
+            0,
+            BTreeMap::new(),
+        );
 
         assert_eq!(
             summary.failure_kind,
@@ -26618,11 +27972,16 @@ mod tests {
 
     #[test]
     fn validation_summary_classifies_timeout_before_test_failure() {
-        let summary = build_validation_summary(vec![ScenarioResult {
-            scenario_id: "cargo_test".to_string(),
-            passed: false,
-            details: "Command terminated_by_signal after timeout".to_string(),
-        }]);
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "cargo_test".to_string(),
+                passed: false,
+                details: "Command terminated_by_signal after timeout".to_string(),
+            }],
+            0,
+            0,
+            BTreeMap::new(),
+        );
 
         assert_eq!(
             summary.failure_kind,
@@ -26632,16 +27991,176 @@ mod tests {
 
     #[test]
     fn validation_summary_classifies_generic_test_failure() {
-        let summary = build_validation_summary(vec![ScenarioResult {
-            scenario_id: "cargo_test".to_string(),
-            passed: false,
-            details: "test failed: process exited with status 1".to_string(),
-        }]);
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "cargo_test".to_string(),
+                passed: false,
+                details: "test failed: process exited with status 1".to_string(),
+            }],
+            0,
+            0,
+            BTreeMap::new(),
+        );
 
         assert_eq!(
             summary.failure_kind,
             Some(crate::models::FailureKind::TestFailure)
         );
+    }
+
+    #[test]
+    fn validation_summary_tracks_explicit_real_test_counts() {
+        let summary = build_validation_summary(
+            vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: true,
+                    details: "ok".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "failed".to_string(),
+                },
+            ],
+            2,
+            1,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(summary.real_test_commands, 2);
+        assert_eq!(summary.passed_real_test_commands, 1);
+    }
+
+    #[test]
+    fn extract_wrong_answer_evidence_parses_expected_and_actual_blocks() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "Wrong answer\nExpected output:\n8\nActual output:\n7".to_string(),
+        };
+
+        let evidence = extract_wrong_answer_evidence(&outcome).unwrap();
+        assert_eq!(evidence.expected.as_deref(), Some("8"));
+        assert_eq!(evidence.actual.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn format_validation_failure_output_includes_structured_wrong_answer_evidence() {
+        let mut wrong_answer_evidence = BTreeMap::new();
+        wrong_answer_evidence.insert(
+            "test_command_1".to_string(),
+            crate::models::WrongAnswerEvidence {
+                expected: Some("42".to_string()),
+                actual: Some("41".to_string()),
+                excerpt: "expected: 42 actual: 41".to_string(),
+            },
+        );
+
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "Command failed (runtime_failure): expected: 42 actual: 41".to_string(),
+            }],
+            1,
+            0,
+            wrong_answer_evidence,
+        );
+
+        let formatted = format_validation_failure_output(&summary);
+        assert!(formatted.contains("EXPECTED:\n42"));
+        assert!(formatted.contains("ACTUAL:\n41"));
+        assert!(formatted.contains("OBSERVED OUTPUT:"));
+    }
+
+    #[test]
+    fn assess_validation_repair_attempt_marks_improvement_when_failures_drop() {
+        let before = ValidationSummary {
+            passed: false,
+            scored_checks: 0,
+            passed_scored_checks: 0,
+            real_test_commands: 2,
+            passed_real_test_commands: 0,
+            results: vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: false,
+                    details: "expected 1 got 0".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "expected 2 got 0".to_string(),
+                },
+            ],
+            wrong_answer_evidence: BTreeMap::new(),
+            failure_kind: Some(FailureKind::WrongAnswer),
+        };
+        let after = ValidationSummary {
+            passed: false,
+            scored_checks: 0,
+            passed_scored_checks: 0,
+            real_test_commands: 2,
+            passed_real_test_commands: 1,
+            results: vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: true,
+                    details: "ok".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "expected 2 got 1".to_string(),
+                },
+            ],
+            wrong_answer_evidence: BTreeMap::new(),
+            failure_kind: Some(FailureKind::WrongAnswer),
+        };
+        let proposal = MasonEditProposal {
+            summary: "Fix edge-case handling".to_string(),
+            rationale: vec!["The first case now passes.".to_string()],
+            edits: Vec::new(),
+        };
+
+        let attempt = assess_validation_repair_attempt(1, &proposal, 1, &before, &after);
+        assert_eq!(attempt.outcome, "improved");
+        assert!(attempt
+            .guidance_for_next_attempt
+            .contains("target only the remaining failures"));
+    }
+
+    #[test]
+    fn render_validation_repair_markdown_includes_attempt_guidance() {
+        let artifact = ValidationRepairArtifact {
+            run_id: "run-1".to_string(),
+            spec_id: "spec-1".to_string(),
+            product: "product".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            attempts: vec![ValidationRepairAttemptRecord {
+                iteration: 1,
+                proposal_summary: "Fix sum logic".to_string(),
+                proposal_rationale: vec!["The loop skipped the final value.".to_string()],
+                edits_applied: 1,
+                before_summary: "before".to_string(),
+                after_summary: "after".to_string(),
+                failure_kind_before: Some("WrongAnswer".to_string()),
+                failure_kind_after: Some("WrongAnswer".to_string()),
+                before_failing_checks: vec!["test_command_1 (expected 8 got 7)".to_string()],
+                after_failing_checks: vec!["test_command_1 (expected 8 got 7)".to_string()],
+                outcome: "stalled".to_string(),
+                guidance_for_next_attempt: "Previous attempt did not change the failing signal."
+                    .to_string(),
+                passed_after: false,
+            }],
+        };
+
+        let markdown = render_validation_repair_markdown(&artifact);
+        assert!(markdown.contains("# Validation Repair Attempts"));
+        assert!(markdown.contains("Outcome: stalled"));
+        assert!(markdown.contains("Previous attempt did not change the failing signal."));
     }
 
     #[test]

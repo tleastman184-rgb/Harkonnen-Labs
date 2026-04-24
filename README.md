@@ -188,9 +188,9 @@ Most scores are still pending first runs. StreamingQA now has a first local Hark
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | SWE-bench Verified | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent / OpenCode | planned | Phase 2 |
 | SWE-bench Pro | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent | planned | Phase 2 |
-| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | planned | Phase 2 |
+| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | wired | Phase 2 |
 | Aider Polyglot | Mason / Piper | % Correct | pending | pending | Aider (published leaderboard) | planned | Phase 2 |
-| DevBench | Full factory pipeline | Lifecycle score | pending | pending | Single-agent tools | planned | Phase 3 |
+| DevBench | Full factory pipeline | Lifecycle score | pending | pending | Single-agent tools | planned | Phase 10 |
 
 #### Multi-turn and tool-use — vs general agent frameworks
 
@@ -204,8 +204,8 @@ Most scores are still pending first runs. StreamingQA now has a first local Hark
 
 | Benchmark | Subsystem | Metric | Result | Notes | Status | Phase |
 | --- | --- | --- | ---: | --- | --- | --- |
-| Spec Adherence Rate | Scout / Mason | Completeness % / Precision % | pending | Measures spec-first contribution — run with and without Scout | internal | Phase 3 |
-| Hidden Scenario Delta | Bramble / Sable | Pass rate gap (hidden − visible) | pending | Proves Sable catches what Bramble misses | internal | Phase 3 |
+| Spec Adherence Rate | Scout / Mason | Completeness % / Precision % | pending | Measures spec-first contribution — run with and without Scout | internal | Phase 10 |
+| Hidden Scenario Delta | Bramble / Sable | Pass rate gap (hidden − visible) | pending | Proves Sable catches what Bramble misses | internal | Phase 10 |
 | Causal Attribution Accuracy | Coobie diagnose | Top-1 / Top-3 accuracy | pending | Seeded failure corpus; measures causal memory vs semantic recall | internal | Phase 5 |
 | Local Regression Gate | Whole factory | pass / fail | passing | Hard merge gate, runs on every change | wired | Phase 1 done |
 
@@ -482,7 +482,7 @@ Spec → Agents → Validation → Artifacts → Memory → Consolidation → Be
 
 ## ⚠️ Status
 
-Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and the v1-A through v1-D coordination/continuity slices are shipped. The v1-E transactional execution slice now includes the implementation-phase Mason edit boundary, approve/reject/revise/rollback checkpoint handling, visible-validation plus hidden-scenario/artifact/causal-report continuation after approved edits, rollback restore from a named backup, privileged MCP/tool-surface approval boundaries, and invocation-level host-command gateway logging/enforcement for run-loop build and validation commands; Phase 2 real test execution follows the narrow v1 pass.
+Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and the v1-A through v1-D coordination/continuity slices are shipped. The v1-E transactional execution slice now includes the implementation-phase Mason edit boundary, approve/reject/revise/rollback checkpoint handling, visible-validation plus hidden-scenario/artifact/causal-report continuation after approved edits, rollback restore from a named backup, privileged MCP/tool-surface approval boundaries, and invocation-level host-command gateway logging/enforcement for run-loop build and validation commands. Phase 2 is now partially shipped as an explicit Bramble test harness for raw `spec.test_commands`, a structured wrong-answer evidence path into Mason's repair loop, retry-improvement tracking artifacts for validation fixes, and a wired LiveCodeBench adapter; the remaining comparison adapters still follow.
 
 | Area | Status |
 | --- | --- |
@@ -508,7 +508,7 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and the 
 | Run decision log API (`GET /api/runs/:id/decisions`) | Live |
 | Benchmark toolchain (LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, CLADDER native adapters) | Live |
 | Transactional execution and approval boundaries | v1-E — implementation approval, validation plus hidden/artifact continuation, rollback execution, privileged tool-surface boundaries, and invocation-level host-command gateway shipped |
-| Bramble real test execution | Phase 2 — follows v1-E |
+| Bramble real test execution | Phase 2 — explicit `spec.test_commands` harness shipped, structured wrong-answer evidence reaches Mason/reporting, validation retry improvement is tracked, LiveCodeBench wired; additional comparison adapters remain |
 | Ash live twin provisioning (Docker stubs) | Deferred unless a future product explicitly requires running service virtualization |
 | Qdrant + OCR memory infrastructure | Phase 5b |
 | TypeDB 3.x semantic graph layer | Phase 6 |
@@ -559,8 +559,9 @@ Full design: [the-soul-of-ai/06-The-Calvin-Archive.md](the-soul-of-ai/06-The-Cal
 Near-term:
 
 * **v1-E** — extend the invocation gateway from in-process host-command execution to any future proxied third-party MCP traffic Harkonnen brokers directly
-* **Phase 2** — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
-* **Phase 3** — Flint documentation, spec-grounded evaluation, and DevBench readiness after the coordination path; live twin provisioning remains deferred unless a product explicitly needs it
+* **Phase 2** — finish the remaining Bramble real-test work after the shipped `spec.test_commands` harness and wired LiveCodeBench lane, with benchmark expansion intentionally kept narrow while the core run path matures
+* **Phase 5-C** — explicit sub-slices: `5-C1` shipped as Coobie preflight `ContextTarget` budgeting + attribution telemetry, `5-C2` is now shipped as the Scout/Mason/Sable scope split plus scoped preflight artifacts and repo-local prompt filtering, and `5-C3` is next as sub-agent dispatch/isolation
+* **Phase 10** — Flint documentation, spec-grounded evaluation, and DevBench readiness after the coordination path; live twin provisioning remains deferred unless a product explicitly needs it
 * **Operator Model full five-layer interview** — extend the shipped two-layer MVP (v1-D) to cover dependencies, institutional knowledge, and friction layers; generate the full artifact set (`USER.md`, `HEARTBEAT.md`, `operating-model.json`)
 
 Mid-term:

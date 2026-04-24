@@ -494,6 +494,14 @@ pub struct PhaseAttributionRecord {
     #[serde(default)]
     pub query_terms: Vec<String>,
     #[serde(default)]
+    pub briefing_scope: Option<BriefingScope>,
+    #[serde(default)]
+    pub briefing_token_budget: u32,
+    #[serde(default)]
+    pub briefing_tokens_used: u32,
+    #[serde(default)]
+    pub briefing_hits_provided: usize,
+    #[serde(default)]
     pub stakeholder_alignment: Option<StakeholderAlignmentSummary>,
     pub created_at: DateTime<Utc>,
 }
@@ -602,6 +610,62 @@ pub struct PriorCauseSignal {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefingScope {
+    CoobiePreflight,
+    ScoutPreflight,
+    MasonPreflight,
+    PiperPreflight,
+    SablePreflight,
+    CoobieConsolidation,
+    OperatorQuery,
+}
+
+impl std::fmt::Display for BriefingScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            BriefingScope::CoobiePreflight => "coobie_preflight",
+            BriefingScope::ScoutPreflight => "scout_preflight",
+            BriefingScope::MasonPreflight => "mason_preflight",
+            BriefingScope::PiperPreflight => "piper_preflight",
+            BriefingScope::SablePreflight => "sable_preflight",
+            BriefingScope::CoobieConsolidation => "coobie_consolidation",
+            BriefingScope::OperatorQuery => "operator_query",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSection {
+    ProjectInterview,
+    OperatorModel,
+    SoulIdentity,
+}
+
+impl std::fmt::Display for ContextSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ContextSection::ProjectInterview => "project_interview",
+            ContextSection::OperatorModel => "operator_model",
+            ContextSection::SoulIdentity => "soul_identity",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTarget {
+    pub scope: BriefingScope,
+    pub task_description: String,
+    pub token_budget: u32,
+    pub min_hits: u32,
+    #[serde(default)]
+    pub required_sections: Vec<ContextSection>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoobieBriefing {
     pub spec_id: String,
@@ -648,6 +712,18 @@ pub struct CoobieBriefing {
     pub scenario_blueprint: Option<ScenarioBlueprint>,
     #[serde(default)]
     pub project_memory_root: Option<String>,
+    #[serde(default)]
+    pub briefing_scope: Option<BriefingScope>,
+    #[serde(default)]
+    pub briefing_task_description: String,
+    #[serde(default)]
+    pub target_token_budget: u32,
+    #[serde(default)]
+    pub briefing_tokens_used: u32,
+    #[serde(default)]
+    pub briefing_hits_provided: usize,
+    #[serde(default)]
+    pub required_sections_applied: Vec<ContextSection>,
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
     pub regulatory_considerations: Vec<String>,
@@ -885,6 +961,16 @@ pub struct ScenarioResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WrongAnswerEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     CompileError,
@@ -902,7 +988,13 @@ pub struct ValidationSummary {
     pub scored_checks: usize,
     #[serde(default)]
     pub passed_scored_checks: usize,
+    #[serde(default)]
+    pub real_test_commands: usize,
+    #[serde(default)]
+    pub passed_real_test_commands: usize,
     pub results: Vec<ScenarioResult>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wrong_answer_evidence: BTreeMap<String, WrongAnswerEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
 }

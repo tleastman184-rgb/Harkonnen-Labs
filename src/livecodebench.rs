@@ -33,7 +33,8 @@
 //! - `LCB_OUTPUT`        — output directory (defaults to `factory/artifacts/benchmarks/livecodebench/`)
 //! - `LCB_MODE`          — `harkonnen` (default, Mason via agent dispatch) or `direct` (raw LLM)
 //! - `LCB_LIMIT`         — max problems to evaluate
-//! - `LCB_PROVIDER`      — LLM provider for `direct` mode
+//! - `LCB_DIRECT_PROVIDER` — LLM provider for `direct` mode
+//! - `LCB_PROVIDER`      — legacy alias for `LCB_DIRECT_PROVIDER`
 //! - `LCB_MIN_PASS_RATE` — minimum pass@1 to pass the suite (0.0 – 1.0)
 //! - `LCB_TIMEOUT_SECS`  — per-test-case subprocess timeout in seconds (default 10)
 
@@ -206,8 +207,9 @@ pub async fn run_with_overrides(
 
     let mode = LcbMode::parse(get_override(overrides, "LCB_MODE"))?;
     let agent = get_override(overrides, "LCB_AGENT").unwrap_or_else(|| DEFAULT_AGENT.to_string());
-    let direct_provider =
-        get_override(overrides, "LCB_PROVIDER").unwrap_or_else(|| "anthropic".to_string());
+    let direct_provider = get_override(overrides, "LCB_DIRECT_PROVIDER")
+        .or_else(|| get_override(overrides, "LCB_PROVIDER"))
+        .unwrap_or_else(|| "anthropic".to_string());
     let limit: Option<usize> = get_override(overrides, "LCB_LIMIT").and_then(|v| v.parse().ok());
     let min_pass_rate: Option<f64> =
         get_override(overrides, "LCB_MIN_PASS_RATE").and_then(|v| v.parse().ok());
@@ -244,7 +246,10 @@ pub async fn run(paths: &Paths, config: &LcbRunConfig) -> Result<LcbRunOutput> {
         problems
     };
 
-    let provider_label = format!("{}-{}", config.mode.as_str(), &config.agent);
+    let provider_label = match config.mode {
+        LcbMode::Harkonnen => format!("{}-{}", config.mode.as_str(), &config.agent),
+        LcbMode::Direct => format!("{}-{}", config.mode.as_str(), &config.direct_provider),
+    };
     let mut results: Vec<LcbProblemResult> = Vec::with_capacity(problems.len());
     let mut by_difficulty: BTreeMap<String, LcbDifficultyMetrics> = BTreeMap::new();
     let mut by_platform: BTreeMap<String, LcbDifficultyMetrics> = BTreeMap::new();
@@ -719,11 +724,42 @@ pub fn reason_for_output(output: &LcbRunOutput) -> Option<String> {
 
 pub fn render_step_stdout(output: &LcbRunOutput) -> String {
     format!(
-        "LiveCodeBench [{}] n={} pass@1={:.1}% ({}/{})\n",
+        "LiveCodeBench [{}] n={} pass@1={:.1}% ({}/{})\nSummary JSON: {}\nReport Markdown: {}\n",
         output.mode.as_str(),
         output.metrics.total_problems,
         output.metrics.pass_at_1 * 100.0,
         output.metrics.passed_problems,
         output.metrics.total_problems,
+        output.summary_path.display(),
+        output.markdown_path.display(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_step_stdout_includes_summary_artifacts() {
+        let output = LcbRunOutput {
+            output_dir: PathBuf::from("/tmp/livecodebench"),
+            summary_path: PathBuf::from("/tmp/livecodebench/lcb_summary.json"),
+            markdown_path: PathBuf::from("/tmp/livecodebench/lcb_report.md"),
+            mode: LcbMode::Harkonnen,
+            provider_label: "harkonnen-mason".to_string(),
+            metrics: LcbMetrics {
+                total_problems: 3,
+                passed_problems: 2,
+                pass_at_1: 2.0 / 3.0,
+                by_difficulty: BTreeMap::new(),
+                by_platform: BTreeMap::new(),
+            },
+            threshold_failure: None,
+        };
+
+        let stdout = render_step_stdout(&output);
+        assert!(stdout.contains("LiveCodeBench [harkonnen] n=3 pass@1=66.7% (2/3)"));
+        assert!(stdout.contains("Summary JSON: /tmp/livecodebench/lcb_summary.json"));
+        assert!(stdout.contains("Report Markdown: /tmp/livecodebench/lcb_report.md"));
+    }
 }

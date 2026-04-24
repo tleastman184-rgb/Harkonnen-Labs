@@ -739,21 +739,24 @@ Mason workspace lease claim/check/release is now live, with DB-backed lease mirr
 
 - `bramble_run_tests` in orchestrator
 - `ValidationSummary` from real exit codes and parsed test output
-- Mason online-judge feedback loop — `FailureKind::WrongAnswer` feeds diff-focused fix prompt
-- LiveCodeBench adapter
-- Aider Polyglot adapter
+  Progress: raw-shell `spec.test_commands` execution, explicit real-test counts in `ValidationSummary`, and Coobie/report visibility are shipped.
+- Mason online-judge feedback loop — `FailureKind::WrongAnswer` now carries structured expected/actual evidence from Bramble's explicit test-command harness into `validation.json`, the run report, and Mason's diff-focused fix prompt; validation retries also emit `validation_repair_attempts.{json,md}`, classify each retry as `resolved / improved / stalled / regressed`, and feed that note into the next Mason attempt
+- LiveCodeBench adapter — wired through the benchmark manifest and benchmark report path with suite-level pass@1 artifacts
+- Benchmark posture — keep `LiveCodeBench` as the single active external coding canary while the core run path matures; additional public coding benchmarks stay adapter-ready until they answer a materially different question.
+- Aider Polyglot adapter — adapter-ready, but intentionally deferred as an active lane until the narrow end-to-end path is more mature
 
-**Done when:** A spec with `test_commands` shows real pass/fail in the run report, and Mason's fix loop handles wrong-answer failures end-to-end.
+**Done when:** A spec with `test_commands` shows real pass/fail in the run report, and Mason's fix loop handles wrong-answer failures end-to-end. The explicit Bramble test harness, structured wrong-answer evidence path, retry-improvement tracking, and LiveCodeBench canary lane are now shipped; broader benchmark expansion remains intentionally deferred behind core factory maturity.
 
 ---
 
-### Phase 3 — Documentation, DevBench, And Spec-Grounded Evaluation
+### Phase 10 — Documentation, DevBench, And Spec-Grounded Evaluation
 
 - Flint documentation phase — produces README / API reference / doc comments as first-class output
 - DevBench adapter and launch scripts after the narrow coordination path is complete
 - Spec Adherence Rate benchmark
 - Hidden Scenario Delta benchmark
-- Optional twin-fidelity telemetry remains available, but live twin provisioning is not a Phase 3 gate
+- Optional twin-fidelity telemetry remains available, but live twin provisioning is not a Phase 10 gate
+- Phase 5-C is now explicitly split so the critical-path continuation is unambiguous: `5-C1` shipped as Coobie preflight `ContextTarget` budgeting + attribution telemetry, `5-C2` is now shipped as the Scout/Mason/Sable scope split plus scoped preflight artifacts and repo-local prompt filtering, and `5-C3` is next as sub-agent dispatch/isolation
 
 **Done when:** Flint produces a doc artifact per run, spec adherence and hidden-scenario delta have first-run baselines, and the DevBench adapter can launch through the benchmark manifest. Live Docker-backed twin provisioning remains deferred unless a future product explicitly requires running service virtualization.
 
@@ -907,7 +910,7 @@ Benchmark wiring advances with implementation phases, but the current engineerin
 | SWE-bench Verified | Human-validated issue resolution | Adapter-ready; Phase 2 |
 | LiveCodeBench | Recent competitive programming, no contamination | Phase 2 |
 | Aider Polyglot | Multi-language coding, public leaderboard | Phase 2 |
-| DevBench | Full software lifecycle | Phase 3 |
+| DevBench | Full software lifecycle | Phase 10 |
 | Local Regression Gate | Hard merge gate (fmt, check, test) | Live, always-on |
 
 **Multi-turn and tool-use (vs general agent frameworks):**
@@ -928,8 +931,8 @@ Benchmark wiring advances with implementation phases, but the current engineerin
 
 | Suite | What it measures | Status |
 | --- | --- | --- |
-| Spec Adherence Rate | Completeness and precision vs stated spec | Phase 3 |
-| Hidden Scenario Delta | Gap between visible test pass rate and hidden scenario pass rate | Phase 3 |
+| Spec Adherence Rate | Completeness and precision vs stated spec | Phase 10 |
+| Hidden Scenario Delta | Gap between visible test pass rate and hidden scenario pass rate | Phase 10 |
 | Causal Attribution Accuracy | Seeded failure corpus, top-1 / top-3 | Phase 7 |
 
 ### Phase-Aligned Benchmark Gates
@@ -938,7 +941,7 @@ Benchmark wiring advances with implementation phases, but the current engineerin
 | --- | --- |
 | v1 | Decision audit completeness, memory supersession accuracy (StreamingQA), WrongAnswer classification rate, operator-model context visibility |
 | Phase 2 | SWE-bench Verified readiness, LiveCodeBench, Aider Polyglot |
-| Phase 3 | spec adherence rate, hidden scenario delta, DevBench; twin fidelity remains optional diagnostic telemetry |
+| Phase 10 | spec adherence rate, hidden scenario delta, DevBench; twin fidelity remains optional diagnostic telemetry |
 | Phase 4b | StreamingQA belief-update accuracy |
 | Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
 | Phase 6 | GAIA Level 3, AgentBench |

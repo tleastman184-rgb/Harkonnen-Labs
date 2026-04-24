@@ -734,6 +734,14 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
 - Project memory hits: {}
 - Core memory hits: {}
 
+## Briefing Shape
+- Scope: {}
+- Task: {}
+- Token budget: {}
+- Tokens used for retrieved hits: {}
+- Retrieved hits included: {}
+- Required sections injected: {}
+
 ## Resume Packet Summary
 {}
 
@@ -830,6 +838,28 @@ I reviewed prior memory and causal history for `{}` targeting `{}`.
         project_memory_root,
         briefing.project_memory_hits.len(),
         briefing.core_memory_hits.len(),
+        briefing
+            .briefing_scope
+            .map(|scope| scope.to_string())
+            .unwrap_or_else(|| "unspecified".to_string()),
+        if briefing.briefing_task_description.trim().is_empty() {
+            "not recorded".to_string()
+        } else {
+            briefing.briefing_task_description.clone()
+        },
+        briefing.target_token_budget,
+        briefing.briefing_tokens_used,
+        briefing.briefing_hits_provided,
+        if briefing.required_sections_applied.is_empty() {
+            "none".to_string()
+        } else {
+            briefing
+                .required_sections_applied
+                .iter()
+                .map(|section| section.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
         render_bullet_lines(
             &briefing.resume_packet_summary,
             "No resume packet summary was generated yet.",
@@ -1334,7 +1364,9 @@ impl SqliteCoobie {
         let test_coverage = match &ep.validation {
             None => 0.0,
             Some(v) => {
-                if v.scored_checks > 0 {
+                if v.real_test_commands > 0 {
+                    v.passed_real_test_commands as f32 / v.real_test_commands as f32
+                } else if v.scored_checks > 0 {
                     v.passed_scored_checks as f32 / v.scored_checks as f32
                 } else if v.results.is_empty() {
                     0.0
@@ -2083,6 +2115,8 @@ impl CoobieReasoner for SqliteCoobie {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{FactoryEpisode, ValidationSummary};
+    use chrono::Utc;
 
     #[test]
     fn deep_causality_activates_failure_signals() {
@@ -2131,5 +2165,35 @@ mod tests {
         assert_eq!(analysis.effect_score, 0.1);
         assert_eq!(analysis.active_signal_count, 0);
         assert!(analysis.active_signals.is_empty());
+    }
+
+    #[test]
+    fn score_episode_prefers_explicit_real_test_counts() {
+        let episode = FactoryEpisode {
+            run_id: "run-tests".to_string(),
+            product: "product".to_string(),
+            spec_id: "spec".to_string(),
+            features: vec!["feature".to_string()],
+            agent_events: Vec::new(),
+            tool_events: Vec::new(),
+            phase_attributions: Vec::new(),
+            twin_env: None,
+            validation: Some(ValidationSummary {
+                passed: false,
+                scored_checks: 4,
+                passed_scored_checks: 4,
+                real_test_commands: 2,
+                passed_real_test_commands: 1,
+                results: Vec::new(),
+                wrong_answer_evidence: std::collections::BTreeMap::new(),
+                failure_kind: None,
+            }),
+            scenarios: None,
+            decision: None,
+            created_at: Utc::now(),
+        };
+
+        let scores = SqliteCoobie::score_episode(&episode);
+        assert!((scores.test_coverage_score - 0.5).abs() < f32::EPSILON);
     }
 }

@@ -358,6 +358,17 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
     report.push_str("\nVisible Validation\n------------------\n");
     if let Some(validation) = validation {
         report.push_str(&format!("Passed: {}\n", validation.passed));
+        report.push_str(&format!(
+            "Scored checks: {}/{}\n",
+            validation.passed_scored_checks, validation.scored_checks
+        ));
+        report.push_str(&format!(
+            "Explicit test commands: {}/{}\n",
+            validation.passed_real_test_commands, validation.real_test_commands
+        ));
+        if let Some(kind) = &validation.failure_kind {
+            report.push_str(&format!("Failure kind: {kind:?}\n"));
+        }
         for result in validation.results {
             report.push_str(&format!(
                 "- {}: {}\n  {}\n",
@@ -365,6 +376,18 @@ pub async fn build_report(app: &AppContext, run_id: &str) -> Result<String> {
                 if result.passed { "pass" } else { "fail" },
                 result.details
             ));
+            if let Some(evidence) = validation.wrong_answer_evidence.get(&result.scenario_id) {
+                if let Some(expected) = evidence.expected.as_ref().filter(|value| !value.is_empty())
+                {
+                    report.push_str(&format!("    expected: {}\n", expected));
+                }
+                if let Some(actual) = evidence.actual.as_ref().filter(|value| !value.is_empty()) {
+                    report.push_str(&format!("    actual: {}\n", actual));
+                }
+                if !evidence.excerpt.trim().is_empty() {
+                    report.push_str(&format!("    observed: {}\n", evidence.excerpt.trim()));
+                }
+            }
         }
     } else {
         report.push_str("No validation summary written yet.\n");

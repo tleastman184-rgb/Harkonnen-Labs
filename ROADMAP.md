@@ -6,7 +6,7 @@ The fastest reasonable path: v1-A (Keeper-backed lease enforcement) → v1-B
 (testable harness) → Phase 5-C (context gating, no new infra) → Phase 5b
 (Qdrant, memory refactor) → Phase 6 (TypeDB) → Phase 7 (causal corpus) →
 Phase 8 (Calvin Archive).
-Phase 3 (docs, DevBench, benchmark suites) follows the coordination path rather
+Phase 10 (docs, DevBench, benchmark suites) follows the coordination path rather
 than interrupting it. Live twin provisioning is permanently deferred unless a
 product explicitly requires running service virtualization. Phase 2's real test
 execution IS the testable harness. The Calvin Archive is now a working sidecar
@@ -42,14 +42,14 @@ A structured gap analysis identified seven practical gaps. Gap-closure phases A�
 - `.harkonnen/gap-closure-progress.md` tracks strategic bridge work phases A–D (all shipped)
 - Phase v1 (below) is the structural gate before the factory can be called Tier 4
 - After v1, the roadmap drives through grounded execution and scoped context before deeper memory infrastructure
-- Phase 3 benchmarks and docs follow the coordination path
+- Phase 10 benchmarks and docs follow the coordination path
 - Operator Model and External Integrations are parallel product tracks
 
 ---
 
 ## Twin Policy
 
-**Bramble's real test execution (Phase 2) is the testable harness.** There is no mandatory dependency on Docker-backed service virtualization anywhere in this roadmap. "Digital twin" in this system means the manifest-based twin fidelity score used for diagnostic telemetry — it does not mean a running containerized replica of the target service. `twin_fidelity_score` remains available as optional telemetry. Phase 3-D exists only as a maintenance note for that signal; it is not a Phase 3 completion gate.
+**Bramble's real test execution (Phase 2) is the testable harness.** There is no mandatory dependency on Docker-backed service virtualization anywhere in this roadmap. "Digital twin" in this system means the manifest-based twin fidelity score used for diagnostic telemetry — it does not mean a running containerized replica of the target service. `twin_fidelity_score` remains available as optional telemetry. Phase 10-D exists only as a maintenance note for that signal; it is not a Phase 10 completion gate.
 
 If a specific product built on Harkonnen requires live service virtualization for its own testing needs, that capability can be revisited then with that product's requirements as the driver. It does not belong in the core factory sequence.
 
@@ -68,7 +68,7 @@ The factory needs a clear line from coordination authority to durable continuity
 7. **Phase 6** — TypeDB semantic layer for cross-run typed causal queries.
 8. **Phase 7** — causal attribution corpus so the deeper continuity layer opens with real evidence.
 9. **Phase 8** — the Calvin Archive: persisted identity, governed integration, D*/SSA streaming. This remains the long-horizon destination, but no longer blocks coordination-first engineering.
-10. **Phase 3** — documentation, DevBench, benchmark suites. Important for external claims and usability but not on the current critical path.
+10. **Phase 10** — documentation, DevBench, benchmark suites. Important for external claims and usability but not on the current critical path.
 
 Parallel tracks (Compiled State Synthesis, External Integrations, Operator Model, Hosted/Team, Calvin Archive Visualizer) advance independently of the above sequence and do not block it.
 
@@ -189,27 +189,30 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 
 ## Phase 2 — Bramble Real Test Execution
 
-**This is the testable harness.** Until this ships, `validation_passed` reflects scenario results and stubs rather than real test output. Every downstream quality signal (Coobie's `test_coverage_score`, Phase 3 benchmarks, the fix loop's wrong-answer path) depends on real exit codes coming from real test commands.
+**This is the testable harness.** Until this ships, `validation_passed` reflects scenario results and stubs rather than real test output. Every downstream quality signal (Coobie's `test_coverage_score`, Phase 10 benchmarks, the fix loop's wrong-answer path) depends on real exit codes coming from real test commands.
 
 **What to build:**
 
 - `bramble_run_tests` in orchestrator — reads `spec.test_commands` (same detection logic as Piper) and executes them in the staged workspace
+  Shipped: explicit Bramble test harness now runs raw `spec.test_commands` through shell-preserving execution, records `real_test_commands` / `passed_real_test_commands` in `ValidationSummary`, and writes corpus results from those runs.
 - Stdout/stderr streamed as `LiveEvent::BuildOutput` on the broadcast channel (already exists — Bramble just needs to use it)
 - `ValidationSummary` populated from real exit codes and parsed test output, not from scenario results or stubs
 - Bramble's phase attribution records `validation_passed: true/false` from actual runs
 - Feed result back as `test_coverage_score` into the Coobie episode at ingest time
-- **Mason online-judge feedback loop** — `FailureKind::WrongAnswer` (wired in v1-C) feeds into Mason's fix loop with a diff-focused prompt. Phase 2 formalises the loop end-to-end: parse stdout diff output from competitive programming judges as a first-class failure signal.
-- **LiveCodeBench adapter** — wrapper command that pulls recent problems, runs Mason/Piper, and emits pass/fail per problem into the benchmark runner.
-- **Aider Polyglot adapter** — maps Aider's multi-language benchmark format to Harkonnen specs; no structural changes needed.
+  Shipped: Coobie now prefers explicit real-test counts over generic scored-check counts when `spec.test_commands` were present, and run reports show explicit test-command totals.
+- **Mason online-judge feedback loop** — `FailureKind::WrongAnswer` (wired in v1-C) now carries structured wrong-answer evidence from Bramble's explicit test-command harness into `validation.json`, the run report, and Mason's diff-focused repair prompt. The loop also records `validation_repair_attempts.{json,md}`, classifies each retry as `resolved / improved / stalled / regressed`, feeds that guidance into the next Mason attempt, and stops early after repeated non-improving retries.
+- **LiveCodeBench adapter** — native builtin now wired through the benchmark manifest and report path; generates per-problem artifacts plus suite-level pass@1 breakdowns in benchmark reports.
+- **Benchmark posture** — keep `LiveCodeBench` as the single active external coding canary while the narrow end-to-end Harkonnen pass matures. Additional public coding benchmarks stay adapter-ready but are not a near-term build gate unless they answer a question the current canary cannot.
+- **Aider Polyglot adapter** — remains adapter-ready for a later comparison lane once the core run path is stable enough to justify broader external measurement.
 
 **Benchmark gate:**
 
 - `local_regression` stays green on every merge
-- the code loop should be runnable through the emerging `SWE-bench Verified` adapter, even if scores are unpublished
-- `LiveCodeBench` adapter wired and producing artifacts
-- `Aider Polyglot` adapter wired for a direct open-source comparison line
+- `LiveCodeBench` remains wired and producing artifacts as the active external coding canary
+- additional coding benchmark expansion stays deferred until the core run path is practical and trustworthy in daily use
+- `SWE-bench Verified`, `SWE-bench Pro`, and `Aider Polyglot` remain comparison-ready backlog items rather than near-term gates
 
-**Done when:** A spec with `test_commands` shows real pass/fail in the run report, Coobie's episode scores reflect actual test execution, and Mason's fix loop handles wrong-answer failures.
+**Done when:** A spec with `test_commands` shows real pass/fail in the run report, Coobie's episode scores reflect actual test execution, and Mason's fix loop handles wrong-answer failures. The explicit test harness, structured wrong-answer evidence path, retry-improvement tracking, and LiveCodeBench canary lane are now shipped; broader benchmark expansion remains intentionally deferred behind core factory maturity.
 
 ---
 
@@ -220,6 +223,12 @@ Benchmark wiring advances in lockstep with implementation phases. Each phase shi
 This is a retrieval-shaping and isolation capability, not a storage change. It does not require TypeDB or Qdrant. It is placed here — before the memory module refactor — because the `BriefingScope` enum and filter logic can land in `src/coobie.rs` now and move cleanly into `src/memory/briefing.rs` during Phase 5b's refactor. The `SubAgentDispatcher` lands in `src/subagent.rs`; orchestrator call sites are thin wrappers.
 
 Full design: `factory/context/briefing-scope-design.md` (BriefingScope) and `factory/context/sub-agent-dispatch-design.md` (SubAgentDispatcher).
+
+**Explicit sub-slice order so this phase does not blur again:**
+
+- **Phase 5-C1 — shipped:** `ContextTarget` metadata for Coobie preflight, budgeted memory-hit shaping, stamped-context section injection tracking, and attribution observability (`briefing_scope`, token budget/usage, hits provided).
+- **Phase 5-C2 — shipped:** distinct Scout, Mason, and Sable briefing projections are now materialized as run artifacts, Scout and Mason now consume their scoped briefings on the hot path, Sable's generated-scenario prompt now receives only the scenario-pure scoped summary, and repo-local prompt support / retriever bundles are filtered by role so hidden-scenario work is not primed with Mason implementation context.
+- **Phase 5-C3 — next critical slice:** `SubAgentDispatcher`, profile/config dispatch resolution, and isolated remote briefing/scenario backends.
 
 **What to build:**
 
@@ -254,7 +263,7 @@ Full design: `factory/context/briefing-scope-design.md` (BriefingScope) and `fac
 
 **Done when:**
 
-- Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; a log entry confirms which scope and token budget were used per phase; and Sable's briefing verifiably contains no Mason implementation content.
+- Scout, Mason, and Sable each receive a distinct briefing shaped to their role; stamped repo interview context is visible in the relevant preflight surfaces; run artifacts now include `scout_briefing.{json,md}`, `mason_briefing.{json,md}`, and `sable_briefing.{json,md}`; scoped repo-local prompt support is filtered per role; and Sable's briefing verifiably contains no Mason implementation content.
 - `ContextTarget` struct in `src/coobie.rs`; `build_targeted_briefing()` replaces `build_preflight_briefing`; `phase_defaults()` provides sane per-scope budgets; episode record captures `briefing_tokens_used` and `briefing_hits_provided`.
 - `SubAgentDispatcher` struct in `src/subagent.rs` with `dispatch()` method; `[sub_agents]` section parsed from `harkonnen.toml` into `SetupConfig`; `coobie_briefing` and `sable_evaluation` tasks dispatch to `ClaudeCodeAgent` backend.
 - Agent profile `dispatch:` blocks parsed for coobie and sable; resolution order enforced.
@@ -585,6 +594,8 @@ This phase is the point established in Phase 5b: Zenoh and Buffa become worth
 their complexity overhead only when agents genuinely span machines. Before this
 phase opens, the single-machine setup should be complete and stable.
 
+**Twilight Bark alignment note:** [`Twilight Bark`](https://github.com/durinwinter/twilight-bark) is a plausible concrete implementation target for this future databus because it already ships a Zenoh-powered bus, a traffic controller/registry, MCP-native access, and JSONL event logging. Harkonnen should therefore keep PackChat bus-facing contracts transport-agnostic and shaped around: stable thread/message/checkpoint envelopes, role/runtime identity, topic/keyexpr routing, and append-only eventlog semantics. The current local PackChat path now emits those envelopes to a local JSONL bus log so the eventual Phase 9 switchover can target Twilight Bark rather than a bespoke second transport.
+
 ### Proto schema (`factory/proto/`)
 
 Define Buffa proto schema for all cross-machine wire types:
@@ -662,13 +673,22 @@ No change to agent profiles or skill files.
 
 ### PackChat distributed mode
 
-`src/chat.rs` gains a Zenoh-backed publisher/subscriber alongside the existing
-SQLite store. Messages written on work-windows are published to
+`src/chat.rs` now has a PackChat bus seam with future-facing envelope emission;
+Phase 9 upgrades that seam from local JSONL/eventlog output to a real
+publisher/subscriber transport alongside the existing SQLite store. Messages
+written on work-windows are published to
 `harkonnen/{setup}/chat/{thread_id}/message` and received by home-linux in real
 time without polling. SQLite remains the durable store; Zenoh is the delivery
 layer. The MCP `post_chat_message` and `list_chat_messages` tools continue to
 work unchanged — the Zenoh subscription fires a write-through to the local
 SQLite replica.
+
+If Twilight Bark is adopted here, Harkonnen should map:
+
+- PackChat `thread_opened`, `thread_roster_synced`, `message_appended`, and `checkpoint_resolved` envelopes onto Twilight Bark bus topics without changing PackChat API semantics.
+- canonical Labrador role + `agent_runtime_id` onto Twilight Bark agent identity / presence records.
+- local `packchat-bus.jsonl` observability onto Twilight Bark's `twilight-eventlog` so replay and audit stay append-only.
+- PackChat thread topics onto Zenoh keyexprs directly rather than introducing a second naming scheme.
 
 ### Calvin Archive cross-machine consistency
 
@@ -736,13 +756,13 @@ local machine for that agent's tasks and logs a `remote_fallback` event in
 
 ---
 
-## Phase 3 — Documentation, Evaluation, and Lifecycle Benchmarks
+## Phase 10 — Documentation, Evaluation, and Lifecycle Benchmarks
 
-**Sequenced after Phase 8** so benchmarks run against the complete system rather than a pre-archive baseline. The DevBench adapter and spec adherence scores are most meaningful once the factory's full memory and governance stack is live. Phase 3 items with no archive dependency (Flint docs, 3-B, 3-C) can begin earlier if capacity allows, but Phase 3 is not a gate on the Calvin Archive path.
+**Sequenced after Phase 8** so benchmarks run against the complete system rather than a pre-archive baseline. The DevBench adapter and spec adherence scores are most meaningful once the factory's full memory and governance stack is live. Phase 10 items with no archive dependency (Flint docs, 10-B, 10-C) can begin earlier if capacity allows, but Phase 10 is not a gate on the Calvin Archive path.
 
-**Twin policy note:** Live twin provisioning is not a Phase 3 completion gate. Phase 3-D (twin fidelity benchmark) is optional diagnostic telemetry only — see Twin Policy above.
+**Twin policy note:** Live twin provisioning is not a Phase 10 completion gate. Phase 10-D (twin fidelity benchmark) is optional diagnostic telemetry only — see Twin Policy above.
 
-### 3-A — Flint documentation phase
+### 10-A — Flint documentation phase
 
 - After `self.package_artifacts(run_id)` in the Flint phase, call a new `flint_generate_docs` method
 - `flint_generate_docs` reads the spec and Mason's implementation artifacts from the run dir, calls the Flint LLM agent to generate a `README.md` and optionally an `API.md`
@@ -750,7 +770,7 @@ local machine for that agent's tasks and logs a `remote_fallback` event in
 - Adds `docs/README.md` to `blackboard.artifact_refs`
 - Required for DevBench — must land before the DevBench gate
 
-### 3-B — `src/spec_adherence.rs` — LLM-as-judge benchmark
+### 10-B — `src/spec_adherence.rs` — LLM-as-judge benchmark
 
 New builtin benchmark module (follows the same pattern as `cladder.rs`).
 
@@ -761,7 +781,7 @@ New builtin benchmark module (follows the same pattern as `cladder.rs`).
 - Builtin name: `"spec_adherence"`
 - Also supports a `without_scout` mode to measure what Scout's formalization step contributes
 
-### 3-C — `src/scenario_delta.rs` — Hidden Scenario Delta benchmark
+### 10-C — `src/scenario_delta.rs` — Hidden Scenario Delta benchmark
 
 New builtin benchmark module — Harkonnen-native, no external dataset.
 
@@ -772,33 +792,33 @@ New builtin benchmark module — Harkonnen-native, no external dataset.
 - Builtin name: `"scenario_delta"`
 - Env: `SCENARIO_DELTA_LIMIT` (max runs to include), `SCENARIO_DELTA_OUTPUT`
 
-### 3-D — `src/twin_fidelity.rs` — Optional twin telemetry benchmark
+### 10-D — `src/twin_fidelity.rs` — Optional twin telemetry benchmark
 
 - Keep `twin_fidelity_score` honest by counting only services whose status is `"running"`
 - Retain a Harkonnen-native summary suite for historical comparison and future revisit
-- **Not a Phase 3 blocker.** Live twin provisioning is deferred per Twin Policy above.
+- **Not a Phase 10 blocker.** Live twin provisioning is deferred per Twin Policy above.
 
-### 3-E — `suites.yaml` entries
+### 10-E — `suites.yaml` entries
 
 - `harkonnen_spec_adherence` — Spec Adherence Rate (harkonnen-native, builtin: `spec_adherence`)
 - `harkonnen_scenario_delta` — Hidden Scenario Delta (harkonnen-native, builtin: `scenario_delta`)
 - `harkonnen_twin_fidelity` — Twin Fidelity telemetry (harkonnen-native, builtin: `twin_fidelity`)
 - `harkonnen_devbench` — DevBench wrapper suite (script-based external adapter)
 
-### 3-F — DevBench adapter wiring
+### 10-F — DevBench adapter wiring
 
 - Add `scripts/benchmark-devbench.sh` following the same skip-and-delegate pattern as the existing SWE-bench and tau2 wrappers
 - `DEVBENCH_COMMAND` supplies the exact local or hosted command that runs Harkonnen on DevBench
 - Optional `DEVBENCH_ROOT` points at the benchmark checkout or adapter workspace
-- The wrapper exits with skip code `10` when DevBench is not configured so Phase 3 can be wired before the full external harness is installed
+- The wrapper exits with skip code `10` when DevBench is not configured so Phase 10 can be wired before the full external harness is installed
 
-### 3-G — Comparative Control-Style Benchmarking
+### 10-G — Comparative Control-Style Benchmarking
 
 - Add benchmark suites that compare three execution styles on the same tasks where practical: pure-LLM baseline, rule-heavy baseline, and Harkonnen's hybrid pack/control-plane path
 - Publish not only task success but also recovery rate, guardrail violation rate, operator interruption count, and time-to-correctness
 - Treat this as a factory benchmark, not a model-only benchmark: the question is how safely and efficiently the delivery system moves, not only how strong one model is in isolation
 
-### 3-H — Adversarial Tool-Use And Stakeholder-Alignment Evaluation
+### 10-H — Adversarial Tool-Use And Stakeholder-Alignment Evaluation
 
 - Add adversarial smokes that probe unsafe tool invocation, policy-bypass attempts, MCP misuse, and recovery behavior after intentionally hostile prompts or malformed tool outputs
 - Add stakeholder-alignment reporting per run: did the plan respect recorded project purpose, operator stakes, stakeholder attitudes, prohibitions, and approved MCP posture?
@@ -1122,7 +1142,7 @@ Benchmarks advance in lockstep with implementation phases. Each phase ships with
 | Phase 6 | GAIA Level 3, AgentBench, TypeDB vs SQL causal recall comparison |
 | Phase 7 | E-CARE, causal attribution accuracy (top-1 / top-3) |
 | Phase 8 | D* drift score, SSA baseline, quarantine resolution quality, schema revision stability |
-| Phase 3 | Spec adherence rate, hidden scenario delta, DevBench |
+| Phase 10 | Spec adherence rate, hidden scenario delta, DevBench |
 
 ### Always-on benchmarks
 
@@ -1144,7 +1164,7 @@ Benchmarks advance in lockstep with implementation phases. Each phase ships with
 
 - `LiveCodeBench` — recent competitive programming problems; contamination-resistant. Phase 2.
 - `Aider Polyglot` — Aider's own multi-language leaderboard. Phase 2.
-- `DevBench` — full software lifecycle; structural argument against single-phase tools. Phase 3.
+- `DevBench` — full software lifecycle; structural argument against single-phase tools. Phase 10.
 - `SWE-bench Verified` / `SWE-bench Pro` — industry-standard code loop benchmarks. Phase 2.
 
 #### vs general agent frameworks
@@ -1159,8 +1179,8 @@ Benchmarks advance in lockstep with implementation phases. Each phase ships with
 
 #### Harkonnen-native — cannot be run by any competitor
 
-- `Spec Adherence Rate` — completeness and precision vs spec. Phase 3.
-- `Hidden Scenario Delta` — visible vs hidden pass rate gap. Phase 3.
+- `Spec Adherence Rate` — completeness and precision vs spec. Phase 10.
+- `Hidden Scenario Delta` — visible vs hidden pass rate gap. Phase 10.
 - `Causal Attribution Accuracy` — seeded failure corpus, top-1 / top-3. Phase 7.
 
 ### Reporting standard

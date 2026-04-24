@@ -532,6 +532,7 @@ suites:
       - "Set LCB_DATASET to the local JSONL file path."
       - "python3 must be available on PATH."
       - "Optionally set LCB_DIRECT_PROVIDER to target a specific named setup provider."
+      - "LCB_PROVIDER remains accepted as a legacy alias for LCB_DIRECT_PROVIDER."
     tags:
       - "external"
       - "baseline"

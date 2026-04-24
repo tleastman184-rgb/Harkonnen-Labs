@@ -111,6 +111,10 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             required_checks TEXT NOT NULL DEFAULT '[]',
             guardrails TEXT NOT NULL DEFAULT '[]',
             query_terms TEXT NOT NULL DEFAULT '[]',
+            briefing_scope TEXT,
+            briefing_token_budget INTEGER NOT NULL DEFAULT 0,
+            briefing_tokens_used INTEGER NOT NULL DEFAULT 0,
+            briefing_hits_provided INTEGER NOT NULL DEFAULT 0,
             stakeholder_alignment_json TEXT NOT NULL DEFAULT 'null',
             created_at TEXT NOT NULL,
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
@@ -118,6 +122,38 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_scope",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_scope TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_token_budget",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_token_budget INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_tokens_used",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_tokens_used INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_hits_provided",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_hits_provided INTEGER NOT NULL DEFAULT 0",
+    )
     .await?;
 
     ensure_column(
