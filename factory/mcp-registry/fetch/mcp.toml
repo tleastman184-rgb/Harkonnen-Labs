@@ -1,0 +1,12 @@
+name = "fetch"
+description = "Generic web fetch surface for pulling reference pages over HTTP."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-fetch"]
+requires_config = []
+requires_env = []
+extra_permissions = ["WebFetch(*)"]
+settings_target = "settings.json"
+
+[[triggers]]
+kind = "always"
+value = "true"

@@ -124,6 +124,8 @@ PackChat shifts the factory from pure autonomous orchestration to **supervised a
 * **Blocking checkpoint flow** — when an agent needs an answer before proceeding, it surfaces a structured reply card in the thread; you answer there, the run continues
 * **Unblock flow** — `POST /api/agents/:id/unblock` releases a stalled run after you reply
 * **Default to Coobie** for unaddressed messages — memory and context retrieval without `@mention`
+* **Run-scoped coordination threads** — every run now gets an automatic PackChat coordination thread so the pack has a durable shared conversation surface even before the operator opens a chat manually
+* **Canonical dog runtimes** — PackChat now distinguishes canonical dog role (`mason`) from live runtime instance (`mason#codex`, `mason#claude`) so multiple workers can coordinate as the same dog rather than as disconnected provider personas
 
 ---
 
@@ -153,7 +155,7 @@ cargo run -- benchmark run --all
 ./scripts/run-benchmarks.sh
 ```
 
-The machine-readable suite manifest lives at `factory/benchmarks/suites.yaml`, benchmark strategy and reporting guidance live in `MASTER_SPEC.md` (Part 6), and reports are written to `factory/artifacts/benchmarks/`. The default suite is a local regression gate, and LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER now run through native Harkonnen adapters alongside raw-LLM or direct baselines where supported. The execution roadmap in `ROADMAP.md` treats benchmark gates as phase-level exit criteria rather than optional follow-up work.
+The machine-readable suite manifest lives at `factory/benchmarks/suites.yaml`, benchmark strategy and reporting guidance live in `MASTER_SPEC.md` (Part 6), and reports are written to `factory/artifacts/benchmarks/`. The default suite is a local regression gate, and LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, and CLADDER now run through native Harkonnen adapters alongside raw-LLM or direct baselines where supported. The execution roadmap in `ROADMAP.md` treats benchmark gates as phase-level exit criteria rather than optional follow-up work, but broader benchmark expansion is intentionally paused until the current narrow end-to-end Harkonnen pass is complete.
 
 The OpenAI/Codex provider path also supports optional OpenAI-compatible BYO endpoints through a setup `base_url`, so benchmark runs can target local or third-party compatible backends without changing Rust code.
 
@@ -161,7 +163,7 @@ The OpenAI/Codex provider path also supports optional OpenAI-compatible BYO endp
 
 Status legend: **wired** = adapter integrated and runnable; **planned** = adapter not yet built; **internal** = Harkonnen-native, no external suite.
 
-All scores are pending first runs. The comparison targets listed are the systems each benchmark is designed to compare against.
+Most scores are still pending first runs. StreamingQA now has a first local Harkonnen smoke on the bundled fixture under `lm-studio-local`, including a persisted supersession row and a clean updated-fact trace.
 
 #### Memory and retrieval — vs Mem0 / MindPalace / Zep
 
@@ -169,7 +171,7 @@ All scores are pending first runs. The comparison targets listed are the systems
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | LongMemEval-S | Coobie | Accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 1 done |
 | FRAMES | Coobie | Multi-hop accuracy | pending | pending | Mem0 / raw LLM | wired | Phase 4 done |
-| StreamingQA | Coobie | Belief-update accuracy | pending | pending | raw LLM | wired | Phase 4b done |
+| StreamingQA | Coobie | Belief-update accuracy | 1.0000 (smoke) | pending | raw LLM | wired | Phase 4b done |
 | LoCoMo QA | Coobie | QA score | pending | pending | raw LLM | wired | Phase 1 done |
 | HELMET | Coobie | Retrieval precision / recall | pending | pending | raw LLM | wired | Phase 4 done |
 
@@ -186,9 +188,9 @@ All scores are pending first runs. The comparison targets listed are the systems
 | --- | --- | --- | ---: | ---: | --- | --- | --- |
 | SWE-bench Verified | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent / OpenCode | planned | Phase 2 |
 | SWE-bench Pro | Mason / Piper / Bramble | % Resolved | pending | pending | SWE-agent | planned | Phase 2 |
-| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | planned | Phase 2 |
+| LiveCodeBench | Mason / Piper | Pass rate | pending | pending | OpenCode / Aider | wired | Phase 2 |
 | Aider Polyglot | Mason / Piper | % Correct | pending | pending | Aider (published leaderboard) | planned | Phase 2 |
-| DevBench | Full factory pipeline | Lifecycle score | pending | pending | Single-agent tools | planned | Phase 3 |
+| DevBench | Full factory pipeline | Lifecycle score | pending | pending | Single-agent tools | planned | Phase 10 |
 
 #### Multi-turn and tool-use — vs general agent frameworks
 
@@ -202,8 +204,8 @@ All scores are pending first runs. The comparison targets listed are the systems
 
 | Benchmark | Subsystem | Metric | Result | Notes | Status | Phase |
 | --- | --- | --- | ---: | --- | --- | --- |
-| Spec Adherence Rate | Scout / Mason | Completeness % / Precision % | pending | Measures spec-first contribution — run with and without Scout | internal | Phase 3 |
-| Hidden Scenario Delta | Bramble / Sable | Pass rate gap (hidden − visible) | pending | Proves Sable catches what Bramble misses | internal | Phase 3 |
+| Spec Adherence Rate | Scout / Mason | Completeness % / Precision % | pending | Measures spec-first contribution — run with and without Scout | internal | Phase 10 |
+| Hidden Scenario Delta | Bramble / Sable | Pass rate gap (hidden − visible) | pending | Proves Sable catches what Bramble misses | internal | Phase 10 |
 | Causal Attribution Accuracy | Coobie diagnose | Top-1 / Top-3 accuracy | pending | Seeded failure corpus; measures causal memory vs semantic recall | internal | Phase 5 |
 | Local Regression Gate | Whole factory | pass / fail | passing | Hard merge gate, runs on every change | wired | Phase 1 done |
 
@@ -239,6 +241,14 @@ cargo build
 ### 2. Check Your Setup
 
 ```bash
+cargo run -- setup check
+```
+
+For this machine with LM Studio as the local model backend:
+
+```bash
+export LM_STUDIO_API_KEY=lm-studio
+export HARKONNEN_SETUP=lm-studio-local
 cargo run -- setup check
 ```
 
@@ -296,6 +306,45 @@ cargo run -- artifact package <run-id>
 
 ```bash
 cargo run -- serve
+```
+
+### 7. Launch Harkonnen Locally And Expose It Over MCP
+
+The fastest local path on this machine is:
+
+```bash
+export LM_STUDIO_API_KEY=lm-studio
+export HARKONNEN_SETUP=lm-studio-local
+./scripts/launch-harkonnen-local.sh
+```
+
+That starts the main Harkonnen API on `127.0.0.1:3000`.
+
+To expose Harkonnen itself as an MCP server for a local MCP client:
+
+```bash
+export LM_STUDIO_API_KEY=lm-studio
+export HARKONNEN_SETUP=lm-studio-local
+cargo run -- mcp serve
+```
+
+Because `lm-studio-local` now defaults `mcp.self.transport` to `stdio`, MCP clients can launch Harkonnen directly as a subprocess without a second always-on network server.
+
+Example Claude Code MCP block:
+
+```json
+{
+  "mcpServers": {
+    "harkonnen": {
+      "command": "cargo",
+      "args": ["run", "--", "mcp", "serve"],
+      "env": {
+        "HARKONNEN_SETUP": "lm-studio-local",
+        "LM_STUDIO_API_KEY": "lm-studio"
+      }
+    }
+  }
+}
 ```
 
 ## 🛠 Core Commands
@@ -433,17 +482,17 @@ Spec → Agents → Validation → Artifacts → Memory → Consolidation → Be
 
 ## ⚠️ Status
 
-Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and v1 (gap closure) are shipped. Phase 2 is next.
+Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and the v1-A through v1-D coordination/continuity slices are shipped. The v1-E transactional execution slice now includes the implementation-phase Mason edit boundary, approve/reject/revise/rollback checkpoint handling, visible-validation plus hidden-scenario/artifact/causal-report continuation after approved edits, rollback restore from a named backup, privileged MCP/tool-surface approval boundaries, and invocation-level host-command gateway logging/enforcement for run-loop build and validation commands. Phase 2 is now partially shipped as an explicit Bramble test harness for raw `spec.test_commands`, a structured wrong-answer evidence path into Mason's repair loop, retry-improvement tracking artifacts for validation fixes, and a wired LiveCodeBench adapter; the remaining comparison adapters still follow.
 
 | Area | Status |
 | --- | --- |
 | Core factory pipeline (Scout → Mason → Piper → Bramble → Sable → Ash → Flint) | Live |
 | Mason fix loop with FailureKind classification (compile / test / wrong-answer / timeout) | Live |
 | Mason workspace lease enforcement — blocks competing agent writes | Live |
-| Memory invalidation persistence (`memory_updates` table, supersession tracking) | Live |
-| PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow |
-| Operator Model two-layer interview (operating rhythms → recurring decisions) | Live — MVP shipped (v1-D) |
-| Commissioning brief (`commissioning-brief.json`) — consumed by Scout + Coobie preflight | Live |
+| Memory invalidation persistence (`memory_updates` table, supersession tracking, Memory Board updates panel) | Live — includes operator confirm/reject review |
+| PackChat conversational control plane | Live — threads, `@mention` routing, checkpoint/unblock flow, auto-created run coordination threads |
+| Operator Model two-layer interview (operating rhythms → recurring decisions) | Live — MVP shipped and hardened (v1-D) |
+| Commissioning brief (`commissioning-brief.json`) — consumed by Scout + Coobie preflight | Live — approval/export path persists metadata and carries preferred-tool/risk posture |
 | Coobie layered memory (episodic, semantic, causal) | Live |
 | Coobie Palace (den-based compound recall, patrol, scent) | Live |
 | Coobie causal streaks and cross-run pattern detection | Live |
@@ -454,10 +503,13 @@ Harkonnen Labs is an **active development system**. Phases 1, 4, 4b, 5, and v1 (
 | Consolidation Workbench | Live |
 | Hybrid semantic + keyword retrieval (fastembed / OpenAI-compatible) | Live |
 | Pack Board React UI (PackChat, Attribution Board, Factory Floor, Memory Board, Workbench) | Live |
-| Keeper coordination API (claims, heartbeats, conflict detection) | Live |
+| Keeper coordination API (claims, heartbeats, conflict detection, lease mirror in SQLite) | Live |
+| Canonical dog runtime registry (`agent_runtime_state` + PackChat runtime roster) | Live |
+| Run decision log API (`GET /api/runs/:id/decisions`) | Live |
 | Benchmark toolchain (LongMemEval, LoCoMo, FRAMES, StreamingQA, HELMET, CLADDER native adapters) | Live |
-| Bramble real test execution | Phase 2 — next |
-| Ash live twin provisioning (Docker stubs) | Phase 3 |
+| Transactional execution and approval boundaries | v1-E — implementation approval, validation plus hidden/artifact continuation, rollback execution, privileged tool-surface boundaries, and invocation-level host-command gateway shipped |
+| Bramble real test execution | Phase 2 — explicit `spec.test_commands` harness shipped, structured wrong-answer evidence reaches Mason/reporting, validation retry improvement is tracked, LiveCodeBench wired; additional comparison adapters remain |
+| Ash live twin provisioning (Docker stubs) | Deferred unless a future product explicitly requires running service virtualization |
 | Qdrant + OCR memory infrastructure | Phase 5b |
 | TypeDB 3.x semantic graph layer | Phase 6 |
 | E-CARE + causal attribution corpus | Phase 7 |
@@ -506,9 +558,11 @@ Full design: [the-soul-of-ai/06-The-Calvin-Archive.md](the-soul-of-ai/06-The-Cal
 
 Near-term:
 
-* **Phase 2** — Bramble real test execution so `validation_passed` and coverage-style signals are grounded in actual test runs
-* **Phase 3** — Ash live twin provisioning plus Flint documentation artifacts for richer hidden-scenario and DevBench evaluation
-* **Operator Model full five-layer interview** — extend the MVP (v1-D) to cover dependencies, institutional knowledge, and friction layers; generate the full artifact set (`USER.md`, `HEARTBEAT.md`, `operating-model.json`)
+* **v1-E** — extend the invocation gateway from in-process host-command execution to any future proxied third-party MCP traffic Harkonnen brokers directly
+* **Phase 2** — finish the remaining Bramble real-test work after the shipped `spec.test_commands` harness and wired LiveCodeBench lane, with benchmark expansion intentionally kept narrow while the core run path matures
+* **Phase 5-C** — explicit sub-slices: `5-C1` shipped as Coobie preflight `ContextTarget` budgeting + attribution telemetry, `5-C2` is now shipped as the Scout/Mason/Sable scope split plus scoped preflight artifacts and repo-local prompt filtering, and `5-C3` is next as sub-agent dispatch/isolation
+* **Phase 10** — Flint documentation, spec-grounded evaluation, and DevBench readiness after the coordination path; live twin provisioning remains deferred unless a product explicitly needs it
+* **Operator Model full five-layer interview** — extend the shipped two-layer MVP (v1-D) to cover dependencies, institutional knowledge, and friction layers; generate the full artifact set (`USER.md`, `HEARTBEAT.md`, `operating-model.json`)
 
 Mid-term:
 

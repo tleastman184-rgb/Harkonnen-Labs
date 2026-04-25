@@ -1,0 +1,48 @@
+id: transaction-approval-required
+spec_id: sample-feature
+title: Transaction paused for operator approval — checkpoint created and run halted
+description: >
+  Verifies the checkpoint path of v1-E: when Coobie raises implementation
+  blockers, the orchestrator must set approval_state=operator_review_required,
+  create a checkpoint of type needs_transaction_approval, pause the run at
+  status=paused_before_mutation, and write the transaction artifact in its
+  pre-approval state. The run must NOT proceed to Mason edits while paused.
+  This tests the architectural guarantee that Harkonnen pauses at a reversible
+  boundary rather than drifting forward and apologizing later.
+  Note: this scenario requires a spec that reliably triggers a Coobie
+  implementation blocker (e.g. a sensitive path or a prohibited pattern
+  matched by the configured guardrails).
+checks:
+  - kind: run_status
+    equals: paused
+  - kind: event_present
+    phase: implementation
+    agent: mason
+  - kind: artifact_exists
+    path: transaction_implementation.json
+  - kind: artifact_exists
+    path: transaction_implementation.md
+  - kind: metric_eq
+    artifact: transaction_implementation.json
+    field: approval_state
+    value: operator_review_required
+  - kind: metric_eq
+    artifact: transaction_implementation.json
+    field: status
+    value: paused_before_mutation
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: checkpoint_id
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: approval_blockers
+  - kind: artifact_field_nonempty
+    path: transaction_implementation.json
+    field: approval_blockers
+  - kind: checkpoint_present
+    checkpoint_type: needs_transaction_approval
+  - kind: decision_record_present
+    kind_value: transaction_boundary
+  # Mason edits must NOT have been applied while paused
+  - kind: no_decision_record
+    kind_value: transaction_commit

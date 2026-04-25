@@ -354,6 +354,35 @@ pub struct RunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunPhaseTiming {
+    pub phase: String,
+    #[serde(default)]
+    pub episode_count: usize,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunTimingReport {
+    pub run_id: String,
+    #[serde(default)]
+    pub total_duration_ms: u64,
+    #[serde(default)]
+    pub memory_duration_ms: u64,
+    #[serde(default)]
+    pub intake_duration_ms: u64,
+    #[serde(default)]
+    pub implementation_duration_ms: u64,
+    #[serde(default)]
+    pub validation_duration_ms: u64,
+    #[serde(default)]
+    pub other_duration_ms: u64,
+    #[serde(default)]
+    pub phase_durations: Vec<RunPhaseTiming>,
+    pub generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub event_id: i64,
@@ -464,7 +493,71 @@ pub struct PhaseAttributionRecord {
     pub guardrails: Vec<String>,
     #[serde(default)]
     pub query_terms: Vec<String>,
+    #[serde(default)]
+    pub briefing_scope: Option<BriefingScope>,
+    #[serde(default)]
+    pub briefing_token_budget: u32,
+    #[serde(default)]
+    pub briefing_tokens_used: u32,
+    #[serde(default)]
+    pub briefing_hits_provided: usize,
+    #[serde(default)]
+    pub stakeholder_alignment: Option<StakeholderAlignmentSummary>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StakeholderAlignmentSummary {
+    #[serde(default)]
+    pub stamped_context_present: bool,
+    #[serde(default)]
+    pub repo_purpose: String,
+    #[serde(default)]
+    pub operator_intent: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub vertical: String,
+    #[serde(default)]
+    pub attitudes_recorded: usize,
+    #[serde(default)]
+    pub constraints_recorded: usize,
+    #[serde(default)]
+    pub skill_sources_recorded: usize,
+    #[serde(default)]
+    pub mcp_servers_recorded: usize,
+    #[serde(default)]
+    pub alignment_guardrails: Vec<String>,
+    #[serde(default)]
+    pub alignment_checks: Vec<String>,
+    #[serde(default)]
+    pub alignment_open_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkStakeholderAlignmentSnapshot {
+    #[serde(default)]
+    pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub phases_considered: usize,
+    #[serde(default)]
+    pub phases_with_stamped_context: usize,
+    #[serde(default)]
+    pub phases_with_alignment_guardrails: usize,
+    #[serde(default)]
+    pub phases_with_alignment_checks: usize,
+    #[serde(default)]
+    pub phases_with_alignment_questions: usize,
+    #[serde(default)]
+    pub phases_with_attitude_signals: usize,
+    #[serde(default)]
+    pub phases_with_constraint_signals: usize,
+    #[serde(default)]
+    pub phases_with_mcp_signals: usize,
+    #[serde(default)]
+    pub latest_repo_purpose: String,
+    #[serde(default)]
+    pub latest_operator_intent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +610,62 @@ pub struct PriorCauseSignal {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefingScope {
+    CoobiePreflight,
+    ScoutPreflight,
+    MasonPreflight,
+    PiperPreflight,
+    SablePreflight,
+    CoobieConsolidation,
+    OperatorQuery,
+}
+
+impl std::fmt::Display for BriefingScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            BriefingScope::CoobiePreflight => "coobie_preflight",
+            BriefingScope::ScoutPreflight => "scout_preflight",
+            BriefingScope::MasonPreflight => "mason_preflight",
+            BriefingScope::PiperPreflight => "piper_preflight",
+            BriefingScope::SablePreflight => "sable_preflight",
+            BriefingScope::CoobieConsolidation => "coobie_consolidation",
+            BriefingScope::OperatorQuery => "operator_query",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSection {
+    ProjectInterview,
+    OperatorModel,
+    SoulIdentity,
+}
+
+impl std::fmt::Display for ContextSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ContextSection::ProjectInterview => "project_interview",
+            ContextSection::OperatorModel => "operator_model",
+            ContextSection::SoulIdentity => "soul_identity",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTarget {
+    pub scope: BriefingScope,
+    pub task_description: String,
+    pub token_budget: u32,
+    pub min_hits: u32,
+    #[serde(default)]
+    pub required_sections: Vec<ContextSection>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoobieBriefing {
     pub spec_id: String,
@@ -563,11 +712,25 @@ pub struct CoobieBriefing {
     pub scenario_blueprint: Option<ScenarioBlueprint>,
     #[serde(default)]
     pub project_memory_root: Option<String>,
+    #[serde(default)]
+    pub briefing_scope: Option<BriefingScope>,
+    #[serde(default)]
+    pub briefing_task_description: String,
+    #[serde(default)]
+    pub target_token_budget: u32,
+    #[serde(default)]
+    pub briefing_tokens_used: u32,
+    #[serde(default)]
+    pub briefing_hits_provided: usize,
+    #[serde(default)]
+    pub required_sections_applied: Vec<ContextSection>,
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
     pub regulatory_considerations: Vec<String>,
     #[serde(default)]
     pub operator_model_context: Option<OperatorModelContext>,
+    #[serde(default)]
+    pub project_interview_context: Option<ProjectInterviewContext>,
     #[serde(default)]
     pub soul_identity_context: Option<SoulIdentityContext>,
     pub recommended_guardrails: Vec<String>,
@@ -575,6 +738,32 @@ pub struct CoobieBriefing {
     pub open_questions: Vec<String>,
     pub coobie_response: String,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectInterviewContext {
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub repo_purpose: String,
+    #[serde(default)]
+    pub operator_intent: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub vertical: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub attitudes: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub skill_sources: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub interview_context_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -593,6 +782,28 @@ pub struct SoulIdentityContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentRuntimeState {
+    pub runtime_id: String,
+    pub canonical_role: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub ownership: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub last_heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlackboardState {
     pub run_id: String,
     pub current_phase: String,
@@ -602,7 +813,11 @@ pub struct BlackboardState {
     pub artifact_refs: Vec<String>,
     pub lesson_refs: Vec<String>,
     pub policy_flags: Vec<String>,
+    #[serde(default)]
+    pub packchat_thread_id: Option<String>,
     pub agent_claims: HashMap<String, String>,
+    #[serde(default)]
+    pub agent_instances: Vec<AgentRuntimeState>,
 }
 
 impl BlackboardState {
@@ -619,12 +834,16 @@ impl BlackboardState {
         match role.as_str() {
             "coobie" => {
                 view.agent_claims.clear();
+                view.agent_instances.clear();
             }
             "sable" => {
                 view.agent_claims.clear();
+                view.agent_instances.clear();
             }
             "scout" => {
                 view.agent_claims.retain(|agent, _| agent == "scout");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "scout");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -637,6 +856,8 @@ impl BlackboardState {
             }
             "mason" => {
                 view.agent_claims.retain(|agent, _| agent == "mason");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "mason");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -651,6 +872,8 @@ impl BlackboardState {
             }
             "bramble" => {
                 view.agent_claims.retain(|agent, _| agent == "bramble");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "bramble");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -663,6 +886,8 @@ impl BlackboardState {
             }
             "ash" => {
                 view.agent_claims.retain(|agent, _| agent == "ash");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "ash");
                 view.artifact_refs.retain(|artifact| {
                     matches!(
                         artifact.as_str(),
@@ -675,9 +900,13 @@ impl BlackboardState {
             }
             "flint" => {
                 view.agent_claims.retain(|agent, _| agent == "flint");
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == "flint");
             }
             _ => {
                 view.agent_claims.retain(|agent, _| agent == &role);
+                view.agent_instances
+                    .retain(|instance| instance.canonical_role == role);
             }
         }
 
@@ -732,12 +961,23 @@ pub struct ScenarioResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WrongAnswerEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     CompileError,
     TestFailure,
     WrongAnswer,
     Timeout,
+    Blocked,
     Unknown,
 }
 
@@ -748,7 +988,13 @@ pub struct ValidationSummary {
     pub scored_checks: usize,
     #[serde(default)]
     pub passed_scored_checks: usize,
+    #[serde(default)]
+    pub real_test_commands: usize,
+    #[serde(default)]
+    pub passed_real_test_commands: usize,
     pub results: Vec<ScenarioResult>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wrong_answer_evidence: BTreeMap<String, WrongAnswerEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<FailureKind>,
 }
@@ -1054,7 +1300,17 @@ pub struct MemoryUpdateRecord {
     pub update_id: String,
     pub old_memory_id: String,
     pub new_memory_id: String,
+    #[serde(default)]
+    pub memory_root: Option<String>,
     pub reason: String,
+    #[serde(default)]
+    pub review_status: String,
+    #[serde(default)]
+    pub reviewed_by: Option<String>,
+    #[serde(default)]
+    pub review_note: Option<String>,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
     pub created_at: String,
 }
 
@@ -1108,6 +1364,10 @@ pub struct OperatorModelContext {
     pub escalation_rules: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub preferred_tools: Vec<String>,
+    #[serde(default)]
+    pub risk_tolerances: Vec<String>,
     #[serde(default)]
     pub open_questions: Vec<String>,
     #[serde(default)]

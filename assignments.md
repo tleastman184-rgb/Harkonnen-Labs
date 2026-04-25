@@ -1,42 +1,27 @@
 # Assignments
 
-This is the repo-root fallback coordination document for cases where the live
-coordination API is not running yet.
+This is the fallback coordination document when the Harkonnen API server is not running.
 
-Keep this file lightweight and current. Do not preserve session transcripts,
-stale claims, or historical handoffs here; those belong in runtime logs or the
-coordination API, not in the public repository.
+Keeper manages file-claim policy for this repo.
+Policy mode: exclusive_file_claims
+Heartbeat timeout: 600 seconds
 
-Preferred live source once the server is up:
+Preferred live source once the server is up: `GET /api/coordination/assignments`.
 
-- `GET /api/coordination/assignments`
-- `GET /api/coordination/policy-events`
+Policy event stream: `GET /api/coordination/policy-events`.
 
-API shortcuts:
+Claim work with `POST /api/coordination/claim`, heartbeat with `POST /api/coordination/heartbeat`, and release it with `POST /api/coordination/release`.
 
-- `POST /api/coordination/claim`
-- `POST /api/coordination/heartbeat`
-- `POST /api/coordination/release`
+Last updated: 2026-04-22T19:44:50.866401468+00:00
 
 ## Active Claims
 
-None. Add claims only while the coordination API is unavailable.
+No active claims.
 
-## Template
+## How To Use This Fallback
 
-```md
-### <agent-name>
-Task: <short task>
-Status: in-progress | blocked | stale
-Claimed: <timestamp>
-Last heartbeat: <timestamp>
-Files:
-- path/to/file
-```
-
-## Coordination Rules
-
-1. Check this file before starting work if the live API is down.
-2. Keep claims scoped to the smallest practical file set.
-3. Clear stale claims and historical notes once the live API is available again.
-4. Move long handoffs and investigation notes into durable docs, issues, or artifacts.
+1. Before assigning work, read the relevant active claim section.
+2. Paste only the relevant section into the AI's context.
+3. If you are actively holding files, send a heartbeat about once per minute.
+4. Keeper may reap stale conflicting claims when another agent needs the same files.
+5. Once the server is running, switch all agents to the live coordination endpoint.

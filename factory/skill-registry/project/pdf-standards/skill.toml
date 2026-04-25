@@ -1,0 +1,6 @@
+name = "pdf-standards"
+tier = "project"
+description = "Patterns for reading and citing standards documents: ISO, IEC, GMP, CFR, HIPAA, SOX"
+tags = ["pdf", "standards", "iso", "iec", "gmp", "regulatory", "compliance"]
+extra_permissions = ["Read(*.pdf)"]
+

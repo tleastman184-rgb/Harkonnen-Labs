@@ -1,0 +1,16 @@
+name = "puppeteer"
+description = "Browser automation for scripted UI checks and interactive web flows."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-puppeteer"]
+requires_config = []
+requires_env = []
+extra_permissions = ["mcp__puppeteer__*"]
+settings_target = "settings.json"
+
+[[triggers]]
+kind = "skill"
+value = "node"
+
+[[triggers]]
+kind = "file"
+value = "playwright"

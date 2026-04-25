@@ -111,12 +111,57 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             required_checks TEXT NOT NULL DEFAULT '[]',
             guardrails TEXT NOT NULL DEFAULT '[]',
             query_terms TEXT NOT NULL DEFAULT '[]',
+            briefing_scope TEXT,
+            briefing_token_budget INTEGER NOT NULL DEFAULT 0,
+            briefing_tokens_used INTEGER NOT NULL DEFAULT 0,
+            briefing_hits_provided INTEGER NOT NULL DEFAULT 0,
+            stakeholder_alignment_json TEXT NOT NULL DEFAULT 'null',
             created_at TEXT NOT NULL,
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_scope",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_scope TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_token_budget",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_token_budget INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_tokens_used",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_tokens_used INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "briefing_hits_provided",
+        "ALTER TABLE phase_attributions ADD COLUMN briefing_hits_provided INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "phase_attributions",
+        "stakeholder_alignment_json",
+        "ALTER TABLE phase_attributions ADD COLUMN stakeholder_alignment_json TEXT NOT NULL DEFAULT 'null'",
+    )
     .await?;
 
     sqlx::query(
@@ -452,6 +497,7 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             thread_id       TEXT NOT NULL REFERENCES chat_threads(thread_id),
             role            TEXT NOT NULL,  -- 'operator' | 'agent' | 'system'
             agent           TEXT,           -- which agent sent/received this
+            agent_runtime_id TEXT,          -- stable dog instance identifier when present
             content         TEXT NOT NULL,
             checkpoint_id   TEXT,           -- non-null when this msg resolves a checkpoint
             created_at      TEXT NOT NULL
@@ -459,6 +505,14 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "chat_messages",
+        "agent_runtime_id",
+        "ALTER TABLE chat_messages ADD COLUMN agent_runtime_id TEXT",
+    )
     .await?;
 
     sqlx::query(
@@ -729,9 +783,106 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
-    // ── A3: ActionLease columns on assignments ────────────────────────────────
-    // The assignments are stored as JSON in assignments.json (file-based), so
-    // the lease fields live on the Assignment struct. No SQLite table needed.
+    // ── A3: Coordination registry / ActionLease mirror ───────────────────────
+    // The JSON assignments file remains the hot-path interchange surface for
+    // now, but the active leases and Keeper policy events are mirrored into
+    // SQLite so coordination state survives restarts and can be queried
+    // alongside the rest of the run metadata.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS coordination_leases (
+            agent             TEXT PRIMARY KEY,
+            task              TEXT NOT NULL DEFAULT '',
+            files_json        TEXT NOT NULL DEFAULT '[]',
+            claimed_at        TEXT NOT NULL,
+            last_heartbeat_at TEXT NOT NULL DEFAULT '',
+            status            TEXT NOT NULL DEFAULT 'active',
+            resource_kind     TEXT NOT NULL DEFAULT 'file',
+            ttl_secs          INTEGER NOT NULL DEFAULT 0,
+            guardrails_json   TEXT NOT NULL DEFAULT '[]',
+            expires_at        TEXT NOT NULL DEFAULT '',
+            updated_at        TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_coordination_leases_status_updated
+        ON coordination_leases (status, updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS coordination_policy_events_db (
+            event_id            TEXT PRIMARY KEY,
+            managed_by          TEXT NOT NULL DEFAULT 'keeper',
+            event_type          TEXT NOT NULL DEFAULT '',
+            status              TEXT NOT NULL DEFAULT '',
+            agent               TEXT,
+            conflicting_agent   TEXT,
+            files_json          TEXT NOT NULL DEFAULT '[]',
+            message             TEXT NOT NULL DEFAULT '',
+            created_at          TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_coordination_policy_events_created_at
+        ON coordination_policy_events_db (created_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_runtime_state (
+            runtime_id         TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL,
+            thread_id          TEXT,
+            canonical_role     TEXT NOT NULL DEFAULT '',
+            display_name       TEXT NOT NULL DEFAULT '',
+            ownership          TEXT NOT NULL DEFAULT '',
+            status             TEXT NOT NULL DEFAULT 'active',
+            provider           TEXT,
+            surface            TEXT,
+            source             TEXT NOT NULL DEFAULT '',
+            last_heartbeat_at  TEXT NOT NULL DEFAULT '',
+            started_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_agent_runtime_state_run
+        ON agent_runtime_state (run_id, canonical_role, updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_agent_runtime_state_thread
+        ON agent_runtime_state (thread_id, updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
 
     // ── v1-B: Memory supersession / invalidation persistence ─────────────────
     // Tracks when a new memory entry supersedes an older one. The old entry's
@@ -742,12 +893,57 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             update_id       TEXT PRIMARY KEY,
             old_memory_id   TEXT NOT NULL,
             new_memory_id   TEXT NOT NULL,
+            memory_root     TEXT NOT NULL DEFAULT '',
             reason          TEXT NOT NULL DEFAULT '',
+            review_status   TEXT NOT NULL DEFAULT 'pending',
+            reviewed_by     TEXT,
+            review_note     TEXT,
+            reviewed_at     TEXT,
             created_at      TEXT NOT NULL
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_updates",
+        "memory_root",
+        "ALTER TABLE memory_updates ADD COLUMN memory_root TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_updates",
+        "review_status",
+        "ALTER TABLE memory_updates ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_updates",
+        "reviewed_by",
+        "ALTER TABLE memory_updates ADD COLUMN reviewed_by TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_updates",
+        "review_note",
+        "ALTER TABLE memory_updates ADD COLUMN review_note TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_updates",
+        "reviewed_at",
+        "ALTER TABLE memory_updates ADD COLUMN reviewed_at TEXT",
+    )
     .await?;
 
     sqlx::query(
@@ -800,6 +996,147 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     .await?;
 
     Ok(pool)
+}
+
+pub async fn sync_coordination_leases(
+    pool: &SqlitePool,
+    state: &crate::api::AssignmentsState,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM coordination_leases")
+        .execute(&mut *tx)
+        .await?;
+
+    for assignment in state.active.values() {
+        sqlx::query(
+            r#"
+            INSERT INTO coordination_leases (
+                agent,
+                task,
+                files_json,
+                claimed_at,
+                last_heartbeat_at,
+                status,
+                resource_kind,
+                ttl_secs,
+                guardrails_json,
+                expires_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+        )
+        .bind(&assignment.agent)
+        .bind(&assignment.task)
+        .bind(serde_json::to_string(&assignment.files)?)
+        .bind(&assignment.claimed_at)
+        .bind(&assignment.last_heartbeat_at)
+        .bind(&assignment.status)
+        .bind(&assignment.resource_kind)
+        .bind(assignment.ttl_secs)
+        .bind(serde_json::to_string(&assignment.guardrails)?)
+        .bind(&assignment.expires_at)
+        .bind(&state.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn sync_agent_runtime_state(
+    pool: &SqlitePool,
+    run_id: &str,
+    runtimes: &[crate::models::AgentRuntimeState],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM agent_runtime_state WHERE run_id = ?1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+
+    for runtime in runtimes {
+        let started_at = if runtime.last_heartbeat_at.trim().is_empty() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            runtime.last_heartbeat_at.clone()
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO agent_runtime_state (
+                runtime_id,
+                run_id,
+                thread_id,
+                canonical_role,
+                display_name,
+                ownership,
+                status,
+                provider,
+                surface,
+                source,
+                last_heartbeat_at,
+                started_at,
+                updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+        )
+        .bind(&runtime.runtime_id)
+        .bind(run_id)
+        .bind(&runtime.thread_id)
+        .bind(&runtime.canonical_role)
+        .bind(&runtime.display_name)
+        .bind(&runtime.ownership)
+        .bind(&runtime.status)
+        .bind(&runtime.provider)
+        .bind(&runtime.surface)
+        .bind(&runtime.source)
+        .bind(&runtime.last_heartbeat_at)
+        .bind(&started_at)
+        .bind(&runtime.last_heartbeat_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn insert_coordination_policy_event(
+    pool: &SqlitePool,
+    event: &crate::api::CoordinationPolicyEvent,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO coordination_policy_events_db (
+            event_id,
+            managed_by,
+            event_type,
+            status,
+            agent,
+            conflicting_agent,
+            files_json,
+            message,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&event.event_id)
+    .bind(&event.managed_by)
+    .bind(&event.event_type)
+    .bind(&event.status)
+    .bind(&event.agent)
+    .bind(&event.conflicting_agent)
+    .bind(serde_json::to_string(&event.files)?)
+    .bind(&event.message)
+    .bind(&event.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn ensure_column(

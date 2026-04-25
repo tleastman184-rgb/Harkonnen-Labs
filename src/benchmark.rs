@@ -8,7 +8,10 @@ use std::time::Instant;
 use tokio::process::Command;
 
 use crate::{
-    aider_polyglot, cladder, config::Paths, frames, helmet, livecodebench, locomo, longmemeval,
+    aider_polyglot, cladder,
+    config::Paths,
+    frames, helmet, livecodebench, locomo, longmemeval,
+    models::{BenchmarkStakeholderAlignmentSnapshot, PhaseAttributionRecord},
     scenario_delta, spec_adherence, streamingqa, twin_fidelity,
 };
 
@@ -149,6 +152,8 @@ pub struct BenchmarkRunReport {
     pub repo_root: String,
     pub selected_suites: Vec<String>,
     pub summary: BenchmarkRunSummary,
+    #[serde(default)]
+    pub stakeholder_alignment: Option<BenchmarkStakeholderAlignmentSnapshot>,
     pub suites: Vec<BenchmarkSuiteResult>,
 }
 
@@ -159,16 +164,28 @@ pub struct BenchmarkRunOutput {
     pub report: BenchmarkRunReport,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkRunArtifactSummary {
+    pub report_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub manifest_path: String,
+    pub json_path: String,
+    pub markdown_path: String,
+    pub selected_suites: Vec<String>,
+    pub summary: BenchmarkRunSummary,
+}
+
+pub fn artifact_dir(paths: &Paths) -> PathBuf {
+    paths.artifacts.join("benchmarks")
+}
+
 pub fn default_manifest_path(paths: &Paths) -> PathBuf {
     paths.factory.join("benchmarks").join("suites.yaml")
 }
 
 pub fn default_output_path(paths: &Paths) -> PathBuf {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    paths
-        .artifacts
-        .join("benchmarks")
-        .join(format!("benchmark-run-{}.json", stamp))
+    artifact_dir(paths).join(format!("benchmark-run-{}.json", stamp))
 }
 
 pub fn load_manifest(path: &Path) -> Result<BenchmarkManifest> {
@@ -249,6 +266,7 @@ pub async fn run_benchmarks(
         repo_root: paths.root.display().to_string(),
         selected_suites: selected_ids,
         summary,
+        stakeholder_alignment: build_benchmark_alignment_snapshot(paths),
         suites: results,
     };
 
@@ -285,6 +303,17 @@ pub fn load_run_report(path: &Path) -> Result<BenchmarkRunReport> {
         .with_context(|| format!("parsing benchmark run report {}", path.display()))
 }
 
+pub fn list_recent_run_reports(
+    paths: &Paths,
+    limit: usize,
+) -> Result<Vec<BenchmarkRunArtifactSummary>> {
+    list_recent_run_reports_in_dir(&artifact_dir(paths), limit)
+}
+
+pub fn resolve_run_report_path(paths: &Paths, report_id: Option<&str>) -> Result<PathBuf> {
+    resolve_run_report_path_in_dir(&artifact_dir(paths), report_id)
+}
+
 pub fn render_report_markdown(report: &BenchmarkRunReport) -> String {
     let mut lines = vec![
         "# Benchmark Report".to_string(),
@@ -305,6 +334,57 @@ pub fn render_report_markdown(report: &BenchmarkRunReport) -> String {
         "| Suite | Subsystem | Tier | Status | Duration ms |".to_string(),
         "| --- | --- | --- | --- | ---: |".to_string(),
     ];
+
+    if let Some(alignment) = report.stakeholder_alignment.as_ref() {
+        lines.push(String::new());
+        lines.push("## Stakeholder Alignment Snapshot".to_string());
+        lines.push(String::new());
+        lines.push(format!("- Runs considered: {}", alignment.run_ids.len()));
+        lines.push(format!(
+            "- Phases considered: {}",
+            alignment.phases_considered
+        ));
+        lines.push(format!(
+            "- Phases with stamped context: {}",
+            alignment.phases_with_stamped_context
+        ));
+        lines.push(format!(
+            "- Phases with alignment guardrails: {}",
+            alignment.phases_with_alignment_guardrails
+        ));
+        lines.push(format!(
+            "- Phases with alignment checks: {}",
+            alignment.phases_with_alignment_checks
+        ));
+        lines.push(format!(
+            "- Phases with alignment questions: {}",
+            alignment.phases_with_alignment_questions
+        ));
+        lines.push(format!(
+            "- Phases with stakeholder attitudes recorded: {}",
+            alignment.phases_with_attitude_signals
+        ));
+        lines.push(format!(
+            "- Phases with constraints recorded: {}",
+            alignment.phases_with_constraint_signals
+        ));
+        lines.push(format!(
+            "- Phases with MCP posture recorded: {}",
+            alignment.phases_with_mcp_signals
+        ));
+        if !alignment.latest_repo_purpose.trim().is_empty() {
+            lines.push(format!(
+                "- Latest recorded purpose: {}",
+                alignment.latest_repo_purpose
+            ));
+        }
+        if !alignment.latest_operator_intent.trim().is_empty() {
+            lines.push(format!(
+                "- Latest recorded stakes: {}",
+                alignment.latest_operator_intent
+            ));
+        }
+    }
 
     for suite in &report.suites {
         lines.push(format!(
@@ -365,6 +445,10 @@ pub fn render_report_markdown(report: &BenchmarkRunReport) -> String {
                 ));
             }
         }
+        if let Some(metrics_section) = render_suite_metrics_section(suite) {
+            lines.push(String::new());
+            lines.extend(metrics_section);
+        }
     }
 
     let correct_sections = render_correct_answer_sections(report);
@@ -389,13 +473,85 @@ fn render_correct_answer_sections(report: &BenchmarkRunReport) -> Vec<Vec<String
         .collect()
 }
 
+fn build_benchmark_alignment_snapshot(
+    paths: &Paths,
+) -> Option<BenchmarkStakeholderAlignmentSnapshot> {
+    let mut candidates = std::fs::read_dir(&paths.workspaces)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let run_id = entry.file_name().to_string_lossy().to_string();
+            let attribution_path = entry.path().join("run").join("phase_attributions.json");
+            if !attribution_path.exists() {
+                return None;
+            }
+            let modified = attribution_path.metadata().ok()?.modified().ok()?;
+            Some((modified, run_id, attribution_path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+
+    let mut snapshot = BenchmarkStakeholderAlignmentSnapshot::default();
+    for (_, run_id, path) in candidates.into_iter().take(5) {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let records = match serde_json::from_str::<Vec<PhaseAttributionRecord>>(&raw) {
+            Ok(records) => records,
+            Err(_) => continue,
+        };
+        if records.is_empty() {
+            continue;
+        }
+        snapshot.run_ids.push(run_id);
+        snapshot.phases_considered += records.len();
+        for record in records {
+            if let Some(alignment) = record.stakeholder_alignment {
+                if alignment.stamped_context_present {
+                    snapshot.phases_with_stamped_context += 1;
+                }
+                if !alignment.alignment_guardrails.is_empty() {
+                    snapshot.phases_with_alignment_guardrails += 1;
+                }
+                if !alignment.alignment_checks.is_empty() {
+                    snapshot.phases_with_alignment_checks += 1;
+                }
+                if !alignment.alignment_open_questions.is_empty() {
+                    snapshot.phases_with_alignment_questions += 1;
+                }
+                if alignment.attitudes_recorded > 0 {
+                    snapshot.phases_with_attitude_signals += 1;
+                }
+                if alignment.constraints_recorded > 0 {
+                    snapshot.phases_with_constraint_signals += 1;
+                }
+                if alignment.mcp_servers_recorded > 0 {
+                    snapshot.phases_with_mcp_signals += 1;
+                }
+                if snapshot.latest_repo_purpose.is_empty()
+                    && !alignment.repo_purpose.trim().is_empty()
+                {
+                    snapshot.latest_repo_purpose = alignment.repo_purpose;
+                }
+                if snapshot.latest_operator_intent.is_empty()
+                    && !alignment.operator_intent.trim().is_empty()
+                {
+                    snapshot.latest_operator_intent = alignment.operator_intent;
+                }
+            }
+        }
+    }
+
+    if snapshot.phases_considered == 0 {
+        None
+    } else {
+        Some(snapshot)
+    }
+}
+
 fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<String>> {
-    let summary_path = suite
-        .steps
-        .iter()
-        .find_map(|step| extract_summary_json_path(&step.stdout))?;
-    let raw = std::fs::read_to_string(&summary_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let json = load_suite_summary_json(suite)?;
     let questions = json.get("questions")?.as_array()?;
 
     let mut lines = vec![format!("### {} ({})", suite.title, suite.id)];
@@ -423,22 +579,180 @@ fn render_correct_answer_section(suite: &BenchmarkSuiteResult) -> Option<Vec<Str
     Some(lines)
 }
 
+fn render_suite_metrics_section(suite: &BenchmarkSuiteResult) -> Option<Vec<String>> {
+    let json = load_suite_summary_json(suite)?;
+    render_question_metrics_section(&json).or_else(|| render_livecodebench_metrics_section(&json))
+}
+
+fn render_question_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
+    let metrics = json.get("metrics")?;
+    let total_questions = metrics.get("total_questions")?.as_u64()?;
+    let accuracy = metrics.get("accuracy")?.as_f64()?;
+    let exact_match = metrics.get("exact_match")?.as_f64()?;
+    let token_f1 = metrics.get("token_f1")?.as_f64()?;
+    let evidence_hit_rate = metrics.get("evidence_hit_rate")?.as_f64()?;
+    let answered_rate = metrics
+        .get("answered_rate")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+
+    let mut lines = vec![
+        "### Observed Metrics".to_string(),
+        String::new(),
+        format!("- Questions: {}", total_questions),
+        format!("- Accuracy: {:.4}", accuracy),
+        format!("- Exact match: {:.4}", exact_match),
+        format!("- Token F1: {:.4}", token_f1),
+        format!("- Evidence hit rate: {:.4}", evidence_hit_rate),
+        format!("- Answered rate: {:.4}", answered_rate),
+    ];
+
+    append_provider_path(json, &mut lines);
+
+    if let Some(persistence) = json.get("persistence").and_then(|value| value.as_object()) {
+        lines.push(String::new());
+        lines.push("### Persistence Metrics".to_string());
+        lines.push(String::new());
+        if let Some(path) = persistence
+            .get("memory_updates_db_path")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("- Memory updates DB: {}", path.trim()));
+        }
+        if let Some(count) = persistence
+            .get("persisted_supersession_events")
+            .and_then(|value| value.as_u64())
+        {
+            lines.push(format!("- Persisted supersession events: {}", count));
+        }
+        if let Some(count) = persistence
+            .get("questions_requiring_supersession_history")
+            .and_then(|value| value.as_u64())
+        {
+            lines.push(format!("- Updated-fact questions: {}", count));
+        }
+        if let Some(value) = persistence
+            .get("accuracy_on_updated_facts")
+            .and_then(|value| value.as_f64())
+        {
+            lines.push(format!("- Updated-fact accuracy: {:.4}", value));
+        }
+        if let Some(value) = persistence
+            .get("exact_match_on_updated_facts")
+            .and_then(|value| value.as_f64())
+        {
+            lines.push(format!("- Updated-fact exact match: {:.4}", value));
+        }
+        if let Some(value) = persistence
+            .get("evidence_hit_rate_on_updated_facts")
+            .and_then(|value| value.as_f64())
+        {
+            lines.push(format!("- Updated-fact evidence hit rate: {:.4}", value));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_livecodebench_metrics_section(json: &serde_json::Value) -> Option<Vec<String>> {
+    let metrics = json.get("metrics")?;
+    let total_problems = metrics.get("total_problems")?.as_u64()?;
+    let pass_at_1 = metrics.get("pass_at_1")?.as_f64()?;
+
+    let mut lines = vec![
+        "### Observed Metrics".to_string(),
+        String::new(),
+        format!("- Problems: {}", total_problems),
+        format!("- Pass@1: {:.4}", pass_at_1),
+    ];
+
+    append_provider_path(json, &mut lines);
+    append_named_rate_breakdown(
+        metrics,
+        "by_difficulty",
+        "### Difficulty Breakdown",
+        &mut lines,
+    );
+    append_named_rate_breakdown(metrics, "by_platform", "### Platform Breakdown", &mut lines);
+
+    Some(lines)
+}
+
+fn append_provider_path(json: &serde_json::Value, lines: &mut Vec<String>) {
+    if let Some(provider_label) = json.get("provider_label").and_then(|value| value.as_str()) {
+        if !provider_label.trim().is_empty() {
+            lines.push(format!("- Provider path: {}", provider_label.trim()));
+        }
+    }
+}
+
+fn append_named_rate_breakdown(
+    metrics: &serde_json::Value,
+    field: &str,
+    heading: &str,
+    lines: &mut Vec<String>,
+) {
+    let Some(entries) = metrics.get(field).and_then(|value| value.as_object()) else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    lines.push(String::new());
+    lines.push(heading.to_string());
+    lines.push(String::new());
+    for (name, entry) in entries {
+        let total = entry.get("total").and_then(|value| value.as_u64());
+        let passed = entry.get("passed").and_then(|value| value.as_u64());
+        let pass_rate = entry.get("pass_rate").and_then(|value| value.as_f64());
+        if let (Some(total), Some(passed), Some(pass_rate)) = (total, passed, pass_rate) {
+            lines.push(format!(
+                "- {}: {}/{} ({:.4})",
+                name, passed, total, pass_rate
+            ));
+        }
+    }
+}
+
+fn load_suite_summary_json(suite: &BenchmarkSuiteResult) -> Option<serde_json::Value> {
+    let summary_path = suite
+        .steps
+        .iter()
+        .find_map(|step| extract_summary_json_path(&step.stdout))?;
+    let raw = std::fs::read_to_string(&summary_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 fn correct_answer_entry(question: &serde_json::Value) -> Option<String> {
+    let answer = question.get("hypothesis")?.as_str()?.trim();
+    if answer.is_empty() {
+        return None;
+    }
+
     if question
         .get("exact_match")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+        || question
+            .get("accuracy")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     {
-        let id = question.get("question_id")?.as_str()?;
-        let answer = question.get("hypothesis")?.as_str()?.trim();
-        return Some(format!("`{}`: `{}`", id, answer));
+        if let Some(id) = question
+            .get("question_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| question.get("qa_id").and_then(|value| value.as_str()))
+        {
+            return Some(format!("`{}`: `{}`", id, answer));
+        }
     }
 
     let score = question.get("score").and_then(|value| value.as_f64())?;
     if score >= 1.0 {
         let sample_id = question.get("sample_id")?.as_str()?;
         let qa_index = question.get("qa_index")?.as_u64()?;
-        let answer = question.get("hypothesis")?.as_str()?.trim();
         return Some(format!("`{}#{}`: `{}`", sample_id, qa_index, answer));
     }
 
@@ -982,15 +1296,100 @@ fn first_non_empty(preferred: &str, fallback: &str) -> Option<String> {
     None
 }
 
+fn list_recent_run_reports_in_dir(
+    dir: &Path,
+    limit: usize,
+) -> Result<Vec<BenchmarkRunArtifactSummary>> {
+    if limit == 0 || !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut json_paths = std::fs::read_dir(dir)
+        .with_context(|| format!("reading benchmark artifact dir {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| is_benchmark_report_json_path(path))
+        .collect::<Vec<_>>();
+    json_paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+
+    json_paths
+        .into_iter()
+        .take(limit)
+        .map(|json_path| {
+            let report = load_run_report(&json_path)?;
+            let report_id = report_id_from_json_path(&json_path).with_context(|| {
+                format!("invalid benchmark report path {}", json_path.display())
+            })?;
+            Ok(BenchmarkRunArtifactSummary {
+                report_id,
+                generated_at: report.generated_at,
+                manifest_path: report.manifest_path,
+                json_path: json_path.display().to_string(),
+                markdown_path: json_path.with_extension("md").display().to_string(),
+                selected_suites: report.selected_suites,
+                summary: report.summary,
+            })
+        })
+        .collect()
+}
+
+fn resolve_run_report_path_in_dir(dir: &Path, report_id: Option<&str>) -> Result<PathBuf> {
+    if !dir.exists() {
+        bail!("benchmark artifact dir does not exist: {}", dir.display());
+    }
+
+    match report_id.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("latest") => latest_run_report_path_in_dir(dir),
+        Some(value) => {
+            if value.contains('/') || value.contains('\\') {
+                bail!("benchmark report id must be a basename, not a path");
+            }
+            let stem = value.strip_suffix(".json").unwrap_or(value);
+            let path = dir.join(format!("{stem}.json"));
+            if !path.exists() {
+                bail!("benchmark report not found: {}", path.display());
+            }
+            Ok(path)
+        }
+    }
+}
+
+fn latest_run_report_path_in_dir(dir: &Path) -> Result<PathBuf> {
+    let mut json_paths = std::fs::read_dir(dir)
+        .with_context(|| format!("reading benchmark artifact dir {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| is_benchmark_report_json_path(path))
+        .collect::<Vec<_>>();
+    json_paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    json_paths
+        .into_iter()
+        .next()
+        .with_context(|| format!("no benchmark run reports found in {}", dir.display()))
+}
+
+fn is_benchmark_report_json_path(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.starts_with("benchmark-run-") && value.ends_with(".json"))
+            .unwrap_or(false)
+}
+
+fn report_id_from_json_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    #[test]
-    fn render_report_contains_suite_summary() {
-        let report = BenchmarkRunReport {
+    fn sample_report(generated_at: DateTime<Utc>) -> BenchmarkRunReport {
+        BenchmarkRunReport {
             version: 1,
-            generated_at: Utc::now(),
+            generated_at,
             manifest_path: "factory/benchmarks/suites.yaml".to_string(),
             repo_root: "/tmp/harkonnen".to_string(),
             selected_suites: vec!["local_regression".to_string()],
@@ -1000,6 +1399,19 @@ mod tests {
                 failed: 0,
                 skipped: 0,
             },
+            stakeholder_alignment: Some(BenchmarkStakeholderAlignmentSnapshot {
+                run_ids: vec!["run-123".to_string()],
+                phases_considered: 3,
+                phases_with_stamped_context: 3,
+                phases_with_alignment_guardrails: 3,
+                phases_with_alignment_checks: 2,
+                phases_with_alignment_questions: 1,
+                phases_with_attitude_signals: 2,
+                phases_with_constraint_signals: 2,
+                phases_with_mcp_signals: 1,
+                latest_repo_purpose: "Protect benchmark trust".to_string(),
+                latest_operator_intent: "Keep the system honest under evaluation".to_string(),
+            }),
             suites: vec![BenchmarkSuiteResult {
                 id: "local_regression".to_string(),
                 title: "Local Regression Gate".to_string(),
@@ -1018,11 +1430,354 @@ mod tests {
                 reason: None,
                 steps: Vec::new(),
             }],
-        };
+        }
+    }
+
+    fn write_report(dir: &Path, stem: &str, report: &BenchmarkRunReport) {
+        fs::create_dir_all(dir).unwrap();
+        let json = serde_json::to_string_pretty(report).unwrap();
+        fs::write(dir.join(format!("{stem}.json")), json).unwrap();
+        fs::write(dir.join(format!("{stem}.md")), "# benchmark report").unwrap();
+    }
+
+    #[test]
+    fn render_report_contains_suite_summary() {
+        let report = sample_report(Utc::now());
 
         let markdown = render_report_markdown(&report);
         assert!(markdown.contains("# Benchmark Report"));
+        assert!(markdown.contains("## Stakeholder Alignment Snapshot"));
+        assert!(markdown.contains("Protect benchmark trust"));
         assert!(markdown.contains("local_regression"));
         assert!(markdown.contains("Local Regression Gate"));
+    }
+
+    #[test]
+    fn recent_run_reports_are_listed_newest_first() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        write_report(
+            &temp_dir,
+            "benchmark-run-20260421T010000Z",
+            &sample_report(Utc::now()),
+        );
+        write_report(
+            &temp_dir,
+            "benchmark-run-20260421T020000Z",
+            &sample_report(Utc::now()),
+        );
+
+        let reports = list_recent_run_reports_in_dir(&temp_dir, 10).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].report_id, "benchmark-run-20260421T020000Z");
+        assert_eq!(reports[1].report_id, "benchmark-run-20260421T010000Z");
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_run_report_path_supports_latest_and_named_ids() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-resolve-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        write_report(
+            &temp_dir,
+            "benchmark-run-20260421T030000Z",
+            &sample_report(Utc::now()),
+        );
+        write_report(
+            &temp_dir,
+            "benchmark-run-20260421T040000Z",
+            &sample_report(Utc::now()),
+        );
+
+        let latest = resolve_run_report_path_in_dir(&temp_dir, None).unwrap();
+        assert!(latest
+            .display()
+            .to_string()
+            .ends_with("benchmark-run-20260421T040000Z.json"));
+
+        let explicit =
+            resolve_run_report_path_in_dir(&temp_dir, Some("benchmark-run-20260421T030000Z"))
+                .unwrap();
+        assert!(explicit
+            .display()
+            .to_string()
+            .ends_with("benchmark-run-20260421T030000Z.json"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn correct_answer_entry_supports_streamingqa_qa_id() {
+        let question = serde_json::json!({
+            "qa_id": "streamingqa-smoke-2",
+            "hypothesis": "Ben Moss",
+            "accuracy": true,
+            "exact_match": true
+        });
+
+        let entry = correct_answer_entry(&question).unwrap();
+        assert_eq!(entry, "`streamingqa-smoke-2`: `Ben Moss`");
+    }
+
+    #[test]
+    fn render_correct_answer_section_counts_streamingqa_matches() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-correct-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let summary_path = temp_dir.join("summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "questions": [
+                    {
+                        "qa_id": "streamingqa-smoke-2",
+                        "hypothesis": "Ben Moss",
+                        "accuracy": true,
+                        "exact_match": true
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suite = BenchmarkSuiteResult {
+            id: "coobie_streamingqa".to_string(),
+            title: "Coobie on StreamingQA".to_string(),
+            subsystem: "coobie".to_string(),
+            category: "belief_updates".to_string(),
+            tier: "target".to_string(),
+            description: "StreamingQA smoke".to_string(),
+            benchmark_url: None,
+            leaderboard_url: None,
+            baseline_reference: None,
+            setup_notes: Vec::new(),
+            required_env: Vec::new(),
+            tags: Vec::new(),
+            status: BenchmarkStatus::Passed,
+            duration_ms: 1,
+            reason: None,
+            steps: vec![BenchmarkStepResult {
+                id: "streamingqa_adapter".to_string(),
+                label: "StreamingQA adapter".to_string(),
+                status: BenchmarkStatus::Passed,
+                program: "builtin".to_string(),
+                args: Vec::new(),
+                cwd: temp_dir.display().to_string(),
+                duration_ms: 1,
+                exit_code: None,
+                stdout: format!("Summary JSON: {}", summary_path.display()),
+                stderr: String::new(),
+                reason: None,
+            }],
+        };
+
+        let section = render_correct_answer_section(&suite).unwrap().join("\n");
+        assert!(section.contains("- Correct answers: 1/1"));
+        assert!(section.contains("`streamingqa-smoke-2`: `Ben Moss`"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn render_report_markdown_includes_streamingqa_persistence_metrics() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-metrics-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let summary_path = temp_dir.join("summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "provider_label": "PackChat agent coobie with temporal invalidation-aware retrieval",
+                "metrics": {
+                    "total_questions": 3,
+                    "accuracy": 1.0,
+                    "exact_match": 1.0,
+                    "token_f1": 1.0,
+                    "evidence_hit_rate": 1.0,
+                    "answered_rate": 1.0
+                },
+                "persistence": {
+                    "memory_updates_db_path": "/tmp/streamingqa/memory-updates.db",
+                    "persisted_supersession_events": 1,
+                    "questions_requiring_supersession_history": 1,
+                    "accuracy_on_updated_facts": 1.0,
+                    "exact_match_on_updated_facts": 1.0,
+                    "evidence_hit_rate_on_updated_facts": 1.0
+                },
+                "questions": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = BenchmarkRunReport {
+            version: 1,
+            generated_at: Utc::now(),
+            manifest_path: "factory/benchmarks/suites.yaml".to_string(),
+            repo_root: "/tmp/harkonnen".to_string(),
+            selected_suites: vec!["coobie_streamingqa".to_string()],
+            summary: BenchmarkRunSummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+            },
+            stakeholder_alignment: None,
+            suites: vec![BenchmarkSuiteResult {
+                id: "coobie_streamingqa".to_string(),
+                title: "Coobie on StreamingQA".to_string(),
+                subsystem: "coobie".to_string(),
+                category: "belief_updates".to_string(),
+                tier: "target".to_string(),
+                description: "StreamingQA smoke".to_string(),
+                benchmark_url: None,
+                leaderboard_url: None,
+                baseline_reference: None,
+                setup_notes: Vec::new(),
+                required_env: Vec::new(),
+                tags: Vec::new(),
+                status: BenchmarkStatus::Passed,
+                duration_ms: 1,
+                reason: None,
+                steps: vec![BenchmarkStepResult {
+                    id: "streamingqa_adapter".to_string(),
+                    label: "StreamingQA adapter".to_string(),
+                    status: BenchmarkStatus::Passed,
+                    program: "builtin".to_string(),
+                    args: Vec::new(),
+                    cwd: temp_dir.display().to_string(),
+                    duration_ms: 1,
+                    exit_code: None,
+                    stdout: format!("Summary JSON: {}", summary_path.display()),
+                    stderr: String::new(),
+                    reason: None,
+                }],
+            }],
+        };
+
+        let markdown = render_report_markdown(&report);
+        assert!(markdown.contains("### Observed Metrics"));
+        assert!(markdown.contains("- Questions: 3"));
+        assert!(markdown.contains("- Accuracy: 1.0000"));
+        assert!(markdown.contains("### Persistence Metrics"));
+        assert!(markdown.contains("- Persisted supersession events: 1"));
+        assert!(markdown.contains("- Updated-fact accuracy: 1.0000"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn render_report_markdown_includes_livecodebench_metrics() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "harkonnen-benchmark-livecodebench-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let summary_path = temp_dir.join("lcb_summary.json");
+        fs::write(
+            &summary_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "provider_label": "direct-codex",
+                "metrics": {
+                    "total_problems": 3,
+                    "passed_problems": 2,
+                    "pass_at_1": 0.6667,
+                    "by_difficulty": {
+                        "easy": {
+                            "total": 2,
+                            "passed": 2,
+                            "pass_rate": 1.0
+                        },
+                        "medium": {
+                            "total": 1,
+                            "passed": 0,
+                            "pass_rate": 0.0
+                        }
+                    },
+                    "by_platform": {
+                        "leetcode": {
+                            "total": 1,
+                            "passed": 1,
+                            "pass_rate": 1.0
+                        },
+                        "codeforces": {
+                            "total": 1,
+                            "passed": 0,
+                            "pass_rate": 0.0
+                        }
+                    }
+                },
+                "results": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = BenchmarkRunReport {
+            version: 1,
+            generated_at: Utc::now(),
+            manifest_path: "factory/benchmarks/suites.yaml".to_string(),
+            repo_root: "/tmp/harkonnen".to_string(),
+            selected_suites: vec!["mason_livecodebench_direct".to_string()],
+            summary: BenchmarkRunSummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+            },
+            stakeholder_alignment: None,
+            suites: vec![BenchmarkSuiteResult {
+                id: "mason_livecodebench_direct".to_string(),
+                title: "Raw LLM Baseline on LiveCodeBench".to_string(),
+                subsystem: "baseline".to_string(),
+                category: "software_engineering".to_string(),
+                tier: "target".to_string(),
+                description: "LiveCodeBench smoke".to_string(),
+                benchmark_url: None,
+                leaderboard_url: None,
+                baseline_reference: None,
+                setup_notes: Vec::new(),
+                required_env: Vec::new(),
+                tags: Vec::new(),
+                status: BenchmarkStatus::Passed,
+                duration_ms: 1,
+                reason: None,
+                steps: vec![BenchmarkStepResult {
+                    id: "livecodebench_direct_adapter".to_string(),
+                    label: "LiveCodeBench raw-model adapter".to_string(),
+                    status: BenchmarkStatus::Passed,
+                    program: "builtin".to_string(),
+                    args: Vec::new(),
+                    cwd: temp_dir.display().to_string(),
+                    duration_ms: 1,
+                    exit_code: None,
+                    stdout: format!("Summary JSON: {}", summary_path.display()),
+                    stderr: String::new(),
+                    reason: None,
+                }],
+            }],
+        };
+
+        let markdown = render_report_markdown(&report);
+        assert!(markdown.contains("### Observed Metrics"));
+        assert!(markdown.contains("- Problems: 3"));
+        assert!(markdown.contains("- Pass@1: 0.6667"));
+        assert!(markdown.contains("- Provider path: direct-codex"));
+        assert!(markdown.contains("### Difficulty Breakdown"));
+        assert!(markdown.contains("- easy: 2/2 (1.0000)"));
+        assert!(markdown.contains("### Platform Breakdown"));
+        assert!(markdown.contains("- codeforces: 0/1 (0.0000)"));
+
+        fs::remove_dir_all(temp_dir).unwrap();
     }
 }

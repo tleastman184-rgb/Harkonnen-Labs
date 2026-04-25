@@ -8,7 +8,13 @@ use std::time::SystemTime;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::setup::SetupConfig;
+use crate::setup::{command_available, SetupConfig};
+
+#[derive(Debug, Clone)]
+pub struct MemorySupersessionCandidate {
+    pub stale_memory_id: String,
+    pub reason: String,
+}
 
 // ── Stored entry ──────────────────────────────────────────────────────────────
 
@@ -109,6 +115,7 @@ pub struct MemoryIngestOptions {
 pub struct MemoryIngestResult {
     pub note_path: PathBuf,
     pub asset_path: Option<PathBuf>,
+    pub extracted_text_sidecar_path: Option<PathBuf>,
     pub title: String,
     pub extracted_chars: usize,
     pub memory_root: PathBuf,
@@ -123,6 +130,29 @@ struct ExtractedMemorySource {
     media_kind: String,
     extension_tag: Option<String>,
     asset_source_path: Option<PathBuf>,
+    extraction_method: String,
+    ocr_applied: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedTextPayload {
+    text: String,
+    extraction_method: String,
+    ocr_applied: bool,
+}
+
+impl ExtractedTextPayload {
+    fn new(
+        text: impl Into<String>,
+        extraction_method: impl Into<String>,
+        ocr_applied: bool,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            extraction_method: extraction_method.into(),
+            ocr_applied,
+        }
+    }
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -163,6 +193,10 @@ struct MemoryRetrievalCandidate<'a> {
 impl MemoryStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Create the memory directory, write seed documents, and build the index.
@@ -498,6 +532,133 @@ impl MemoryStore {
         Ok(read_memory_index(&index_path).await?.entries)
     }
 
+    pub async fn detect_supersession_candidates(
+        &self,
+        new_entry_id: &str,
+        embedding_store: Option<&crate::embeddings::EmbeddingStore>,
+    ) -> Result<Vec<MemorySupersessionCandidate>> {
+        let entries = self.list_entries().await?;
+        let Some(new_entry) = entries.iter().find(|entry| entry.id == new_entry_id) else {
+            return Ok(Vec::new());
+        };
+        let new_entry_tags = new_entry.tags.clone();
+        let new_entry_summary = new_entry.summary.clone();
+        let new_entry_content = new_entry.content.clone();
+
+        let memory_root = self.root.display().to_string();
+        let mut semantic_scores = HashMap::new();
+        if let Some(embedding_store) = embedding_store {
+            if embedding_store
+                .ensure_embedded(&entries, &memory_root)
+                .await
+                .is_ok()
+            {
+                let query = format!(
+                    "{}\n{}\n{}",
+                    new_entry_summary,
+                    new_entry_tags.join(", "),
+                    new_entry_content.chars().take(240).collect::<String>()
+                );
+                if let Ok(hits) = embedding_store
+                    .query_semantic(&query, &memory_root, 12)
+                    .await
+                {
+                    for (score, id) in hits {
+                        semantic_scores.insert(id, score);
+                    }
+                }
+            }
+        }
+
+        let new_summary_key = normalize_memory_text(&new_entry_summary);
+        let new_content_key =
+            normalize_memory_text(&new_entry_content.chars().take(400).collect::<String>());
+        let new_source_path = new_entry
+            .provenance
+            .source_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let new_source_label = new_entry
+            .provenance
+            .source_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.id == new_entry_id {
+                continue;
+            }
+            if entry.provenance.superseded_by.is_some()
+                || entry
+                    .provenance
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status == "superseded")
+            {
+                continue;
+            }
+
+            let same_source_path = new_source_path.is_some()
+                && entry.provenance.source_path.as_deref().map(str::trim)
+                    == new_source_path.as_deref();
+            let same_source_label = new_source_label.is_some()
+                && entry.provenance.source_label.as_deref().map(str::trim)
+                    == new_source_label.as_deref();
+            let summary_key = normalize_memory_text(&entry.summary);
+            let content_key =
+                normalize_memory_text(&entry.content.chars().take(400).collect::<String>());
+            let same_summary = !summary_key.is_empty() && summary_key == new_summary_key;
+            let materially_different = !content_key.is_empty()
+                && !new_content_key.is_empty()
+                && content_key != new_content_key;
+            let semantic_score = semantic_scores.get(&entry.id).copied().unwrap_or(0.0);
+            let shared_tags = shared_tag_count(&entry.tags, &new_entry_tags);
+            let negation_flip = has_negation_terms(&entry.summary, &entry.content)
+                != has_negation_terms(&new_entry_summary, &new_entry_content);
+
+            let should_supersede = if same_source_path || same_source_label {
+                materially_different && (same_summary || semantic_score >= 0.86 || negation_flip)
+            } else {
+                same_summary && materially_different && semantic_score >= 0.93 && shared_tags >= 1
+            };
+
+            if !should_supersede {
+                continue;
+            }
+
+            let reason = if same_source_path {
+                format!(
+                    "new ingest supersedes prior fact from the same source path (semantic score {:.2})",
+                    semantic_score
+                )
+            } else if same_source_label {
+                format!(
+                    "new ingest supersedes prior fact from the same source label (semantic score {:.2})",
+                    semantic_score
+                )
+            } else {
+                format!(
+                    "new ingest supersedes a near-duplicate prior fact (semantic score {:.2})",
+                    semantic_score
+                )
+            };
+
+            candidates.push(MemorySupersessionCandidate {
+                stale_memory_id: entry.id,
+                reason,
+            });
+        }
+
+        candidates.sort_by(|left, right| left.stale_memory_id.cmp(&right.stale_memory_id));
+        candidates.truncate(3);
+        Ok(candidates)
+    }
+
     pub async fn annotate_entry_status(
         &self,
         id: &str,
@@ -512,6 +673,49 @@ impl MemoryStore {
         let raw = tokio::fs::read_to_string(&path).await?;
         let mut parsed = parse_frontmatter(&raw);
         annotate_memory_provenance_status(&mut parsed.provenance, status, related_id);
+        let doc = render_memory_document(
+            &parsed.tags,
+            &parsed.summary,
+            &parsed.body,
+            &parsed.provenance,
+        );
+        tokio::fs::write(&path, doc).await?;
+        self.reindex().await?;
+        Ok(())
+    }
+
+    pub async fn clear_entry_supersession(
+        &self,
+        id: &str,
+        expected_successor_id: Option<&str>,
+    ) -> Result<()> {
+        let path = self.root.join(format!("{}.md", sanitize_memory_id(id)));
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let mut parsed = parse_frontmatter(&raw);
+        let should_clear = match expected_successor_id {
+            Some(expected) => parsed.provenance.superseded_by.as_deref() == Some(expected),
+            None => {
+                parsed.provenance.superseded_by.is_some()
+                    || parsed.provenance.status.as_deref() == Some("superseded")
+            }
+        };
+        if !should_clear {
+            return Ok(());
+        }
+
+        parsed.provenance.superseded_by = None;
+        if parsed.provenance.status.as_deref() == Some("superseded") {
+            parsed.provenance.status = if parsed.provenance.challenged_by.is_empty() {
+                None
+            } else {
+                Some("challenged".to_string())
+            };
+        }
+
         let doc = render_memory_document(
             &parsed.tags,
             &parsed.summary,
@@ -723,6 +927,25 @@ impl MemoryStore {
             None
         };
 
+        let extracted_text_sidecar = if let Some(imported_asset) = imported_asset.as_ref() {
+            if should_write_extracted_text_sidecar(&extracted) {
+                Some(
+                    write_extracted_text_sidecar(imported_asset, &extracted.text)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "writing extracted text sidecar for {}",
+                                imported_asset.display()
+                            )
+                        })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut tags = vec!["ingested".to_string(), "document".to_string()];
         append_unique_tag(&mut tags, extracted.media_kind.clone());
         if let Some(extension_tag) = extracted.extension_tag.clone() {
@@ -743,6 +966,7 @@ impl MemoryStore {
         let note_body = render_ingested_memory_body(
             &extracted,
             imported_asset.as_ref(),
+            extracted_text_sidecar.as_ref(),
             options.notes.as_deref(),
         );
         let note_doc = render_memory_document(&tags, &summary, &note_body, &provenance);
@@ -755,6 +979,7 @@ impl MemoryStore {
         Ok(MemoryIngestResult {
             note_path,
             asset_path: imported_asset,
+            extracted_text_sidecar_path: extracted_text_sidecar,
             title: extracted.title,
             extracted_chars: extracted.text.chars().count(),
             memory_root: self.root.clone(),
@@ -799,6 +1024,46 @@ fn append_unique_tag(tags: &mut Vec<String>, tag: String) {
     if !tags.iter().any(|existing| existing == normalized) {
         tags.push(normalized.to_string());
     }
+}
+
+fn normalize_memory_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shared_tag_count(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .filter(|tag| {
+            let trimmed = tag.trim();
+            !trimmed.is_empty() && right.iter().any(|candidate| candidate.trim() == trimmed)
+        })
+        .count()
+}
+
+fn has_negation_terms(summary: &str, content: &str) -> bool {
+    let corpus = format!("{} {}", summary, content).to_ascii_lowercase();
+    [
+        " no ",
+        " not ",
+        " never ",
+        " disabled ",
+        " disable ",
+        " false ",
+        " deprecated ",
+    ]
+    .iter()
+    .any(|needle| corpus.contains(needle))
 }
 
 fn next_available_memory_id(root: &Path, raw: &str) -> String {
@@ -850,19 +1115,26 @@ fn default_ingest_summary(extracted: &ExtractedMemorySource) -> String {
 fn render_ingested_memory_body(
     extracted: &ExtractedMemorySource,
     imported_asset: Option<&PathBuf>,
+    extracted_text_sidecar: Option<&PathBuf>,
     notes: Option<&str>,
 ) -> String {
     let highlights = summarize_extracted_text(&extracted.text, 12);
     let rel_asset = imported_asset
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "not stored".to_string());
+    let rel_sidecar = extracted_text_sidecar
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not stored".to_string());
     let extracted_text = truncate_for_memory(&extracted.text, 120_000);
     format!(
-        "# Ingested Knowledge\n\n- Title: {}\n- Source kind: {}\n- Source locator: {}\n- Imported asset: {}\n- Ingested at: {}\n- Extracted chars: {}\n\n## Notes\n{}\n\n## Distilled Highlights\n{}\n\n## Extracted Text\n{}\n",
+        "# Ingested Knowledge\n\n- Title: {}\n- Source kind: {}\n- Source locator: {}\n- Imported asset: {}\n- Extracted text sidecar: {}\n- Extraction method: {}\n- OCR applied: {}\n- Ingested at: {}\n- Extracted chars: {}\n\n## Notes\n{}\n\n## Distilled Highlights\n{}\n\n## Extracted Text\n{}\n",
         extracted.title,
         extracted.source_kind,
         extracted.source_locator,
         rel_asset,
+        rel_sidecar,
+        extracted.extraction_method,
+        if extracted.ocr_applied { "yes" } else { "no" },
         Utc::now().to_rfc3339(),
         extracted.text.chars().count(),
         notes
@@ -993,6 +1265,12 @@ async fn extract_memory_source_from_url(source: &str) -> Result<ExtractedMemoryS
             "txt".to_string()
         }),
         asset_source_path: None,
+        extraction_method: if is_html {
+            "http_html_to_text".to_string()
+        } else {
+            "http_text".to_string()
+        },
+        ocr_applied: false,
     })
 }
 
@@ -1032,27 +1310,28 @@ async fn extract_memory_source_from_file(source: &Path) -> Result<ExtractedMemor
         .to_lowercase();
     let title = derive_title_from_path(&canonical);
     let media_kind = detect_media_kind(&canonical).to_string();
-    let raw_text = match ext.as_str() {
+    let extracted_payload = match ext.as_str() {
         "txt" | "md" | "csv" | "json" | "toml" | "yaml" | "yml" | "log" => {
-            tokio::fs::read_to_string(&canonical).await?
+            ExtractedTextPayload::new(tokio::fs::read_to_string(&canonical).await?, "read_to_string", false)
         }
         "html" | "htm" | "xml" => {
             let raw = tokio::fs::read_to_string(&canonical).await?;
-            html_to_text(&raw)
+            ExtractedTextPayload::new(html_to_text(&raw), "html_to_text", false)
         }
         "pdf" => extract_pdf_text(&canonical).await?,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => extract_image_text_with_ocr(&canonical).await?,
         "docx" => extract_docx_text(&canonical).await?,
         "pptx" => extract_pptx_text(&canonical).await?,
         "doc" | "ppt" | "odt" | "odp" => extract_with_libreoffice(&canonical).await?,
         _ => match tokio::fs::read_to_string(&canonical).await {
-            Ok(text) => text,
+            Ok(text) => ExtractedTextPayload::new(text, "read_to_string", false),
             Err(_) => bail!(
                 "unsupported ingest format for {}. Use memory import for raw asset storage or convert it to txt/pdf/docx/pptx/html first",
                 canonical.display()
             ),
         },
     };
-    let text = normalize_ingested_text(&raw_text);
+    let text = normalize_ingested_text(&extracted_payload.text);
     if text.trim().is_empty() {
         bail!("no extractable text found in {}", canonical.display());
     }
@@ -1064,10 +1343,41 @@ async fn extract_memory_source_from_file(source: &Path) -> Result<ExtractedMemor
         media_kind,
         extension_tag: if ext.is_empty() { None } else { Some(ext) },
         asset_source_path: Some(canonical),
+        extraction_method: extracted_payload.extraction_method,
+        ocr_applied: extracted_payload.ocr_applied,
     })
 }
 
-async fn extract_pdf_text(source: &Path) -> Result<String> {
+async fn extract_pdf_text(source: &Path) -> Result<ExtractedTextPayload> {
+    if let Some(text) = try_extract_pdf_text_native(source).await? {
+        return Ok(ExtractedTextPayload::new(text, "pdftotext", false));
+    }
+
+    if let Some(text) =
+        try_extract_text_via_external_command(source, "HARKONNEN_MEMORY_PDF_EXTRACT_COMMAND")
+            .await?
+    {
+        return Ok(ExtractedTextPayload::new(
+            text,
+            "external_pdf_extractor",
+            false,
+        ));
+    }
+
+    if let Some(text) = try_extract_pdf_text_with_ocr(source).await? {
+        return Ok(ExtractedTextPayload::new(text, "ocr_pdf", true));
+    }
+
+    bail!(
+        "no extractable text found in {}. Install pdftotext, configure HARKONNEN_MEMORY_PDF_EXTRACT_COMMAND, or install pdftoppm+tesseract for OCR fallback",
+        source.display()
+    );
+}
+
+async fn try_extract_pdf_text_native(source: &Path) -> Result<Option<String>> {
+    if !command_available("pdftotext") {
+        return Ok(None);
+    }
     let output = Command::new("pdftotext")
         .arg("-layout")
         .arg(source)
@@ -1076,21 +1386,34 @@ async fn extract_pdf_text(source: &Path) -> Result<String> {
         .await
         .with_context(|| format!("running pdftotext for {}", source.display()))?;
     if !output.status.success() {
-        bail!(
+        tracing::warn!(
             "pdftotext failed for {}: {}",
             source.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        return Ok(None);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let text = normalize_ingested_text(&String::from_utf8_lossy(&output.stdout));
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(text))
 }
 
-async fn extract_docx_text(source: &Path) -> Result<String> {
-    extract_zip_text_with_python(source, "docx").await
+async fn extract_docx_text(source: &Path) -> Result<ExtractedTextPayload> {
+    Ok(ExtractedTextPayload::new(
+        extract_zip_text_with_python(source, "docx").await?,
+        "docx_zip_xml",
+        false,
+    ))
 }
 
-async fn extract_pptx_text(source: &Path) -> Result<String> {
-    extract_zip_text_with_python(source, "pptx").await
+async fn extract_pptx_text(source: &Path) -> Result<ExtractedTextPayload> {
+    Ok(ExtractedTextPayload::new(
+        extract_zip_text_with_python(source, "pptx").await?,
+        "pptx_zip_xml",
+        false,
+    ))
 }
 
 async fn extract_zip_text_with_python(source: &Path, mode: &str) -> Result<String> {
@@ -1144,7 +1467,7 @@ print('\n\n'.join(parts))"#
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn extract_with_libreoffice(source: &Path) -> Result<String> {
+async fn extract_with_libreoffice(source: &Path) -> Result<ExtractedTextPayload> {
     let out_dir = std::env::temp_dir().join(format!("harkonnen-memory-lo-{}", Uuid::new_v4()));
     tokio::fs::create_dir_all(&out_dir).await?;
     let output = Command::new("libreoffice")
@@ -1175,12 +1498,171 @@ async fn extract_with_libreoffice(source: &Path) -> Result<String> {
         }
     }
     let _ = tokio::fs::remove_dir_all(&out_dir).await;
-    text.with_context(|| {
+    let text = text.with_context(|| {
         format!(
             "libreoffice did not produce a txt output for {}",
             source.display()
         )
-    })
+    })?;
+    Ok(ExtractedTextPayload::new(text, "libreoffice_txt", false))
+}
+
+async fn extract_image_text_with_ocr(source: &Path) -> Result<ExtractedTextPayload> {
+    if !command_available("tesseract") {
+        bail!(
+            "OCR requires tesseract for {}. Install tesseract or use memory import for raw asset storage",
+            source.display()
+        );
+    }
+    let output = Command::new("tesseract")
+        .arg(source)
+        .arg("stdout")
+        .output()
+        .await
+        .with_context(|| format!("running tesseract for {}", source.display()))?;
+    if !output.status.success() {
+        bail!(
+            "tesseract failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(ExtractedTextPayload::new(
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        "ocr_image",
+        true,
+    ))
+}
+
+async fn try_extract_pdf_text_with_ocr(source: &Path) -> Result<Option<String>> {
+    if !command_available("pdftoppm") || !command_available("tesseract") {
+        return Ok(None);
+    }
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("harkonnen-memory-pdf-ocr-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir).await?;
+    let page_prefix = temp_dir.join("page");
+    let render_output = Command::new("pdftoppm")
+        .arg("-png")
+        .arg(source)
+        .arg(&page_prefix)
+        .output()
+        .await
+        .with_context(|| format!("running pdftoppm for {}", source.display()))?;
+    if !render_output.status.success() {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tracing::warn!(
+            "pdftoppm failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&render_output.stderr).trim()
+        );
+        return Ok(None);
+    }
+
+    let mut pages = Vec::new();
+    let mut entries = tokio::fs::read_dir(&temp_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("png") {
+            pages.push(path);
+        }
+    }
+    pages.sort();
+
+    let mut parts = Vec::new();
+    for page in &pages {
+        let output = Command::new("tesseract")
+            .arg(page)
+            .arg("stdout")
+            .output()
+            .await
+            .with_context(|| format!("running tesseract for {}", page.display()))?;
+        if !output.status.success() {
+            tracing::warn!(
+                "tesseract failed for OCR page {}: {}",
+                page.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            continue;
+        }
+        let text = normalize_ingested_text(&String::from_utf8_lossy(&output.stdout));
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.join("\n\n")))
+}
+
+async fn try_extract_text_via_external_command(
+    source: &Path,
+    env_var: &str,
+) -> Result<Option<String>> {
+    let template = match std::env::var(env_var) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+
+    let source_arg = shell_escape_arg(&source.to_string_lossy());
+    let raw_command = if template.contains("{source}") {
+        template.replace("{source}", &source_arg)
+    } else {
+        format!("{template} {source_arg}")
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(&raw_command);
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(&raw_command);
+        command
+    };
+
+    let output = command.output().await.with_context(|| {
+        format!(
+            "running external extractor '{}' for {}",
+            env_var,
+            source.display()
+        )
+    })?;
+    if !output.status.success() {
+        tracing::warn!(
+            "external extractor {} failed for {}: {}",
+            env_var,
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(None);
+    }
+
+    let text = normalize_ingested_text(&String::from_utf8_lossy(&output.stdout));
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(text))
+}
+
+fn shell_escape_arg(arg: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn derive_title_from_path(source: &Path) -> String {
@@ -1404,35 +1886,96 @@ fn format_memory_hit_note(hit: &MemoryRetrievalHit) -> String {
 }
 
 fn memory_matches(entry: &MemoryEntry, query: &str) -> bool {
-    entry.summary.to_lowercase().contains(query)
+    let summary = entry.summary.to_lowercase();
+    let content = entry.content.to_lowercase();
+    let query = query.to_lowercase();
+    if summary.contains(&query)
         || entry
             .tags
             .iter()
-            .any(|tag| tag.to_lowercase().contains(query))
-        || entry.content.to_lowercase().contains(query)
+            .any(|tag| tag.to_lowercase().contains(&query))
+        || content.contains(&query)
+    {
+        return true;
+    }
+
+    let terms = keyword_query_terms(&query);
+    if terms.is_empty() {
+        return false;
+    }
+    let matched_terms = terms
+        .iter()
+        .filter(|term| {
+            summary.contains(term.as_str())
+                || entry
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(term.as_str()))
+                || content.contains(term.as_str())
+        })
+        .count();
+    let required_matches = if terms.len() <= 2 { 1 } else { 2 };
+    matched_terms >= required_matches
 }
 
 fn memory_match_score(entry: &MemoryEntry, query: &str) -> i64 {
     let mut score = 0_i64;
     let summary = entry.summary.to_lowercase();
     let content = entry.content.to_lowercase();
-    if summary.contains(query) {
+    let query = query.to_lowercase();
+    if summary.contains(&query) {
         score += 40;
     }
     if entry
         .tags
         .iter()
-        .any(|tag| tag.to_lowercase().contains(query))
+        .any(|tag| tag.to_lowercase().contains(&query))
     {
         score += 25;
     }
-    if content.contains(query) {
+    if content.contains(&query) {
         score += 15;
+    }
+    for term in keyword_query_terms(&query) {
+        if summary.contains(&term) {
+            score += 12;
+        } else if entry
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(&term))
+        {
+            score += 8;
+        } else if content.contains(&term) {
+            score += 4;
+        }
     }
     score += entry.contributed_to_success_count * 10;
     score -= entry.contributed_to_failure_count * 4;
     score += entry.recall_count.min(20);
     score
+}
+
+fn keyword_query_terms(query: &str) -> Vec<String> {
+    let stopwords = [
+        "about", "after", "before", "could", "does", "from", "have", "into", "only", "that",
+        "their", "there", "they", "this", "were", "what", "when", "where", "which", "while",
+        "with", "would",
+    ];
+    let mut terms = Vec::new();
+    for token in query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+    {
+        let useful = token.len() >= 4 || token.chars().all(|ch| ch.is_ascii_digit());
+        if !useful || stopwords.contains(&token.as_str()) {
+            continue;
+        }
+        if !terms.iter().any(|existing| existing == &token) {
+            terms.push(token);
+        }
+    }
+    terms
 }
 
 fn adjust_retrieval_score_for_provenance(base_score: f32, entry: &MemoryEntry) -> f32 {
@@ -1692,11 +2235,199 @@ fn detect_media_kind(path: &Path) -> &'static str {
     }
 }
 
+fn should_write_extracted_text_sidecar(extracted: &ExtractedMemorySource) -> bool {
+    matches!(extracted.media_kind.as_str(), "pdf" | "image" | "document")
+        && extracted.extension_tag.as_deref().is_none_or(|ext| {
+            !matches!(
+                ext,
+                "txt"
+                    | "md"
+                    | "csv"
+                    | "json"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "log"
+                    | "html"
+                    | "htm"
+                    | "xml"
+            )
+        })
+}
+
+async fn write_extracted_text_sidecar(asset_path: &Path, text: &str) -> Result<PathBuf> {
+    let sidecar_path = extracted_text_sidecar_path(asset_path);
+    tokio::fs::write(&sidecar_path, text).await?;
+    Ok(sidecar_path)
+}
+
+fn extracted_text_sidecar_path(asset_path: &Path) -> PathBuf {
+    let stem = asset_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("extracted");
+    let parent = asset_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}.extracted.txt"))
+}
+
 fn asset_path_for(imports_dir: &Path, id: &str, ext: &str) -> PathBuf {
     if ext.is_empty() {
         imports_dir.join(id)
     } else {
         imports_dir.join(format!("{}.{}", id, ext))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extracted_text_sidecar_path, memory_match_score, memory_matches, parse_frontmatter,
+        shell_escape_arg, should_write_extracted_text_sidecar, ExtractedMemorySource, MemoryEntry,
+        MemoryProvenance, MemoryStore,
+    };
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    #[test]
+    fn extracted_text_sidecar_uses_asset_stem() {
+        let path = extracted_text_sidecar_path(Path::new("/tmp/scan.pdf"));
+        assert_eq!(path, Path::new("/tmp/scan.extracted.txt"));
+    }
+
+    #[test]
+    fn binary_ingests_request_text_sidecar() {
+        let extracted = ExtractedMemorySource {
+            title: "scan".to_string(),
+            source_kind: "file".to_string(),
+            source_locator: "/tmp/scan.pdf".to_string(),
+            text: "hello".to_string(),
+            media_kind: "pdf".to_string(),
+            extension_tag: Some("pdf".to_string()),
+            asset_source_path: None,
+            extraction_method: "pdftotext".to_string(),
+            ocr_applied: false,
+        };
+        assert!(should_write_extracted_text_sidecar(&extracted));
+    }
+
+    #[test]
+    fn plain_text_ingests_skip_sidecar() {
+        let extracted = ExtractedMemorySource {
+            title: "note".to_string(),
+            source_kind: "file".to_string(),
+            source_locator: "/tmp/note.txt".to_string(),
+            text: "hello".to_string(),
+            media_kind: "document".to_string(),
+            extension_tag: Some("txt".to_string()),
+            asset_source_path: None,
+            extraction_method: "read_to_string".to_string(),
+            ocr_applied: false,
+        };
+        assert!(!should_write_extracted_text_sidecar(&extracted));
+    }
+
+    #[test]
+    fn shell_escape_contains_wrapped_argument() {
+        let escaped = shell_escape_arg("/tmp/with spaces/file.pdf");
+        assert!(escaped.starts_with('\'') || escaped.starts_with('"'));
+    }
+
+    #[test]
+    fn keyword_memory_match_handles_streamingqa_style_questions() {
+        let entry = MemoryEntry {
+            id: "oakview-mayor-2024-01".to_string(),
+            tags: vec!["streamingqa".to_string(), "year:2024".to_string()],
+            summary: "Oakview elects Alice Hart".to_string(),
+            content:
+                "On January 1, 2024, Oakview elected Alice Hart as mayor after a close city race."
+                    .to_string(),
+            created_at: "2026-04-22T00:00:00Z".to_string(),
+            provenance: MemoryProvenance::default(),
+            recall_count: 0,
+            last_recalled: None,
+            loaded_for_run_count: 0,
+            contributed_to_success_count: 0,
+            contributed_to_failure_count: 0,
+        };
+
+        let query = "Who was the mayor of Oakview in February 2024?";
+        assert!(memory_matches(&entry, query));
+        assert!(memory_match_score(&entry, query) > 0);
+    }
+
+    #[tokio::test]
+    async fn detect_supersession_candidates_marks_same_source_path_changes() {
+        let temp = tempdir().unwrap();
+        let store = MemoryStore::new(temp.path().to_path_buf());
+        let provenance = MemoryProvenance {
+            source_path: Some("/tmp/harkonnen-memory-supersession.txt".to_string()),
+            source_label: Some("harkonnen-memory-supersession".to_string()),
+            ..MemoryProvenance::default()
+        };
+
+        store
+            .store_with_metadata(
+                "deployment-target-aws",
+                vec!["deploy".to_string()],
+                "deployment target",
+                "Deployment target is AWS us-west-2.",
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .store_with_metadata(
+                "deployment-target-onprem",
+                vec!["deploy".to_string()],
+                "deployment target",
+                "Deployment target is on-premises only.",
+                provenance,
+            )
+            .await
+            .unwrap();
+
+        let candidates = store
+            .detect_supersession_candidates("deployment-target-onprem", None)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].stale_memory_id, "deployment-target-aws");
+        assert!(candidates[0].reason.contains("same source path"));
+    }
+
+    #[tokio::test]
+    async fn clear_entry_supersession_removes_pointer_and_status() {
+        let temp = tempdir().unwrap();
+        let store = MemoryStore::new(temp.path().to_path_buf());
+
+        store
+            .store_with_metadata(
+                "deployment-target-aws",
+                vec!["deploy".to_string()],
+                "deployment target",
+                "Deployment target is AWS us-west-2.",
+                MemoryProvenance {
+                    status: Some("superseded".to_string()),
+                    superseded_by: Some("deployment-target-onprem".to_string()),
+                    ..MemoryProvenance::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .clear_entry_supersession("deployment-target-aws", Some("deployment-target-onprem"))
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(temp.path().join("deployment-target-aws.md"))
+            .await
+            .unwrap();
+        let parsed = parse_frontmatter(&raw);
+
+        assert_eq!(parsed.provenance.superseded_by, None);
+        assert_eq!(parsed.provenance.status, None);
     }
 }
 

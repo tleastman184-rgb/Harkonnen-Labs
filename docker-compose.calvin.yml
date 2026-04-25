@@ -1,0 +1,84 @@
+services:
+  typedb:
+    image: typedb/typedb:latest
+    ports:
+      - "1729:1729"
+    volumes:
+      - typedb_data:/opt/typedb/server/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/1729'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    profiles: ["full"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: harkonnen_telemetry
+      POSTGRES_USER: harkonnen
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD:-harkonnen}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=5
+        -c max_wal_senders=5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harkonnen -d harkonnen_telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  materialize:
+    image: materialize/materialized:v0.130.0
+    profiles: ["full"]
+    ports:
+      - "6875:6875"
+      - "6876:6876"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6876/api/readyz"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  harmony:
+    build:
+      context: .
+      dockerfile: calvin/docker/Dockerfile
+    ports:
+      - "7171:7171"
+    depends_on:
+      typedb:
+        condition: service_healthy
+    environment:
+      TYPEDB_URL: ${TYPEDB_URL:-typedb:1729}
+      TIMESCALE_URL: postgres://harkonnen:${TIMESCALE_PASSWORD:-harkonnen}@timescaledb:5432/harkonnen_telemetry
+      MATERIALIZE_URL: postgres://materialize@materialize:6875/materialize
+      CALVIN_ENABLE_TELEMETRY: ${CALVIN_ENABLE_TELEMETRY:-false}
+      CALVIN_ENABLE_STREAMING: ${CALVIN_ENABLE_STREAMING:-false}
+      CALVIN_PORT: 7171
+      CALVIN_DB: ${CALVIN_DB:-harkonnen}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./factory/calvin_archive:/data/calvin_archive:ro
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7171/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  typedb_data:
+  timescale_data:

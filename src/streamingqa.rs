@@ -2,9 +2,14 @@ use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    SqlitePool,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use crate::{
     benchmark::BenchmarkStatus,
@@ -71,6 +76,7 @@ pub struct StreamingQaRunOutput {
     pub mode: StreamingQaMode,
     pub provider_label: String,
     pub metrics: StreamingQaMetrics,
+    pub persistence: StreamingQaPersistenceSummary,
     pub threshold_failure: Option<String>,
 }
 
@@ -93,6 +99,16 @@ pub struct StreamingQaMetrics {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamingQaPersistenceSummary {
+    pub memory_updates_db_path: String,
+    pub persisted_supersession_events: usize,
+    pub questions_requiring_supersession_history: usize,
+    pub accuracy_on_updated_facts: f64,
+    pub exact_match_on_updated_facts: f64,
+    pub evidence_hit_rate_on_updated_facts: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StreamingQaSliceMetrics {
     pub total_questions: usize,
     pub accuracy: f64,
@@ -111,6 +127,7 @@ struct StreamingQaSummary {
     limit: Option<usize>,
     generated_at: String,
     metrics: StreamingQaMetrics,
+    persistence: StreamingQaPersistenceSummary,
     predictions_path: String,
     questions: Vec<StreamingQaQuestionResult>,
 }
@@ -126,6 +143,7 @@ struct StreamingQaQuestionResult {
     exact_match: bool,
     token_f1: f64,
     evidence_hit: bool,
+    requires_supersession_history: bool,
     recent_or_past: String,
     written_or_generated: String,
     question_ts: i64,
@@ -298,7 +316,11 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
     let predictions_path = config.output_dir.join("predictions.jsonl");
     let summary_path = config.output_dir.join("summary.json");
     let markdown_path = config.output_dir.join("summary.md");
+    let memory_updates_db_path = config.output_dir.join("memory-updates.db");
     let memory_root = config.output_dir.join("temporal-memory");
+    if memory_updates_db_path.exists() {
+        let _ = tokio::fs::remove_file(&memory_updates_db_path).await;
+    }
     if memory_root.exists() {
         let _ = tokio::fs::remove_dir_all(&memory_root).await;
     }
@@ -306,6 +328,7 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
         .await
         .with_context(|| format!("creating StreamingQA memory dir {}", memory_root.display()))?;
     let store = MemoryStore::new(memory_root.clone());
+    let persistence_db = init_memory_updates_db(&memory_updates_db_path).await?;
 
     let mut document_by_id = HashMap::new();
     for document in &documents {
@@ -317,6 +340,7 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
     let mut accumulator = StreamingQaAccumulator::default();
     let mut by_recency: HashMap<String, StreamingQaAccumulator> = HashMap::new();
     let mut by_origin: HashMap<String, StreamingQaAccumulator> = HashMap::new();
+    let mut update_questions = StreamingQaAccumulator::default();
     let verbose_progress = benchmark_verbose_progress();
     let show_raw_output = benchmark_show_raw_output();
     let mut doc_cursor = 0usize;
@@ -329,6 +353,8 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
             &mut doc_cursor,
             question.question_ts,
             &mut loaded_doc_memory_ids,
+            &persistence_db,
+            &memory_root,
         )
         .await?;
 
@@ -362,12 +388,15 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
             }
         };
 
+        let requires_supersession_history =
+            question_requires_supersession_history(question, &document_by_id);
         let result = evaluate_question(
             question,
             answer.raw_hypothesis,
             answer.contexts_used,
             answer.retrieval_trace,
             answer.evidence_hit,
+            requires_supersession_history,
         );
         if !answer.retrieved_ids.is_empty() {
             store.mark_entries_loaded(&answer.retrieved_ids).await?;
@@ -409,6 +438,9 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
             .entry(normalize_slice_key(&result.written_or_generated))
             .or_default()
             .add(&result);
+        if result.requires_supersession_history {
+            update_questions.add(&result);
+        }
         predictions.push(serde_json::to_string(&StreamingQaPrediction {
             qa_id: &result.qa_id,
             hypothesis: &result.hypothesis,
@@ -428,6 +460,23 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
         ),
         by_recency: finalize_slices(by_recency),
         by_origin: finalize_slices(by_origin),
+    };
+    let persistence = StreamingQaPersistenceSummary {
+        memory_updates_db_path: memory_updates_db_path.display().to_string(),
+        persisted_supersession_events: count_memory_updates(&persistence_db).await?,
+        questions_requiring_supersession_history: update_questions.total_questions,
+        accuracy_on_updated_facts: ratio(
+            update_questions.accuracy_sum,
+            update_questions.total_questions,
+        ),
+        exact_match_on_updated_facts: ratio(
+            update_questions.exact_match_sum,
+            update_questions.total_questions,
+        ),
+        evidence_hit_rate_on_updated_facts: ratio(
+            update_questions.evidence_hit_sum,
+            update_questions.total_questions,
+        ),
     };
 
     tokio::fs::write(&predictions_path, format!("{}\n", predictions.join("\n")))
@@ -451,6 +500,7 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
         limit: config.limit,
         generated_at: Utc::now().to_rfc3339(),
         metrics: metrics.clone(),
+        persistence: persistence.clone(),
         predictions_path: predictions_path.display().to_string(),
         questions: results,
     };
@@ -462,7 +512,7 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
         .await
         .with_context(|| format!("writing StreamingQA markdown {}", markdown_path.display()))?;
 
-    let threshold_failure = threshold_failure(&metrics, config);
+    let threshold_failure = threshold_failure(&metrics, &persistence, config);
 
     Ok(StreamingQaRunOutput {
         output_dir: config.output_dir.clone(),
@@ -472,6 +522,7 @@ pub async fn run(paths: &Paths, config: &StreamingQaRunConfig) -> Result<Streami
         mode: config.mode,
         provider_label: provider_label(config),
         metrics,
+        persistence,
         threshold_failure,
     })
 }
@@ -489,6 +540,22 @@ pub fn render_step_stdout(output: &StreamingQaRunOutput) -> String {
         format!("Exact match: {:.4}", output.metrics.exact_match),
         format!("Token F1: {:.4}", output.metrics.token_f1),
         format!("Evidence hit rate: {:.4}", output.metrics.evidence_hit_rate),
+        format!(
+            "Memory updates DB: {}",
+            output.persistence.memory_updates_db_path
+        ),
+        format!(
+            "Persisted supersession events: {}",
+            output.persistence.persisted_supersession_events
+        ),
+        format!(
+            "Updated-fact questions: {}",
+            output.persistence.questions_requiring_supersession_history
+        ),
+        format!(
+            "Updated-fact accuracy: {:.4}",
+            output.persistence.accuracy_on_updated_facts
+        ),
     ];
     if let Some(reason) = &output.threshold_failure {
         lines.push(format!("Threshold failure: {}", reason));
@@ -663,6 +730,8 @@ async fn ingest_available_documents(
     doc_cursor: &mut usize,
     question_ts: i64,
     loaded_doc_memory_ids: &mut HashMap<String, String>,
+    persistence_db: &SqlitePool,
+    memory_root: &Path,
 ) -> Result<()> {
     while *doc_cursor < documents.len() && documents[*doc_cursor].publication_ts <= question_ts {
         let document = &documents[*doc_cursor];
@@ -699,6 +768,14 @@ async fn ingest_available_documents(
                 store
                     .annotate_entry_status(old_memory_id, "superseded", Some(&memory_id))
                     .await?;
+                persist_memory_update(
+                    persistence_db,
+                    old_memory_id,
+                    &memory_id,
+                    memory_root,
+                    &format!("StreamingQA document {} supersedes {}", document.id, old_id),
+                )
+                .await?;
             }
         }
         *doc_cursor += 1;
@@ -1016,6 +1093,7 @@ fn build_context_history(
             thread_id: thread_id.to_string(),
             role: "operator".to_string(),
             agent: Some(agent.to_string()),
+            agent_runtime_id: None,
             content: format_context_note(context, 3_200),
             checkpoint_id: None,
             created_at: Utc::now(),
@@ -1035,6 +1113,7 @@ fn history_with_prompt(
         thread_id: thread_id.to_string(),
         role: "operator".to_string(),
         agent: Some(agent.to_string()),
+        agent_runtime_id: None,
         content: prompt.to_string(),
         checkpoint_id: None,
         created_at: Utc::now(),
@@ -1096,6 +1175,7 @@ fn evaluate_question(
     contexts_used: Vec<String>,
     retrieval_trace: Vec<String>,
     evidence_hit: bool,
+    requires_supersession_history: bool,
 ) -> StreamingQaQuestionResult {
     let hypothesis = extract_final_answer(&raw_hypothesis);
     let normalized_hypothesis = normalize_text(&hypothesis);
@@ -1129,6 +1209,7 @@ fn evaluate_question(
         exact_match,
         token_f1,
         evidence_hit,
+        requires_supersession_history,
         recent_or_past: question.recent_or_past.clone(),
         written_or_generated: question.written_or_generated.clone(),
         question_ts: question.question_ts,
@@ -1176,6 +1257,33 @@ fn render_markdown_summary(summary: &StreamingQaSummary) -> String {
         ),
         format!("- Answered rate: {:.4}", summary.metrics.answered_rate),
         String::new(),
+        "## Persistence".to_string(),
+        String::new(),
+        format!(
+            "- Memory updates DB: {}",
+            summary.persistence.memory_updates_db_path
+        ),
+        format!(
+            "- Persisted supersession events: {}",
+            summary.persistence.persisted_supersession_events
+        ),
+        format!(
+            "- Updated-fact questions: {}",
+            summary.persistence.questions_requiring_supersession_history
+        ),
+        format!(
+            "- Updated-fact accuracy: {:.4}",
+            summary.persistence.accuracy_on_updated_facts
+        ),
+        format!(
+            "- Updated-fact exact match: {:.4}",
+            summary.persistence.exact_match_on_updated_facts
+        ),
+        format!(
+            "- Updated-fact evidence hit rate: {:.4}",
+            summary.persistence.evidence_hit_rate_on_updated_facts
+        ),
+        String::new(),
         "## By Recency".to_string(),
         String::new(),
         "| Slice | Questions | Accuracy | Exact Match | Token F1 | Evidence Hit |".to_string(),
@@ -1219,8 +1327,17 @@ fn render_markdown_summary(summary: &StreamingQaSummary) -> String {
 
 fn threshold_failure(
     metrics: &StreamingQaMetrics,
+    persistence: &StreamingQaPersistenceSummary,
     config: &StreamingQaRunConfig,
 ) -> Option<String> {
+    if persistence.questions_requiring_supersession_history > 0
+        && persistence.persisted_supersession_events == 0
+    {
+        return Some(
+            "fixture required supersession history, but no persisted memory_updates rows were recorded"
+                .to_string(),
+        );
+    }
     if let Some(min_accuracy) = config.min_accuracy {
         if metrics.accuracy < min_accuracy {
             return Some(format!(
@@ -1230,6 +1347,72 @@ fn threshold_failure(
         }
     }
     None
+}
+
+async fn init_memory_updates_db(path: &Path) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_updates (
+            update_id       TEXT PRIMARY KEY,
+            old_memory_id   TEXT NOT NULL,
+            new_memory_id   TEXT NOT NULL,
+            memory_root     TEXT NOT NULL DEFAULT '',
+            reason          TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    Ok(pool)
+}
+
+async fn persist_memory_update(
+    pool: &SqlitePool,
+    old_memory_id: &str,
+    new_memory_id: &str,
+    memory_root: &Path,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO memory_updates (update_id, old_memory_id, new_memory_id, memory_root, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(old_memory_id)
+    .bind(new_memory_id)
+    .bind(memory_root.display().to_string())
+    .bind(reason)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn count_memory_updates(pool: &SqlitePool) -> Result<usize> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_updates")
+        .fetch_one(pool)
+        .await?;
+    Ok(count.max(0) as usize)
+}
+
+fn question_requires_supersession_history(
+    question: &StreamingQaQuestion,
+    document_by_id: &HashMap<String, StreamingQaDocument>,
+) -> bool {
+    document_by_id
+        .get(&question.evidence_id)
+        .map(|document| !document.supersedes.is_empty())
+        .unwrap_or(false)
 }
 
 fn finalize_slices(
@@ -1592,6 +1775,7 @@ fn extend_unique_strings(target: &mut Vec<String>, values: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_question_answers_from_string_list_literal() {
@@ -1642,8 +1826,58 @@ mod tests {
             Vec::new(),
             Vec::new(),
             true,
+            false,
         );
         assert!(result.accuracy);
         assert!(result.exact_match);
+    }
+
+    #[test]
+    fn question_requires_supersession_history_when_evidence_supersedes_prior_doc() {
+        let question = StreamingQaQuestion {
+            qa_id: "q".to_string(),
+            question: "Who became mayor after the special election?".to_string(),
+            answers: vec!["Ben Moss".to_string()],
+            question_ts: 20,
+            evidence_ts: 20,
+            evidence_id: "doc-2".to_string(),
+            recent_or_past: "recent".to_string(),
+            written_or_generated: "written".to_string(),
+        };
+        let mut documents = HashMap::new();
+        documents.insert(
+            "doc-2".to_string(),
+            StreamingQaDocument {
+                id: "doc-2".to_string(),
+                title: "Oakview update".to_string(),
+                text: "Ben Moss became mayor.".to_string(),
+                publication_ts: 20,
+                supersedes: vec!["doc-1".to_string()],
+            },
+        );
+        assert!(question_requires_supersession_history(
+            &question, &documents
+        ));
+    }
+
+    #[test]
+    fn threshold_failure_requires_persisted_updates_for_updated_fact_questions() {
+        let metrics = StreamingQaMetrics::default();
+        let persistence = StreamingQaPersistenceSummary {
+            questions_requiring_supersession_history: 1,
+            ..StreamingQaPersistenceSummary::default()
+        };
+        let config = StreamingQaRunConfig {
+            dataset_path: PathBuf::from("fixture.json"),
+            docs_path: None,
+            output_dir: PathBuf::from("/tmp/streamingqa"),
+            mode: StreamingQaMode::Harkonnen,
+            agent: "coobie".to_string(),
+            direct_provider: "default".to_string(),
+            limit: None,
+            min_accuracy: None,
+        };
+        let reason = threshold_failure(&metrics, &persistence, &config).unwrap();
+        assert!(reason.contains("memory_updates"));
     }
 }

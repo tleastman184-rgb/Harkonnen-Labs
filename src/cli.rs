@@ -70,6 +70,24 @@ pub enum Commands {
         #[command(subcommand)]
         command: BenchmarkCommands,
     },
+    Stamp {
+        #[command(subcommand)]
+        command: StampCommands,
+    },
+    Subagent {
+        #[command(subcommand)]
+        command: SubagentCommands,
+    },
+    /// Deterministic enforcement hooks for Claude Code PreToolUse / PostToolUse events.
+    /// Reads JSON from stdin; exits 0 (allow) or 2 (block).
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -618,6 +636,9 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
             if let Some(asset_path) = result.asset_path {
                 println!("Stored source asset: {}", asset_path.display());
             }
+            if let Some(sidecar_path) = result.extracted_text_sidecar_path {
+                println!("Stored extracted text sidecar: {}", sidecar_path.display());
+            }
             println!("Extracted title: {}", result.title);
             println!("Extracted chars: {}", result.extracted_chars);
             println!("Memory root: {}", result.memory_root.display());
@@ -1157,7 +1178,7 @@ fn normalize_optional_slug(raw: &str) -> Option<String> {
     }
 }
 
-fn prompt_optional_text(label: &str, default: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn prompt_optional_text(label: &str, default: Option<&str>) -> Result<Option<String>> {
     let default = default.unwrap_or("");
     let value = prompt_text(label, default)?;
     Ok(normalize_optional_slug(&value))
@@ -1939,7 +1960,7 @@ fn provider_notes(config: &ProviderConfig) -> String {
     }
 }
 
-fn prompt_text(label: &str, default: &str) -> Result<String> {
+pub(crate) fn prompt_text(label: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", label, default);
     io::stdout().flush()?;
     let mut input = String::new();
@@ -1952,7 +1973,7 @@ fn prompt_text(label: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_choice(label: &str, options: &[&str], default: &str) -> Result<String> {
+pub(crate) fn prompt_choice(label: &str, options: &[&str], default: &str) -> Result<String> {
     loop {
         let joined = options.join(", ");
         let chosen = prompt_text(&format!("{label} ({joined})"), default)?;
@@ -1963,7 +1984,7 @@ fn prompt_choice(label: &str, options: &[&str], default: &str) -> Result<String>
     }
 }
 
-fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+pub(crate) fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     let suffix = if default { "Y/n" } else { "y/N" };
     loop {
         print!("{} [{}]: ", label, suffix);
@@ -2134,6 +2155,303 @@ pub async fn handle_capacity(command: CapacityCommands, paths: &Paths) -> Result
         }
     }
     Ok(())
+}
+
+// ── Stamp ────────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum StampCommands {
+    /// Initialize managed-repo stamp (copy skills + templates).
+    Init(StampInitArgs),
+    /// Refresh skills in an already-stamped repo.
+    Update(StampUpdateArgs),
+    /// Show stamp status for a managed repo.
+    Status(StampStatusArgs),
+    /// Run the intake interview to deploy context-aware skills and seed the Calvin Archive.
+    Interview(StampInterviewArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct StampInitArgs {
+    /// Path to the managed repo to stamp.
+    pub repo_path: String,
+    /// Harkonnen Labs root (defaults to current directory).
+    #[arg(long)]
+    pub harkonnen_root: Option<String>,
+    /// Reinitialize even if already at latest stamp version.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+    /// Replace CLAUDE.md even if it already exists (use on major version bumps).
+    #[arg(long, default_value_t = false)]
+    pub overwrite_claude_md: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StampUpdateArgs {
+    /// Path to the managed repo to update.
+    pub repo_path: String,
+    /// Replace CLAUDE.md with the current template.
+    #[arg(long, default_value_t = false)]
+    pub overwrite_claude_md: bool,
+    /// Re-run the full intake interview (requires prior `stamp interview`).
+    #[arg(long, default_value_t = false)]
+    pub re_interview: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StampStatusArgs {
+    /// Path to the managed repo to inspect.
+    pub repo_path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct StampInterviewArgs {
+    /// Path to the managed repo to interview.
+    pub repo_path: String,
+    /// Harkonnen Labs root (defaults to current directory).
+    #[arg(long)]
+    pub harkonnen_root: Option<String>,
+    /// Re-run even if interview was already completed.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+pub async fn handle_stamp(command: StampCommands, paths: &Paths) -> Result<()> {
+    match command {
+        StampCommands::Init(args) => {
+            let repo_path = PathBuf::from(&args.repo_path);
+            let harkonnen_root = args
+                .harkonnen_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.root.clone());
+            crate::stamp::stamp_init(
+                &repo_path,
+                &harkonnen_root,
+                args.force,
+                args.overwrite_claude_md,
+            )
+            .await?;
+        }
+        StampCommands::Update(args) => {
+            let repo_path = PathBuf::from(&args.repo_path);
+            let harkonnen_root = paths.root.clone();
+            crate::stamp::stamp_update(
+                &repo_path,
+                &harkonnen_root,
+                args.overwrite_claude_md,
+                args.re_interview,
+            )
+            .await?;
+        }
+        StampCommands::Status(args) => {
+            let repo_path = PathBuf::from(&args.repo_path);
+            crate::stamp::stamp_status(&repo_path).await?;
+        }
+        StampCommands::Interview(args) => {
+            let repo_path = PathBuf::from(&args.repo_path);
+            let harkonnen_root = args
+                .harkonnen_root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.root.clone());
+            crate::stamp::stamp_interview(&repo_path, &harkonnen_root, args.force).await?;
+        }
+    }
+    Ok(())
+}
+
+// ── Hook ─────────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum HookCommands {
+    /// PreToolUse guard for Edit/Write: sable isolation + memory gate.
+    PreWrite,
+    /// PreToolUse guard for Bash: blocks destructive command patterns.
+    PreBash,
+    /// PostToolUse formatter: runs rustfmt on .rs files.
+    PostFormat,
+    /// PostToolUse audit: appends a structured entry to tool-audit.jsonl.
+    PostAudit,
+}
+
+/// Handle hook subcommands. Intentionally sync and lightweight — no AppContext.
+pub fn handle_hook(command: HookCommands) -> Result<()> {
+    let input = crate::hook::read_stdin_input();
+    let project_dir = crate::hook::resolve_project_dir();
+    match command {
+        HookCommands::PreWrite => crate::hook::run_pre_write(&input, &project_dir)?,
+        HookCommands::PreBash => crate::hook::run_pre_bash(&input)?,
+        HookCommands::PostFormat => crate::hook::run_post_format(&input)?,
+        HookCommands::PostAudit => crate::hook::run_post_audit(&input, &project_dir)?,
+    }
+    Ok(())
+}
+
+// ── Subagent ─────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum SubagentCommands {
+    /// Print a role-specific prompt for use with the Claude Code Agent tool.
+    Prompt(SubagentPromptArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SubagentPromptArgs {
+    /// Role to generate a prompt for: scout, coobie, sable, keeper.
+    pub role: String,
+    /// Spec path (used by scout).
+    #[arg(long)]
+    pub spec: Option<String>,
+    /// Run ID context.
+    #[arg(long, default_value = "")]
+    pub run_id: String,
+    /// Phase context (used by coobie).
+    #[arg(long, default_value = "pre-run")]
+    pub phase: String,
+    /// Comma-separated search keywords (used by coobie).
+    #[arg(long, default_value = "")]
+    pub keywords: String,
+    /// Artifact path (used by sable).
+    #[arg(long, default_value = "")]
+    pub artifact: String,
+    /// Action description (used by keeper).
+    #[arg(long, default_value = "")]
+    pub action: String,
+    /// Additional context (used by keeper).
+    #[arg(long, default_value = "")]
+    pub context: String,
+}
+
+pub async fn handle_subagent(command: SubagentCommands) -> Result<()> {
+    match command {
+        SubagentCommands::Prompt(args) => {
+            let prompt = match args.role.as_str() {
+                "scout" => {
+                    let spec = args.spec.as_deref().unwrap_or("");
+                    crate::subagent::scout_prompt(spec, &args.run_id)
+                }
+                "coobie" => {
+                    let kws: Vec<&str> = args.keywords.split(',').map(str::trim).collect();
+                    crate::subagent::coobie_briefing_prompt(&args.run_id, &args.phase, &kws)
+                }
+                "sable" => crate::subagent::sable_prompt(&args.run_id, &args.artifact),
+                "keeper" => crate::subagent::keeper_prompt(&args.action, &args.context),
+                other => bail!("unknown role: {other} (valid: scout, coobie, sable, keeper)"),
+            };
+            println!("{prompt}");
+        }
+    }
+    Ok(())
+}
+
+// ── Archive ───────────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum ArchiveCommands {
+    /// Show Calvin Archive status (TypeDB entity counts + D* snapshot).
+    Status,
+    /// Start the Calvin Archive container stack.
+    Start,
+    /// Stop the Calvin Archive container stack.
+    Stop,
+    /// Show identity metrics for an agent.
+    Metrics(ArchiveMetricsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ArchiveMetricsArgs {
+    /// Agent name (e.g. coobie).
+    #[arg(long, default_value = "coobie")]
+    pub agent: String,
+}
+
+pub async fn handle_archive(
+    command: ArchiveCommands,
+    app: crate::orchestrator::AppContext,
+) -> Result<()> {
+    match command {
+        ArchiveCommands::Status => {
+            if !app.paths.setup.calvin_archive.enabled {
+                println!(
+                    "Calvin Archive: disabled (set calvin_archive.enabled = true in setup.toml)"
+                );
+            } else {
+                match &app.calvin {
+                    None => {
+                        println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                    }
+                    Some(client) => {
+                        if client.health_check().await {
+                            match client.status().await {
+                                Ok(status) => {
+                                    println!("{}", serde_json::to_string_pretty(&status)?)
+                                }
+                                Err(e) => {
+                                    println!("Calvin Archive: reachable but status failed — {e}")
+                                }
+                            }
+                        } else {
+                            println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                        }
+                    }
+                }
+            }
+        }
+        ArchiveCommands::Start => {
+            println!("Starting Calvin Archive stack...");
+            let status = build_docker_compose_command(["up", "--build", "-d"])?
+                .status()
+                .context("running docker compose")?;
+            if status.success() {
+                println!("Calvin Archive stack started.");
+            } else {
+                anyhow::bail!("docker compose exited with {status}");
+            }
+        }
+        ArchiveCommands::Stop => {
+            println!("Stopping Calvin Archive stack...");
+            let status = build_docker_compose_command(["down"])?
+                .status()
+                .context("running docker compose")?;
+            if status.success() {
+                println!("Calvin Archive stack stopped.");
+            } else {
+                anyhow::bail!("docker compose exited with {status}");
+            }
+        }
+        ArchiveCommands::Metrics(args) => match &app.calvin {
+            None => println!("Calvin Archive: disabled"),
+            Some(client) => match client.get_metrics(&args.agent).await {
+                Ok(snap) => {
+                    println!("Agent:     {}", snap.agent_id);
+                    println!("D*:        {:.3}", snap.d_star);
+                    println!("SSA:       {:.3}", snap.ssa);
+                    println!("Stress:    {:.3}", snap.stress);
+                    if let Some(h) = snap.hysteresis {
+                        println!("Hysteresis:{:.3}", h);
+                    }
+                }
+                Err(e) => println!("metrics unavailable: {e}"),
+            },
+        },
+    }
+    Ok(())
+}
+
+fn build_docker_compose_command<const N: usize>(args: [&str; N]) -> Result<std::process::Command> {
+    let mut cmd = if command_available("docker") {
+        std::process::Command::new("docker")
+    } else if command_available("flatpak-spawn") {
+        let mut command = std::process::Command::new("flatpak-spawn");
+        command.args(["--host", "docker"]);
+        command
+    } else {
+        anyhow::bail!("docker is not available in the sandbox or via flatpak-spawn --host");
+    };
+    cmd.args(["compose", "-f", "docker-compose.calvin.yml"]);
+    cmd.args(args);
+    Ok(cmd)
 }
 
 fn print_template_preview(template: &str) {

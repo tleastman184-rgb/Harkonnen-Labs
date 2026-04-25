@@ -65,12 +65,12 @@ struct PackProject {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-struct ProjectScan {
-    detected_roots: Vec<String>,
-    read_first_files: Vec<String>,
-    launch_commands: Vec<String>,
-    validation_commands: Vec<String>,
-    stack_signals: Vec<String>,
+pub(crate) struct ProjectScan {
+    pub(crate) detected_roots: Vec<String>,
+    pub(crate) read_first_files: Vec<String>,
+    pub(crate) launch_commands: Vec<String>,
+    pub(crate) validation_commands: Vec<String>,
+    pub(crate) stack_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1390,7 +1390,7 @@ notes:
     out
 }
 
-fn scan_target_project(target_root: &Path) -> Result<ProjectScan> {
+pub(crate) fn scan_target_project(target_root: &Path) -> Result<ProjectScan> {
     let mut roots = vec![String::from(".")];
     let mut stack_signals = Vec::new();
     let mut read_first_files = Vec::new();
@@ -1732,7 +1732,7 @@ fn resolve_target_path(root: &Path, raw: &str) -> Result<PathBuf> {
     Ok(resolved.canonicalize().unwrap_or(resolved))
 }
 
-fn write_text_file(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn write_text_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1747,7 +1747,7 @@ fn write_text_file_if_missing(path: &Path, content: &str) -> Result<()> {
     write_text_file(path, content)
 }
 
-fn copy_if_exists(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_if_exists(from: &Path, to: &Path) -> Result<()> {
     if !from.exists() {
         return Ok(());
     }

@@ -28,13 +28,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
     config::Paths,
     llm::{self, LlmRequest, Message},
-    models::{CheckpointAnswerRecord, RunCheckpointRecord},
+    models::{AgentRuntimeState, CheckpointAnswerRecord, RunCheckpointRecord},
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -83,6 +83,9 @@ pub struct ChatMessage {
     pub role: String,
     /// Which agent sent or is addressed by this message.
     pub agent: Option<String>,
+    /// Stable dog instance identifier when a canonical role has multiple lives.
+    #[serde(default)]
+    pub agent_runtime_id: Option<String>,
     pub content: String,
     /// Set when this message resolved a checkpoint.
     pub checkpoint_id: Option<String>,
@@ -134,17 +137,224 @@ const PACKCHAT_MIN_MESSAGE_EXCERPT_CHARS: usize = 300;
 const PACKCHAT_ASSISTANT_CONTEXT_CHARS: usize = 2_400;
 const PACKCHAT_MIN_ASSISTANT_CONTEXT_CHARS: usize = 600;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackChatBusEventKind {
+    ThreadOpened,
+    ThreadRosterSynced,
+    MessageAppended,
+    CheckpointResolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackChatBusEvent {
+    pub event_id: String,
+    pub topic: String,
+    pub kind: PackChatBusEventKind,
+    #[serde(default)]
+    pub setup_name: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub spec_id: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub agent_runtime_id: Option<String>,
+    #[serde(default)]
+    pub content_preview: String,
+    #[serde(default)]
+    pub metadata_json: Value,
+    pub emitted_at: chrono::DateTime<Utc>,
+}
+
+pub trait PackChatBus: Send + Sync {
+    fn publish(&self, event: &PackChatBusEvent) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopPackChatBus;
+
+impl PackChatBus for NoopPackChatBus {
+    fn publish(&self, _event: &PackChatBusEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalJsonlPackChatBus {
+    path: PathBuf,
+    setup_name: String,
+}
+
+impl LocalJsonlPackChatBus {
+    pub fn new(path: PathBuf, setup_name: impl Into<String>) -> Self {
+        Self {
+            path,
+            setup_name: setup_name.into(),
+        }
+    }
+
+    fn topic(&self, suffix: &str) -> String {
+        format!("harkonnen/{}/{}", self.setup_name, suffix)
+    }
+
+    fn enrich_event(&self, event: &PackChatBusEvent) -> PackChatBusEvent {
+        let mut enriched = event.clone();
+        if enriched.setup_name.is_empty() {
+            enriched.setup_name = self.setup_name.clone();
+        }
+        if enriched.topic.is_empty() {
+            enriched.topic = self.topic("chat/unknown");
+        } else if !enriched.topic.starts_with("harkonnen/") {
+            enriched.topic = self.topic(enriched.topic.trim_start_matches('/'));
+        }
+        enriched
+    }
+}
+
+impl PackChatBus for LocalJsonlPackChatBus {
+    fn publish(&self, event: &PackChatBusEvent) -> Result<()> {
+        let enriched = self.enrich_event(event);
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        serde_json::to_writer(&mut file, &enriched)?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
 // ── Chat store ────────────────────────────────────────────────────────────────
 
 /// Thin persistence wrapper — all chat state lives in SQLite.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatStore {
     pool: SqlitePool,
+    bus: Arc<dyn PackChatBus>,
+}
+
+impl std::fmt::Debug for ChatStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatStore").finish_non_exhaustive()
+    }
 }
 
 impl ChatStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self::with_bus(pool, Arc::new(NoopPackChatBus))
+    }
+
+    pub fn with_bus(pool: SqlitePool, bus: Arc<dyn PackChatBus>) -> Self {
+        Self { pool, bus }
+    }
+
+    fn publish_bus_event(&self, event: PackChatBusEvent) {
+        if let Err(error) = self.bus.publish(&event) {
+            tracing::warn!("packchat bus publish failed: {}", error);
+        }
+    }
+
+    fn build_thread_event(
+        &self,
+        thread: &ChatThread,
+        kind: PackChatBusEventKind,
+    ) -> PackChatBusEvent {
+        let topic_suffix = match kind {
+            PackChatBusEventKind::ThreadOpened => {
+                format!("chat/{}/thread/open", thread.thread_id)
+            }
+            PackChatBusEventKind::ThreadRosterSynced => {
+                format!("chat/{}/thread/roster", thread.thread_id)
+            }
+            PackChatBusEventKind::MessageAppended => {
+                format!("chat/{}/message", thread.thread_id)
+            }
+            PackChatBusEventKind::CheckpointResolved => {
+                format!("chat/{}/checkpoint", thread.thread_id)
+            }
+        };
+        PackChatBusEvent {
+            event_id: Uuid::new_v4().to_string(),
+            topic: topic_suffix,
+            kind,
+            setup_name: String::new(),
+            thread_id: Some(thread.thread_id.clone()),
+            run_id: thread.run_id.clone(),
+            spec_id: thread.spec_id.clone(),
+            message_id: None,
+            checkpoint_id: None,
+            role: None,
+            agent: None,
+            agent_runtime_id: None,
+            content_preview: String::new(),
+            metadata_json: thread.metadata_json.clone(),
+            emitted_at: Utc::now(),
+        }
+    }
+
+    fn build_message_event(&self, thread: &ChatThread, message: &ChatMessage) -> PackChatBusEvent {
+        PackChatBusEvent {
+            event_id: Uuid::new_v4().to_string(),
+            topic: format!("chat/{}/message", message.thread_id),
+            kind: PackChatBusEventKind::MessageAppended,
+            setup_name: String::new(),
+            thread_id: Some(message.thread_id.clone()),
+            run_id: thread.run_id.clone(),
+            spec_id: thread.spec_id.clone(),
+            message_id: Some(message.message_id.clone()),
+            checkpoint_id: message.checkpoint_id.clone(),
+            role: Some(message.role.clone()),
+            agent: message.agent.clone(),
+            agent_runtime_id: message.agent_runtime_id.clone(),
+            content_preview: preview_chat_content(&message.content, 240),
+            metadata_json: serde_json::json!({
+                "thread_kind": thread.thread_kind.as_str(),
+                "thread_status": thread.status,
+            }),
+            emitted_at: Utc::now(),
+        }
+    }
+
+    fn build_checkpoint_event(
+        &self,
+        checkpoint_id: &str,
+        answered_by: &str,
+        answer_text: &str,
+    ) -> PackChatBusEvent {
+        PackChatBusEvent {
+            event_id: Uuid::new_v4().to_string(),
+            topic: format!("checkpoint/{}/resolved", checkpoint_id),
+            kind: PackChatBusEventKind::CheckpointResolved,
+            setup_name: String::new(),
+            thread_id: None,
+            run_id: None,
+            spec_id: None,
+            message_id: None,
+            checkpoint_id: Some(checkpoint_id.to_string()),
+            role: Some("operator".to_string()),
+            agent: None,
+            agent_runtime_id: None,
+            content_preview: preview_chat_content(answer_text, 240),
+            metadata_json: serde_json::json!({
+                "answered_by": answered_by,
+            }),
+            emitted_at: Utc::now(),
+        }
     }
 
     // ── Threads ───────────────────────────────────────────────────────────────
@@ -179,7 +389,7 @@ impl ChatStore {
         .await
         .context("insert chat_thread")?;
 
-        Ok(ChatThread {
+        let thread = ChatThread {
             thread_id,
             run_id: req.run_id.clone(),
             spec_id: req.spec_id.clone(),
@@ -189,7 +399,11 @@ impl ChatStore {
             metadata_json,
             created_at: now,
             updated_at: now,
-        })
+        };
+        self.publish_bus_event(
+            self.build_thread_event(&thread, PackChatBusEventKind::ThreadOpened),
+        );
+        Ok(thread)
     }
 
     pub async fn get_thread(&self, thread_id: &str) -> Result<Option<ChatThread>> {
@@ -259,6 +473,85 @@ impl ChatStore {
         rows.into_iter().map(parse_chat_thread).collect()
     }
 
+    pub async fn ensure_run_thread(&self, run_id: &str, title: &str) -> Result<ChatThread> {
+        if let Some(thread) = self
+            .list_threads(Some(run_id), Some(&ChatThreadKind::Run), 1)
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(thread);
+        }
+
+        let thread = self
+            .open_thread(&OpenThreadRequest {
+                run_id: Some(run_id.to_string()),
+                spec_id: None,
+                title: Some(title.to_string()),
+                thread_kind: ChatThreadKind::Run,
+                metadata_json: Some(serde_json::json!({
+                    "surface": "pack_coordination",
+                    "active_dogs": [],
+                })),
+            })
+            .await?;
+
+        self.append_message(
+            &thread.thread_id,
+            "system",
+            None,
+            None,
+            "Pack coordination thread opened. Canonical dogs may have multiple live runtime instances here (for example `mason#codex` and `mason#claude`) while still coordinating as Mason.",
+            None,
+        )
+        .await?;
+
+        Ok(thread)
+    }
+
+    pub async fn sync_runtime_roster(
+        &self,
+        thread_id: &str,
+        runtimes: &[AgentRuntimeState],
+    ) -> Result<()> {
+        let Some(thread) = self.get_thread(thread_id).await? else {
+            return Ok(());
+        };
+
+        let mut metadata = match thread.metadata_json {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "surface".to_string(),
+            Value::String("pack_coordination".to_string()),
+        );
+        metadata.insert("active_dogs".to_string(), serde_json::to_value(runtimes)?);
+
+        let updated_at = Utc::now();
+        let metadata_value = Value::Object(metadata.clone());
+        sqlx::query(
+            "UPDATE chat_threads SET metadata_json = ?1, updated_at = ?2 WHERE thread_id = ?3",
+        )
+        .bind(serde_json::to_string(&metadata_value)?)
+        .bind(updated_at.to_rfc3339())
+        .bind(thread_id)
+        .execute(&self.pool)
+        .await
+        .context("update chat_thread metadata")?;
+
+        let synced_thread = ChatThread {
+            updated_at,
+            metadata_json: metadata_value,
+            ..thread
+        };
+        self.publish_bus_event(
+            self.build_thread_event(&synced_thread, PackChatBusEventKind::ThreadRosterSynced),
+        );
+
+        Ok(())
+    }
+
     // ── Messages ──────────────────────────────────────────────────────────────
 
     pub async fn append_message(
@@ -266,6 +559,7 @@ impl ChatStore {
         thread_id: &str,
         role: &str,
         agent: Option<&str>,
+        agent_runtime_id: Option<&str>,
         content: &str,
         checkpoint_id: Option<&str>,
     ) -> Result<ChatMessage> {
@@ -274,14 +568,15 @@ impl ChatStore {
 
         sqlx::query(
             r#"
-            INSERT INTO chat_messages (message_id, thread_id, role, agent, content, checkpoint_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO chat_messages (message_id, thread_id, role, agent, agent_runtime_id, content, checkpoint_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
         )
         .bind(&message_id)
         .bind(thread_id)
         .bind(role)
         .bind(agent)
+        .bind(agent_runtime_id)
         .bind(content)
         .bind(checkpoint_id)
         .bind(now.to_rfc3339())
@@ -296,20 +591,25 @@ impl ChatStore {
             .execute(&self.pool)
             .await?;
 
-        Ok(ChatMessage {
+        let message = ChatMessage {
             message_id,
             thread_id: thread_id.to_string(),
             role: role.to_string(),
             agent: agent.map(|s| s.to_string()),
+            agent_runtime_id: agent_runtime_id.map(|s| s.to_string()),
             content: content.to_string(),
             checkpoint_id: checkpoint_id.map(|s| s.to_string()),
             created_at: now,
-        })
+        };
+        if let Ok(Some(thread)) = self.get_thread(thread_id).await {
+            self.publish_bus_event(self.build_message_event(&thread, &message));
+        }
+        Ok(message)
     }
 
     pub async fn list_messages(&self, thread_id: &str) -> Result<Vec<ChatMessage>> {
         let rows = sqlx::query(
-            "SELECT message_id, thread_id, role, agent, content, checkpoint_id, created_at
+            "SELECT message_id, thread_id, role, agent, agent_runtime_id, content, checkpoint_id, created_at
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at ASC",
         )
         .bind(thread_id)
@@ -323,6 +623,7 @@ impl ChatStore {
                 thread_id: r.get("thread_id"),
                 role: r.get("role"),
                 agent: r.get("agent"),
+                agent_runtime_id: r.get("agent_runtime_id"),
                 content: r.get("content"),
                 checkpoint_id: r.get("checkpoint_id"),
                 created_at: parse_dt(r.get("created_at")),
@@ -407,6 +708,12 @@ impl ChatStore {
         .bind(checkpoint_id)
         .execute(&self.pool)
         .await?;
+
+        self.publish_bus_event(self.build_checkpoint_event(
+            checkpoint_id,
+            &answered_by,
+            &req.answer_text,
+        ));
 
         Ok(CheckpointAnswerRecord {
             answer_id,
@@ -608,6 +915,7 @@ pub async fn dispatch_message(
             &thread.thread_id,
             "operator",
             Some(agent),
+            None,
             &req.content,
             None,
         )
@@ -625,6 +933,7 @@ pub async fn dispatch_message(
                     &thread.thread_id,
                     "agent",
                     Some(agent),
+                    None,
                     &reply_content,
                     None,
                 )
@@ -1128,9 +1437,23 @@ fn parse_dt(s: String) -> chrono::DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn preview_chat_content(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut chars = trimmed.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    preview
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn msg(id: &str, role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -1138,6 +1461,7 @@ mod tests {
             thread_id: "thread-1".to_string(),
             role: role.to_string(),
             agent: Some("coobie".to_string()),
+            agent_runtime_id: None,
             content: content.to_string(),
             checkpoint_id: None,
             created_at: Utc::now(),
@@ -1197,5 +1521,36 @@ mod tests {
         );
         assert!(excerpt.contains("Business Administration"));
         assert!(excerpt.starts_with("...") || excerpt.ends_with("..."));
+    }
+
+    #[test]
+    fn local_jsonl_packchat_bus_writes_event_envelope() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("packchat-bus.jsonl");
+        let bus = LocalJsonlPackChatBus::new(path.clone(), "lm-studio-local");
+        let event = PackChatBusEvent {
+            event_id: "evt-1".to_string(),
+            topic: "chat/thread-1/message".to_string(),
+            kind: PackChatBusEventKind::MessageAppended,
+            setup_name: String::new(),
+            thread_id: Some("thread-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            spec_id: None,
+            message_id: Some("msg-1".to_string()),
+            checkpoint_id: None,
+            role: Some("operator".to_string()),
+            agent: Some("coobie".to_string()),
+            agent_runtime_id: None,
+            content_preview: "hello".to_string(),
+            metadata_json: serde_json::json!({"thread_kind": "run"}),
+            emitted_at: Utc::now(),
+        };
+
+        bus.publish(&event).expect("publish");
+
+        let raw = std::fs::read_to_string(&path).expect("read jsonl");
+        assert!(raw.contains("\"event_id\":\"evt-1\""));
+        assert!(raw.contains("\"setup_name\":\"lm-studio-local\""));
+        assert!(raw.contains("\"topic\":\"harkonnen/lm-studio-local/chat/thread-1/message\""));
     }
 }

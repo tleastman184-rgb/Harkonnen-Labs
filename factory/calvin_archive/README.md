@@ -11,9 +11,17 @@ It is intentionally narrow:
 ## Files
 
 - `typedb/schema.tql`
-  Minimal TypeDB 3.x schema for Calvin Archive bootstrap.
+  Minimal Phase 6 TypeDB 3.x schema — soul, agent-self, belief, trait, and
+  basic relations. Active for Phase 6 development.
+- `typedb/schema_phase8.tql`
+  Full Phase 8 Calvin Archive schema. Replaces schema.tql when Phase 8 opens.
+  Covers all six chambers (Mythos, Episteme, Ethos, Pathos, Logos, Praxis),
+  the Meta-Governor integration machinery (integration-candidate,
+  integration-policy, quarantine-entry), continuity snapshots, and factory
+  wiring (run-record, spec-context, artifact, summary-view).
 - `typedb/coobie_kernel_seed.tql`
-  Seed data for Coobie's invariant soul kernel.
+  Seed data for Coobie's invariant soul kernel. Compatible with schema.tql
+  (Phase 6) and schema_phase8.tql (Phase 8 — same entities, richer schema).
 - `projections/coobie_identity_kernel.json`
   Inspectable projection of the same seed model for humans and tooling.
 - `coobie_soul_guide.md`

@@ -41,7 +41,6 @@ src/                    Rust CLI (cargo run -- <command>)
   db.rs                 SQLite init and schema migrations
   embeddings.rs         fastembed + OpenAI-compatible vector store, hybrid retrieval
   llm.rs                LLM request/response types and provider routing
-  longmemeval.rs        LongMemEval native adapter (Harkonnen vs raw-LLM paired mode)
   memory.rs             File-backed memory store, init, reindex, retrieve
   models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
   orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
@@ -51,12 +50,34 @@ src/                    Rust CLI (cargo run -- <command>)
   scenarios.rs          Hidden scenario loading and evaluation (Sable)
   setup.rs              SetupConfig structs, provider resolution, routing
   spec.rs               YAML spec loader and validation
+  stamp.rs              Repo stamp interview and .harkonnen/repo.toml generation
+  subagent.rs           Sub-agent dispatch and provider handoff
   tesseract.rs          Workspace isolation and file-write permission model
   workspace.rs          Per-run workspace creation
+
+  # Benchmark adapters (one file per external benchmark suite)
+  aider_polyglot.rs     Aider Polyglot multi-language benchmark adapter
+  calvin_client.rs      Calvin Archive TypeDB client (Phase 8 stub)
+  cladder.rs            CLADDER Pearl-hierarchy causal benchmark adapter
+  frames.rs             FRAMES multi-hop factual recall benchmark adapter
+  helmet.rs             HELMET retrieval precision/recall benchmark adapter
+  livecodebench.rs      LiveCodeBench competitive programming adapter
+  locomo.rs             LoCoMo long-horizon dialogue memory adapter
+  longmemeval.rs        LongMemEval long-term assistant memory adapter
+  mcp_registry.rs       MCP server registry — loading and routing
+  mcp_server.rs         Harkonnen self-hosted MCP server (ENT-1)
+  operator_model.rs     Operator model interview, layers, and artifact generation
+  scenario_delta.rs     Hidden Scenario Delta benchmark (visible vs hidden gap)
+  skill_fetcher.rs      Skill/slash-command fetching and resolution
+  skill_registry.rs     Skill registry — loading and dispatch
+  spec_adherence.rs     Spec Adherence Rate benchmark adapter
+  streamingqa.rs        StreamingQA belief-update accuracy benchmark adapter
+  twin_fidelity.rs      Twin fidelity telemetry benchmark adapter
 
 factory/
   agents/profiles/      Nine agent YAML profiles (one per agent)
   agents/personality/   labrador.md — shared personality for all agents
+                        <agent>.md — per-agent addendum for each Labrador role
   memory/               Coobie's memory store (md files + index.json)
   mcp/                  MCP server documentation YAMLs
   context/              Machine-parseable YAML context for agent consumption
@@ -108,6 +129,8 @@ While the API server is running, the live coordination source is:
 
 ```sh
 GET /api/coordination/assignments
+GET /api/coordination/policy-events
+POST /api/coordination/check-lease
 POST /api/coordination/claim
 POST /api/coordination/heartbeat
 POST /api/coordination/release
@@ -125,7 +148,8 @@ Release example:
 { "agent": "claude" }
 ```
 
-Keeper is the policy owner of file-claim coordination. While the API server is running, claim conflicts, stale claims, heartbeats, and releases should be treated as Keeper-managed policy events.
+Keeper is the policy owner of file-claim coordination. While the API server is running, claim conflicts, stale claims, heartbeats, releases, and workspace lease outcomes should be treated as Keeper-managed policy events.
+Workspace writes are lease-gated: Mason must hold an active `resource_kind: "workspace"` lease before edits are applied, and Keeper-managed policy events are mirrored into SQLite.
 
 Agents holding files should send a heartbeat about once per minute with:
 
@@ -134,6 +158,8 @@ Agents holding files should send a heartbeat about once per minute with:
 ```
 
 Keeper marks claims stale after 600 seconds without a heartbeat and may reap stale conflicting claims when another agent needs the same files.
+
+Per-run coordination is also reflected into PackChat. Each run auto-creates a PackChat coordination thread, and dogs may have multiple live runtime instances where it makes sense. Treat `mason`, `mason#codex`, and `mason#claude` as the same canonical dog with different active working lives; Coobie and Keeper remain singleton dogs.
 
 If the API server is not running yet, use repo-root `assignments.md` as the coordination document and paste only the relevant claim section into each AI's context.
 
@@ -165,6 +191,7 @@ Agent profiles live in `factory/agents/profiles/<name>.yaml`.
 - Sable **cannot** write implementation code
 - Only Keeper has `policy_engine` access
 - Keeper owns file-claim coordination and conflict policy through the coordination API
+- PackChat run threads are the shared conversation surface for live dog instances of the same canonical role
 - All agents share the labrador personality: loyal, honest, persistent, never bluffs
 
 ---
@@ -411,8 +438,12 @@ security_expectations: [auth, secrets, isolation]
 **[ROADMAP.md](ROADMAP.md) is the canonical phase-by-phase build order.**
 All agents and contributors must check it before starting new work.
 Phases 1, 4, 4b, and 5 are already shipped.
-The active numbered build phases are Phase 2 (Bramble real test execution) and
-Phase 3 (Flint docs, spec-grounded evaluation, and DevBench readiness, with
+The active numbered build phase is Phase 2 (Bramble real test execution), with
+Phase 5-C now explicitly split into `5-C1` (shipped: Coobie preflight
+`ContextTarget` budgeting + attribution telemetry), `5-C2` (shipped: Scout /
+Mason / Sable scope split plus scoped preflight artifacts and repo-local
+prompt filtering), and `5-C3` (next: sub-agent dispatch/isolation).
+Phase 10 (Flint docs, spec-grounded evaluation, and DevBench readiness, with
 live twin provisioning deferred unless a future product needs it), with
 Operator Model Activation running as a parallel product/control-plane track.
 Long-term roadmap work remains Phase 5b
@@ -461,13 +492,14 @@ Long-term roadmap work remains Phase 5b
 - **Native FRAMES, StreamingQA, HELMET, and CLADDER adapters** — benchmarked retrieval and causal-reasoning surfaces wired into the Rust runner
 - **First-class benchmark toolchain** — `benchmark list/run/report`; manifest-driven suites in `factory/benchmarks/suites.yaml`; CI workflow; LM Studio local routing
 - Keeper coordination API with claims, heartbeats, conflict detection, and release flow
+- Keeper workspace lease enforcement and DB-backed coordination mirrors
 - Pack Board web UI with PackChat conversation surface, Attribution Board, Factory Floor, Memory Board, and Consolidation Workbench
 - Bootstrap scripts for home-linux and work-windows
 
 ### Planned (next build layer)
 
 - **Phase 2** — Bramble real test execution from spec-driven `test_commands`; Mason online-judge feedback loop (`FailureKind::WrongAnswer`); LiveCodeBench and Aider Polyglot adapters
-- **Phase 3** — Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter; twin provisioning remains deferred unless a future product needs running service virtualization
+- **Phase 10** — Flint documentation phase; spec adherence rate and hidden scenario delta internal benchmarks; DevBench adapter; twin provisioning remains deferred unless a future product needs running service virtualization
 - **Operator Model full five-layer interview** — extend the v1-D MVP (two layers shipped) to cover dependencies, institutional knowledge, and friction; generate full artifact set
 - **Phase 5b** — Memory infrastructure: Qdrant semantic layer, OCR ingest, and `src/memory.rs` refactor into a proper module tree
 - **Phase 6** — TypeDB 3.x semantic graph layer (see MASTER_SPEC.md Part 4); GAIA Level 3 and AgentBench adapters

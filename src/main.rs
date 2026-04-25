@@ -3,6 +3,7 @@ mod aider_polyglot;
 mod api;
 mod benchmark;
 mod calvin_archive;
+mod calvin_client;
 mod capacity;
 mod chat;
 mod cladder;
@@ -15,10 +16,12 @@ mod db;
 mod embeddings;
 mod frames;
 mod helmet;
+mod hook;
 mod livecodebench;
 mod llm;
 mod locomo;
 mod longmemeval;
+mod mcp_registry;
 mod mcp_server;
 mod memory;
 mod models;
@@ -30,9 +33,13 @@ mod reporting;
 mod scenario_delta;
 mod scenarios;
 mod setup;
+mod skill_fetcher;
+mod skill_registry;
 mod spec;
 mod spec_adherence;
+mod stamp;
 mod streamingqa;
+mod subagent;
 mod tesseract;
 mod twin_fidelity;
 mod workspace;
@@ -78,7 +85,7 @@ async fn main() -> Result<()> {
             cli::handle_setup(command, &paths).await?
         }
         Commands::Mcp { command } => {
-            let app = AppContext::bootstrap().await?;
+            let app = AppContext::bootstrap_for_mcp().await?;
             cli::handle_mcp(command, app).await?
         }
         Commands::Soul { command } => {
@@ -96,6 +103,16 @@ async fn main() -> Result<()> {
         Commands::Benchmark { command } => {
             let paths = config::Paths::discover()?;
             cli::handle_benchmark(command, &paths).await?
+        }
+        Commands::Stamp { command } => {
+            let paths = config::Paths::discover()?;
+            cli::handle_stamp(command, &paths).await?
+        }
+        Commands::Hook { command } => cli::handle_hook(command)?,
+        Commands::Subagent { command } => cli::handle_subagent(command).await?,
+        Commands::Archive { command } => {
+            let app = AppContext::bootstrap().await?;
+            cli::handle_archive(command, app).await?
         }
     }
 

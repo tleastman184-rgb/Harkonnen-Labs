@@ -46,6 +46,7 @@ function titleCase(value) {
 
 export default function RunDetailDrawer({ runId, onClose }) {
   const [state, setState] = useState(null);
+  const [decisions, setDecisions] = useState([]);
   const [tab, setTab] = useState('overview');
   const [error, setError] = useState('');
   const [explorationLog, setExplorationLog] = useState(null);
@@ -59,8 +60,15 @@ export default function RunDetailDrawer({ runId, onClose }) {
 
     const load = async () => {
       try {
-        const data = await fetchJson(`${API_BASE}/runs/${runId}/state`);
-        if (!cancelled) { setState(data); setError(''); }
+        const [data, decisionData] = await Promise.all([
+          fetchJson(`${API_BASE}/runs/${runId}/state`),
+          fetchJson(`${API_BASE}/runs/${runId}/decisions`),
+        ]);
+        if (!cancelled) {
+          setState(data);
+          setDecisions(decisionData);
+          setError('');
+        }
       } catch (err) {
         if (!cancelled) setError(err.message);
       }
@@ -127,7 +135,7 @@ export default function RunDetailDrawer({ runId, onClose }) {
 
   const hasExploreLog = blackboard?.artifact_refs?.includes('exploration_log.md');
   const hasCorpusResults = blackboard?.artifact_refs?.includes('corpus_results.json');
-  const TABS = ['overview', 'timeline', 'agents', 'causal', 'lessons', 'workbench', 'explore', 'corpus'];
+  const TABS = ['overview', 'timeline', 'decisions', 'agents', 'causal', 'lessons', 'workbench', 'explore', 'corpus'];
 
   return (
     <div className="drawer-overlay">
@@ -188,6 +196,10 @@ export default function RunDetailDrawer({ runId, onClose }) {
                 <span className="ov-value">{blackboard?.artifact_refs?.length || 0}</span>
               </div>
               <div className="ov-stat">
+                <span className="ov-label">Decisions</span>
+                <span className="ov-value">{decisions.length}</span>
+              </div>
+              <div className="ov-stat">
                 <span className="ov-label">Agents run</span>
                 <span className="ov-value">{executions.length}</span>
               </div>
@@ -229,6 +241,34 @@ export default function RunDetailDrawer({ runId, onClose }) {
                     </div>
                     <div className="tl-message">{ev.message}</div>
                     <div className="tl-time">{new Date(ev.created_at).toLocaleString()}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {tab === 'decisions' && (
+            <div className="timeline-scroll">
+              {decisions.length === 0 ? (
+                <div className="drawer-empty">No decisions recorded.</div>
+              ) : (
+                [...decisions].reverse().map((decision) => (
+                  <div key={decision.decision_id} className="tl-item">
+                    <div className="tl-meta">
+                      <span>{titleCase(decision.phase)}</span>
+                      <span>{decision.agent}</span>
+                      <span className="tl-status">{titleCase(decision.decision_kind)}</span>
+                    </div>
+                    <div className="tl-message">
+                      <strong>{decision.chose}</strong>
+                      {decision.justification ? ` — ${decision.justification}` : ''}
+                    </div>
+                    {decision.alternatives?.length > 0 && (
+                      <div className="ar-summary">
+                        Alternatives: {decision.alternatives.join(', ')}
+                      </div>
+                    )}
+                    <div className="tl-time">{new Date(decision.created_at).toLocaleString()}</div>
                   </div>
                 ))
               )}

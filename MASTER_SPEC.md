@@ -3,7 +3,7 @@
 **This is the single canonical reference for Harkonnen Labs.**
 It collapses ARCHITECTURE.md, AGENTS.md, COOBIE_SPEC.md, OPERATOR_MODEL_ACTIVATION_PLAN.md, calvin_archive_codex_spec.md, BENCHMARKS.md, and ROADMAP.md into one coherent document.
 
-For source docs still referenced individually: [09-SOUL.md](the-soul-of-ai/09-SOUL.md) and [02-What-Is-An-AI-Soul.md](the-soul-of-ai/02-What-Is-An-AI-Soul.md) (identity + theory, in `the-soul-of-ai/`), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
+For source docs still referenced individually: [09-Identity-Continuity.md](the-soul-of-ai/09-Identity-Continuity.md) and [02-What-Is-An-AI-Soul.md](the-soul-of-ai/02-What-Is-An-AI-Soul.md) (identity + theory, in `the-soul-of-ai/`), CLAUDE.md (Claude-specific conventions), and the agent profiles under `factory/agents/profiles/`.
 
 ---
 
@@ -94,37 +94,64 @@ src/                    Rust CLI (cargo run -- <command>)
   llm.rs                LLM request/response types and provider routing
   memory.rs             File-backed memory store, init, reindex, retrieve
   models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
+  operator_model.rs     Operator model interview, layers, and artifact generation
   orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
+  pidgin.rs             Inter-agent message format and handoff protocol
   policy.rs             Path boundary enforcement
   reporting.rs          Run report generation
   scenarios.rs          Hidden scenario loading and evaluation (Sable)
   setup.rs              SetupConfig structs, provider resolution, routing
   spec.rs               YAML spec loader and validation
+  stamp.rs              Repo stamp interview and .harkonnen/repo.toml generation
+  subagent.rs           Sub-agent dispatch and provider handoff
+  tesseract.rs          Workspace isolation and file-write permission model
   workspace.rs          Per-run workspace creation
+  mcp_registry.rs       MCP server registry — loading and routing
+  mcp_server.rs         Harkonnen self-hosted MCP server (ENT-1)
+  skill_fetcher.rs      Skill/slash-command fetching and resolution
+  skill_registry.rs     Skill registry — loading and dispatch
+
+  # Benchmark adapters
+  aider_polyglot.rs     Aider Polyglot multi-language adapter
+  calvin_client.rs      Calvin Archive TypeDB client (Phase 8 stub)
+  cladder.rs            CLADDER Pearl-hierarchy causal benchmark
+  frames.rs             FRAMES multi-hop factual recall benchmark
+  helmet.rs             HELMET retrieval precision/recall benchmark
+  livecodebench.rs      LiveCodeBench competitive programming adapter
+  locomo.rs             LoCoMo long-horizon dialogue memory adapter
+  longmemeval.rs        LongMemEval long-term assistant memory adapter
+  scenario_delta.rs     Hidden Scenario Delta (visible vs hidden gap)
+  spec_adherence.rs     Spec Adherence Rate benchmark adapter
+  streamingqa.rs        StreamingQA belief-update accuracy adapter
+  twin_fidelity.rs      Twin fidelity telemetry adapter
 
   calvin_archive/       (Phase 8 — not yet built)
     mod.rs
     schema.rs           TypeDB schema bootstrap and migrations
     types.rs            Rust domain structs and DTOs
     ingest.rs           Write-paths for experiences, beliefs, reflections
+    governor.rs         Meta-Governor integration adjudication
     queries.rs          Typed query helpers
     continuity.rs       Continuity snapshot computation
     drift.rs            Drift detection, overgeneralization heuristics, lab-ness scoring
     kernel.rs           Identity kernel constraints and preservation checks
     projections.rs      Summary views, narrative rendering, graph projections
+    reflection.rs       Pattern-level reflection and schema revision
     typedb.rs           TypeDB driver abstraction
 
 factory/
   agents/profiles/      Nine agent YAML profiles
-  agents/personality/   labrador.md — shared personality for all agents
+  agents/personality/   labrador.md + per-agent addendum for each Labrador role
+  agents/contracts/     Behavioral contracts C=(P,I,G,R) for all 9 agents + base
+  context/              Machine-parseable YAML/MD design context for agents
   memory/               Coobie's durable memory store (md files + index.json)
   mcp/                  MCP server documentation YAMLs
-  context/              Machine-parseable YAML context for agent consumption
   specs/                Factory input specs (YAML)
   scenarios/            Hidden behavioral scenarios (Sable + Keeper only)
   workspaces/           Per-run isolated workspaces
   artifacts/            Packaged run outputs
-  benchmarks/           Benchmark suite manifests
+  benchmarks/           Benchmark suite manifests and fixtures
+  calvin_archive/       Calvin Archive TypeQL schema, seed data, projections
   state.db              SQLite run metadata
 
 setups/                 Named environment TOML files
@@ -245,7 +272,7 @@ POST /api/coordination/release
 POST /api/coordination/check-lease     # guardrail gate — must be called before writes
 ```
 
-Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record.
+Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record. Active leases and Keeper policy events are mirrored into SQLite, and run-scoped PackChat coordination threads provide the shared conversation surface for live dog runtimes.
 
 ---
 
@@ -262,6 +289,7 @@ Coobie manages six distinct layers — not one undifferentiated note pile:
 | Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | fastembed + SQLite vector store | Live |
 | Causal Memory | Intervention-aware cause/effect with streak detection and cross-run patterns | SQLite causal_links + petgraph | Live |
 | Team Blackboard | Four named slices (Mission, Action, Evidence, Memory) for pack coordination | SQLite + per-run board.json | Live |
+| Dog Runtime Registry | Canonical dog role plus live runtime instances (`mason#codex`, `mason#claude`, etc.) linked to PackChat threads | SQLite + blackboard sync | Live |
 | Consolidation | Operator-reviewed promotion, pruning, and abstraction of high-value episodes | SQLite consolidation_candidates | Live |
 
 ### Coobie Palace
@@ -395,7 +423,7 @@ surface over the Calvin Archive, not the canonical source of continuity.
 
 | File | Purpose |
 | --- | --- |
-| `soul.json` | Manifest, versioning, integrity hashes, compatibility, threshold configuration |
+| `soul.json` | Manifest, versioning, integrity hashes, compatibility, threshold configuration — schema at `factory/calvin_archive/soul-json.schema.json`, reference example at `factory/calvin_archive/soul.example.json` |
 | `SOUL.md` | Core identity kernel, worldview, teleology, uncrossable boundaries |
 | `IDENTITY.md` | External persona and presentation layer |
 | `AGENTS.md` | Coordination, routing, escalation, and operating procedures |
@@ -507,6 +535,8 @@ src/calvin_archive/
 
 A first-class pre-commissioning workflow that interviews the operator about how their work actually runs, saves approved answers as structured Harkonnen data, and generates agent-ready operating artifacts that Scout, Coobie, and Keeper use before a run is commissioned.
 
+**Current implementation:** the two-layer v1-D MVP is live and hardened. Project-first sessions open as PackChat `operator_model` threads, the Pack Board can approve each active layer, completed sessions generate `.harkonnen/operator-model/commissioning-brief.json`, export metadata is persisted, Scout consumes the top patterns during spec drafting, and Coobie preflight consumes preferred-tool and risk-tolerance posture. The full five-layer artifact set remains the Operator Model product track.
+
 ### Interview Layers (fixed order)
 
 1. Operating rhythms
@@ -514,6 +544,8 @@ A first-class pre-commissioning workflow that interviews the operator about how 
 3. Dependencies
 4. Institutional knowledge
 5. Friction
+
+Full question sets, checkpoint formats, artifact field mappings, and the post-run update loop are specified in `factory/context/operator-model-interview.yaml`.
 
 Each layer produces a checkpoint for operator approval, canonical structured entries, and a summary memory write to repo-local project memory.
 
@@ -554,10 +586,10 @@ These land in the target repo under `.harkonnen/operator-model/`.
 
 | Slice | Deliverable |
 | --- | --- |
-| 1 — Storage and models | Migrations compile; CRUD from service methods |
-| 2 — API and PackChat plumbing | Sessions start/resume/approve/export through HTTP; threads typed as `operator_model` |
-| 3 — UI interview flow | Five-layer interview completable from New Run path |
-| 4 — Scout and Coobie integration | Commissioning brief consumed by Scout; operator checks surfaced distinctly in Coobie preflight |
+| 1 — Storage and models | Shipped — migrations compile; CRUD from service methods |
+| 2 — API and PackChat plumbing | Shipped — sessions start/resume/approve/export through HTTP; threads typed as `operator_model` |
+| 3 — UI interview flow | MVP shipped — two-layer interview completable from New Run path; full five-layer UI remains planned |
+| 4 — Scout and Coobie integration | Shipped — commissioning brief consumed by Scout; operator checks surfaced distinctly in Coobie preflight |
 | 5 — Review and update loop | Runs propose operator-model updates; operator keeps/discards/edits; proposals create new profile version |
 | 6 — OB1 interoperability | Import/export OB1-compatible artifact bundle |
 
@@ -641,9 +673,9 @@ The Pack Board is the primary interaction surface. It is not a read-only dashboa
 
 **v1-A — Guardrail Enforcement** *(hard blocker)*
 
-Call `POST /api/coordination/check-lease` inside `mason_generate_and_apply_edits` before writing any file. If denied, return an error and write a decision record. Wire the same check in Mason plan generation. Add `record_decision` call sites at Mason plan selection, Scout optimization derivation, and Sable attack generation. Add `GET /api/runs/:id/decisions` to the Pack Board run detail drawer.
+Mason workspace lease claim/check/release is now live, with DB-backed lease mirrors and PackChat-linked dog runtime rosters. Keeper lease outcomes, Scout optimization programs, Sable metric attacks, and Mason plan selection now all write decision records, and the Pack Board run detail drawer now surfaces the decision log from `GET /api/runs/:id/decisions`.
 
-**Done when:** A Mason edit attempt against a path with no active workspace lease is blocked at the orchestrator level with a decision record, and the Pack Board surfaces the decision log per run.
+**Done when:** Keeper-backed workspace lease claim/check/release is authoritative, planning and lease outcomes write decision records, and the Pack Board surfaces the decision log per run. This slice is now effectively shipped on the current code path.
 
 ---
 
@@ -653,31 +685,53 @@ Call `POST /api/coordination/check-lease` inside `mason_generate_and_apply_edits
 - `invalidated_by: Option<String>` on memory records
 - Coobie ingest: detect semantic near-duplicates with conflicting claims; write supersession record
 - `GET /api/memory/updates` endpoint
-- Memory Board UI: distinguish invalidated entries from current
+- Memory Board UI: distinguish invalidated entries from current and support operator confirm/reject review
 
-**Done when:** Ingesting a new fact that contradicts an older one persists a supersession record, the old entry is flagged, and `GET /api/memory/updates` returns the history.
+**Status:** Core path is now live and smoke-tested on the main ingest flow. Re-ingesting changed content from the same source path persists a supersession record, flags the older note via provenance, returns the history through `GET /api/memory/updates`, and supports operator confirm/reject review from the Memory Board. The bundled StreamingQA smoke fixture has also been rerun against that persisted history under `lm-studio-local`, producing `1.0000` accuracy and updated-fact accuracy. Broader benchmark enrichment is intentionally deferred until the current narrow end-to-end Harkonnen pass is complete.
 
 ---
 
 **v1-C — FailureKind Classification**
 
 - `FailureKind` enum: `CompileError`, `TestFailure`, `WrongAnswer`, `Timeout`, `Unknown`
-- Parser in the fix loop that classifies stdout/stderr
-- `WrongAnswer` variant triggers a diff-focused Mason prompt
-- `failure_kind` field on `ValidationSummary`
+- Validation summary construction classifies stdout/stderr-style details from visible checks, including compile/build errors, generic test failures, wrong-answer diffs, and timeouts
+- `WrongAnswer` variant triggers a diff-focused Mason validation-fix prompt
+- `failure_kind` field on `ValidationSummary`, recalculated after validation harness mutations
 
 **Done when:** A run with a wrong-answer test failure shows `failure_kind: WrongAnswer` in the run summary and Mason uses the diff-focused prompt.
+
+**Status:** Shipped and covered by focused classifier tests. Broader benchmark expansion remains deferred until the narrow full-system pass is complete.
 
 ---
 
 **v1-D — Operator Model Minimum Viable**
 
 - PackChat `interview` command: two-layer intake (operating rhythms + recurring decisions) with checkpoint approval
-- `commissioning-brief.json` generated from approved layers
+- `commissioning-brief.json` generated from approved layers with primary work patterns, preferred tools, recurring decisions, and risk tolerances
 - Scout uses top-3 patterns from brief when `commissioning-brief.json` exists
-- Coobie preflight uses stated risk tolerances for `required_checks` and guardrail text
+- Coobie preflight uses stated risk tolerances and preferred-tool posture for `required_checks` and guardrail text
+- Pack Board approval flow advances the session and persists export metadata in `operator_model_exports`
 
 **Done when:** An operator who has completed the two-layer interview sees their patterns reflected in Scout's intent packages and Coobie's required checks.
+
+**Status:** MVP shipped and hardened. The full five-layer interview and post-run operator-model update review remain planned product-track work.
+
+---
+
+**v1-E — Transactional Execution And Approval Boundaries**
+
+- Transaction envelope for high-impact phases: pre-action snapshot, planned mutation set, approval state, rollback note. The shipped envelope guards implementation-phase Mason LLM edits and writes `transaction_implementation.json`, `transaction_implementation.md`, and a run-local `transaction_backups/implementation_pre_action` restore point.
+- Human-interrupt checkpoint for guarded transitions that Keeper or Coobie flag as privileged or policy-sensitive. The shipped checkpoint is `transaction_approval_required`, created before Mason edits are applied when Coobie identifies implementation blockers.
+- Operator checkpoint resolution for implementation transactions. Approve rehydrates the stored run artifacts, applies the Mason edit lane to the staged workspace, resumes Bramble visible validation, then continues through Sable hidden scenarios, Flint artifacts, and Coobie causal reporting when the tool boundary is approved; reject aborts without mutation; revise stores operator guidance and leaves the run revision-requested.
+- Rollback execution and artifact written per guarded transition. Rollback restores the staged `product/` workspace from the transaction backup, verifies it against the pre-action snapshot, and records `rolled_back` or `rolled_back_with_drift`.
+- Privileged MCP/tool transaction envelope at the tool-surface boundary. The tools phase writes `tool_transaction.json` and `tool_transaction.md`, classifies configured MCP servers and relevant host commands, auto-approves read-only/local surfaces, opens `tool_transaction_approval_required` when write, network, secret-bearing, or external-process surfaces are present, and resumes hidden-scenario/artifact continuation after operator approval when visible validation is already complete.
+- Invocation-level gateway for host-command execution. Build and validation commands now write `tool_invocations.json` and `tool_invocations.md`, classify each actual invocation when it happens, auto-approve common local build/test commands, and require an approved tool transaction before higher-risk external-process invocations proceed.
+- Decision-log records for approval, commit, rollback, and abort outcomes. Implementation transaction boundary, operator approve/reject/revise/rollback, transaction commit, transaction rollback, tool transaction boundary, and tool approve/reject/revise outcomes are now recorded.
+- Remaining work: extend the invocation-level gateway to proxied third-party MCP calls if Harkonnen becomes the broker for external MCP traffic rather than only recording/enforcing host-command invocations inside the run loop.
+
+**Done when:** A guarded run can pause before a privileged transition, record an approval or rejection, and either commit or roll back from a named boundary with an auditable artifact.
+
+**Status:** Implementation transaction approval, visible-validation continuation, hidden-scenario/artifact/causal-report continuation, rollback execution, privileged tool-surface transaction envelopes, and invocation-level host-command gateway enforcement shipped; external MCP proxy interception remains a future extension.
 
 ---
 
@@ -685,26 +739,26 @@ Call `POST /api/coordination/check-lease` inside `mason_generate_and_apply_edits
 
 - `bramble_run_tests` in orchestrator
 - `ValidationSummary` from real exit codes and parsed test output
-- Mason online-judge feedback loop — `FailureKind::WrongAnswer` feeds diff-focused fix prompt
-- LiveCodeBench adapter
-- Aider Polyglot adapter
+  Progress: raw-shell `spec.test_commands` execution, explicit real-test counts in `ValidationSummary`, and Coobie/report visibility are shipped.
+- Mason online-judge feedback loop — `FailureKind::WrongAnswer` now carries structured expected/actual evidence from Bramble's explicit test-command harness into `validation.json`, the run report, and Mason's diff-focused fix prompt; validation retries also emit `validation_repair_attempts.{json,md}`, classify each retry as `resolved / improved / stalled / regressed`, and feed that note into the next Mason attempt
+- LiveCodeBench adapter — wired through the benchmark manifest and benchmark report path with suite-level pass@1 artifacts
+- Benchmark posture — keep `LiveCodeBench` as the single active external coding canary while the core run path matures; additional public coding benchmarks stay adapter-ready until they answer a materially different question.
+- Aider Polyglot adapter — adapter-ready, but intentionally deferred as an active lane until the narrow end-to-end path is more mature
 
-**Done when:** A spec with `test_commands` shows real pass/fail in the run report, and Mason's fix loop handles wrong-answer failures end-to-end.
+**Done when:** A spec with `test_commands` shows real pass/fail in the run report, and Mason's fix loop handles wrong-answer failures end-to-end. The explicit Bramble test harness, structured wrong-answer evidence path, retry-improvement tracking, and LiveCodeBench canary lane are now shipped; broader benchmark expansion remains intentionally deferred behind core factory maturity.
 
 ---
 
-### Phase 3 — Ash Real Twin Provisioning
+### Phase 10 — Documentation, DevBench, And Spec-Grounded Evaluation
 
-- Ash generates `docker-compose.yml` from twin manifest
-- `ash_provision_twin` spawns the compose stack before Sable runs, tears it down after
-- `twin_fidelity_score` derived from which declared dependencies had running stubs
-- Failure injection via env vars on stubs
 - Flint documentation phase — produces README / API reference / doc comments as first-class output
-- DevBench adapter
+- DevBench adapter and launch scripts after the narrow coordination path is complete
 - Spec Adherence Rate benchmark
 - Hidden Scenario Delta benchmark
+- Optional twin-fidelity telemetry remains available, but live twin provisioning is not a Phase 10 gate
+- Phase 5-C is now explicitly split so the critical-path continuation is unambiguous: `5-C1` shipped as Coobie preflight `ContextTarget` budgeting + attribution telemetry, `5-C2` is now shipped as the Scout/Mason/Sable scope split plus scoped preflight artifacts and repo-local prompt filtering, and `5-C3` is next as sub-agent dispatch/isolation
 
-**Done when:** A spec with twin declaration starts Docker containers, Sable's hidden scenarios run against live stubs, and Flint produces a doc artifact.
+**Done when:** Flint produces a doc artifact per run, spec adherence and hidden-scenario delta have first-run baselines, and the DevBench adapter can launch through the benchmark manifest. Live Docker-backed twin provisioning remains deferred unless a future product explicitly requires running service virtualization.
 
 ---
 
@@ -757,7 +811,7 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 **Phase 8-A — Storage layer bootstrap:**
 
 - **TimescaleDB hypertable** for episodic behavioral telemetry: agent events, drift samples, SSA snapshots, stress accumulations. Compression policy (7-day chunks), retention policy (30-day window). This is the time-series foundation for `D*` estimation and the stress-estimator.
-- **TypeDB Calvin Archive schema** (see TypeQL skeleton in Part 5): Rust TypeDB adapter (`src/calvin_archive/typedb.rs`), insert/query support for soul, agent-self, experience, belief, evidence, trait, value-commitment, integration-candidate, quarantine-entry, integration-policy, basic revision graph (`revised-into` relation)
+- **TypeDB Calvin Archive schema** — full Phase 8 TypeQL schema at `factory/calvin_archive/typedb/schema_phase8.tql`; Rust TypeDB adapter (`src/calvin_archive/typedb.rs`), insert/query support for all six chambers, integration-candidate, quarantine-entry, integration-policy, revision graphs (`revised-into`, `schema-revised-into`, `policy-revised-into`)
 - **Materialize streaming SQL views**: `D*` drift alert view (sliding window over TimescaleDB via SUBSCRIBE), SSA tracking view, live Meta-Governor signal surface. `D*` and SSA are the two always-on continuous signals.
 - File-first soul package projection support for `soul.json`, `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `STYLE.md`, `MEMORY.md`, `HEARTBEAT.md`
 - Integrity-hash verification for the projected soul package at boot and during heartbeat audits
@@ -835,6 +889,8 @@ EI-1 should land before any hosted or team surface. ENT-1 is the foundation for 
 
 ## Part 9 — Benchmark Strategy
 
+Benchmark wiring advances with implementation phases, but the current engineering pass is intentionally narrow. Use the native adapters as guardrails and avoid expanding public benchmark coverage until the v1 end-to-end path is closed.
+
 ### Benchmark Matrix
 
 **Memory and retrieval (vs Mem0 / MindPalace / Zep):**
@@ -844,7 +900,7 @@ EI-1 should land before any hosted or team surface. ENT-1 is the foundation for 
 | LongMemEval | Long-term assistant memory, temporal reasoning, belief updates | Native adapter live |
 | LoCoMo | Long-horizon dialogue memory | Native adapter live |
 | FRAMES | Multi-hop factual recall (Mem0 publishes here) | Native adapter live; Qdrant needed for best results |
-| StreamingQA | Belief-update accuracy when facts change | Native adapter live; persistence layer completing in v1-B |
+| StreamingQA | Belief-update accuracy when facts change | Native adapter live; persisted-history smoke published on `lm-studio-local` |
 | HELMET | Retrieval precision/recall | Native adapter live |
 
 **Coding loop (vs OpenCode / Aider / SWE-agent):**
@@ -854,7 +910,7 @@ EI-1 should land before any hosted or team surface. ENT-1 is the foundation for 
 | SWE-bench Verified | Human-validated issue resolution | Adapter-ready; Phase 2 |
 | LiveCodeBench | Recent competitive programming, no contamination | Phase 2 |
 | Aider Polyglot | Multi-language coding, public leaderboard | Phase 2 |
-| DevBench | Full software lifecycle | Phase 3 |
+| DevBench | Full software lifecycle | Phase 10 |
 | Local Regression Gate | Hard merge gate (fmt, check, test) | Live, always-on |
 
 **Multi-turn and tool-use (vs general agent frameworks):**
@@ -875,17 +931,17 @@ EI-1 should land before any hosted or team surface. ENT-1 is the foundation for 
 
 | Suite | What it measures | Status |
 | --- | --- | --- |
-| Spec Adherence Rate | Completeness and precision vs stated spec | Phase 3 |
-| Hidden Scenario Delta | Gap between visible test pass rate and hidden scenario pass rate | Phase 3 |
+| Spec Adherence Rate | Completeness and precision vs stated spec | Phase 10 |
+| Hidden Scenario Delta | Gap between visible test pass rate and hidden scenario pass rate | Phase 10 |
 | Causal Attribution Accuracy | Seeded failure corpus, top-1 / top-3 | Phase 7 |
 
 ### Phase-Aligned Benchmark Gates
 
 | Phase | Key benchmarks unlocked |
 | --- | --- |
-| v1 | Decision audit completeness, memory supersession accuracy, WrongAnswer classification rate |
+| v1 | Decision audit completeness, memory supersession accuracy (StreamingQA), WrongAnswer classification rate, operator-model context visibility |
 | Phase 2 | SWE-bench Verified readiness, LiveCodeBench, Aider Polyglot |
-| Phase 3 | twin fidelity, hidden scenario delta, spec adherence rate, DevBench |
+| Phase 10 | spec adherence rate, hidden scenario delta, DevBench; twin fidelity remains optional diagnostic telemetry |
 | Phase 4b | StreamingQA belief-update accuracy |
 | Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
 | Phase 6 | GAIA Level 3, AgentBench |

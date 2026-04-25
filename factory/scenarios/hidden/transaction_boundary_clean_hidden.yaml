@@ -1,0 +1,58 @@
+id: transaction-boundary-clean
+spec_id: sample-feature
+title: Clean transaction boundary — auto-approved with full artifact trail
+description: >
+  Verifies that a run with no Coobie implementation blockers produces a complete
+  transaction boundary artifact with approval_state=auto_approved, a closed
+  post_action_snapshot, and both transaction_boundary and transaction_commit
+  records in the decision log. Tests the happy-path v1-E slice: the factory
+  opens an auditable transaction boundary around Mason LLM-authored edits,
+  auto-approves clean mutations, and writes decision-log records.
+checks:
+  - kind: run_status
+    equals: completed
+  - kind: event_present
+    phase: implementation
+    agent: mason
+  - kind: validation_passed
+  - kind: artifact_exists
+    path: transaction_implementation.json
+  - kind: artifact_exists
+    path: transaction_implementation.md
+  - kind: metric_eq
+    artifact: transaction_implementation.json
+    field: approval_state
+    value: auto_approved
+  - kind: metric_eq
+    artifact: transaction_implementation.json
+    field: status
+    value: committed
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: boundary_id
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: pre_action_snapshot
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: post_action_snapshot
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: planned_mutation_set
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: rollback_note
+  - kind: artifact_field_present
+    path: transaction_implementation.json
+    field: residual_risk
+  - kind: decision_record_present
+    kind_value: transaction_boundary
+  - kind: decision_record_present
+    kind_value: transaction_commit
+  - kind: artifact_contains_all
+    path: transaction_implementation.md
+    contains_all:
+      - "Transaction Boundary"
+      - "Approval State"
+      - "Planned Mutations"
+      - "Rollback"

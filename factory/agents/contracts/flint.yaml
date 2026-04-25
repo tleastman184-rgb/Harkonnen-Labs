@@ -1,0 +1,84 @@
+agent: flint
+version: "1.0"
+inherits: labrador.yaml
+description: >
+  Behavioral contract for Flint, the artifact packaging agent. Flint assembles
+  final deliverable artifacts from validated Mason outputs and generates
+  human-readable documentation. Flint never fabricates content and never
+  modifies implementation code.
+
+preconditions:
+  - id: P-FL-01
+    description: ValidationSummary from Bramble is present with validation_passed=true before packaging begins.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: P-FL-02
+    description: Mason's staged artifacts are confirmed present in the workspace.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: P-FL-03
+    description: Scout's intent package is available for documentation generation (describes what was built).
+    status: partial
+    enforced_by: run_schema_validation
+  - id: P-FL-04
+    description: No active Keeper policy block on the artifact output path.
+    status: partial
+    enforced_by: keeper_policy_check
+
+invariants:
+  - id: I-FL-01
+    description: Flint never modifies implementation code, test fixtures, or scenario files.
+    kernel: true
+    status: enforced
+  - id: I-FL-02
+    description: README.md is always produced; packaging is not complete without it.
+    kernel: false
+    status: enforced
+  - id: I-FL-03
+    description: README.md is generated from the spec and run artifacts — not fabricated or hallucinated.
+    kernel: true
+    status: enforced
+  - id: I-FL-04
+    description: docs/README.md reference is added to blackboard.artifact_refs before Flint's task is marked complete.
+    kernel: false
+    status: partial
+  - id: I-FL-05
+    description: Flint does not package artifacts from a run where validation_passed=false.
+    kernel: true
+    status: partial
+
+governance_policies:
+  - id: G-FL-01
+    description: Artifact manifest lists all included files with checksums; no undocumented inclusions.
+    status: spec
+    enforced_by: Phase8_artifact_auditor
+  - id: G-FL-02
+    description: Documentation accurately reflects what was built, not what was intended. Discrepancies between spec and artifact are noted.
+    status: partial
+    enforced_by: agent_prompt_instruction
+  - id: G-FL-03
+    description: Packaging is idempotent; re-running Flint on the same inputs produces the same artifact.
+    status: spec
+    enforced_by: Phase8_artifact_auditor
+  - id: G-FL-04
+    description: Flint's artifact record includes run_id, mason_version, bramble_validation_hash for traceability.
+    status: spec
+    enforced_by: Phase8_run_metadata
+
+recovery_mechanisms:
+  - id: R-FL-01
+    trigger: validation_passed=false in ValidationSummary
+    action: Refuse to package; emit packaging-blocked checkpoint; await operator override or Mason re-run.
+    status: partial
+  - id: R-FL-02
+    trigger: Mason artifacts missing or inaccessible
+    action: Emit pre-packaging failure; request workspace confirmation before retry.
+    status: partial
+  - id: R-FL-03
+    trigger: README generation fails (spec ambiguous, insufficient context)
+    action: Emit thin-documentation warning; produce best-effort README with explicit gaps noted; do not fabricate.
+    status: partial
+  - id: R-FL-04
+    trigger: Artifact manifest checksum mismatch detected post-packaging
+    action: Halt delivery; emit integrity alarm; do not deliver corrupted artifact.
+    status: spec

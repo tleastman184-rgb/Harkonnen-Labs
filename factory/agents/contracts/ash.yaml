@@ -1,0 +1,84 @@
+agent: ash
+version: "1.0"
+inherits: labrador.yaml
+description: >
+  Behavioral contract for Ash, the twin retrieval agent. Ash provisions and
+  manages digital twin stubs that allow safe simulation of external dependencies
+  without touching production systems. Ash stubs must faithfully emulate the
+  target interface and must never be confused with real production endpoints.
+
+preconditions:
+  - id: P-AS-01
+    description: Target interface specification is available before stub provisioning begins.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: P-AS-02
+    description: No active Keeper policy block on the twin workspace path.
+    status: partial
+    enforced_by: keeper_policy_check
+  - id: P-AS-03
+    description: Production credential access is confirmed absent from the twin environment before stub activation.
+    status: partial
+    enforced_by: workspace_isolation
+  - id: P-AS-04
+    description: Coobie briefing reviewed for prior twin-related failure patterns before stub design.
+    status: spec
+    enforced_by: Phase8_preflight_gate
+
+invariants:
+  - id: I-AS-01
+    description: Twin stubs never connect to production endpoints, databases, or external services.
+    kernel: true
+    status: enforced
+  - id: I-AS-02
+    description: Stub interface matches the real interface specification; divergence is flagged, not silently papered over.
+    kernel: true
+    status: partial
+  - id: I-AS-03
+    description: Ash never writes implementation code for the system under test — only for the stub harness.
+    kernel: true
+    status: enforced
+  - id: I-AS-04
+    description: Twin stubs are clearly labeled in run artifacts to prevent post-run confusion with real service outputs.
+    kernel: false
+    status: partial
+  - id: I-AS-05
+    description: Stub state is reset between test runs unless carryover is explicitly specified in the invocation spec.
+    kernel: false
+    status: partial
+
+governance_policies:
+  - id: G-AS-01
+    description: All twin stub activations and deactivations are logged in the run artifact.
+    status: partial
+    enforced_by: run_artifact_writer
+  - id: G-AS-02
+    description: Stubs that emulate payment, auth, or PII-bearing interfaces require explicit Keeper approval.
+    status: spec
+    enforced_by: Phase8_twin_policy
+  - id: G-AS-03
+    description: Stub interface drift from the real interface is surfaced to Scout as a spec signal for the next run.
+    status: spec
+    enforced_by: Phase8_drift_detector
+  - id: G-AS-04
+    description: Ash decommissions all stubs at run completion; no orphaned twin processes left running.
+    status: partial
+    enforced_by: run_orchestrator
+
+recovery_mechanisms:
+  - id: R-AS-01
+    trigger: Stub provisioning fails (port conflict, spec mismatch, missing dependency)
+    action: Emit stub-failure checkpoint; do not proceed with simulation on a broken stub.
+    status: partial
+  - id: R-AS-02
+    trigger: Production credential detected in twin environment
+    action: Halt immediately; emit security alarm to Keeper; do not activate stub until credentials are removed.
+    status: partial
+  - id: R-AS-03
+    trigger: Stub interface diverges from real interface specification
+    action: Flag divergence in run artifact; report to Coobie as a causal signal; request operator decision on whether to proceed.
+    status: spec
+  - id: R-AS-04
+    trigger: Orphaned stub process detected at session start
+    action: Decommission orphaned stub before proceeding; log decommission event.
+    status: spec

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -20,15 +20,17 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, BlackboardState, CausalEventEdge, CausalEventNode, CheckpointAnswerRecord,
-        CommissioningBrief, ConsolidationCandidate, CoobieBriefing, CoobieEvidenceCitation,
-        EpisodeCausalState, EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation,
-        EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment,
-        EvidenceMatchReport, EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingScope, CausalEventEdge,
+        CausalEventNode, CheckpointAnswerRecord, CommissioningBrief, ConsolidationCandidate,
+        ContextSection, ContextTarget, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState,
+        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
+        EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, FailureKind,
         HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
         LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
-        PriorCauseSignal, ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent,
-        RunRecord, ScenarioResult, SoulIdentityContext, Spec, TwinEnvironment, TwinFailureMode,
+        PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
+        RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
+        SoulIdentityContext, Spec, StakeholderAlignmentSummary, TwinEnvironment, TwinFailureMode,
         TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
@@ -55,6 +57,8 @@ pub struct AppContext {
     #[allow(dead_code)]
     pub operator_models: crate::operator_model::OperatorModelStore,
     pub started_at: std::time::Instant,
+    /// Calvin Archive HTTP client — None when disabled or harmony not running.
+    pub calvin: Option<crate::calvin_client::CalvinClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +104,14 @@ struct CheckpointDraft {
     context_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedRunLaunch {
+    run_id: String,
+    spec_obj: Spec,
+    target_source: TargetSourceMetadata,
+    log_path: PathBuf,
+}
+
 impl RunRequest {
     fn harness_message(&self, phase: &str) -> Option<&str> {
         self.failure_harness
@@ -116,6 +128,7 @@ struct ExecutionOutput {
     run_dir: PathBuf,
     memory_context: MemoryContextBundle,
     briefing: CoobieBriefing,
+    blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +137,225 @@ struct CommandOutcome {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandTrialRecord {
+    raw_command: String,
+    passed: bool,
+    exit_code: Option<i32>,
+    classification: String,
+    summary: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandTrialReport {
+    run_id: String,
+    spec_id: String,
+    #[serde(default)]
+    product: String,
+    phase: String,
+    agent: String,
+    generated_at: String,
+    passed: bool,
+    summary: String,
+    commands: Vec<CommandTrialRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidationRepairAttemptRecord {
+    iteration: u32,
+    proposal_summary: String,
+    #[serde(default)]
+    proposal_rationale: Vec<String>,
+    edits_applied: usize,
+    before_summary: String,
+    after_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_kind_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_kind_after: Option<String>,
+    #[serde(default)]
+    before_failing_checks: Vec<String>,
+    #[serde(default)]
+    after_failing_checks: Vec<String>,
+    outcome: String,
+    guidance_for_next_attempt: String,
+    passed_after: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidationRepairArtifact {
+    run_id: String,
+    spec_id: String,
+    #[serde(default)]
+    product: String,
+    generated_at: String,
+    #[serde(default)]
+    attempts: Vec<ValidationRepairAttemptRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct BrambleTestHarnessResult {
+    results: Vec<ScenarioResult>,
+    output_chunks: Vec<String>,
+    command_trials: Vec<CommandTrialRecord>,
+    wrong_answer_evidence: BTreeMap<String, crate::models::WrongAnswerEvidence>,
+    real_test_commands: usize,
+    passed_real_test_commands: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransactionBoundaryArtifact {
+    boundary_id: String,
+    run_id: String,
+    spec_id: String,
+    phase: String,
+    agent: String,
+    status: String,
+    approval_state: String,
+    #[serde(default)]
+    checkpoint_id: Option<String>,
+    opened_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    planned_mutation_set: Vec<String>,
+    guardrails: Vec<String>,
+    approval_blockers: Vec<String>,
+    pre_action_snapshot: WorkspaceStateSnapshot,
+    #[serde(default)]
+    post_action_snapshot: Option<WorkspaceStateSnapshot>,
+    #[serde(default)]
+    rollback_backup_path: Option<String>,
+    #[serde(default)]
+    approval_decision: Option<String>,
+    #[serde(default)]
+    operator_guidance: Option<String>,
+    #[serde(default)]
+    approved_by: Option<String>,
+    #[serde(default)]
+    approved_at: Option<String>,
+    rollback_note: String,
+    residual_risk: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionCheckpointDecision {
+    Approve,
+    Reject,
+    Revise,
+    Rollback,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolTransactionArtifact {
+    transaction_id: String,
+    run_id: String,
+    spec_id: String,
+    phase: String,
+    agent: String,
+    status: String,
+    approval_state: String,
+    #[serde(default)]
+    checkpoint_id: Option<String>,
+    opened_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    requested_surfaces: Vec<ToolSurfaceAssessment>,
+    guardrails: Vec<String>,
+    approval_blockers: Vec<String>,
+    rollback_note: String,
+    residual_risk: String,
+    #[serde(default)]
+    approval_decision: Option<String>,
+    #[serde(default)]
+    operator_guidance: Option<String>,
+    #[serde(default)]
+    approved_by: Option<String>,
+    #[serde(default)]
+    approved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolSurfaceAssessment {
+    name: String,
+    surface_type: String,
+    command: String,
+    aliases: Vec<String>,
+    risk: String,
+    approval_required: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolInvocationArtifact {
+    run_id: String,
+    generated_at: String,
+    invocations: Vec<ToolInvocationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolInvocationRecord {
+    invocation_id: String,
+    run_id: String,
+    phase: String,
+    agent: String,
+    surface_type: String,
+    tool_name: String,
+    command: String,
+    cwd: String,
+    risk: String,
+    approval_required: bool,
+    approval_state: String,
+    allowed: bool,
+    reasons: Vec<String>,
+    started_at: String,
+    #[serde(default)]
+    completed_at: Option<String>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    stdout_preview: Option<String>,
+    #[serde(default)]
+    stderr_preview: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolInvocationAssessment {
+    surface_type: String,
+    tool_name: String,
+    command: String,
+    cwd: String,
+    risk: String,
+    approval_required: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DecisionTrialSnapshot {
+    agent: String,
+    phase: String,
+    decision_kind: String,
+    chose: String,
+    alternatives: Vec<String>,
+    justification: String,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointTrialSnapshot {
+    phase: String,
+    agent: String,
+    checkpoint_type: String,
+    prompt: String,
+    answered_by: String,
+    answer_text: String,
+    decision_json: Option<serde_json::Value>,
+    intent: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,6 +372,15 @@ struct MemoryContextBundle {
 struct CollectedMemoryHits {
     hits: Vec<String>,
     ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BriefingMemorySelection {
+    memory_hits: Vec<String>,
+    core_memory_hits: Vec<String>,
+    project_memory_hits: Vec<String>,
+    tokens_used: u32,
+    hits_provided: usize,
 }
 
 /// A causal cause that has fired on prior runs of a specific spec.
@@ -245,6 +486,7 @@ struct RetrieverContextBundleArtifact {
     product: String,
     generated_at: String,
     project_root: String,
+    briefing_scope: Option<BriefingScope>,
     context_entries: Vec<RepoLocalContextEntry>,
     skill_entries: Vec<RepoLocalContextEntry>,
     preload_notes: Vec<String>,
@@ -550,6 +792,7 @@ struct PiperBuildResult {
     succeeded: bool,
     /// True when no build commands were detected and execution was skipped.
     skipped: bool,
+    command_trials: Vec<CommandTrialRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,6 +891,14 @@ struct RetrieverHookArtifact {
 
 impl AppContext {
     pub async fn bootstrap() -> Result<Self> {
+        Self::bootstrap_with_options(true).await
+    }
+
+    pub async fn bootstrap_for_mcp() -> Result<Self> {
+        Self::bootstrap_with_options(false).await
+    }
+
+    async fn bootstrap_with_options(enable_embeddings: bool) -> Result<Self> {
         let paths = Paths::discover()?;
         tokio::fs::create_dir_all(&paths.factory).await?;
         tokio::fs::create_dir_all(&paths.logs).await?;
@@ -661,7 +912,7 @@ impl AppContext {
         let pool = db::init_db(&paths).await?;
         let memory_store = MemoryStore::new(paths.memory.clone());
         let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
-        let embedding_store =
+        let embedding_store = if enable_embeddings {
             match crate::embeddings::EmbeddingStore::new(pool.clone(), &paths.setup).await {
                 Ok(es) => {
                     tracing::info!(backend = %es.backend_label(), "semantic memory ready");
@@ -674,10 +925,21 @@ impl AppContext {
                     );
                     None
                 }
-            };
+            }
+        } else {
+            tracing::info!("semantic memory skipped for lightweight MCP bootstrap");
+            None
+        };
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
-        let chat = crate::chat::ChatStore::new(pool.clone());
+        let chat = crate::chat::ChatStore::with_bus(
+            pool.clone(),
+            Arc::new(crate::chat::LocalJsonlPackChatBus::new(
+                paths.logs.join("packchat-bus.jsonl"),
+                paths.setup.setup.name.clone(),
+            )),
+        );
         let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
+        let calvin = crate::calvin_client::try_connect(&paths.setup.calvin_archive).await;
         Ok(Self {
             paths,
             pool,
@@ -689,6 +951,7 @@ impl AppContext {
             chat,
             operator_models,
             started_at: std::time::Instant::now(),
+            calvin,
         })
     }
 
@@ -706,7 +969,8 @@ impl AppContext {
         let normalized_scope = scope.trim().to_lowercase();
         match normalized_scope.as_str() {
             "core" => {
-                self.memory_store
+                let result = self
+                    .memory_store
                     .ingest_source(
                         source,
                         MemoryIngestOptions {
@@ -719,7 +983,10 @@ impl AppContext {
                             scope_tag: Some("core-memory".to_string()),
                         },
                     )
-                    .await
+                    .await?;
+                self.reconcile_ingested_memory_supersessions(&self.memory_store, &result)
+                    .await?;
+                Ok(result)
             }
             "project" => {
                 let project_root = project_root
@@ -750,6 +1017,8 @@ impl AppContext {
                             scope_tag: Some("project-memory".to_string()),
                         },
                     )
+                    .await?;
+                self.reconcile_ingested_memory_supersessions(&store, &result)
                     .await?;
                 self.refresh_project_resume_packet(&target_source, &store)
                     .await?;
@@ -1490,9 +1759,39 @@ impl AppContext {
     }
 
     pub async fn start_run(&self, req: RunRequest) -> Result<RunRecord> {
-        let spec_obj = spec::load_spec(&req.spec_path)?;
-        let target_source = self.resolve_target_source(&req).await?;
+        let prepared = self.prepare_run_launch(&req).await?;
+        self.execute_prepared_run(&prepared.run_id, &req, &prepared)
+            .await?;
+        self.get_run(&prepared.run_id)
+            .await?
+            .with_context(|| format!("run not found after execution: {}", prepared.run_id))
+    }
 
+    pub async fn queue_run(&self, req: RunRequest) -> Result<RunRecord> {
+        let prepared = self.prepare_run_launch(&req).await?;
+        let app = self.clone();
+        let req_clone = req.clone();
+        let prepared_clone = prepared.clone();
+        tokio::spawn(async move {
+            if let Err(error) = app
+                .execute_prepared_run(&prepared_clone.run_id, &req_clone, &prepared_clone)
+                .await
+            {
+                tracing::error!(
+                    run_id = %prepared_clone.run_id,
+                    error = %error,
+                    "background queued run failed unexpectedly"
+                );
+            }
+        });
+        self.get_run(&prepared.run_id)
+            .await?
+            .with_context(|| format!("run not found after queueing: {}", prepared.run_id))
+    }
+
+    async fn prepare_run_launch(&self, req: &RunRequest) -> Result<PreparedRunLaunch> {
+        let spec_obj = spec::load_spec(&req.spec_path)?;
+        let target_source = self.resolve_target_source(req).await?;
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let log_path = self.run_log_path(&run_id);
@@ -1513,21 +1812,44 @@ impl AppContext {
                 &log_path,
             )
             .await?;
+        self.try_open_calvin_run(&run_id, &spec_obj.id).await;
 
+        Ok(PreparedRunLaunch {
+            run_id,
+            spec_obj,
+            target_source,
+            log_path,
+        })
+    }
+
+    async fn execute_prepared_run(
+        &self,
+        run_id: &str,
+        req: &RunRequest,
+        prepared: &PreparedRunLaunch,
+    ) -> Result<()> {
         match self
-            .execute_run(&run_id, &req, &spec_obj, &target_source, &log_path)
+            .execute_run(
+                run_id,
+                req,
+                &prepared.spec_obj,
+                &prepared.target_source,
+                &prepared.log_path,
+            )
             .await
         {
             Ok(output) => {
-                let final_status = if output.validation.passed && output.hidden_scenarios.passed {
+                let final_status = if output.blocked {
+                    "blocked"
+                } else if output.validation.passed && output.hidden_scenarios.passed {
                     "completed"
                 } else {
                     "completed_with_issues"
                 };
-                self.update_run_status(&run_id, final_status).await?;
+                self.update_run_status(run_id, final_status).await?;
                 if let Err(error) = self
                     .record_memory_context_outcome(
-                        &target_source,
+                        &prepared.target_source,
                         &output.memory_context,
                         final_status == "completed",
                     )
@@ -1535,29 +1857,29 @@ impl AppContext {
                 {
                     let _ = self
                         .record_event(
-                            &run_id,
+                            run_id,
                             None,
                             "memory",
                             "coobie",
                             "warning",
                             &format!("Memory manifest outcome tracking skipped: {error}"),
-                            &log_path,
+                            &prepared.log_path,
                         )
                         .await;
                 }
 
-                let lessons = match self.consolidate_run(&run_id, &spec_obj).await {
+                let lessons = match self.consolidate_run(run_id, &prepared.spec_obj).await {
                     Ok(lessons) => lessons,
                     Err(error) => {
                         let _ = self
                             .record_event(
-                                &run_id,
+                                run_id,
                                 None,
                                 "memory",
                                 "coobie",
                                 "warning",
                                 &format!("Consolidation skipped: {error}"),
-                                &log_path,
+                                &prepared.log_path,
                             )
                             .await;
                         Vec::new()
@@ -1567,9 +1889,9 @@ impl AppContext {
                     .await?;
                 if let Err(error) = self
                     .record_stale_memory_mitigation_outcomes(
-                        &run_id,
-                        &spec_obj,
-                        &target_source,
+                        run_id,
+                        &prepared.spec_obj,
+                        &prepared.target_source,
                         &output.briefing,
                         &output.validation,
                         &output.hidden_scenarios,
@@ -1579,20 +1901,20 @@ impl AppContext {
                 {
                     let _ = self
                         .record_event(
-                            &run_id,
+                            run_id,
                             None,
                             "memory",
                             "coobie",
                             "warning",
                             &format!("Stale-memory mitigation tracking skipped: {error}"),
-                            &log_path,
+                            &prepared.log_path,
                         )
                         .await;
                 }
 
                 let _ = self
                     .record_event(
-                        &run_id,
+                        run_id,
                         None,
                         "complete",
                         "orchestrator",
@@ -1602,41 +1924,45 @@ impl AppContext {
                             "warning"
                         },
                         &format!("Run finished with status {}", final_status),
-                        &log_path,
+                        &prepared.log_path,
                     )
                     .await?;
+                self.try_close_calvin_run(run_id, final_status).await;
                 self.finalize_blackboard(final_status, &output.run_dir)
                     .await?;
-                self.package_artifacts(&run_id).await?;
+                self.write_run_timing_artifact(run_id, &output.run_dir)
+                    .await?;
+                self.package_artifacts(run_id).await?;
             }
             Err(error) => {
                 let message = error.to_string();
-                self.update_run_status(&run_id, "failed").await?;
+                self.update_run_status(run_id, "failed").await?;
                 let _ = self
                     .record_event(
-                        &run_id,
+                        run_id,
                         None,
                         "complete",
                         "orchestrator",
                         "failed",
                         &message,
-                        &log_path,
+                        &prepared.log_path,
                     )
                     .await?;
-                let run_dir = self.run_dir(&run_id);
+                self.try_close_calvin_run(run_id, "failed").await;
+                let run_dir = self.run_dir(run_id);
                 self.mark_blackboard_failed(&message, &run_dir).await?;
-                let lessons = match self.consolidate_run(&run_id, &spec_obj).await {
+                let lessons = match self.consolidate_run(run_id, &prepared.spec_obj).await {
                     Ok(lessons) => lessons,
                     Err(consolidation_error) => {
                         let _ = self
                             .record_event(
-                                &run_id,
+                                run_id,
                                 None,
                                 "memory",
                                 "coobie",
                                 "warning",
                                 &format!("Consolidation skipped: {consolidation_error}"),
-                                &log_path,
+                                &prepared.log_path,
                             )
                             .await;
                         Vec::new()
@@ -1645,12 +1971,15 @@ impl AppContext {
                 if run_dir.exists() {
                     self.attach_lessons_to_blackboard(&run_dir, &lessons)
                         .await?;
-                    if let Ok(Some(briefing)) = self.load_run_briefing(&run_id).await {
+                    if let Ok(Some(briefing)) = self.load_run_briefing(run_id).await {
                         let fallback_validation = ValidationSummary {
                             passed: false,
                             scored_checks: 0,
                             passed_scored_checks: 0,
+                            real_test_commands: 0,
+                            passed_real_test_commands: 0,
                             results: Vec::new(),
+                            wrong_answer_evidence: BTreeMap::new(),
                             failure_kind: None,
                         };
                         let fallback_hidden = HiddenScenarioSummary {
@@ -1659,9 +1988,9 @@ impl AppContext {
                         };
                         if let Err(tracking_error) = self
                             .record_stale_memory_mitigation_outcomes(
-                                &run_id,
-                                &spec_obj,
-                                &target_source,
+                                run_id,
+                                &prepared.spec_obj,
+                                &prepared.target_source,
                                 &briefing,
                                 &fallback_validation,
                                 &fallback_hidden,
@@ -1671,25 +2000,32 @@ impl AppContext {
                         {
                             let _ = self
                                 .record_event(
-                                    &run_id,
+                                    run_id,
                                     None,
                                     "memory",
                                     "coobie",
                                     "warning",
-                                    &format!("Stale-memory mitigation tracking skipped: {tracking_error}"),
-                                    &log_path,
+                                    &format!(
+                                        "Stale-memory mitigation tracking skipped: {tracking_error}"
+                                    ),
+                                    &prepared.log_path,
                                 )
                                 .await;
                         }
                     }
                 }
-                let _ = self.package_artifacts(&run_id).await;
+                if run_dir.exists() {
+                    self.write_run_timing_artifact(run_id, &run_dir).await?;
+                }
+                let _ = self.package_artifacts(run_id).await;
             }
         }
 
-        self.get_run(&run_id)
-            .await?
-            .with_context(|| format!("run not found after execution: {run_id}"))
+        if let Err(error) = self.release_mason_workspace_lease(run_id).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Mason workspace lease release failed");
+        }
+
+        Ok(())
     }
 
     async fn execute_run(
@@ -1718,6 +2054,8 @@ impl AppContext {
             active_goal: spec_obj.title.clone(),
             ..Default::default()
         };
+        let packchat_thread = self.ensure_packchat_run_thread(run_id, spec_obj).await?;
+        blackboard.packchat_thread_id = Some(packchat_thread.thread_id.clone());
         push_unique(&mut blackboard.artifact_refs, "target_source.json");
         push_unique(&mut blackboard.artifact_refs, "phase_attributions.json");
         push_unique(&mut blackboard.artifact_refs, "phase_attributions.md");
@@ -1769,6 +2107,9 @@ impl AppContext {
                 &memory_context,
             )
             .await?;
+        let scout_briefing = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
+        let sable_briefing = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
         let evidence_match_report = self
             .build_evidence_match_report(spec_obj, target_source, &briefing)
             .await?;
@@ -1782,6 +2123,27 @@ impl AppContext {
         tokio::fs::write(
             run_dir.join("coobie_preflight_response.md"),
             &briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("scout_briefing.json"), &scout_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("scout_preflight_response.md"),
+            &scout_briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("mason_briefing.json"), &mason_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("mason_preflight_response.md"),
+            &mason_briefing.coobie_response,
+        )
+        .await?;
+        self.write_json_file(&run_dir.join("sable_briefing.json"), &sable_briefing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("sable_preflight_response.md"),
+            &sable_briefing.coobie_response,
         )
         .await?;
         self.write_json_file(
@@ -1800,6 +2162,12 @@ impl AppContext {
             &mut blackboard.artifact_refs,
             "coobie_preflight_response.md",
         );
+        push_unique(&mut blackboard.artifact_refs, "scout_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "scout_preflight_response.md");
+        push_unique(&mut blackboard.artifact_refs, "mason_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "mason_preflight_response.md");
+        push_unique(&mut blackboard.artifact_refs, "sable_briefing.json");
+        push_unique(&mut blackboard.artifact_refs, "sable_preflight_response.md");
         push_unique(&mut blackboard.artifact_refs, "evidence_match_report.json");
         push_unique(&mut blackboard.artifact_refs, "evidence_match_report.md");
         self.write_agent_execution(
@@ -1890,17 +2258,29 @@ impl AppContext {
             )
             .await?;
         let intent = self
-            .scout_intake(spec_obj, target_source, &briefing)
+            .scout_intake(spec_obj, target_source, &scout_briefing)
             .await?;
         self.write_json_file(&run_dir.join("intent.json"), &intent)
             .await?;
         push_unique(&mut blackboard.artifact_refs, "intent.json");
         let optimization_program = self
-            .scout_derive_optimization_program(run_id, spec_obj, target_source, &briefing, &run_dir)
+            .scout_derive_optimization_program(
+                run_id,
+                spec_obj,
+                target_source,
+                &scout_briefing,
+                &run_dir,
+            )
             .await;
         push_unique(&mut blackboard.artifact_refs, "optimization_program.json");
         let metric_attacks = self
-            .sable_generate_metric_attacks(run_id, spec_obj, &optimization_program, &run_dir)
+            .sable_generate_metric_attacks(
+                run_id,
+                spec_obj,
+                &optimization_program,
+                &sable_briefing,
+                &run_dir,
+            )
             .await;
         if !metric_attacks.is_empty() {
             push_unique(&mut blackboard.artifact_refs, "metric_attacks.json");
@@ -1946,7 +2326,7 @@ impl AppContext {
             "success",
             Some(1.0),
             &memory_context,
-            &briefing,
+            &scout_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -2013,6 +2393,7 @@ impl AppContext {
                 target_source,
                 &staged_product,
                 &query_terms,
+                BriefingScope::MasonPreflight,
             )?;
             self.write_json_file(
                 &run_dir.join("retriever_context_bundle.json"),
@@ -2050,7 +2431,7 @@ impl AppContext {
                 spec_obj,
                 target_source,
                 worker_harness,
-                &briefing,
+                &mason_briefing,
                 &self.paths.root,
                 &workspace_root,
                 &run_dir,
@@ -2103,6 +2484,19 @@ impl AppContext {
         )
         .await?;
         release_agent(&mut blackboard, "keeper");
+        let workspace_prefix = staged_product.to_string_lossy().to_string();
+        self.claim_mason_workspace_lease(
+            run_id,
+            &workspace_prefix,
+            &mason_briefing.recommended_guardrails,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "claiming Keeper-managed Mason workspace lease for {}",
+                workspace_prefix
+            )
+        })?;
         claim_agent(&mut blackboard, "mason", "owns staged product workspace");
         push_unique(&mut blackboard.resolved_items, "workspace");
         self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
@@ -2130,7 +2524,13 @@ impl AppContext {
             )
             .await?;
         let implementation_plan = self
-            .mason_implementation_plan(spec_obj, &intent, &briefing, &staged_product, target_source)
+            .mason_implementation_plan(
+                spec_obj,
+                &intent,
+                &mason_briefing,
+                &staged_product,
+                target_source,
+            )
             .await;
         self.record_decision(
             run_id,
@@ -2145,6 +2545,8 @@ impl AppContext {
         tokio::fs::write(run_dir.join("implementation_plan.md"), &implementation_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "implementation_plan.md");
 
+        let mut implementation_approval_blockers: Vec<String> = Vec::new();
+
         // ── Coobie plan critique ──────────────────────────────────────────────
         // Runs for every spec — not just worker_harness specs.
         // Checks the plan against dead-end registry + escalated guardrails before
@@ -2155,7 +2557,7 @@ impl AppContext {
                 run_id,
                 spec_obj,
                 target_source,
-                &briefing,
+                &mason_briefing,
                 &implementation_plan,
                 Some(&optimization_program),
                 log_path,
@@ -2196,6 +2598,8 @@ impl AppContext {
                     .await;
                 }
                 if !critique.passed {
+                    implementation_approval_blockers
+                        .extend(critique.blocking_concerns.iter().cloned());
                     push_unique(&mut blackboard.open_blockers, "coobie_plan_critique_failed");
                     tracing::warn!(
                         blocking = critique.blocking_concerns.len(),
@@ -2221,7 +2625,7 @@ impl AppContext {
                 spec_obj,
                 target_source,
                 &intent,
-                &briefing,
+                &mason_briefing,
                 &implementation_plan,
                 retriever_context_bundle.as_ref(),
             );
@@ -2287,59 +2691,197 @@ next_actions={}",
                 let _ = self
                     .set_episode_state_before(&implementation_episode, &pre_impl_snap)
                     .await;
-                let mason_edit_application = self
-                    .mason_generate_and_apply_edits(
-                        run_id,
-                        spec_obj,
-                        &intent,
-                        &briefing,
-                        &implementation_plan,
-                        target_source,
-                        &staged_product,
-                        &run_dir,
-                    )
-                    .await?;
-                push_unique(&mut blackboard.artifact_refs, "mason_edit_application.json");
-                push_unique(&mut blackboard.artifact_refs, "mason_edit_application.md");
-                if mason_edit_application.proposal_generated {
-                    push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.json");
-                    push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.md");
-                }
-                if mason_edit_application.status == "applied" {
-                    if let Some(context_bundle) = retriever_context_bundle.as_ref() {
-                        let drift_guard = build_trail_drift_guard(
-                            run_id,
-                            spec_obj,
-                            target_source,
-                            &staged_product,
-                            context_bundle,
-                        )?;
-                        self.write_json_file(&run_dir.join("trail_drift_guard.json"), &drift_guard)
-                            .await?;
-                        tokio::fs::write(
-                            run_dir.join("trail_drift_guard.md"),
-                            render_trail_drift_guard_markdown(&drift_guard),
-                        )
-                        .await?;
-                    }
-                }
-                self.write_agent_execution(
-                    &profiles,
-                    "mason",
-                    &format!(
-                        "Generate and apply bounded LLM-authored edits for target '{}' inside the staged workspace.",
-                        target_source.label
-                    ),
-                    &mason_edit_application.summary,
-                    &serde_json::to_string_pretty(&mason_edit_application)?,
-                    "implementation",
-                    &implementation_episode,
-                    spec_obj,
-                    target_source,
+                let editable_paths =
+                    collect_staged_code_under_test_paths(spec_obj, target_source, &self.paths.root);
+                let mut transaction_boundary = build_implementation_transaction_boundary(
+                    run_id,
+                    &spec_obj.id,
+                    editable_paths,
+                    briefing.recommended_guardrails.clone(),
+                    implementation_approval_blockers.clone(),
+                    pre_impl_snap.clone(),
+                );
+                self.capture_transaction_rollback_backup(
                     &run_dir,
-                    &mut agent_executions,
+                    &staged_product,
+                    &mut transaction_boundary,
                 )
                 .await?;
+                self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                    .await?;
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "transaction_implementation.json",
+                );
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "transaction_implementation.md",
+                );
+
+                if transaction_boundary.approval_state == "operator_review_required" {
+                    push_unique(
+                        &mut blackboard.open_blockers,
+                        "transaction_approval_required",
+                    );
+                    self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+                    self.materialize_run_checkpoints(run_id).await?;
+                    transaction_boundary.checkpoint_id =
+                        Some(format!("checkpoint-{run_id}-transaction-approval-required"));
+                    transaction_boundary.status = "paused_before_mutation".to_string();
+                    transaction_boundary.residual_risk =
+                        "Mason LLM-authored edits were not applied because Coobie identified approval blockers before the mutation boundary.".to_string();
+                    self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_boundary",
+                        "pause_for_operator_approval",
+                        &[
+                            "auto_approve_mutation".to_string(),
+                            "abort_transaction".to_string(),
+                        ],
+                        &format!(
+                            "Implementation transaction paused before Mason edits because {} approval blocker(s) were present: {}",
+                            transaction_boundary.approval_blockers.len(),
+                            transaction_boundary.approval_blockers.join("; ")
+                        ),
+                    )
+                    .await;
+                    self.record_event(
+                        run_id,
+                        Some(&implementation_episode),
+                        "implementation",
+                        "keeper",
+                        "blocked",
+                        "Implementation transaction paused before Mason edits pending operator approval",
+                        log_path,
+                    )
+                    .await?;
+                    let post_impl_snap = snapshot_workspace_state(&staged_product);
+                    let _ = self
+                        .set_episode_state_after(&implementation_episode, &post_impl_snap)
+                        .await;
+                    self.finish_episode(&implementation_episode, "blocked", Some(0.0))
+                        .await?;
+                    let blocked_validation = ValidationSummary {
+                        passed: false,
+                        scored_checks: 0,
+                        passed_scored_checks: 0,
+                        real_test_commands: 0,
+                        passed_real_test_commands: 0,
+                        results: Vec::new(),
+                        wrong_answer_evidence: BTreeMap::new(),
+                        failure_kind: Some(FailureKind::Blocked),
+                    };
+                    let blocked_hidden = HiddenScenarioSummary {
+                        passed: false,
+                        results: Vec::new(),
+                    };
+                    return Ok(ExecutionOutput {
+                        validation: blocked_validation,
+                        hidden_scenarios: blocked_hidden,
+                        run_dir,
+                        memory_context,
+                        briefing,
+                        blocked: true,
+                    });
+                } else {
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_boundary",
+                        "auto_approve_mutation",
+                        &[
+                            "pause_for_operator_approval".to_string(),
+                            "abort_transaction".to_string(),
+                        ],
+                        "No Coobie approval blockers were present, so the implementation mutation boundary was auto-approved.",
+                    )
+                    .await;
+                    let mason_edit_application = self
+                        .mason_generate_and_apply_edits(
+                            run_id,
+                            spec_obj,
+                            &intent,
+                            &mason_briefing,
+                            &implementation_plan,
+                            target_source,
+                            &staged_product,
+                            &run_dir,
+                        )
+                        .await?;
+                    push_unique(&mut blackboard.artifact_refs, "mason_edit_application.json");
+                    push_unique(&mut blackboard.artifact_refs, "mason_edit_application.md");
+                    if mason_edit_application.proposal_generated {
+                        push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.json");
+                        push_unique(&mut blackboard.artifact_refs, "mason_edit_proposal.md");
+                    }
+                    if mason_edit_application.status == "applied" {
+                        if let Some(context_bundle) = retriever_context_bundle.as_ref() {
+                            let drift_guard = build_trail_drift_guard(
+                                run_id,
+                                spec_obj,
+                                target_source,
+                                &staged_product,
+                                context_bundle,
+                            )?;
+                            self.write_json_file(
+                                &run_dir.join("trail_drift_guard.json"),
+                                &drift_guard,
+                            )
+                            .await?;
+                            tokio::fs::write(
+                                run_dir.join("trail_drift_guard.md"),
+                                render_trail_drift_guard_markdown(&drift_guard),
+                            )
+                            .await?;
+                        }
+                    }
+                    let post_transaction_snap = snapshot_workspace_state(&staged_product);
+                    finalize_transaction_boundary(
+                        &mut transaction_boundary,
+                        &mason_edit_application.status,
+                        post_transaction_snap,
+                    );
+                    self.write_transaction_boundary_artifacts(&run_dir, &transaction_boundary)
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "implementation",
+                        "transaction_commit",
+                        &transaction_boundary.status,
+                        &[
+                            "rollback_transaction".to_string(),
+                            "leave_transaction_open".to_string(),
+                        ],
+                        &format!(
+                            "{} Residual risk: {}",
+                            transaction_boundary.rollback_note, transaction_boundary.residual_risk
+                        ),
+                    )
+                    .await;
+                    self.write_agent_execution(
+                        &profiles,
+                        "mason",
+                        &format!(
+                            "Generate and apply bounded LLM-authored edits for target '{}' inside the staged workspace.",
+                            target_source.label
+                        ),
+                        &mason_edit_application.summary,
+                        &serde_json::to_string_pretty(&mason_edit_application)?,
+                        "implementation",
+                        &implementation_episode,
+                        spec_obj,
+                        target_source,
+                        &run_dir,
+                        &mut agent_executions,
+                    )
+                    .await?;
+                }
             }
         }
         self.write_agent_execution(
@@ -2385,7 +2927,7 @@ next_actions={}",
             "success",
             Some(1.0),
             &memory_context,
-            &briefing,
+            &mason_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -2457,7 +2999,7 @@ next_actions={}",
                             .mason_fix_from_build_failure(
                                 run_id,
                                 spec_obj,
-                                &briefing,
+                                &mason_briefing,
                                 target_source,
                                 &staged_product,
                                 &build_result.combined_output,
@@ -2542,6 +3084,21 @@ next_actions={}",
                 )
                 .await?;
                 push_unique(&mut blackboard.artifact_refs, "build_output.txt");
+                if !build_result.command_trials.is_empty() {
+                    let report = build_command_trial_report(
+                        run_id,
+                        &spec_obj.id,
+                        &target_source.label,
+                        "build",
+                        "piper",
+                        build_result.succeeded,
+                        &build_result.command_trials,
+                    );
+                    self.write_command_trial_report(&run_dir, "build_command_trials", &report)
+                        .await?;
+                    push_unique(&mut blackboard.artifact_refs, "build_command_trials.json");
+                    push_unique(&mut blackboard.artifact_refs, "build_command_trials.md");
+                }
 
                 let post_build_snap = snapshot_workspace_state(&staged_product);
                 let _ = self
@@ -2590,6 +3147,98 @@ next_actions={}",
             .await;
         tokio::fs::write(run_dir.join("tool_plan.md"), &tool_plan).await?;
         push_unique(&mut blackboard.artifact_refs, "tool_plan.md");
+        let mut tool_transaction = build_tool_transaction_artifact(
+            run_id,
+            &spec_obj.id,
+            &self.paths.setup,
+            &staged_product,
+            &briefing,
+        );
+        self.write_tool_transaction_artifacts(&run_dir, &tool_transaction)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.json");
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.md");
+        if tool_transaction.approval_state == "operator_review_required" {
+            push_unique(
+                &mut blackboard.open_blockers,
+                "tool_transaction_approval_required",
+            );
+            self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+            self.materialize_run_checkpoints(run_id).await?;
+            tool_transaction.checkpoint_id = Some(format!(
+                "checkpoint-{run_id}-tool-transaction-approval-required"
+            ));
+            tool_transaction.status = "paused_before_privileged_tool_use".to_string();
+            tool_transaction.residual_risk =
+                "Privileged tool/MCP surfaces were identified. Later tool-bearing phases were not executed until Keeper receives operator approval."
+                    .to_string();
+            self.write_tool_transaction_artifacts(&run_dir, &tool_transaction)
+                .await?;
+            self.record_decision(
+                run_id,
+                "keeper",
+                "tools",
+                "tool_transaction_boundary",
+                "pause_for_operator_approval",
+                &[
+                    "auto_approve_read_only_tools".to_string(),
+                    "reject_privileged_tool_surface".to_string(),
+                ],
+                &format!(
+                    "Tool transaction paused because {} privileged surface(s) require approval: {}",
+                    tool_transaction.approval_blockers.len(),
+                    tool_transaction.approval_blockers.join("; ")
+                ),
+            )
+            .await;
+            self.record_event(
+                run_id,
+                Some(&tools_episode),
+                "tools",
+                "keeper",
+                "blocked",
+                "Tool transaction paused pending operator approval for privileged MCP/tool surfaces",
+                log_path,
+            )
+            .await?;
+            self.finish_episode(&tools_episode, "blocked", Some(0.0))
+                .await?;
+            release_agent(&mut blackboard, "piper");
+            return Ok(ExecutionOutput {
+                validation: ValidationSummary {
+                    passed: false,
+                    scored_checks: 0,
+                    passed_scored_checks: 0,
+                    real_test_commands: 0,
+                    passed_real_test_commands: 0,
+                    results: Vec::new(),
+                    wrong_answer_evidence: BTreeMap::new(),
+                    failure_kind: Some(FailureKind::Blocked),
+                },
+                hidden_scenarios: HiddenScenarioSummary {
+                    passed: false,
+                    results: Vec::new(),
+                },
+                run_dir,
+                memory_context,
+                briefing,
+                blocked: true,
+            });
+        } else {
+            self.record_decision(
+                run_id,
+                "keeper",
+                "tools",
+                "tool_transaction_boundary",
+                "auto_approve_read_only_tools",
+                &[
+                    "pause_for_operator_approval".to_string(),
+                    "reject_privileged_tool_surface".to_string(),
+                ],
+                "No privileged MCP/tool surfaces were identified, so the tool transaction boundary was auto-approved.",
+            )
+            .await;
+        }
         self.write_agent_execution(
             &profiles,
             "piper",
@@ -2888,6 +3537,9 @@ next_actions={}",
             release_agent(&mut blackboard, "bramble");
             claim_agent(&mut blackboard, "mason", "fix test failures");
             self.sync_blackboard(&blackboard, Some(&run_dir)).await?;
+            let mut validation_repair_attempts = Vec::new();
+            let mut retry_guidance = None::<String>;
+            let mut consecutive_non_improving_attempts = 0usize;
 
             for iteration in 1u32..=3 {
                 let test_output = format_validation_failure_output(&validation);
@@ -2905,6 +3557,7 @@ next_actions={}",
                         &staged_product,
                         &test_output,
                         iteration,
+                        retry_guidance.as_deref(),
                         log_path,
                         &validation_episode,
                         fix_kind.clone(),
@@ -2912,6 +3565,7 @@ next_actions={}",
                     .await?
                 {
                     Some(proposal) if !proposal.edits.is_empty() => {
+                        let validation_before_fix = validation.clone();
                         let changed =
                             apply_mason_proposal_edits(&proposal, &staged_product).await?;
                         let _ = self
@@ -2941,7 +3595,52 @@ next_actions={}",
                             )
                             .await?;
 
+                        let assessment = assess_validation_repair_attempt(
+                            iteration,
+                            &proposal,
+                            changed.len(),
+                            &validation_before_fix,
+                            &validation,
+                        );
+                        let assessment_outcome = assessment.outcome.clone();
+                        let assessment_guidance = assessment.guidance_for_next_attempt.clone();
+                        let _ = self
+                            .record_event(
+                                run_id,
+                                Some(&validation_episode),
+                                "validation",
+                                "keeper",
+                                "running",
+                                &format!(
+                                    "Validation fix iteration {iteration}: outcome={} {}",
+                                    assessment.outcome, assessment.guidance_for_next_attempt
+                                ),
+                                log_path,
+                            )
+                            .await;
+                        validation_repair_attempts.push(assessment);
+
                         if validation.passed {
+                            break;
+                        }
+                        retry_guidance = Some(assessment_guidance);
+                        if matches!(assessment_outcome.as_str(), "stalled" | "regressed") {
+                            consecutive_non_improving_attempts += 1;
+                        } else {
+                            consecutive_non_improving_attempts = 0;
+                        }
+                        if consecutive_non_improving_attempts >= 2 {
+                            let _ = self
+                                .record_event(
+                                    run_id,
+                                    Some(&validation_episode),
+                                    "validation",
+                                    "keeper",
+                                    "warning",
+                                    "Validation fix loop stopped early after consecutive non-improving attempts",
+                                    log_path,
+                                )
+                                .await;
                             break;
                         }
                         release_agent(&mut blackboard, "bramble");
@@ -2950,6 +3649,24 @@ next_actions={}",
                     }
                     _ => break,
                 }
+            }
+            if !validation_repair_attempts.is_empty() {
+                let report = build_validation_repair_artifact(
+                    run_id,
+                    &spec_obj.id,
+                    &target_source.label,
+                    &validation_repair_attempts,
+                );
+                self.write_validation_repair_report(&run_dir, &report)
+                    .await?;
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "validation_repair_attempts.json",
+                );
+                push_unique(
+                    &mut blackboard.artifact_refs,
+                    "validation_repair_attempts.md",
+                );
             }
             // Restore bramble as the active agent for the rest of the validation phase.
             release_agent(&mut blackboard, "mason");
@@ -2965,6 +3682,8 @@ next_actions={}",
                 passed: false,
                 details: message.to_string(),
             });
+            validation.failure_kind =
+                classify_failure_kind(&validation.results, &validation.wrong_answer_evidence);
         }
         self.write_json_file(&run_dir.join("validation.json"), &validation)
             .await?;
@@ -3114,6 +3833,7 @@ next_actions={}",
                     &validation,
                     &twin,
                     &agent_executions,
+                    Some(&render_sable_context_summary(&sable_briefing)),
                     &run_dir,
                 )
                 .await
@@ -3289,7 +4009,7 @@ next_actions={}",
             hidden_outcome,
             Some(if hidden_scenarios.passed { 1.0 } else { 0.5 }),
             &memory_context,
-            &briefing,
+            &sable_briefing,
             &agent_executions,
             &mut phase_attributions,
             &run_dir,
@@ -3594,6 +4314,7 @@ Top memory hits:
             run_dir,
             memory_context,
             briefing,
+            blocked: false,
         })
     }
 
@@ -5614,8 +6335,22 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         domain_signals: &[String],
         memory_context: &MemoryContextBundle,
     ) -> Result<CoobieBriefing> {
+        let context_target = build_coobie_preflight_context_target(spec_obj, target_source);
+        let memory_selection = select_budgeted_memory_hits(memory_context, &context_target);
+        let project_interview_context = self
+            .load_project_interview_context(Some(Path::new(&target_source.source_path)))
+            .await
+            .unwrap_or(None);
+        let mut briefing_query_terms = query_terms.to_vec();
+        if let Some(context) = project_interview_context.as_ref() {
+            extend_unique(
+                &mut briefing_query_terms,
+                build_project_interview_query_terms(context),
+                32,
+            );
+        }
         let relevant_lessons = self
-            .find_relevant_lessons(query_terms, domain_signals)
+            .find_relevant_lessons(&briefing_query_terms, domain_signals)
             .await?;
         let prior_causes = self.summarize_prior_causes(5).await?;
         let (
@@ -5628,7 +6363,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             .collect_briefing_evidence_citations(
                 spec_obj,
                 target_source,
-                query_terms,
+                &briefing_query_terms,
                 domain_signals,
             )
             .await?;
@@ -5636,7 +6371,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             .collect_evidence_memory_exemplar_citations(
                 spec_obj,
                 target_source,
-                query_terms,
+                &briefing_query_terms,
                 domain_signals,
             )
             .await?;
@@ -5644,19 +6379,19 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             .collect_nearest_evidence_window_citations(
                 spec_obj,
                 target_source,
-                query_terms,
+                &briefing_query_terms,
                 domain_signals,
             )
             .await?;
         let pattern_matching_focus =
             build_pattern_matching_focus(&evidence_pattern_exemplar_citations);
         let causal_chain_focus = build_causal_chain_focus(&evidence_causal_exemplar_citations);
-        let mut enriched_query_terms = query_terms.to_vec();
+        let mut enriched_query_terms = briefing_query_terms.clone();
         let preferred_forge_commands = self
             .collect_preferred_retriever_forge_commands(
                 spec_obj,
                 target_source,
-                query_terms,
+                &briefing_query_terms,
                 domain_signals,
             )
             .await?;
@@ -5669,7 +6404,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         let application_risks = build_application_risks(
             spec_obj,
             domain_signals,
-            &memory_context.memory_hits,
+            &memory_selection.memory_hits,
             &prior_causes,
         );
         let environment_risks = build_environment_risks(spec_obj, domain_signals);
@@ -5679,7 +6414,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
         let mut recommended_guardrails = build_recommended_guardrails(
             spec_obj,
             domain_signals,
-            &memory_context.memory_hits,
+            &memory_selection.memory_hits,
             &prior_causes,
             &relevant_lessons,
         );
@@ -5744,6 +6479,14 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 &mut open_questions,
             );
         }
+        if let Some(context) = project_interview_context.as_ref() {
+            apply_project_interview_preflight_guidance(
+                context,
+                &mut required_checks,
+                &mut recommended_guardrails,
+                &mut open_questions,
+            );
+        }
         let soul_identity_context = Some(build_coobie_soul_identity_context());
         if let Some(context) = soul_identity_context.as_ref() {
             apply_soul_preflight_guidance(
@@ -5752,6 +6495,21 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
                 &mut recommended_guardrails,
                 &mut open_questions,
             );
+        }
+        let mut required_sections_applied = Vec::new();
+        for section in &context_target.required_sections {
+            match section {
+                ContextSection::ProjectInterview if project_interview_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                ContextSection::OperatorModel if operator_model_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                ContextSection::SoulIdentity if soul_identity_context.is_some() => {
+                    required_sections_applied.push(*section);
+                }
+                _ => {}
+            }
         }
 
         // ── Phase 3: causal priors influence preflight ────────────────────────
@@ -5809,9 +6567,9 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             query_terms: enriched_query_terms,
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
-            memory_hits: memory_context.memory_hits.clone(),
-            core_memory_hits: memory_context.core_memory_hits.clone(),
-            project_memory_hits: memory_context.project_memory_hits.clone(),
+            memory_hits: memory_selection.memory_hits,
+            core_memory_hits: memory_selection.core_memory_hits,
+            project_memory_hits: memory_selection.project_memory_hits,
             resume_packet_summary: resume_packet.summary.clone(),
             resume_packet_risks: resume_packet.stale_memory.clone(),
             stale_memory_mitigation_plan,
@@ -5831,10 +6589,17 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             project_components: spec_obj.project_components.clone(),
             scenario_blueprint: spec_obj.scenario_blueprint.clone(),
             project_memory_root: memory_context.project_memory_root.clone(),
+            briefing_scope: Some(context_target.scope),
+            briefing_task_description: context_target.task_description.clone(),
+            target_token_budget: context_target.token_budget,
+            briefing_tokens_used: memory_selection.tokens_used,
+            briefing_hits_provided: memory_selection.hits_provided,
+            required_sections_applied,
             application_risks,
             environment_risks,
             regulatory_considerations,
             operator_model_context,
+            project_interview_context,
             soul_identity_context,
             recommended_guardrails,
             required_checks,
@@ -6135,6 +6900,10 @@ Render Coobie's preflight markdown for the pack. Incorporate repo-local guidance
         target_source: &TargetSourceMetadata,
         briefing: &CoobieBriefing,
     ) -> Result<IntentPackage> {
+        if let Some(intent) = structured_benchmark_intent(spec_obj) {
+            return Ok(intent);
+        }
+
         if let Some(provider) = llm::build_provider("scout", "claude", &self.paths.setup) {
             let memory_section = format_memory_context(&briefing.memory_hits);
             let briefing_json = serde_json::to_string_pretty(briefing).unwrap_or_default();
@@ -6410,6 +7179,23 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
             }
         }
 
+        self.record_decision(
+            run_id,
+            "scout",
+            "intake",
+            "optimization_program",
+            &program.objective_metric,
+            &["acceptance_criteria_pass_rate".to_string()],
+            &format!(
+                "Scout selected objective metric '{}' with {} editable surface(s) and {} evaluation step(s) for spec '{}'.",
+                program.objective_metric,
+                program.editable_surface.len(),
+                program.evaluation_plan.len(),
+                spec_obj.id
+            ),
+        )
+        .await;
+
         let _ = self
             .write_json_file(&run_dir.join("optimization_program.json"), &program)
             .await;
@@ -6428,6 +7214,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
         run_id: &str,
         spec_obj: &Spec,
         program: &crate::models::OptimizationProgram,
+        briefing: &CoobieBriefing,
         run_dir: &Path,
     ) -> Vec<crate::models::MetricAttack> {
         use crate::models::MetricAttack;
@@ -6446,6 +7233,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let sable_context = render_sable_context_summary(briefing);
             let req = LlmRequest::simple(
                 "You are Sable, an adversarial evaluator for a software factory. \
                  Given an objective metric and evaluation plan, generate 2-3 concrete ways \
@@ -6460,12 +7248,14 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                     "SPEC: {} ({})\n\n\
                      OBJECTIVE METRIC: {}\n\
                      OBJECTIVE DESCRIPTION: {}\n\n\
+                     SABLE CONTEXT:\n{}\n\n\
                      EVALUATION PLAN:\n{eval_plan}\n\n\
                      Generate attacks against this metric.",
                     spec_obj.title,
                     spec_obj.id,
                     program.objective_metric,
                     program.objective_description,
+                    sable_context,
                 ),
             );
             if let Ok(resp) = provider.complete(req).await {
@@ -6528,6 +7318,25 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                 }
             }
         }
+
+        self.record_decision(
+            run_id,
+            "sable",
+            "intake",
+            "metric_attack_generation",
+            &if attacks.is_empty() {
+                "no_metric_attacks_generated".to_string()
+            } else {
+                format!("generated_{}_metric_attacks", attacks.len())
+            },
+            &["skip_metric_attack_generation".to_string()],
+            &format!(
+                "Sable evaluated objective metric '{}' and produced {} metric attack probe(s).",
+                program.objective_metric,
+                attacks.len()
+            ),
+        )
+        .await;
 
         let _ = self
             .write_json_file(&run_dir.join("metric_attacks.json"), &attacks)
@@ -7195,11 +8004,13 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 exit_code: 0,
                 succeeded: true,
                 skipped: true,
+                command_trials: Vec::new(),
             });
         }
 
         let mut combined_output = String::new();
         let mut final_exit = 0i32;
+        let mut command_trials = Vec::new();
 
         for cmd_str in &commands {
             self.record_event(
@@ -7216,69 +8027,29 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             let mut parts = cmd_str.split_whitespace();
             let prog = parts.next().unwrap_or("sh");
             let args: Vec<&str> = parts.collect();
+            let outcome = self
+                .run_command_capture_streaming(
+                    run_id,
+                    "build",
+                    "piper",
+                    prog,
+                    &args,
+                    staged_product,
+                )
+                .await?;
+            final_exit = outcome.code.unwrap_or(-1);
+            let trial = build_command_trial_record(cmd_str, &outcome);
 
-            let mut child = tokio::process::Command::new(prog)
-                .args(&args)
-                .current_dir(staged_product)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .with_context(|| format!("spawning build command: {}", cmd_str))?;
-
-            let stdout = child.stdout.take().expect("stdout piped");
-            let stderr = child.stderr.take().expect("stderr piped");
-
-            let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
-            let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
-            let mut done_out = false;
-            let mut done_err = false;
-
-            loop {
-                tokio::select! {
-                    line = stdout_lines.next_line(), if !done_out => {
-                        match line? {
-                            Some(l) => {
-                                combined_output.push_str(&l);
-                                combined_output.push('\n');
-                                let _ = self.event_tx.send(LiveEvent::BuildOutput {
-                                    run_id: run_id.to_string(),
-                                    phase: "build".to_string(),
-                                    agent: "piper".to_string(),
-                                    line: l,
-                                    stream: "stdout".to_string(),
-                                    created_at: Utc::now(),
-                                });
-                            }
-                            None => done_out = true,
-                        }
-                    }
-                    line = stderr_lines.next_line(), if !done_err => {
-                        match line? {
-                            Some(l) => {
-                                combined_output.push_str(&l);
-                                combined_output.push('\n');
-                                let _ = self.event_tx.send(LiveEvent::BuildOutput {
-                                    run_id: run_id.to_string(),
-                                    phase: "build".to_string(),
-                                    agent: "piper".to_string(),
-                                    line: l,
-                                    stream: "stderr".to_string(),
-                                    created_at: Utc::now(),
-                                });
-                            }
-                            None => done_err = true,
-                        }
-                    }
-                }
-                if done_out && done_err {
-                    break;
-                }
+            if !outcome.stdout.is_empty() {
+                combined_output.push_str(&outcome.stdout);
+                combined_output.push('\n');
+            }
+            if !outcome.stderr.is_empty() {
+                combined_output.push_str(&outcome.stderr);
+                combined_output.push('\n');
             }
 
-            let exit_status = child.wait().await?;
-            final_exit = exit_status.code().unwrap_or(-1);
-
-            let verdict = if exit_status.success() {
+            let verdict = if outcome.success {
                 "complete"
             } else {
                 "failed"
@@ -7289,12 +8060,13 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                 "build",
                 "piper",
                 verdict,
-                &format!("exit {}", final_exit),
+                &format!("exit {} ({})", final_exit, trial.classification),
                 log_path,
             )
             .await?;
+            command_trials.push(trial);
 
-            if !exit_status.success() {
+            if !outcome.success {
                 break; // stop on first failing command
             }
         }
@@ -7306,6 +8078,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             exit_code: final_exit,
             succeeded,
             skipped: false,
+            command_trials,
         })
     }
 
@@ -7419,6 +8192,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         staged_product: &Path,
         test_output: &str,
         iteration: u32,
+        retry_guidance: Option<&str>,
         log_path: &Path,
         episode_id: &str,
         failure_kind: crate::models::FailureKind,
@@ -7506,7 +8280,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                  EDITABLE PATHS: {editable_list}\n\n\
                  FILE CONTEXT:\n{context_block}\n\n\
                  TEST FAILURES (iteration {iteration}):\n```\n{test_output}\n```\n\n\
+                 PREVIOUS ATTEMPT FEEDBACK:\n{}\n\n\
                  {user_suffix}",
+                retry_guidance
+                    .unwrap_or("No previous validation-fix attempt feedback for this run."),
             ),
         );
 
@@ -8005,6 +8782,310 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         })
     }
 
+    async fn ensure_tool_invocation_allowed(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<ToolInvocationRecord> {
+        let assessment = assess_tool_invocation(program, args, cwd);
+        self.ensure_tool_invocation_assessment_allowed(run_id, phase, agent, cwd, assessment)
+            .await
+    }
+
+    async fn ensure_raw_shell_tool_invocation_allowed(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        raw_command: &str,
+        cwd: &Path,
+    ) -> Result<ToolInvocationRecord> {
+        let assessment = assess_raw_shell_invocation(raw_command, cwd);
+        self.ensure_tool_invocation_assessment_allowed(run_id, phase, agent, cwd, assessment)
+            .await
+    }
+
+    async fn ensure_tool_invocation_assessment_allowed(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        cwd: &Path,
+        assessment: ToolInvocationAssessment,
+    ) -> Result<ToolInvocationRecord> {
+        let run_dir = self.run_dir(run_id);
+        let mut approval_state = if assessment.approval_required {
+            "approval_pending".to_string()
+        } else {
+            "auto_approved_low_risk".to_string()
+        };
+        let mut allowed = !assessment.approval_required;
+
+        if assessment.approval_required {
+            if !run_dir.join("tool_transaction.json").exists() {
+                let spec_path = run_dir.join("spec.yaml");
+                let spec_obj = if spec_path.exists() {
+                    Some(spec::load_spec(&spec_path.to_string_lossy())?)
+                } else {
+                    None
+                };
+                let briefing = self
+                    .load_run_briefing(run_id)
+                    .await?
+                    .unwrap_or_else(|| fallback_tool_gateway_briefing(run_id, spec_obj.as_ref()));
+                let spec_id = spec_obj
+                    .as_ref()
+                    .map(|spec| spec.id.clone())
+                    .unwrap_or_else(|| "unknown-spec".to_string());
+                let mut transaction = build_tool_transaction_artifact(
+                    run_id,
+                    &spec_id,
+                    &self.paths.setup,
+                    cwd,
+                    &briefing,
+                );
+                if transaction.approval_state == "operator_review_required" {
+                    transaction.checkpoint_id = Some(format!(
+                        "checkpoint-{run_id}-tool-transaction-approval-required"
+                    ));
+                    transaction.status = "paused_before_privileged_tool_use".to_string();
+                    transaction.residual_risk = format!(
+                        "Invocation gateway paused `{}` in phase `{phase}` because privileged tool/MCP surfaces require operator approval before execution.",
+                        assessment.command
+                    );
+                    self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                        .await?;
+                    if let Some(mut board) = self.load_run_blackboard(run_id).await? {
+                        push_unique(&mut board.artifact_refs, "tool_transaction.json");
+                        push_unique(&mut board.artifact_refs, "tool_transaction.md");
+                        push_unique(
+                            &mut board.open_blockers,
+                            "tool_transaction_approval_required",
+                        );
+                        self.sync_blackboard(&board, Some(&run_dir)).await?;
+                    }
+                    self.materialize_run_checkpoints(run_id).await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        phase,
+                        "tool_transaction_gateway",
+                        "pause_for_operator_approval",
+                        &[
+                            "auto_approve_read_only_tools".to_string(),
+                            "reject_privileged_tool_surface".to_string(),
+                        ],
+                        &format!(
+                            "Invocation gateway intercepted `{}` before execution because privileged tool/MCP surfaces require approval.",
+                            assessment.command
+                        ),
+                    )
+                    .await;
+                } else {
+                    self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                        .await?;
+                }
+            }
+
+            let transaction = self.load_tool_transaction_artifact(&run_dir).await?;
+            if matches!(
+                transaction.approval_state.as_str(),
+                "auto_approved" | "operator_approved"
+            ) || matches!(transaction.status.as_str(), "auto_approved" | "approved")
+            {
+                approval_state = transaction.approval_state.clone();
+                allowed = true;
+            } else {
+                approval_state = transaction.approval_state.clone();
+                allowed = false;
+            }
+        }
+
+        let record = ToolInvocationRecord {
+            invocation_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            phase: phase.to_string(),
+            agent: agent.to_string(),
+            surface_type: assessment.surface_type,
+            tool_name: assessment.tool_name,
+            command: assessment.command,
+            cwd: assessment.cwd,
+            risk: assessment.risk,
+            approval_required: assessment.approval_required,
+            approval_state: approval_state.clone(),
+            allowed,
+            reasons: assessment.reasons,
+            started_at: Utc::now().to_rfc3339(),
+            completed_at: if allowed {
+                None
+            } else {
+                Some(Utc::now().to_rfc3339())
+            },
+            success: if allowed { None } else { Some(false) },
+            exit_code: None,
+            stdout_preview: None,
+            stderr_preview: if allowed {
+                None
+            } else {
+                Some(format!(
+                    "Invocation blocked by Keeper until the tool transaction is approved ({approval_state})."
+                ))
+            },
+        };
+        self.append_tool_invocation_record(run_id, record.clone())
+            .await?;
+        if !allowed {
+            self.record_event(
+                run_id,
+                None,
+                phase,
+                "keeper",
+                "blocked",
+                &format!(
+                    "Blocked tool invocation `{}` pending tool transaction approval",
+                    record.command
+                ),
+                &self.run_log_path(run_id),
+            )
+            .await?;
+        }
+        Ok(record)
+    }
+
+    async fn finalize_tool_invocation_record(
+        &self,
+        run_id: &str,
+        invocation: &mut ToolInvocationRecord,
+        outcome: &CommandOutcome,
+    ) -> Result<()> {
+        invocation.completed_at = Some(Utc::now().to_rfc3339());
+        invocation.success = Some(outcome.success);
+        invocation.exit_code = outcome.code;
+        invocation.stdout_preview = preview_text(&outcome.stdout, 400);
+        invocation.stderr_preview = preview_text(&outcome.stderr, 400);
+        self.append_tool_invocation_record(run_id, invocation.clone())
+            .await
+    }
+
+    async fn run_shell_command_capture_streaming(
+        &self,
+        run_id: &str,
+        phase: &str,
+        agent: &str,
+        raw_command: &str,
+        cwd: &Path,
+    ) -> Result<CommandOutcome> {
+        let mut invocation = self
+            .ensure_raw_shell_tool_invocation_allowed(run_id, phase, agent, raw_command, cwd)
+            .await?;
+        if !invocation.allowed {
+            return Ok(CommandOutcome {
+                success: false,
+                code: None,
+                stdout: String::new(),
+                stderr: invocation.stderr_preview.clone().unwrap_or_else(|| {
+                    "Invocation blocked pending tool transaction approval.".to_string()
+                }),
+            });
+        }
+
+        #[cfg(target_os = "windows")]
+        let mut child = {
+            let mut command = Command::new("cmd");
+            command
+                .arg("/C")
+                .arg(raw_command)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("running '{}' in {}", raw_command, cwd.display()))?
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut child = {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-lc")
+                .arg(raw_command)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("running '{}' in {}", raw_command, cwd.display()))?
+        };
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+        let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        let mut done_out = false;
+        let mut done_err = false;
+
+        loop {
+            tokio::select! {
+                line = stdout_lines.next_line(), if !done_out => {
+                    match line? {
+                        Some(l) => {
+                            if !stdout_buf.is_empty() {
+                                stdout_buf.push('\n');
+                            }
+                            stdout_buf.push_str(&l);
+                            let _ = self.event_tx.send(LiveEvent::BuildOutput {
+                                run_id: run_id.to_string(),
+                                phase: phase.to_string(),
+                                agent: agent.to_string(),
+                                line: l,
+                                stream: "stdout".to_string(),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        None => done_out = true,
+                    }
+                }
+                line = stderr_lines.next_line(), if !done_err => {
+                    match line? {
+                        Some(l) => {
+                            if !stderr_buf.is_empty() {
+                                stderr_buf.push('\n');
+                            }
+                            stderr_buf.push_str(&l);
+                            let _ = self.event_tx.send(LiveEvent::BuildOutput {
+                                run_id: run_id.to_string(),
+                                phase: phase.to_string(),
+                                agent: agent.to_string(),
+                                line: l,
+                                stream: "stderr".to_string(),
+                                created_at: Utc::now(),
+                            });
+                        }
+                        None => done_err = true,
+                    }
+                }
+            }
+            if done_out && done_err {
+                break;
+            }
+        }
+
+        let status = child.wait().await?;
+        let outcome = CommandOutcome {
+            success: status.success(),
+            code: status.code(),
+            stdout: stdout_buf.trim().to_string(),
+            stderr: stderr_buf.trim().to_string(),
+        };
+        self.finalize_tool_invocation_record(run_id, &mut invocation, &outcome)
+            .await?;
+        Ok(outcome)
+    }
+
     async fn run_visible_validation(
         &self,
         run_id: &str,
@@ -8013,7 +9094,13 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         spec_obj: &Spec,
     ) -> Result<ValidationSummary> {
         let mut results = Vec::new();
+        let mut wrong_answer_evidence = BTreeMap::new();
         let run_dir = workspace_root.join("run");
+        let product = self
+            .get_run(run_id)
+            .await?
+            .map(|run| run.product)
+            .unwrap_or_default();
         let workspace_ok = staged_product.exists() && run_dir.exists();
         results.push(ScenarioResult {
             scenario_id: "workspace_layout".to_string(),
@@ -8044,6 +9131,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
 
         let validation_log_path = run_dir.join("validation_output.log");
         let mut output_chunks = Vec::new();
+        let mut command_trials = Vec::new();
 
         let cargo_manifest = staged_product.join("Cargo.toml");
         let package_json = staged_product.join("package.json");
@@ -8063,6 +9151,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                     staged_product,
                 )
                 .await?;
+            command_trials.push(build_command_trial_record(
+                "cargo check --quiet",
+                &check_outcome,
+            ));
             output_chunks.push(format_command_output("cargo check --quiet", &check_outcome));
             results.push(ScenarioResult {
                 scenario_id: "cargo_check".to_string(),
@@ -8083,6 +9175,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record(
+                    "cargo test --quiet",
+                    &test_outcome,
+                ));
                 output_chunks.push(format_command_output("cargo test --quiet", &test_outcome));
                 results.push(ScenarioResult {
                     scenario_id: "cargo_test".to_string(),
@@ -8103,6 +9199,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record(&label, &outcome));
                 output_chunks.push(format_command_output(&label, &outcome));
                 results.push(ScenarioResult {
                     scenario_id: "node_bootstrap".to_string(),
@@ -8117,7 +9214,29 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                                 format!("writing validation log {}", validation_log_path.display())
                             })?;
                     }
-                    return Ok(build_validation_summary(results));
+                    if !command_trials.is_empty() {
+                        let report = build_command_trial_report(
+                            run_id,
+                            &spec_obj.id,
+                            &product,
+                            "validation",
+                            "bramble",
+                            false,
+                            &command_trials,
+                        );
+                        self.write_command_trial_report(
+                            &run_dir,
+                            "validation_command_trials",
+                            &report,
+                        )
+                        .await?;
+                    }
+                    return Ok(build_validation_summary(
+                        results,
+                        0,
+                        0,
+                        wrong_answer_evidence,
+                    ));
                 }
             }
 
@@ -8153,6 +9272,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(label, &outcome));
                     output_chunks.push(format_command_output(label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: scenario_id.to_string(),
@@ -8180,6 +9300,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(label, &outcome));
                     output_chunks.push(format_command_output(label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: scenario_id.to_string(),
@@ -8214,6 +9335,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                         staged_product,
                     )
                     .await?;
+                command_trials.push(build_command_trial_record("go test ./...", &outcome));
                 output_chunks.push(format_command_output("go test ./...", &outcome));
                 results.push(ScenarioResult {
                     scenario_id: "go_test".to_string(),
@@ -8252,6 +9374,7 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(command_label, &outcome));
                     output_chunks.push(format_command_output(command_label, &outcome));
                     results.push(ScenarioResult {
                         scenario_id: "python_tests".to_string(),
@@ -8269,6 +9392,10 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                             staged_product,
                         )
                         .await?;
+                    command_trials.push(build_command_trial_record(
+                        "python -m compileall .",
+                        &outcome,
+                    ));
                     output_chunks.push(format_command_output("python -m compileall .", &outcome));
                     results.push(ScenarioResult {
                         scenario_id: "python_compile".to_string(),
@@ -8293,44 +9420,37 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             });
         }
 
-        // Run spec-driven test commands (e.g. corpus tests) and write corpus_results.json.
+        let mut real_test_commands = 0usize;
+        let mut passed_real_test_commands = 0usize;
+
+        // Run spec-driven test commands (e.g. corpus tests) through Bramble's
+        // explicit real-test harness so shell syntax and quoting survive intact.
         if !spec_obj.test_commands.is_empty() {
-            let mut command_results = Vec::new();
-            let mut all_passed = true;
-            for raw_cmd in &spec_obj.test_commands {
-                let parts: Vec<&str> = raw_cmd.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let (program, args) = (parts[0], &parts[1..]);
-                let outcome = self
-                    .run_command_capture_streaming(
-                        run_id,
-                        "validation",
-                        "bramble",
-                        program,
-                        args,
-                        staged_product,
-                    )
-                    .await?;
-                if !outcome.success {
-                    all_passed = false;
-                }
-                output_chunks.push(format_command_output(raw_cmd, &outcome));
-                results.push(ScenarioResult {
-                    scenario_id: format!("test_command_{}", command_results.len() + 1),
-                    passed: outcome.success,
-                    details: command_detail(raw_cmd, &outcome),
-                });
-                command_results.push(serde_json::json!({
-                    "label": raw_cmd,
-                    "exit_code": outcome.code.unwrap_or(-1),
-                    "passed": outcome.success,
-                }));
-            }
+            let harness = self
+                .bramble_run_tests(run_id, staged_product, &spec_obj.test_commands)
+                .await?;
+            real_test_commands = harness.real_test_commands;
+            passed_real_test_commands = harness.passed_real_test_commands;
+            command_trials.extend(harness.command_trials.clone());
+            output_chunks.extend(harness.output_chunks.clone());
+            results.extend(harness.results.clone());
+            wrong_answer_evidence.extend(harness.wrong_answer_evidence.clone());
+
+            let command_results = harness
+                .results
+                .iter()
+                .enumerate()
+                .map(|(idx, result)| {
+                    serde_json::json!({
+                        "label": spec_obj.test_commands.get(idx).cloned().unwrap_or_default(),
+                        "exit_code": harness.command_trials.get(idx).and_then(|trial| trial.exit_code).unwrap_or(-1),
+                        "passed": result.passed,
+                    })
+                })
+                .collect::<Vec<_>>();
             let corpus_results = serde_json::json!({
                 "commands": command_results,
-                "all_passed": all_passed,
+                "all_passed": real_test_commands > 0 && real_test_commands == passed_real_test_commands,
             });
             let corpus_results_path = workspace_root.join("run").join("corpus_results.json");
             if let Ok(json_str) = serde_json::to_string_pretty(&corpus_results) {
@@ -8345,8 +9465,80 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
                     format!("writing validation log {}", validation_log_path.display())
                 })?;
         }
+        if !command_trials.is_empty() {
+            let report = build_command_trial_report(
+                run_id,
+                &spec_obj.id,
+                &product,
+                "validation",
+                "bramble",
+                command_trials.iter().all(|trial| trial.passed),
+                &command_trials,
+            );
+            self.write_command_trial_report(&run_dir, "validation_command_trials", &report)
+                .await?;
+        }
 
-        Ok(build_validation_summary(results))
+        Ok(build_validation_summary(
+            results,
+            real_test_commands,
+            passed_real_test_commands,
+            wrong_answer_evidence,
+        ))
+    }
+
+    async fn bramble_run_tests(
+        &self,
+        run_id: &str,
+        staged_product: &Path,
+        raw_commands: &[String],
+    ) -> Result<BrambleTestHarnessResult> {
+        let mut results = Vec::new();
+        let mut output_chunks = Vec::new();
+        let mut command_trials = Vec::new();
+        let mut wrong_answer_evidence = BTreeMap::new();
+        let mut real_test_commands = 0usize;
+        let mut passed_real_test_commands = 0usize;
+
+        for raw_cmd in raw_commands {
+            let trimmed = raw_cmd.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            real_test_commands += 1;
+            let outcome = self
+                .run_shell_command_capture_streaming(
+                    run_id,
+                    "validation",
+                    "bramble",
+                    trimmed,
+                    staged_product,
+                )
+                .await?;
+            if outcome.success {
+                passed_real_test_commands += 1;
+            }
+            command_trials.push(build_command_trial_record(trimmed, &outcome));
+            output_chunks.push(format_command_output(trimmed, &outcome));
+            let scenario_id = format!("test_command_{real_test_commands}");
+            if let Some(evidence) = extract_wrong_answer_evidence(&outcome) {
+                wrong_answer_evidence.insert(scenario_id.clone(), evidence);
+            }
+            results.push(ScenarioResult {
+                scenario_id,
+                passed: outcome.success,
+                details: command_detail(trimmed, &outcome),
+            });
+        }
+
+        Ok(BrambleTestHarnessResult {
+            results,
+            output_chunks,
+            command_trials,
+            wrong_answer_evidence,
+            real_test_commands,
+            passed_real_test_commands,
+        })
     }
 
     async fn run_command_capture(
@@ -8400,6 +9592,20 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         args: &[&str],
         cwd: &Path,
     ) -> Result<CommandOutcome> {
+        let mut invocation = self
+            .ensure_tool_invocation_allowed(run_id, phase, agent, program, args, cwd)
+            .await?;
+        if !invocation.allowed {
+            return Ok(CommandOutcome {
+                success: false,
+                code: None,
+                stdout: String::new(),
+                stderr: invocation.stderr_preview.clone().unwrap_or_else(|| {
+                    "Invocation blocked pending tool transaction approval.".to_string()
+                }),
+            });
+        }
+
         let mut child = Command::new(program)
             .args(args)
             .current_dir(cwd)
@@ -8464,12 +9670,46 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
         }
 
         let status = child.wait().await?;
-        Ok(CommandOutcome {
+        let outcome = CommandOutcome {
             success: status.success(),
             code: status.code(),
             stdout: stdout_buf.trim().to_string(),
             stderr: stderr_buf.trim().to_string(),
-        })
+        };
+        self.finalize_tool_invocation_record(run_id, &mut invocation, &outcome)
+            .await?;
+        Ok(outcome)
+    }
+
+    async fn write_command_trial_report(
+        &self,
+        run_dir: &Path,
+        base_name: &str,
+        report: &CommandTrialReport,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join(format!("{base_name}.json")), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join(format!("{base_name}.md")),
+            render_command_trial_report_markdown(report),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_validation_repair_report(
+        &self,
+        run_dir: &Path,
+        report: &ValidationRepairArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("validation_repair_attempts.json"), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("validation_repair_attempts.md"),
+            render_validation_repair_markdown(report),
+        )
+        .await?;
+        Ok(())
     }
 
     fn agent_prompt_support(
@@ -8551,13 +9791,17 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             self.load_pinned_skill_excerpts(agent_name, &resolved_provider);
         let query_terms = build_coobie_query_terms(spec_obj, target_source);
         let harkonnen_dir = self.project_harkonnen_dir(target_source);
-        let (context_entries, skill_entries) = discover_repo_local_context_entries(
+        let (mut context_entries, mut skill_entries) = discover_repo_local_context_entries(
             &harkonnen_dir,
             Some(target_source),
             Some(spec_obj),
             &query_terms,
         )
         .unwrap_or_default();
+        if let Some(scope) = briefing_scope_for_agent(agent_name) {
+            (context_entries, skill_entries) =
+                filter_repo_local_entries_for_scope(&context_entries, &skill_entries, scope);
+        }
         let pinned_external_skill_block =
             format_resolved_pinned_skill_excerpts(&pinned_external_skills, &resolved_provider);
         let system_instruction = format!(
@@ -9200,8 +10444,7 @@ Write the twin environment narrative and identify any simulation gaps against Co
             read_optional_json_file(&run_dir.join("hidden_scenarios.json"))?;
         let twin: Option<TwinEnvironment> = read_optional_json_file(&run_dir.join("twin.json"))?;
         let build_output = read_optional_text_file(&run_dir.join("build_output.txt"))?;
-        let validation_analysis =
-            read_optional_text_file(&run_dir.join("validation_analysis.md"))?;
+        let validation_analysis = read_optional_text_file(&run_dir.join("validation_analysis.md"))?;
         let twin_narrative = read_optional_text_file(&run_dir.join("twin_narrative.md"))?;
 
         let provider = llm::build_provider("flint", "claude-haiku", &self.paths.setup);
@@ -9381,7 +10624,10 @@ Requirements:
                     .await
                     .map(|resp| resp.content)
                     .unwrap_or_else(|error| {
-                        tracing::warn!("Flint README generation failed ({}), using fallback", error);
+                        tracing::warn!(
+                            "Flint README generation failed ({}), using fallback",
+                            error
+                        );
                         render_flint_readme_fallback(
                             run_id,
                             spec_obj,
@@ -9430,7 +10676,10 @@ Requirements:
                         .await
                         .map(|resp| resp.content)
                         .unwrap_or_else(|error| {
-                            tracing::warn!("Flint API doc generation failed ({}), using fallback", error);
+                            tracing::warn!(
+                                "Flint API doc generation failed ({}), using fallback",
+                                error
+                            );
                             render_flint_api_fallback(
                                 spec_obj,
                                 &run_artifacts,
@@ -9945,6 +11194,10 @@ Requirements:
                     #[serde(default)]
                     dependencies: Vec<String>,
                     #[serde(default)]
+                    preferred_tools: Vec<String>,
+                    #[serde(default)]
+                    risk_tolerances: Vec<String>,
+                    #[serde(default)]
                     open_questions: Vec<String>,
                 }
 
@@ -9954,7 +11207,7 @@ Requirements:
                     .collect::<Vec<_>>()
                     .join("\n");
                 let request = LlmRequest::simple(
-                    "You are Coobie, summarizing an operator-model interview for Harkonnen Labs. Return one raw JSON object only with keys: summary, operating_rhythms, guardrails, escalation_rules, dependencies, open_questions. Keep every item concrete, reusable, and short. Prefer durable operating logic over biography.",
+                    "You are Coobie, summarizing an operator-model interview for Harkonnen Labs. Return one raw JSON object only with keys: summary, operating_rhythms, guardrails, escalation_rules, dependencies, preferred_tools, risk_tolerances, open_questions. Keep every item concrete, reusable, and short. Prefer durable operating logic over biography.",
                     format!(
                         "PROFILE:
 - scope: {}
@@ -9990,6 +11243,8 @@ Return JSON only.",
                         extend_unique(&mut context.guardrails, raw.guardrails, 6);
                         extend_unique(&mut context.escalation_rules, raw.escalation_rules, 5);
                         extend_unique(&mut context.dependencies, raw.dependencies, 5);
+                        extend_unique(&mut context.preferred_tools, raw.preferred_tools, 5);
+                        extend_unique(&mut context.risk_tolerances, raw.risk_tolerances, 5);
                         extend_unique(&mut context.open_questions, raw.open_questions, 5);
                     }
                 }
@@ -10008,14 +11263,91 @@ Return JSON only.",
         if let Ok(json) = tokio::fs::read_to_string(&brief_path).await {
             if let Ok(brief) = serde_json::from_str::<CommissioningBrief>(&json) {
                 extend_unique(&mut context.operating_rhythms, brief.operating_rhythms, 8);
+                extend_unique(&mut context.preferred_tools, brief.preferred_tools, 6);
+                extend_unique(&mut context.risk_tolerances, brief.risk_tolerances, 6);
                 for pattern in brief.top_patterns.iter().take(3) {
                     let entry = format!("commissioning brief — {pattern}");
                     push_unique(&mut context.guardrails, &entry);
+                }
+                for tolerance in context.risk_tolerances.iter().take(3) {
+                    let entry = format!("risk tolerance — {tolerance}");
+                    push_unique(&mut context.escalation_rules, &entry);
                 }
             }
         }
 
         Ok(Some(context))
+    }
+
+    async fn load_project_interview_context(
+        &self,
+        project_root: Option<&Path>,
+    ) -> Result<Option<ProjectInterviewContext>> {
+        #[derive(Debug, Deserialize, Default)]
+        struct RawStampedRepoToml {
+            #[serde(default)]
+            repo_name: String,
+            #[serde(default)]
+            repo_purpose: Option<String>,
+            #[serde(default)]
+            operator_intent: Option<String>,
+            #[serde(default)]
+            environment: Option<String>,
+            #[serde(default)]
+            vertical: Option<String>,
+            #[serde(default)]
+            domains: Option<Vec<String>>,
+            #[serde(default)]
+            attitudes: Option<Vec<String>>,
+            #[serde(default)]
+            constraints: Option<Vec<String>>,
+            #[serde(default)]
+            skill_sources: Option<Vec<String>>,
+            #[serde(default)]
+            mcp_servers: Option<Vec<String>>,
+        }
+
+        let Some(project_root) = project_root else {
+            return Ok(None);
+        };
+
+        let repo_toml_path = project_root.join(".harkonnen").join("repo.toml");
+        if !repo_toml_path.exists() {
+            return Ok(None);
+        }
+
+        let raw = tokio::fs::read_to_string(&repo_toml_path)
+            .await
+            .with_context(|| format!("reading {}", repo_toml_path.display()))?;
+        let parsed: RawStampedRepoToml = toml::from_str(&raw)
+            .with_context(|| format!("parsing {}", repo_toml_path.display()))?;
+        let interview_context_path = project_root.join(".harkonnen").join("interview-context.md");
+
+        Ok(Some(ProjectInterviewContext {
+            repo_name: if parsed.repo_name.trim().is_empty() {
+                project_root
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown-project")
+                    .to_string()
+            } else {
+                parsed.repo_name
+            },
+            repo_purpose: parsed.repo_purpose.unwrap_or_default(),
+            operator_intent: parsed.operator_intent.unwrap_or_default(),
+            environment: parsed.environment.unwrap_or_default(),
+            vertical: parsed.vertical.unwrap_or_default(),
+            domains: parsed.domains.unwrap_or_default(),
+            attitudes: parsed.attitudes.unwrap_or_default(),
+            constraints: parsed.constraints.unwrap_or_default(),
+            skill_sources: parsed.skill_sources.unwrap_or_default(),
+            mcp_servers: parsed.mcp_servers.unwrap_or_default(),
+            interview_context_path: if interview_context_path.exists() {
+                interview_context_path.display().to_string()
+            } else {
+                String::new()
+            },
+        }))
     }
 
     async fn project_evidence_bundle_path(
@@ -10208,6 +11540,128 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn try_open_calvin_run(&self, run_id: &str, spec_id: &str) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let provider = self.paths.setup.resolve_provider_name("default");
+        let model = self
+            .paths
+            .setup
+            .resolve_provider("default")
+            .map(|config| config.model.clone())
+            .unwrap_or_else(|| "mixed-pack".to_string());
+        if let Err(error) = calvin.open_run(run_id, spec_id, &provider, &model).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin open_run failed");
+        }
+    }
+
+    async fn try_close_calvin_run(&self, run_id: &str, outcome: &str) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        if let Err(error) = calvin.close_run(run_id, outcome).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin close_run failed");
+        }
+    }
+
+    async fn try_write_calvin_event(
+        &self,
+        run_id: &str,
+        phase: Option<&str>,
+        agent: &str,
+        action_type: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        outcome: &str,
+        latency_ms: Option<i32>,
+        tokens_in: Option<i32>,
+        tokens_out: Option<i32>,
+    ) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let evt = crate::calvin_client::TelemetryEvent {
+            agent_id: agent.to_string(),
+            run_id: run_id.to_string(),
+            phase: phase.map(|value| value.to_string()),
+            action_type: action_type.to_string(),
+            provider: provider.map(|value| value.to_string()),
+            model: model.map(|value| value.to_string()),
+            outcome: outcome.to_string(),
+            latency_ms,
+            tokens_in,
+            tokens_out,
+            drift_score: None,
+            lab_ness_score: None,
+        };
+        if let Err(error) = calvin.write_event(&evt).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin telemetry write failed");
+        }
+    }
+
+    async fn try_record_calvin_experience(
+        &self,
+        record: &PhaseAttributionRecord,
+        execution: Option<&AgentExecution>,
+    ) {
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        let provider = execution
+            .map(|value| value.provider.clone())
+            .or_else(|| record.prompt_bundle_provider.clone())
+            .unwrap_or_else(|| "mixed-pack".to_string());
+        let model = execution
+            .map(|value| value.model.clone())
+            .unwrap_or_else(|| "unspecified".to_string());
+        let mut narrative = format!(
+            "{} / {} ended with outcome '{}' and confidence {}.",
+            record.phase,
+            record.agent_name,
+            record.outcome,
+            record
+                .confidence
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "unspecified".to_string())
+        );
+        if let Some(summary) = record.stakeholder_alignment.as_ref() {
+            narrative.push_str(&format!(
+                " Stamped posture: purpose='{}'; stakes='{}'; attitudes={}; constraints={}; mcp_servers={}.",
+                if summary.repo_purpose.is_empty() {
+                    "unspecified"
+                } else {
+                    summary.repo_purpose.as_str()
+                },
+                if summary.operator_intent.is_empty() {
+                    "unspecified"
+                } else {
+                    summary.operator_intent.as_str()
+                },
+                summary.attitudes_recorded,
+                summary.constraints_recorded,
+                summary.mcp_servers_recorded
+            ));
+        }
+        let exp = crate::calvin_client::ArchiveExperience {
+            run_id: record.run_id.clone(),
+            episode_id: Some(record.episode_id.clone()),
+            provider,
+            model,
+            narrative_summary: narrative,
+            scope: record.phase.clone(),
+            chamber: phase_to_calvin_chamber(&record.phase),
+        };
+        if let Err(error) = calvin.record_experience(&record.run_id, &exp).await {
+            tracing::warn!(
+                run_id = %record.run_id,
+                episode_id = %record.episode_id,
+                error = %error,
+                "Calvin record_experience failed"
+            );
+        }
+    }
+
     async fn set_episode_state_before(
         &self,
         episode_id: &str,
@@ -10254,6 +11708,7 @@ Return JSON only.",
             .iter()
             .find(|execution| execution.episode_id.as_deref() == Some(episode_id));
         let created_at = Utc::now();
+        let stakeholder_alignment = build_stakeholder_alignment_summary(briefing);
         let record = PhaseAttributionRecord {
             attribution_id: format!("phase-attribution-{}", episode_id),
             run_id: run_id.to_string(),
@@ -10282,10 +11737,16 @@ Return JSON only.",
             required_checks: briefing.required_checks.clone(),
             guardrails: briefing.recommended_guardrails.clone(),
             query_terms: briefing.query_terms.clone(),
+            briefing_scope: briefing.briefing_scope,
+            briefing_token_budget: briefing.target_token_budget,
+            briefing_tokens_used: briefing.briefing_tokens_used,
+            briefing_hits_provided: briefing.briefing_hits_provided,
+            stakeholder_alignment,
             created_at,
         };
         self.upsert_phase_attribution(&record).await?;
 
+        self.try_record_calvin_experience(&record, execution).await;
         phase_attributions.retain(|existing| existing.episode_id != episode_id);
         phase_attributions.push(record);
         phase_attributions.sort_by(|left, right| {
@@ -10301,6 +11762,1578 @@ Return JSON only.",
         )
         .await?;
         Ok(())
+    }
+
+    async fn write_run_timing_artifact(&self, run_id: &str, run_dir: &Path) -> Result<()> {
+        let Some(run) = self.get_run(run_id).await? else {
+            return Ok(());
+        };
+        let episodes = self.list_run_episodes(run_id).await?;
+        let timing = build_run_timing_report(&run, &episodes, Utc::now());
+        self.write_json_file(&run_dir.join("run_timing.json"), &timing)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("run_timing.md"),
+            render_run_timing_markdown(&timing),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_transaction_boundary_artifacts(
+        &self,
+        run_dir: &Path,
+        boundary: &TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("transaction_implementation.json"), boundary)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("transaction_implementation.md"),
+            render_transaction_boundary_markdown(boundary),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_tool_transaction_artifacts(
+        &self,
+        run_dir: &Path,
+        transaction: &ToolTransactionArtifact,
+    ) -> Result<()> {
+        self.write_json_file(&run_dir.join("tool_transaction.json"), transaction)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("tool_transaction.md"),
+            render_tool_transaction_markdown(transaction),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_tool_invocation_artifacts(
+        &self,
+        run_dir: &Path,
+        run_id: &str,
+        records: &[ToolInvocationRecord],
+    ) -> Result<()> {
+        let artifact = ToolInvocationArtifact {
+            run_id: run_id.to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            invocations: records.to_vec(),
+        };
+        self.write_json_file(&run_dir.join("tool_invocations.json"), &artifact)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("tool_invocations.md"),
+            render_tool_invocation_markdown(&artifact),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn load_tool_invocation_artifact(
+        &self,
+        run_dir: &Path,
+    ) -> Result<ToolInvocationArtifact> {
+        let path = run_dir.join("tool_invocations.json");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn load_tool_transaction_artifact(
+        &self,
+        run_dir: &Path,
+    ) -> Result<ToolTransactionArtifact> {
+        let path = run_dir.join("tool_transaction.json");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn append_tool_invocation_record(
+        &self,
+        run_id: &str,
+        record: ToolInvocationRecord,
+    ) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let mut artifact = if run_dir.join("tool_invocations.json").exists() {
+            self.load_tool_invocation_artifact(&run_dir).await?
+        } else {
+            ToolInvocationArtifact {
+                run_id: run_id.to_string(),
+                generated_at: Utc::now().to_rfc3339(),
+                invocations: Vec::new(),
+            }
+        };
+        artifact
+            .invocations
+            .retain(|existing| existing.invocation_id != record.invocation_id);
+        artifact.invocations.push(record);
+        artifact
+            .invocations
+            .sort_by(|left, right| left.started_at.cmp(&right.started_at));
+        self.write_tool_invocation_artifacts(&run_dir, run_id, &artifact.invocations)
+            .await?;
+        if let Some(mut board) = self.load_run_blackboard(run_id).await? {
+            push_unique(&mut board.artifact_refs, "tool_invocations.json");
+            push_unique(&mut board.artifact_refs, "tool_invocations.md");
+            self.sync_blackboard(&board, Some(&run_dir)).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_transaction_boundary_artifact(
+        &self,
+        run_dir: &Path,
+    ) -> Result<TransactionBoundaryArtifact> {
+        let path = run_dir.join("transaction_implementation.json");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn capture_transaction_rollback_backup(
+        &self,
+        run_dir: &Path,
+        staged_product: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        let backup_dir = run_dir
+            .join("transaction_backups")
+            .join("implementation_pre_action");
+        if backup_dir.exists() {
+            tokio::fs::remove_dir_all(&backup_dir)
+                .await
+                .with_context(|| format!("clearing rollback backup {}", backup_dir.display()))?;
+        }
+        copy_dir_recursive(staged_product, &backup_dir)?;
+        boundary.rollback_backup_path = Some(
+            backup_dir
+                .strip_prefix(run_dir)
+                .unwrap_or(backup_dir.as_path())
+                .to_string_lossy()
+                .trim_start_matches(std::path::MAIN_SEPARATOR)
+                .to_string(),
+        );
+        boundary.rollback_note = format!(
+            "Rollback boundary opened before Mason LLM-authored edits; restore the staged workspace from `{}` if the mutation is rejected or later rolled back.",
+            boundary
+                .rollback_backup_path
+                .as_deref()
+                .unwrap_or("transaction_backups/implementation_pre_action")
+        );
+        Ok(())
+    }
+
+    async fn handle_tool_transaction_checkpoint_resolution(
+        &self,
+        run_id: &str,
+        checkpoint: &RunCheckpointRecord,
+        answered_by: &str,
+        answer_text: &str,
+        decision_json: &Option<serde_json::Value>,
+    ) -> Result<()> {
+        if checkpoint.checkpoint_type != "needs_tool_transaction_approval" {
+            return Ok(());
+        }
+
+        let decision = transaction_checkpoint_decision(answer_text, decision_json);
+        let run_dir = self.run_dir(run_id);
+        let mut transaction = self.load_tool_transaction_artifact(&run_dir).await?;
+        transaction.checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+        transaction.approval_decision =
+            Some(transaction_checkpoint_decision_label(decision).into());
+        transaction.operator_guidance = transaction_operator_guidance(answer_text, decision_json);
+        transaction.approved_by = Some(answered_by.to_string());
+        transaction.approved_at = Some(Utc::now().to_rfc3339());
+
+        match decision {
+            TransactionCheckpointDecision::Approve => {
+                transaction.approval_state = "operator_approved".to_string();
+                transaction.status = "approved".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Privileged MCP/tool surfaces were approved for this run. If visible validation has already completed, Harkonnen will resume hidden scenarios and artifact packaging under this approval context."
+                        .to_string();
+                transaction.rollback_note =
+                    "Tool transactions are authorization boundaries; no filesystem rollback is available for mere approval. Revoke by rejecting a later checkpoint or disabling the surface in setup.".to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_approved")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_approved",
+                    &[
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator approved privileged MCP/tool surfaces for this run.",
+                )
+                .await;
+                let validation_ready = run_dir.join("validation.json").exists();
+                let hidden_already_written = run_dir.join("hidden_scenarios.json").exists();
+                if validation_ready && !hidden_already_written {
+                    if let Err(error) = self
+                        .resume_hidden_artifacts_after_tool_approval(run_id)
+                        .await
+                    {
+                        self.update_run_status(run_id, "tool_transaction_resume_error")
+                            .await?;
+                        self.record_decision(
+                            run_id,
+                            "keeper",
+                            "tools",
+                            "tool_transaction_resume",
+                            "resume_error",
+                            &[
+                                "retry_hidden_scenarios".to_string(),
+                                "pause_after_tool_approval".to_string(),
+                            ],
+                            &format!(
+                                "Tool transaction was approved, but hidden-scenario/artifact continuation failed: {error}"
+                            ),
+                        )
+                        .await;
+                        self.audit_checkpoint_activity(
+                            run_id,
+                            "tools",
+                            "keeper",
+                            "warning",
+                            &format!(
+                                "Tool transaction approved; continuation failed before hidden scenarios/artifacts: {error}"
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            TransactionCheckpointDecision::Reject => {
+                transaction.approval_state = "operator_rejected".to_string();
+                transaction.status = "rejected".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Privileged MCP/tool surfaces were rejected; later tool-bearing phases remain blocked until the plan or setup changes."
+                        .to_string();
+                transaction.rollback_note =
+                    "No tool call was executed from this transaction boundary, so no rollback was required."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_rejected")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_rejected",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator rejected privileged MCP/tool surfaces for this run.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Revise => {
+                transaction.approval_state = "operator_revision_requested".to_string();
+                transaction.status = "revision_requested".to_string();
+                transaction.residual_risk =
+                    "Operator requested a revised tool plan; privileged MCP/tool surfaces remain blocked."
+                        .to_string();
+                transaction.rollback_note =
+                    "Revise the tool plan or setup before opening another privileged tool boundary."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.update_run_status(run_id, "tool_transaction_revision_requested")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_requested_revision",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                    ],
+                    "Operator requested revision of the privileged MCP/tool plan.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Rollback => {
+                transaction.approval_state = "rollback_not_applicable".to_string();
+                transaction.status = "rollback_not_applicable".to_string();
+                transaction.closed_at = Some(Utc::now().to_rfc3339());
+                transaction.residual_risk =
+                    "Rollback was requested, but this tool transaction had not executed a reversible tool call."
+                        .to_string();
+                transaction.rollback_note =
+                    "Tool transaction rollback is only meaningful after a concrete tool invocation. This boundary only governed access approval."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_rollback",
+                    "rollback_not_applicable",
+                    &[
+                        "operator_rejected".to_string(),
+                        "disable_tool_surface".to_string(),
+                    ],
+                    &transaction.residual_risk,
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Unknown => {
+                transaction.approval_state = "operator_response_unclassified".to_string();
+                transaction.status = "approval_response_recorded".to_string();
+                transaction.residual_risk =
+                    "Operator response did not clearly approve, reject, or request revision; privileged MCP/tool surfaces remain blocked."
+                        .to_string();
+                self.write_tool_transaction_artifacts(&run_dir, &transaction)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "tools",
+                    "tool_transaction_approval",
+                    "operator_response_unclassified",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                    ],
+                    "Operator resolved the tool transaction checkpoint without an unambiguous approve/reject/revise decision.",
+                )
+                .await;
+            }
+        }
+
+        let _ = self.package_artifacts(run_id).await;
+        Ok(())
+    }
+
+    async fn handle_transaction_checkpoint_resolution(
+        &self,
+        run_id: &str,
+        checkpoint: &RunCheckpointRecord,
+        answered_by: &str,
+        answer_text: &str,
+        decision_json: &Option<serde_json::Value>,
+    ) -> Result<()> {
+        if checkpoint.checkpoint_type != "needs_transaction_approval" {
+            return Ok(());
+        }
+
+        let decision = transaction_checkpoint_decision(answer_text, decision_json);
+        let run_dir = self.run_dir(run_id);
+        let mut boundary = self.load_transaction_boundary_artifact(&run_dir).await?;
+        boundary.checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+        boundary.approval_decision = Some(transaction_checkpoint_decision_label(decision).into());
+        boundary.operator_guidance = transaction_operator_guidance(answer_text, decision_json);
+        boundary.approved_by = Some(answered_by.to_string());
+        boundary.approved_at = Some(Utc::now().to_rfc3339());
+
+        match decision {
+            TransactionCheckpointDecision::Approve => {
+                self.approve_implementation_transaction(
+                    run_id,
+                    &run_dir,
+                    &mut boundary,
+                    answered_by,
+                )
+                .await?;
+            }
+            TransactionCheckpointDecision::Rollback => {
+                self.rollback_implementation_transaction(run_id, &run_dir, &mut boundary)
+                    .await?;
+            }
+            TransactionCheckpointDecision::Reject => {
+                boundary.approval_state = "operator_rejected".to_string();
+                boundary.status = "aborted_by_operator".to_string();
+                boundary.closed_at = Some(Utc::now().to_rfc3339());
+                boundary.rollback_note =
+                    "Operator rejected the implementation transaction before Mason edits were applied; no rollback execution was required."
+                        .to_string();
+                boundary.residual_risk =
+                    "No Mason LLM-authored mutation was applied from this transaction boundary."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_rejected")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_rejected",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_requested_revision".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator rejected the implementation transaction checkpoint; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Revise => {
+                boundary.approval_state = "operator_revision_requested".to_string();
+                boundary.status = "revision_requested".to_string();
+                boundary.residual_risk =
+                    "Operator requested a revised implementation plan; no Mason LLM-authored mutation was applied from this boundary."
+                        .to_string();
+                boundary.rollback_note =
+                    "Revision request recorded before mutation; regenerate or edit the Mason plan before opening a new commit boundary."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_revision_requested")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_requested_revision",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator requested revision of the implementation transaction; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+            TransactionCheckpointDecision::Unknown => {
+                boundary.approval_state = "operator_response_unclassified".to_string();
+                boundary.status = "approval_response_recorded".to_string();
+                boundary.residual_risk =
+                    "Operator response did not clearly approve, reject, or request revision; Mason edits remain unapplied."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(&run_dir, &boundary)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_approval",
+                    "operator_response_unclassified",
+                    &[
+                        "operator_approved".to_string(),
+                        "operator_rejected".to_string(),
+                        "operator_requested_revision".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    "Operator resolved the transaction checkpoint without an unambiguous approve/reject/revise decision; Mason edits remain unapplied.",
+                )
+                .await;
+            }
+        }
+
+        let _ = self.package_artifacts(run_id).await;
+        Ok(())
+    }
+
+    async fn rollback_implementation_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+    ) -> Result<()> {
+        boundary.approval_state = "rollback_requested".to_string();
+        boundary.status = "rollback_restoring".to_string();
+        self.write_transaction_boundary_artifacts(run_dir, boundary)
+            .await?;
+
+        let backup_rel = boundary
+            .rollback_backup_path
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("transaction_backups/implementation_pre_action");
+        let backup_dir = run_dir.join(backup_rel);
+        let staged_product = self.paths.workspaces.join(run_id).join("product");
+
+        match restore_dir_from_backup(&backup_dir, &staged_product) {
+            Ok(()) => {
+                let restored_snapshot = snapshot_workspace_state(&staged_product);
+                let restored_matches = workspace_snapshots_equivalent(
+                    &boundary.pre_action_snapshot,
+                    &restored_snapshot,
+                );
+                boundary.approval_state = "rollback_executed".to_string();
+                boundary.status = if restored_matches {
+                    "rolled_back".to_string()
+                } else {
+                    "rolled_back_with_drift".to_string()
+                };
+                boundary.closed_at = Some(Utc::now().to_rfc3339());
+                boundary.post_action_snapshot = Some(restored_snapshot);
+                boundary.rollback_note = format!(
+                    "Rollback executed from `{backup_rel}` into `{}`.",
+                    staged_product.display()
+                );
+                boundary.residual_risk = if restored_matches {
+                    "Restored staged workspace matches the pre-action transaction snapshot."
+                        .to_string()
+                } else {
+                    "Restored staged workspace does not exactly match the pre-action transaction snapshot; inspect the transaction artifact before promotion."
+                        .to_string()
+                };
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(
+                    run_id,
+                    if restored_matches {
+                        "transaction_rolled_back"
+                    } else {
+                        "transaction_rolled_back_with_drift"
+                    },
+                )
+                .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_rollback",
+                    &boundary.status,
+                    &[
+                        "leave_transaction_committed".to_string(),
+                        "retry_transaction_rollback".to_string(),
+                    ],
+                    &format!(
+                        "{} Residual risk: {}",
+                        boundary.rollback_note, boundary.residual_risk
+                    ),
+                )
+                .await;
+                self.mark_transaction_rollback_on_blackboard(run_id, restored_matches)
+                    .await?;
+                self.audit_checkpoint_activity(
+                    run_id,
+                    "implementation",
+                    "keeper",
+                    if restored_matches {
+                        "complete"
+                    } else {
+                        "warning"
+                    },
+                    &format!(
+                        "Implementation transaction rollback finished as {}.",
+                        boundary.status
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                boundary.approval_state = "rollback_failed".to_string();
+                boundary.status = "rollback_failed".to_string();
+                boundary.residual_risk = format!(
+                    "Rollback failed while restoring `{}` into `{}`: {error}",
+                    backup_dir.display(),
+                    staged_product.display()
+                );
+                boundary.rollback_note =
+                    "Rollback was requested but could not be executed; inspect the staged workspace and backup path before retrying."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_rollback_failed")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_rollback",
+                    "rollback_failed",
+                    &[
+                        "retry_transaction_rollback".to_string(),
+                        "manual_restore".to_string(),
+                    ],
+                    &boundary.residual_risk,
+                )
+                .await;
+            }
+        }
+
+        self.write_run_timing_artifact(run_id, run_dir).await?;
+        self.package_artifacts(run_id).await?;
+        Ok(())
+    }
+
+    async fn approve_implementation_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        boundary: &mut TransactionBoundaryArtifact,
+        answered_by: &str,
+    ) -> Result<()> {
+        boundary.approval_state = "operator_approved".to_string();
+        boundary.status = "approved_applying".to_string();
+        self.write_transaction_boundary_artifacts(run_dir, boundary)
+            .await?;
+        self.record_decision(
+            run_id,
+            "keeper",
+            "implementation",
+            "transaction_approval",
+            "operator_approved",
+            &[
+                "operator_rejected".to_string(),
+                "operator_requested_revision".to_string(),
+                "rollback_transaction".to_string(),
+            ],
+            &format!("{answered_by} approved the implementation transaction checkpoint."),
+        )
+        .await;
+
+        let spec_path = run_dir.join("spec.yaml");
+        let spec_obj = spec::load_spec(&spec_path.to_string_lossy())?;
+        let target_source = self
+            .target_source_for_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target_source.json missing for run {run_id}"))?;
+        let briefing = self
+            .load_run_briefing(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("coobie_briefing.json missing for run {run_id}"))?;
+        let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
+        let intent_path = run_dir.join("intent.json");
+        let intent_raw = tokio::fs::read_to_string(&intent_path)
+            .await
+            .with_context(|| format!("reading {}", intent_path.display()))?;
+        let intent: IntentPackage = serde_json::from_str(&intent_raw)
+            .with_context(|| format!("parsing {}", intent_path.display()))?;
+        let implementation_plan_path = run_dir.join("implementation_plan.md");
+        let implementation_plan = tokio::fs::read_to_string(&implementation_plan_path)
+            .await
+            .with_context(|| format!("reading {}", implementation_plan_path.display()))?;
+        let staged_product = self.paths.workspaces.join(run_id).join("product");
+        if !staged_product.exists() {
+            bail!(
+                "staged product workspace missing for approved transaction: {}",
+                staged_product.display()
+            );
+        }
+
+        match self
+            .mason_generate_and_apply_edits(
+                run_id,
+                &spec_obj,
+                &intent,
+                &mason_briefing,
+                &implementation_plan,
+                &target_source,
+                &staged_product,
+                run_dir,
+            )
+            .await
+        {
+            Ok(application) => {
+                let post_transaction_snap = snapshot_workspace_state(&staged_product);
+                finalize_transaction_boundary(boundary, &application.status, post_transaction_snap);
+                boundary.approval_state = "operator_approved".to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_commit",
+                    &boundary.status,
+                    &[
+                        "rollback_transaction".to_string(),
+                        "leave_transaction_open".to_string(),
+                    ],
+                    &format!(
+                        "Approved transaction applied through Mason with status '{}'. {} Residual risk: {}",
+                        application.status, boundary.rollback_note, boundary.residual_risk
+                    ),
+                )
+                .await;
+                self.attach_transaction_artifacts_to_blackboard(run_id)
+                    .await?;
+                if let Err(error) = self
+                    .resume_visible_validation_after_transaction(
+                        run_id,
+                        run_dir,
+                        &spec_obj,
+                        &target_source,
+                        &mason_briefing,
+                        &staged_product,
+                    )
+                    .await
+                {
+                    self.update_run_status(run_id, "transaction_validation_error")
+                        .await?;
+                    self.record_decision(
+                        run_id,
+                        "keeper",
+                        "validation",
+                        "transaction_validation",
+                        "validation_error",
+                        &[
+                            "validation_passed_after_transaction".to_string(),
+                            "validation_failed_after_transaction".to_string(),
+                        ],
+                        &format!(
+                            "Approved implementation transaction committed, but validation continuation failed: {error}"
+                        ),
+                    )
+                    .await;
+                    self.audit_checkpoint_activity(
+                        run_id,
+                        "validation",
+                        "keeper",
+                        "warning",
+                        &format!(
+                            "Approved implementation transaction applied; validation continuation failed: {error}"
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            Err(error) => {
+                boundary.status = "resume_failed".to_string();
+                boundary.residual_risk = format!(
+                    "Operator approved the transaction, but Mason edit application failed: {error}"
+                );
+                boundary.rollback_note =
+                    "Resume failed while applying Mason edits; inspect the staged workspace before retrying or rolling back."
+                        .to_string();
+                self.write_transaction_boundary_artifacts(run_dir, boundary)
+                    .await?;
+                self.update_run_status(run_id, "transaction_resume_failed")
+                    .await?;
+                self.record_decision(
+                    run_id,
+                    "keeper",
+                    "implementation",
+                    "transaction_commit",
+                    "resume_failed",
+                    &[
+                        "retry_transaction_resume".to_string(),
+                        "rollback_transaction".to_string(),
+                    ],
+                    &boundary.residual_risk,
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resume_visible_validation_after_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        briefing: &CoobieBriefing,
+        staged_product: &Path,
+    ) -> Result<ValidationSummary> {
+        let workspace_root = self.paths.workspaces.join(run_id);
+        let log_path = self.run_log_path(run_id);
+        let validation_episode = self
+            .start_episode(
+                run_id,
+                "validation",
+                "Resume visible validation after transaction approval",
+            )
+            .await?;
+
+        let mut blackboard =
+            self.load_run_blackboard(run_id)
+                .await?
+                .unwrap_or_else(|| BlackboardState {
+                    run_id: run_id.to_string(),
+                    current_phase: "validation".to_string(),
+                    active_goal: "Resume visible validation after transaction approval".to_string(),
+                    ..Default::default()
+                });
+        blackboard.current_phase = "validation".to_string();
+        blackboard.active_goal = "Resume visible validation after transaction approval".to_string();
+        claim_agent(
+            &mut blackboard,
+            "bramble",
+            "resume visible validation after transaction",
+        );
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.update_run_status(run_id, "validation").await?;
+        let validation_start = self
+            .record_event(
+                run_id,
+                Some(&validation_episode),
+                "validation",
+                "bramble",
+                "running",
+                "Running visible validation after approved implementation transaction",
+                &log_path,
+            )
+            .await?;
+
+        let pre_validation_snap = snapshot_workspace_state(staged_product);
+        let _ = self
+            .set_episode_state_before(&validation_episode, &pre_validation_snap)
+            .await;
+        let validation = self
+            .run_visible_validation(run_id, &workspace_root, staged_product, spec_obj)
+            .await?;
+        self.write_json_file(&run_dir.join("validation.json"), &validation)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "validation.json");
+        if run_dir.join("validation_command_trials.json").exists() {
+            push_unique(
+                &mut blackboard.artifact_refs,
+                "validation_command_trials.json",
+            );
+            push_unique(
+                &mut blackboard.artifact_refs,
+                "validation_command_trials.md",
+            );
+        }
+        if run_dir.join("corpus_results.json").exists() {
+            push_unique(&mut blackboard.artifact_refs, "corpus_results.json");
+        }
+        if let Some(analysis) = self
+            .bramble_interpret_validation(spec_obj, target_source, &validation, briefing)
+            .await
+        {
+            let _ = tokio::fs::write(run_dir.join("validation_analysis.md"), &analysis).await;
+            push_unique(&mut blackboard.artifact_refs, "validation_analysis.md");
+        }
+
+        let validation_outcome = if validation.passed {
+            "success"
+        } else {
+            "failure"
+        };
+        let validation_end = self
+            .record_event(
+                run_id,
+                Some(&validation_episode),
+                "validation",
+                "bramble",
+                if validation.passed {
+                    "complete"
+                } else {
+                    "warning"
+                },
+                &format!(
+                    "Transaction validation finished: {} checks, {} passed",
+                    validation.results.len(),
+                    validation
+                        .results
+                        .iter()
+                        .filter(|result| result.passed)
+                        .count()
+                ),
+                &log_path,
+            )
+            .await?;
+        let post_validation_snap = snapshot_workspace_state(staged_product);
+        let _ = self
+            .set_episode_state_after(&validation_episode, &post_validation_snap)
+            .await;
+        self.finish_episode(
+            &validation_episode,
+            validation_outcome,
+            Some(if validation.passed { 1.0 } else { 0.5 }),
+        )
+        .await?;
+        self.link_events(
+            validation_start.event_id,
+            validation_end.event_id,
+            "contributed_to",
+            if validation.passed { 1.0 } else { 0.5 },
+        )
+        .await?;
+
+        release_agent(&mut blackboard, "bramble");
+        if validation.passed {
+            push_unique(&mut blackboard.resolved_items, "validation");
+            remove_blocker(&mut blackboard, "visible_validation_failed");
+            self.update_run_status(run_id, "validation_passed_after_transaction")
+                .await?;
+        } else {
+            push_unique(&mut blackboard.open_blockers, "visible_validation_failed");
+            self.update_run_status(run_id, "validation_failed_after_transaction")
+                .await?;
+        }
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.materialize_run_checkpoints(run_id).await?;
+
+        let mut phase_attributions = self.list_phase_attributions_for_run(run_id).await?;
+        let memory_context = MemoryContextBundle::default();
+        self.record_phase_attribution(
+            run_id,
+            &validation_episode,
+            "validation",
+            "bramble",
+            validation_outcome,
+            Some(if validation.passed { 1.0 } else { 0.5 }),
+            &memory_context,
+            briefing,
+            &[],
+            &mut phase_attributions,
+            run_dir,
+        )
+        .await?;
+        self.write_run_timing_artifact(run_id, run_dir).await?;
+        self.package_artifacts(run_id).await?;
+        self.record_decision(
+            run_id,
+            "keeper",
+            "validation",
+            "transaction_validation",
+            if validation.passed {
+                "validation_passed_after_transaction"
+            } else {
+                "validation_failed_after_transaction"
+            },
+            &[
+                "skip_validation_after_transaction".to_string(),
+                "retry_validation_after_transaction".to_string(),
+            ],
+            &format!(
+                "Visible validation resumed after approved implementation transaction: {} check(s), {} passed.",
+                validation.results.len(),
+                validation
+                    .results
+                    .iter()
+                    .filter(|result| result.passed)
+                    .count()
+            ),
+        )
+        .await;
+
+        if self
+            .ensure_tool_transaction_resume_allowed(
+                run_id,
+                run_dir,
+                spec_obj,
+                staged_product,
+                briefing,
+                &mut blackboard,
+            )
+            .await?
+        {
+            self.resume_hidden_artifacts_after_transaction(
+                run_id,
+                run_dir,
+                spec_obj,
+                target_source,
+                briefing,
+                staged_product,
+                &validation,
+            )
+            .await?;
+        }
+
+        Ok(validation)
+    }
+
+    async fn ensure_tool_transaction_resume_allowed(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        spec_obj: &Spec,
+        staged_product: &Path,
+        briefing: &CoobieBriefing,
+        blackboard: &mut BlackboardState,
+    ) -> Result<bool> {
+        let existing = if run_dir.join("tool_transaction.json").exists() {
+            Some(self.load_tool_transaction_artifact(run_dir).await?)
+        } else {
+            None
+        };
+        if let Some(transaction) = existing {
+            if matches!(
+                transaction.approval_state.as_str(),
+                "auto_approved" | "operator_approved"
+            ) || matches!(transaction.status.as_str(), "auto_approved" | "approved")
+            {
+                return Ok(true);
+            }
+            push_unique(
+                &mut blackboard.open_blockers,
+                "tool_transaction_approval_required",
+            );
+            self.sync_blackboard(blackboard, Some(run_dir)).await?;
+            self.materialize_run_checkpoints(run_id).await?;
+            return Ok(false);
+        }
+
+        let mut transaction = build_tool_transaction_artifact(
+            run_id,
+            &spec_obj.id,
+            &self.paths.setup,
+            staged_product,
+            briefing,
+        );
+        self.write_tool_transaction_artifacts(run_dir, &transaction)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.json");
+        push_unique(&mut blackboard.artifact_refs, "tool_transaction.md");
+
+        if transaction.approval_state == "operator_review_required" {
+            push_unique(
+                &mut blackboard.open_blockers,
+                "tool_transaction_approval_required",
+            );
+            self.sync_blackboard(blackboard, Some(run_dir)).await?;
+            self.materialize_run_checkpoints(run_id).await?;
+            transaction.checkpoint_id = Some(format!(
+                "checkpoint-{run_id}-tool-transaction-approval-required"
+            ));
+            transaction.status = "paused_before_privileged_tool_use".to_string();
+            transaction.residual_risk =
+                "Approved implementation transaction reached post-validation continuation, but privileged tool/MCP surfaces require operator approval before hidden scenarios and artifact work."
+                    .to_string();
+            self.write_tool_transaction_artifacts(run_dir, &transaction)
+                .await?;
+            self.update_run_status(run_id, "tool_transaction_required_after_validation")
+                .await?;
+            self.record_decision(
+                run_id,
+                "keeper",
+                "tools",
+                "tool_transaction_boundary",
+                "pause_for_operator_approval",
+                &[
+                    "auto_approve_read_only_tools".to_string(),
+                    "reject_privileged_tool_surface".to_string(),
+                ],
+                &format!(
+                    "Post-transaction continuation paused because {} privileged surface(s) require approval: {}",
+                    transaction.approval_blockers.len(),
+                    transaction.approval_blockers.join("; ")
+                ),
+            )
+            .await;
+            self.package_artifacts(run_id).await?;
+            return Ok(false);
+        }
+
+        self.record_decision(
+            run_id,
+            "keeper",
+            "tools",
+            "tool_transaction_boundary",
+            "auto_approve_read_only_tools",
+            &[
+                "pause_for_operator_approval".to_string(),
+                "reject_privileged_tool_surface".to_string(),
+            ],
+            "Post-transaction continuation found no privileged MCP/tool surfaces, so hidden scenarios and artifacts can resume.",
+        )
+        .await;
+        self.sync_blackboard(blackboard, Some(run_dir)).await?;
+        Ok(true)
+    }
+
+    async fn resume_hidden_artifacts_after_tool_approval(&self, run_id: &str) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let spec_path = run_dir.join("spec.yaml");
+        if !spec_path.exists() {
+            bail!("run {run_id} is missing spec.yaml; cannot resume hidden scenarios");
+        }
+        let spec_obj = spec::load_spec(&spec_path.to_string_lossy())?;
+        let target_source = self
+            .target_source_for_run(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target_source.json missing for run {run_id}"))?;
+        let briefing = self
+            .load_run_briefing(run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("coobie_briefing.json missing for run {run_id}"))?;
+        let validation =
+            read_optional_json_file::<ValidationSummary>(&run_dir.join("validation.json"))?
+                .ok_or_else(|| anyhow::anyhow!("validation.json missing for run {run_id}"))?;
+        let staged_product = self.paths.workspaces.join(run_id).join("product");
+        self.resume_hidden_artifacts_after_transaction(
+            run_id,
+            &run_dir,
+            &spec_obj,
+            &target_source,
+            &briefing,
+            &staged_product,
+            &validation,
+        )
+        .await
+    }
+
+    async fn resume_hidden_artifacts_after_transaction(
+        &self,
+        run_id: &str,
+        run_dir: &Path,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        briefing: &CoobieBriefing,
+        _staged_product: &Path,
+        validation: &ValidationSummary,
+    ) -> Result<()> {
+        let profiles = agents::load_profiles(&self.paths.factory.join("agents").join("profiles"))?;
+        let sable_briefing = build_scoped_briefing(briefing, BriefingScope::SablePreflight);
+        let mut agent_executions =
+            read_optional_json_file::<Vec<AgentExecution>>(&run_dir.join("agent_executions.json"))?
+                .unwrap_or_default();
+        let mut phase_attributions = self.list_phase_attributions_for_run(run_id).await?;
+        let memory_context = MemoryContextBundle::default();
+        let log_path = self.run_log_path(run_id);
+        let mut blackboard =
+            self.load_run_blackboard(run_id)
+                .await?
+                .unwrap_or_else(|| BlackboardState {
+                    run_id: run_id.to_string(),
+                    current_phase: "hidden_scenarios".to_string(),
+                    active_goal: "Resume hidden scenarios after transaction approval".to_string(),
+                    ..Default::default()
+                });
+
+        let twin_episode = self
+            .start_episode(
+                run_id,
+                "twin",
+                "Provision local twin environment after transaction approval",
+            )
+            .await?;
+        blackboard.current_phase = "twin".to_string();
+        blackboard.active_goal =
+            "Provision local twin environment after transaction approval".to_string();
+        claim_agent(&mut blackboard, "ash", "prepare resumed twin environment");
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.update_run_status(run_id, "twin").await?;
+        let twin_start = self
+            .record_event(
+                run_id,
+                Some(&twin_episode),
+                "twin",
+                "ash",
+                "running",
+                "Provisioning local twin environment after transaction approval",
+                &log_path,
+            )
+            .await?;
+        let twin = self.ash_provision_twin(run_id, spec_obj, run_dir).await?;
+        self.write_json_file(&run_dir.join("twin.json"), &twin)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "twin.json");
+        if let Some(narrative) = self
+            .ash_twin_narrative(spec_obj, target_source, &twin, briefing)
+            .await
+        {
+            let _ = tokio::fs::write(run_dir.join("twin_narrative.md"), &narrative).await;
+            push_unique(&mut blackboard.artifact_refs, "twin_narrative.md");
+        }
+        self.write_agent_execution(
+            &profiles,
+            "ash",
+            "Provision a safe local twin environment for resumed hidden scenario work.",
+            &format!("Provisioned {} twin service(s).", twin.services.len()),
+            &serde_json::to_string_pretty(&twin)?,
+            "twin",
+            &twin_episode,
+            spec_obj,
+            target_source,
+            run_dir,
+            &mut agent_executions,
+        )
+        .await?;
+        let twin_end = self
+            .record_event(
+                run_id,
+                Some(&twin_episode),
+                "twin",
+                "ash",
+                "complete",
+                &format!("Provisioned {} twin service(s)", twin.services.len()),
+                &log_path,
+            )
+            .await?;
+        self.finish_episode(&twin_episode, "success", Some(1.0))
+            .await?;
+        self.record_phase_attribution(
+            run_id,
+            &twin_episode,
+            "twin",
+            "ash",
+            "success",
+            Some(1.0),
+            &memory_context,
+            briefing,
+            &agent_executions,
+            &mut phase_attributions,
+            run_dir,
+        )
+        .await?;
+        self.link_events(
+            twin_start.event_id,
+            twin_end.event_id,
+            "contributed_to",
+            1.0,
+        )
+        .await?;
+        release_agent(&mut blackboard, "ash");
+        push_unique(&mut blackboard.resolved_items, "twin");
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+
+        let hidden_episode = self
+            .start_episode(
+                run_id,
+                "hidden_scenarios",
+                "Resume hidden scenarios after transaction approval",
+            )
+            .await?;
+        blackboard.current_phase = "hidden_scenarios".to_string();
+        blackboard.active_goal = "Resume hidden scenarios after transaction approval".to_string();
+        claim_agent(
+            &mut blackboard,
+            "sable",
+            "evaluate hidden scenarios after transaction",
+        );
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.update_run_status(run_id, "hidden_scenarios").await?;
+        let hidden_start = self
+            .record_event(
+                run_id,
+                Some(&hidden_episode),
+                "hidden_scenarios",
+                "sable",
+                "running",
+                "Evaluating hidden scenarios after transaction approval",
+                &log_path,
+            )
+            .await?;
+        let predicted_final_status = if validation.passed {
+            "completed"
+        } else {
+            "completed_with_issues"
+        };
+        let events_so_far = self.list_run_events(run_id).await?;
+        let run_attempt = self.run_attempt_number(run_id).await?;
+        let hidden_definitions =
+            scenarios::load_hidden_scenarios(&self.paths.scenarios, &spec_obj.id)?;
+        let hidden_scenarios = if hidden_definitions.is_empty() {
+            HiddenScenarioSummary {
+                passed: true,
+                results: vec![HiddenScenarioEvaluation {
+                    scenario_id: "resume-no-hidden-definitions".to_string(),
+                    title: "No hidden scenarios configured".to_string(),
+                    passed: true,
+                    details: "No protected hidden scenarios were configured for this spec during transaction resume.".to_string(),
+                    checks: vec![HiddenScenarioCheckResult {
+                        kind: "scenario_store".to_string(),
+                        passed: true,
+                        details: "No hidden scenario definition matched the spec id.".to_string(),
+                    }],
+                }],
+            }
+        } else {
+            scenarios::evaluate_hidden_scenarios(
+                &hidden_definitions,
+                predicted_final_status,
+                run_attempt,
+                &events_so_far,
+                validation,
+                &twin,
+                &agent_executions,
+                run_dir,
+            )
+        };
+        self.write_json_file(&run_dir.join("hidden_scenarios.json"), &hidden_scenarios)
+            .await?;
+        push_unique(&mut blackboard.artifact_refs, "hidden_scenarios.json");
+        self.write_agent_execution(
+            &profiles,
+            "sable",
+            "Execute hidden scenarios after an approved implementation transaction.",
+            &format!("Hidden scenarios passed: {}", hidden_scenarios.passed),
+            &serde_json::to_string_pretty(&hidden_scenarios)?,
+            "hidden_scenarios",
+            &hidden_episode,
+            spec_obj,
+            target_source,
+            run_dir,
+            &mut agent_executions,
+        )
+        .await?;
+        let hidden_outcome = if hidden_scenarios.passed {
+            "success"
+        } else {
+            "failure"
+        };
+        let hidden_end = self
+            .record_event(
+                run_id,
+                Some(&hidden_episode),
+                "hidden_scenarios",
+                "sable",
+                if hidden_scenarios.passed {
+                    "complete"
+                } else {
+                    "warning"
+                },
+                &format!(
+                    "Transaction hidden-scenario continuation finished: {} scenario(s)",
+                    hidden_scenarios.results.len()
+                ),
+                &log_path,
+            )
+            .await?;
+        self.finish_episode(
+            &hidden_episode,
+            hidden_outcome,
+            Some(if hidden_scenarios.passed { 1.0 } else { 0.5 }),
+        )
+        .await?;
+        self.record_phase_attribution(
+            run_id,
+            &hidden_episode,
+            "hidden_scenarios",
+            "sable",
+            hidden_outcome,
+            Some(if hidden_scenarios.passed { 1.0 } else { 0.5 }),
+            &memory_context,
+            &sable_briefing,
+            &agent_executions,
+            &mut phase_attributions,
+            run_dir,
+        )
+        .await?;
+        self.link_events(
+            hidden_start.event_id,
+            hidden_end.event_id,
+            "contributed_to",
+            if hidden_scenarios.passed { 1.0 } else { 0.5 },
+        )
+        .await?;
+        release_agent(&mut blackboard, "sable");
+        if hidden_scenarios.passed {
+            push_unique(&mut blackboard.resolved_items, "hidden_scenarios");
+            remove_blocker(&mut blackboard, "hidden_scenarios_failed");
+        } else {
+            push_unique(&mut blackboard.open_blockers, "hidden_scenarios_failed");
+        }
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+
+        let artifacts_episode = self
+            .start_episode(
+                run_id,
+                "artifacts",
+                "Package artifacts after transaction continuation",
+            )
+            .await?;
+        blackboard.current_phase = "artifacts".to_string();
+        blackboard.active_goal =
+            "Refresh artifact bundle after transaction continuation".to_string();
+        claim_agent(&mut blackboard, "flint", "prepare resumed artifact bundle");
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        self.update_run_status(run_id, "artifacts").await?;
+        let artifacts_start = self
+            .record_event(
+                run_id,
+                Some(&artifacts_episode),
+                "artifacts",
+                "flint",
+                "running",
+                "Packaging artifacts after transaction continuation",
+                &log_path,
+            )
+            .await?;
+        self.write_agent_execution(
+            &profiles,
+            "flint",
+            "Collect resumed transaction outputs, logs, and evaluation evidence into the artifact bundle.",
+            "Prepared resumed bundle contents for packaging.",
+            &list_run_directory(run_dir)?.join("\n"),
+            "artifacts",
+            &artifacts_episode,
+            spec_obj,
+            target_source,
+            run_dir,
+            &mut agent_executions,
+        )
+        .await?;
+        if let Err(error) = self
+            .write_exploration_log(run_id, spec_obj, target_source, run_dir)
+            .await
+        {
+            tracing::warn!("exploration log write failed during transaction resume: {error}");
+        } else {
+            push_unique(&mut blackboard.artifact_refs, "exploration_log.md");
+            push_unique(&mut blackboard.artifact_refs, "exploration_log.json");
+            push_unique(
+                &mut blackboard.artifact_refs,
+                "dead_end_registry_snapshot.json",
+            );
+        }
+        self.package_artifacts(run_id).await?;
+        let generated_docs = self
+            .flint_generate_docs(run_id, spec_obj, target_source, run_dir, briefing)
+            .await?;
+        for artifact in &generated_docs {
+            push_unique(&mut blackboard.artifact_refs, artifact);
+        }
+        let artifacts_end = self
+            .record_event(
+                run_id,
+                Some(&artifacts_episode),
+                "artifacts",
+                "flint",
+                "complete",
+                "Artifact bundle refreshed after transaction continuation",
+                &log_path,
+            )
+            .await?;
+        self.finish_episode(&artifacts_episode, "success", Some(1.0))
+            .await?;
+        self.record_phase_attribution(
+            run_id,
+            &artifacts_episode,
+            "artifacts",
+            "flint",
+            "success",
+            Some(1.0),
+            &memory_context,
+            briefing,
+            &agent_executions,
+            &mut phase_attributions,
+            run_dir,
+        )
+        .await?;
+        self.link_events(
+            artifacts_start.event_id,
+            artifacts_end.event_id,
+            "contributed_to",
+            1.0,
+        )
+        .await?;
+        release_agent(&mut blackboard, "flint");
+        push_unique(&mut blackboard.resolved_items, "artifacts");
+        self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+
+        let factory_episode = crate::models::FactoryEpisode {
+            run_id: run_id.to_string(),
+            product: target_source.label.clone(),
+            spec_id: spec_obj.id.clone(),
+            features: spec_obj.acceptance_criteria.clone(),
+            agent_events: self.list_run_events(run_id).await.unwrap_or_default(),
+            tool_events: vec![],
+            phase_attributions: phase_attributions.clone(),
+            twin_env: Some(twin.clone()),
+            validation: Some(validation.clone()),
+            scenarios: Some(hidden_scenarios.clone()),
+            decision: None,
+            created_at: Utc::now(),
+        };
+        if let Err(error) = self.coobie.ingest_episode(&factory_episode).await {
+            tracing::warn!("Coobie ingest failed during transaction continuation: {error}");
+        } else if let Ok(report) = self.coobie.emit_report(run_id, &spec_obj.id).await {
+            let report_response = crate::coobie::render_coobie_report_response(&report);
+            let _ = self
+                .write_json_file(&run_dir.join("causal_report.json"), &report)
+                .await;
+            let _ =
+                tokio::fs::write(run_dir.join("coobie_report_response.md"), &report_response).await;
+            let _ = tokio::fs::write(run_dir.join("causal_summary.md"), &report_response).await;
+            push_unique(&mut blackboard.artifact_refs, "causal_report.json");
+            push_unique(&mut blackboard.artifact_refs, "coobie_report_response.md");
+            push_unique(&mut blackboard.artifact_refs, "causal_summary.md");
+            self.sync_blackboard(&blackboard, Some(run_dir)).await?;
+        }
+
+        if let Err(error) = self.ash_teardown_twin(&twin, run_dir).await {
+            let _ = self
+                .record_event(
+                    run_id,
+                    None,
+                    "twin",
+                    "ash",
+                    "warning",
+                    &format!("Twin teardown skipped after transaction continuation: {error}"),
+                    &log_path,
+                )
+                .await;
+        }
+        self.write_run_timing_artifact(run_id, run_dir).await?;
+        self.package_artifacts(run_id).await?;
+        let final_status = if validation.passed && hidden_scenarios.passed {
+            "completed"
+        } else {
+            "completed_with_issues"
+        };
+        self.update_run_status(run_id, final_status).await?;
+        self.record_decision(
+            run_id,
+            "keeper",
+            "artifacts",
+            "transaction_continuation",
+            final_status,
+            &[
+                "pause_after_validation".to_string(),
+                "retry_hidden_scenarios".to_string(),
+            ],
+            &format!(
+                "Transaction continuation completed hidden scenarios and artifacts: validation_passed={}, hidden_passed={}.",
+                validation.passed, hidden_scenarios.passed
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn attach_transaction_artifacts_to_blackboard(&self, run_id: &str) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let blackboard_path = run_dir.join("blackboard.json");
+        if !blackboard_path.exists() {
+            return Ok(());
+        }
+        let raw = tokio::fs::read_to_string(&blackboard_path).await?;
+        let mut board = serde_json::from_str::<BlackboardState>(&raw)?;
+        push_unique(&mut board.artifact_refs, "transaction_implementation.json");
+        push_unique(&mut board.artifact_refs, "transaction_implementation.md");
+        push_unique(&mut board.artifact_refs, "mason_edit_application.json");
+        push_unique(&mut board.artifact_refs, "mason_edit_application.md");
+        self.sync_blackboard(&board, Some(&run_dir)).await
+    }
+
+    async fn mark_transaction_rollback_on_blackboard(
+        &self,
+        run_id: &str,
+        restored_matches: bool,
+    ) -> Result<()> {
+        let run_dir = self.run_dir(run_id);
+        let blackboard_path = run_dir.join("blackboard.json");
+        if !blackboard_path.exists() {
+            return Ok(());
+        }
+        let raw = tokio::fs::read_to_string(&blackboard_path).await?;
+        let mut board = serde_json::from_str::<BlackboardState>(&raw)?;
+        push_unique(&mut board.artifact_refs, "transaction_implementation.json");
+        push_unique(&mut board.artifact_refs, "transaction_implementation.md");
+        push_unique(&mut board.resolved_items, "transaction_rollback");
+        push_unique(
+            &mut board.open_blockers,
+            "validation_after_rollback_required",
+        );
+        if !restored_matches {
+            push_unique(&mut board.open_blockers, "transaction_rollback_drift");
+        }
+        self.sync_blackboard(&board, Some(&run_dir)).await
     }
 
     async fn upsert_phase_attribution(&self, record: &PhaseAttributionRecord) -> Result<()> {
@@ -10325,11 +13358,17 @@ Return JSON only.",
                 required_checks,
                 guardrails,
                 query_terms,
+                briefing_scope,
+                briefing_token_budget,
+                briefing_tokens_used,
+                briefing_hits_provided,
+                stakeholder_alignment_json,
                 created_at
             )
             VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24
             )
             ON CONFLICT(episode_id) DO UPDATE SET
                 attribution_id = excluded.attribution_id,
@@ -10349,6 +13388,11 @@ Return JSON only.",
                 required_checks = excluded.required_checks,
                 guardrails = excluded.guardrails,
                 query_terms = excluded.query_terms,
+                briefing_scope = excluded.briefing_scope,
+                briefing_token_budget = excluded.briefing_token_budget,
+                briefing_tokens_used = excluded.briefing_tokens_used,
+                briefing_hits_provided = excluded.briefing_hits_provided,
+                stakeholder_alignment_json = excluded.stakeholder_alignment_json,
                 created_at = excluded.created_at
             "#,
         )
@@ -10370,6 +13414,11 @@ Return JSON only.",
         .bind(serde_json::to_string(&record.required_checks)?)
         .bind(serde_json::to_string(&record.guardrails)?)
         .bind(serde_json::to_string(&record.query_terms)?)
+        .bind(record.briefing_scope.map(|scope| scope.to_string()))
+        .bind(i64::from(record.briefing_token_budget))
+        .bind(i64::from(record.briefing_tokens_used))
+        .bind(record.briefing_hits_provided as i64)
+        .bind(serde_json::to_string(&record.stakeholder_alignment)?)
         .bind(record.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -10468,6 +13517,19 @@ Return JSON only.",
         let _ = self
             .event_tx
             .send(crate::models::LiveEvent::RunEvent(live.clone()));
+        self.try_write_calvin_event(
+            run_id,
+            Some(phase),
+            agent,
+            "run_event",
+            None,
+            None,
+            status,
+            None,
+            None,
+            None,
+        )
+        .await;
         Ok(live)
     }
 
@@ -10507,7 +13569,21 @@ Return JSON only.",
         .await
         {
             tracing::warn!("record_llm_cost_event failed: {e}");
+            return;
         }
+        self.try_write_calvin_event(
+            run_id,
+            Some(phase),
+            agent,
+            "llm_call",
+            Some(provider),
+            Some(model),
+            "success",
+            Some(usage.latency_ms as i32),
+            Some(usage.input_tokens as i32),
+            Some(usage.output_tokens as i32),
+        )
+        .await;
     }
 
     /// Aggregate all cost events for a run into a summary.
@@ -10650,82 +13726,65 @@ Return JSON only.",
         &self,
         workspace_prefix: &str,
     ) -> (bool, Vec<String>, String) {
-        let coord_path = self
-            .paths
-            .factory
-            .join("coordination")
-            .join("assignments.json");
-
-        let raw = match tokio::fs::read_to_string(&coord_path).await {
-            Ok(r) => r,
-            // No coordination file means no active claims — allow.
-            Err(_) => {
-                return (
-                    true,
-                    vec![],
-                    "No active coordination state — write allowed.".to_string(),
-                )
-            }
-        };
-
-        let state: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    true,
-                    vec![],
-                    "Coordination state unreadable — write allowed.".to_string(),
-                )
+        let state = match crate::api::ensure_assignments_state(self).await {
+            Ok(state) => state,
+            Err(error) => {
+                let msg = format!("Coordination state unavailable — denying write: {error}");
+                return (false, vec![msg.clone()], msg);
             }
         };
 
         let now = Utc::now();
-        let active = match state.get("active").and_then(|v| v.as_object()) {
-            Some(map) => map,
-            None => {
-                return (
-                    true,
-                    vec![],
-                    "No active claims — write allowed.".to_string(),
-                )
-            }
+        let overlaps = |files: &[String]| {
+            files
+                .iter()
+                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f))
         };
 
-        for (owner, assignment) in active {
-            if owner == "mason" {
-                continue; // Mason's own claim is fine.
-            }
-            // Check TTL: if expired, skip.
-            if let Some(expires_at) = assignment.get("expires_at").and_then(|v| v.as_str()) {
-                if !expires_at.is_empty() {
-                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                        if exp.with_timezone(&Utc) < now {
-                            continue;
-                        }
-                    }
+        let Some(mason_assignment) = state.active.get("mason") else {
+            let msg = format!(
+                "Cannot write to '{}': Mason does not hold an active workspace lease",
+                workspace_prefix
+            );
+            return (false, vec![msg.clone()], msg);
+        };
+
+        if mason_assignment.status == "stale" || !overlaps(&mason_assignment.files) {
+            let msg = format!(
+                "Cannot write to '{}': Mason workspace lease is stale or does not cover this path",
+                workspace_prefix
+            );
+            return (false, vec![msg.clone()], msg);
+        };
+
+        if !mason_assignment.expires_at.is_empty() {
+            if let Ok(expires_at) =
+                chrono::DateTime::parse_from_rfc3339(&mason_assignment.expires_at)
+            {
+                if expires_at.with_timezone(&Utc) < now {
+                    let msg = format!(
+                        "Cannot write to '{}': Mason workspace lease has expired",
+                        workspace_prefix
+                    );
+                    return (false, vec![msg.clone()], msg);
                 }
             }
-            // Check if the files overlap with workspace_prefix.
-            let files = assignment
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
+        }
 
-            let overlaps = files
-                .iter()
-                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f));
-            if !overlaps && !files.is_empty() {
+        for (owner, assignment) in &state.active {
+            if owner == "mason" {
                 continue;
             }
-
-            // Another agent holds an active, non-expired, overlapping claim.
-            let status = assignment
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("active");
-            if status == "stale" {
+            if assignment.status == "stale" || !overlaps(&assignment.files) {
                 continue;
+            }
+            if !assignment.expires_at.is_empty() {
+                if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(&assignment.expires_at)
+                {
+                    if expires_at.with_timezone(&Utc) < now {
+                        continue;
+                    }
+                }
             }
 
             let msg = format!(
@@ -10738,55 +13797,318 @@ Return JSON only.",
         (true, vec![], "Workspace lease check passed.".to_string())
     }
 
+    pub async fn claim_mason_workspace_lease(
+        &self,
+        run_id: &str,
+        workspace_prefix: &str,
+        guardrails: &[String],
+    ) -> Result<()> {
+        let mut state = crate::api::ensure_assignments_state(self)
+            .await
+            .context("loading coordination state for Mason workspace claim")?;
+        let now = Utc::now();
+        let overlaps = |files: &[String]| {
+            files
+                .iter()
+                .any(|f| f.starts_with(workspace_prefix) || workspace_prefix.starts_with(f))
+        };
+
+        if let Some(existing) = state.active.get("mason") {
+            if existing.status != "stale" && overlaps(&existing.files) {
+                return Ok(());
+            }
+            if existing.status != "stale" && !existing.files.is_empty() {
+                anyhow::bail!(
+                    "Mason already holds an active workspace lease on {}",
+                    existing.files.join(", ")
+                );
+            }
+        }
+
+        for (owner, assignment) in &state.active {
+            if owner == "mason" || assignment.status == "stale" {
+                continue;
+            }
+            if !overlaps(&assignment.files) {
+                continue;
+            }
+            if !assignment.expires_at.is_empty() {
+                if let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(&assignment.expires_at)
+                {
+                    if expires_at.with_timezone(&Utc) < now {
+                        continue;
+                    }
+                }
+            }
+
+            let message = format!(
+                "Keeper blocked Mason workspace claim: {} already owns {}",
+                owner, workspace_prefix
+            );
+            self.record_decision(
+                run_id,
+                "keeper",
+                "coordination",
+                "workspace_claim",
+                "deny_workspace_claim",
+                &[
+                    "grant_workspace_claim".to_string(),
+                    "wait_for_conflicting_lease".to_string(),
+                ],
+                &message,
+            )
+            .await;
+            crate::api::append_policy_event(
+                self,
+                crate::api::CoordinationPolicyEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    managed_by: state.managed_by.clone(),
+                    event_type: "workspace_claim_conflict".to_string(),
+                    status: "blocked".to_string(),
+                    agent: Some("mason".to_string()),
+                    conflicting_agent: Some(owner.clone()),
+                    files: assignment.files.clone(),
+                    message: message.clone(),
+                    created_at: now.to_rfc3339(),
+                },
+            )
+            .await
+            .ok();
+            anyhow::bail!(message);
+        }
+
+        let ttl_secs = if state.stale_after_seconds > 0 {
+            state.stale_after_seconds
+        } else {
+            600
+        };
+        let claimed_at = now.to_rfc3339();
+        state.active.insert(
+            "mason".to_string(),
+            crate::api::Assignment {
+                agent: "mason".to_string(),
+                task: "owns staged product workspace".to_string(),
+                files: vec![workspace_prefix.to_string()],
+                claimed_at: claimed_at.clone(),
+                last_heartbeat_at: claimed_at,
+                status: "active".to_string(),
+                resource_kind: "workspace".to_string(),
+                ttl_secs,
+                guardrails: guardrails.to_vec(),
+                expires_at: (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339(),
+            },
+        );
+        state.updated_at = now.to_rfc3339();
+
+        crate::api::append_policy_event(
+            self,
+            crate::api::CoordinationPolicyEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                managed_by: state.managed_by.clone(),
+                event_type: "workspace_claim_granted".to_string(),
+                status: "granted".to_string(),
+                agent: Some("mason".to_string()),
+                conflicting_agent: None,
+                files: vec![workspace_prefix.to_string()],
+                message: format!(
+                    "Keeper granted Mason workspace lease for {}",
+                    workspace_prefix
+                ),
+                created_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .ok();
+        self.record_decision(
+            run_id,
+            "keeper",
+            "coordination",
+            "workspace_claim",
+            "grant_workspace_claim",
+            &[
+                "deny_workspace_claim".to_string(),
+                "wait_for_conflicting_lease".to_string(),
+            ],
+            &format!(
+                "Keeper granted Mason workspace lease for {} with {} guardrail(s).",
+                workspace_prefix,
+                guardrails.len()
+            ),
+        )
+        .await;
+
+        crate::api::save_assignments(self, &state)
+            .await
+            .context("saving Mason workspace claim")
+    }
+
+    pub async fn release_mason_workspace_lease(&self, run_id: &str) -> Result<()> {
+        let mut state = crate::api::ensure_assignments_state(self)
+            .await
+            .context("loading coordination state for Mason workspace release")?;
+        let Some(assignment) = state.active.remove("mason") else {
+            return Ok(());
+        };
+        state.updated_at = Utc::now().to_rfc3339();
+
+        crate::api::append_policy_event(
+            self,
+            crate::api::CoordinationPolicyEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                managed_by: state.managed_by.clone(),
+                event_type: "workspace_claim_released".to_string(),
+                status: "released".to_string(),
+                agent: Some("mason".to_string()),
+                conflicting_agent: None,
+                files: assignment.files.clone(),
+                message: "Keeper released Mason workspace lease".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .ok();
+        self.record_decision(
+            run_id,
+            "keeper",
+            "coordination",
+            "workspace_release",
+            "release_workspace_claim",
+            &["retain_workspace_claim".to_string()],
+            &format!(
+                "Keeper released Mason workspace lease covering {}.",
+                assignment.files.join(", ")
+            ),
+        )
+        .await;
+
+        crate::api::save_assignments(self, &state)
+            .await
+            .context("saving Mason workspace release")
+    }
+
     // ── v1-B: Memory supersession persistence ────────────────────────────────
 
     /// Persist a memory supersession event: old_id was invalidated by new_id.
     ///
     /// Also updates the old entry's provenance.superseded_by on disk (via
     /// MemoryStore) so retrieval hits include the invalidation reason.
-    pub async fn record_memory_supersession(
+    pub async fn record_memory_supersession_in_store(
         &self,
+        store: &MemoryStore,
         old_memory_id: &str,
         new_memory_id: &str,
         reason: &str,
-    ) {
+    ) -> Result<()> {
+        let memory_root = store.root().display().to_string();
+        let existing = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(1)
+            FROM memory_updates
+            WHERE old_memory_id = ?1 AND new_memory_id = ?2 AND memory_root = ?3
+            "#,
+        )
+        .bind(old_memory_id)
+        .bind(new_memory_id)
+        .bind(&memory_root)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+        if existing > 0 {
+            return Ok(());
+        }
+
         let update_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        if let Err(e) = sqlx::query(
+        sqlx::query(
             r#"
-            INSERT INTO memory_updates (update_id, old_memory_id, new_memory_id, reason, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO memory_updates (
+                update_id,
+                old_memory_id,
+                new_memory_id,
+                memory_root,
+                reason,
+                review_status,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)
             "#,
         )
         .bind(&update_id)
         .bind(old_memory_id)
         .bind(new_memory_id)
+        .bind(&memory_root)
         .bind(reason)
         .bind(&now)
         .execute(&self.pool)
-        .await
-        {
-            tracing::warn!("record_memory_supersession db write failed: {e}");
-        }
+        .await?;
 
         // Mark the old entry on disk as superseded so retrieval surfaces the flag.
-        if let Err(e) = self
-            .memory_store
+        store
             .annotate_entry_status(old_memory_id, "superseded", Some(new_memory_id))
-            .await
-        {
-            tracing::warn!(
-                "record_memory_supersession file annotation failed for {old_memory_id}: {e}"
-            );
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_memory_supersession(
+        &self,
+        old_memory_id: &str,
+        new_memory_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.record_memory_supersession_in_store(
+            &self.memory_store,
+            old_memory_id,
+            new_memory_id,
+            reason,
+        )
+        .await
+    }
+
+    async fn reconcile_ingested_memory_supersessions(
+        &self,
+        store: &MemoryStore,
+        result: &MemoryIngestResult,
+    ) -> Result<()> {
+        let Some(new_memory_id) = result
+            .note_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+        else {
+            return Ok(());
+        };
+
+        let candidates = store
+            .detect_supersession_candidates(&new_memory_id, self.embedding_store.as_ref())
+            .await?;
+        for candidate in candidates {
+            self.record_memory_supersession_in_store(
+                store,
+                &candidate.stale_memory_id,
+                &new_memory_id,
+                &candidate.reason,
+            )
+            .await?;
         }
+        Ok(())
     }
 
     /// Return the full supersession history, most recent first.
     pub async fn list_memory_updates(&self) -> Result<Vec<crate::models::MemoryUpdateRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT update_id, old_memory_id, new_memory_id, reason, created_at
+            SELECT
+                update_id,
+                old_memory_id,
+                new_memory_id,
+                memory_root,
+                reason,
+                review_status,
+                reviewed_by,
+                review_note,
+                reviewed_at,
+                created_at
             FROM memory_updates
             ORDER BY created_at DESC
             "#,
@@ -10800,11 +14122,142 @@ Return JSON only.",
                     update_id: row.get("update_id"),
                     old_memory_id: row.get("old_memory_id"),
                     new_memory_id: row.get("new_memory_id"),
+                    memory_root: row
+                        .get::<Option<String>, _>("memory_root")
+                        .filter(|value| !value.trim().is_empty()),
                     reason: row.get("reason"),
+                    review_status: row.get::<String, _>("review_status"),
+                    reviewed_by: row
+                        .get::<Option<String>, _>("reviewed_by")
+                        .filter(|value| !value.trim().is_empty()),
+                    review_note: row
+                        .get::<Option<String>, _>("review_note")
+                        .filter(|value| !value.trim().is_empty()),
+                    reviewed_at: row
+                        .get::<Option<String>, _>("reviewed_at")
+                        .filter(|value| !value.trim().is_empty()),
                     created_at: row.get("created_at"),
                 })
             })
             .collect()
+    }
+
+    pub async fn review_memory_update(
+        &self,
+        update_id: &str,
+        status: &str,
+        reviewed_by: Option<&str>,
+        review_note: Option<&str>,
+    ) -> Result<crate::models::MemoryUpdateRecord> {
+        let normalized_status = normalize_memory_update_review_status(status)?;
+        let Some(current) = self.get_memory_update(update_id).await? else {
+            bail!("memory update '{}' not found", update_id);
+        };
+
+        let store = current
+            .memory_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| MemoryStore::new(PathBuf::from(value)))
+            .unwrap_or_else(|| self.memory_store.clone());
+
+        match normalized_status {
+            "confirmed" => {
+                store
+                    .annotate_entry_status(
+                        &current.old_memory_id,
+                        "superseded",
+                        Some(&current.new_memory_id),
+                    )
+                    .await?;
+            }
+            "rejected" => {
+                store
+                    .clear_entry_supersession(&current.old_memory_id, Some(&current.new_memory_id))
+                    .await?;
+            }
+            _ => {}
+        }
+
+        let reviewed_by = reviewed_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let review_note = review_note
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let reviewed_at = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE memory_updates
+            SET review_status = ?2, reviewed_by = ?3, review_note = ?4, reviewed_at = ?5
+            WHERE update_id = ?1
+            "#,
+        )
+        .bind(update_id)
+        .bind(normalized_status)
+        .bind(reviewed_by.as_deref())
+        .bind(review_note.as_deref())
+        .bind(&reviewed_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_memory_update(update_id)
+            .await?
+            .with_context(|| format!("memory update '{}' not found after review", update_id))
+    }
+
+    async fn get_memory_update(
+        &self,
+        update_id: &str,
+    ) -> Result<Option<crate::models::MemoryUpdateRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                update_id,
+                old_memory_id,
+                new_memory_id,
+                memory_root,
+                reason,
+                review_status,
+                reviewed_by,
+                review_note,
+                reviewed_at,
+                created_at
+            FROM memory_updates
+            WHERE update_id = ?1
+            "#,
+        )
+        .bind(update_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            Ok(crate::models::MemoryUpdateRecord {
+                update_id: row.get("update_id"),
+                old_memory_id: row.get("old_memory_id"),
+                new_memory_id: row.get("new_memory_id"),
+                memory_root: row
+                    .get::<Option<String>, _>("memory_root")
+                    .filter(|value| !value.trim().is_empty()),
+                reason: row.get("reason"),
+                review_status: row.get::<String, _>("review_status"),
+                reviewed_by: row
+                    .get::<Option<String>, _>("reviewed_by")
+                    .filter(|value| !value.trim().is_empty()),
+                review_note: row
+                    .get::<Option<String>, _>("review_note")
+                    .filter(|value| !value.trim().is_empty()),
+                reviewed_at: row
+                    .get::<Option<String>, _>("reviewed_at")
+                    .filter(|value| !value.trim().is_empty()),
+                created_at: row.get("created_at"),
+            })
+        })
+        .transpose()
     }
 
     // ── v1-D: Operator Model Interview ───────────────────────────────────────
@@ -10824,6 +14277,15 @@ Return JSON only.",
             .get_session(session_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("operator model session not found: {session_id}"))?;
+        if session.status == "completed" {
+            anyhow::bail!("operator model session is already completed: {session_id}");
+        }
+        if session.pending_layer.as_deref() != Some(layer) {
+            anyhow::bail!(
+                "operator model layer mismatch: session expects {:?}, got {layer}",
+                session.pending_layer
+            );
+        }
 
         let messages = self.chat.list_messages(thread_id).await?;
         let layer_messages: Vec<_> = messages
@@ -10901,19 +14363,22 @@ Return JSON only.",
 
         let mut operating_rhythms: Vec<String> = Vec::new();
         let mut recurring_decisions: Vec<String> = Vec::new();
+        let mut preferred_tools: Vec<String> = Vec::new();
+        let mut risk_tolerances: Vec<String> = Vec::new();
+        let version = checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.version)
+            .max()
+            .unwrap_or(profile.current_version.max(1));
 
         for cp in &checkpoints {
-            let lines: Vec<String> = cp
-                .summary_md
-                .lines()
-                .map(|l| l.trim_start_matches("- ").trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
+            let lines = operator_model_checkpoint_lines(&cp.summary_md);
             match cp.layer.as_str() {
-                "operating_rhythms" => operating_rhythms.extend(lines),
-                "recurring_decisions" => recurring_decisions.extend(lines),
+                "operating_rhythms" => extend_unique(&mut operating_rhythms, lines.clone(), 12),
+                "recurring_decisions" => extend_unique(&mut recurring_decisions, lines.clone(), 12),
                 _ => {}
             }
+            collect_commissioning_brief_signals(&lines, &mut preferred_tools, &mut risk_tolerances);
         }
 
         // Top-3 patterns for Scout: rhythms first, then decisions
@@ -10930,8 +14395,8 @@ Return JSON only.",
             operating_rhythms,
             recurring_decisions,
             top_patterns,
-            preferred_tools: Vec::new(),
-            risk_tolerances: Vec::new(),
+            preferred_tools,
+            risk_tolerances,
         };
 
         // Persist to export root
@@ -10941,7 +14406,17 @@ Return JSON only.",
         tokio::fs::create_dir_all(&export_root).await?;
         let brief_path = export_root.join("commissioning-brief.json");
         let json = serde_json::to_string_pretty(&brief)?;
-        tokio::fs::write(&brief_path, json).await?;
+        tokio::fs::write(&brief_path, &json).await?;
+        let _ = self
+            .operator_models
+            .record_export(
+                profile_id,
+                version,
+                "commissioning-brief.json",
+                &json,
+                "application/json",
+            )
+            .await?;
 
         Ok(brief)
     }
@@ -11832,6 +15307,10 @@ Return JSON only.",
             let mut guard = self.blackboard.write().await;
             *guard = board.clone();
         }
+        if !board.run_id.trim().is_empty() {
+            db::sync_agent_runtime_state(&self.pool, &board.run_id, &board.agent_instances).await?;
+            self.sync_packchat_runtime_rosters(board).await?;
+        }
         if let Some(run_dir) = run_dir {
             self.write_json_file(&run_dir.join("blackboard.json"), board)
                 .await?;
@@ -11843,20 +15322,28 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn load_run_blackboard(&self, run_id: &str) -> Result<Option<BlackboardState>> {
+        let path = self.run_dir(run_id).join("blackboard.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
     async fn finalize_blackboard(&self, final_status: &str, run_dir: &Path) -> Result<()> {
         let mut board = self.blackboard.write().await;
         board.current_phase = "complete".to_string();
         board.active_goal = format!("Run finished with status {final_status}");
         board.agent_claims.clear();
+        board.agent_instances.clear();
         let snapshot = board.clone();
         drop(board);
-        self.write_json_file(&run_dir.join("blackboard.json"), &snapshot)
-            .await?;
-        if !snapshot.run_id.trim().is_empty() {
-            self.sync_checkpoints_for_board(&snapshot.run_id, &snapshot)
-                .await?;
-        }
-        Ok(())
+        self.sync_blackboard(&snapshot, Some(run_dir)).await
     }
 
     async fn mark_blackboard_failed(&self, message: &str, run_dir: &Path) -> Result<()> {
@@ -11865,17 +15352,42 @@ Return JSON only.",
         board.active_goal = "Run failed".to_string();
         push_unique(&mut board.open_blockers, message);
         board.agent_claims.clear();
+        board.agent_instances.clear();
         let snapshot = board.clone();
         drop(board);
         if run_dir.exists() {
-            self.write_json_file(&run_dir.join("blackboard.json"), &snapshot)
-                .await?;
-            if !snapshot.run_id.trim().is_empty() {
-                self.sync_checkpoints_for_board(&snapshot.run_id, &snapshot)
-                    .await?;
-            }
+            self.sync_blackboard(&snapshot, Some(run_dir)).await?;
         }
         Ok(())
+    }
+
+    async fn sync_packchat_runtime_rosters(&self, board: &BlackboardState) -> Result<()> {
+        let mut by_thread: BTreeMap<String, Vec<AgentRuntimeState>> = BTreeMap::new();
+        for runtime in &board.agent_instances {
+            if let Some(thread_id) = runtime.thread_id.as_ref() {
+                by_thread
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .push(runtime.clone());
+            }
+        }
+        if let Some(thread_id) = board.packchat_thread_id.as_ref() {
+            by_thread.entry(thread_id.clone()).or_default();
+        }
+        for (thread_id, runtimes) in by_thread {
+            self.chat.sync_runtime_roster(&thread_id, &runtimes).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_packchat_run_thread(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+    ) -> Result<crate::chat::ChatThread> {
+        self.chat
+            .ensure_run_thread(run_id, &format!("Pack Coordination — {}", spec_obj.title))
+            .await
     }
 
     async fn attach_lessons_to_blackboard(
@@ -12193,7 +15705,10 @@ Return JSON only.",
             SELECT attribution_id, run_id, episode_id, phase, agent_name, outcome, confidence,
                    prompt_bundle_fingerprint, prompt_bundle_provider, prompt_bundle_artifact,
                    pinned_skill_ids, memory_hits, core_memory_ids, project_memory_ids,
-                   relevant_lesson_ids, required_checks, guardrails, query_terms, created_at
+                   relevant_lesson_ids, required_checks, guardrails, query_terms,
+                   briefing_scope, briefing_token_budget, briefing_tokens_used,
+                   briefing_hits_provided,
+                   stakeholder_alignment_json, created_at
             FROM phase_attributions
             WHERE run_id = ?1
             ORDER BY created_at ASC
@@ -12243,6 +15758,18 @@ Return JSON only.",
                     .with_context(|| "parsing phase attribution guardrails")?,
                 query_terms: serde_json::from_str(row.get::<String, _>("query_terms").as_str())
                     .with_context(|| "parsing phase attribution query_terms")?,
+                briefing_scope: row
+                    .get::<Option<String>, _>("briefing_scope")
+                    .map(|value| serde_json::from_str::<BriefingScope>(&format!("\"{value}\"")))
+                    .transpose()
+                    .with_context(|| "parsing phase attribution briefing_scope")?,
+                briefing_token_budget: row.get::<i64, _>("briefing_token_budget") as u32,
+                briefing_tokens_used: row.get::<i64, _>("briefing_tokens_used") as u32,
+                briefing_hits_provided: row.get::<i64, _>("briefing_hits_provided") as usize,
+                stakeholder_alignment: serde_json::from_str(
+                    row.get::<String, _>("stakeholder_alignment_json").as_str(),
+                )
+                .with_context(|| "parsing phase attribution stakeholder_alignment_json")?,
                 created_at: chrono::DateTime::parse_from_rfc3339(
                     row.get::<String, _>("created_at").as_str(),
                 )?
@@ -12782,6 +16309,22 @@ Return JSON only.",
         if resolve {
             self.resolve_checkpoint_on_blackboard(run_id, checkpoint_id)
                 .await?;
+            self.handle_transaction_checkpoint_resolution(
+                run_id,
+                &checkpoint,
+                answered_by,
+                trimmed_answer,
+                &decision_json,
+            )
+            .await?;
+            self.handle_tool_transaction_checkpoint_resolution(
+                run_id,
+                &checkpoint,
+                answered_by,
+                trimmed_answer,
+                &decision_json,
+            )
+            .await?;
         }
 
         let phase = checkpoint.phase.as_deref().unwrap_or("interaction");
@@ -13225,6 +16768,22 @@ Observed pattern: {}",
             &mut new_lessons,
         )
         .await?;
+        self.consolidate_command_trial_lessons(
+            run_id,
+            spec_obj,
+            target_source.as_ref(),
+            &mut known_lesson_ids,
+            &mut new_lessons,
+        )
+        .await?;
+        self.consolidate_reasoning_trial_lessons(
+            run_id,
+            spec_obj,
+            target_source.as_ref(),
+            &mut known_lesson_ids,
+            &mut new_lessons,
+        )
+        .await?;
 
         // Populate cross-phase causal links so Coobie can trace failure chains
         // across the full episode sequence.
@@ -13616,9 +17175,13 @@ Query terms: {}",
                 && !lesson_intervention.is_empty()
                 && !entry.content.to_lowercase().contains(&lesson_intervention)
             {
-                store
-                    .annotate_entry_status(&entry.id, "superseded", Some(&lesson.lesson_id))
-                    .await?;
+                self.record_memory_supersession_in_store(
+                    &store,
+                    &entry.id,
+                    &lesson.lesson_id,
+                    "new project lesson superseded an older lesson with the same normalized pattern",
+                )
+                .await?;
             } else if overlap >= 2 && entry_key != lesson_key {
                 store
                     .annotate_entry_status(&entry.id, "challenged", Some(&lesson.lesson_id))
@@ -13820,6 +17383,469 @@ Run ids: {}",
         }
 
         Ok(())
+    }
+
+    async fn consolidate_command_trial_lessons(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: Option<&TargetSourceMetadata>,
+        known_lesson_ids: &mut HashSet<String>,
+        new_lessons: &mut Vec<LessonRecord>,
+    ) -> Result<()> {
+        let Some(current_run) = self.get_run(run_id).await? else {
+            return Ok(());
+        };
+        let current_trials = self.load_run_command_trials(run_id).await?;
+        if current_trials.is_empty() {
+            return Ok(());
+        }
+
+        let peer_runs = self
+            .list_runs(40)
+            .await?
+            .into_iter()
+            .filter(|run| run.run_id != run_id && run.product == current_run.product)
+            .collect::<Vec<_>>();
+        let mut support_map = HashMap::<String, Vec<String>>::new();
+        for peer_run in peer_runs {
+            let peer_trials = self.load_run_command_trials(&peer_run.run_id).await?;
+            let mut seen_keys = HashSet::new();
+            for (phase, trial) in peer_trials {
+                let key =
+                    command_trial_pattern_key(&phase, &trial.raw_command, &trial.classification);
+                if seen_keys.insert(key.clone()) {
+                    support_map
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+        }
+
+        for (phase, trial) in current_trials {
+            let key = command_trial_pattern_key(&phase, &trial.raw_command, &trial.classification);
+            let Some(supporting_runs) = support_map.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-command-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "command-trial".to_string(),
+                "project-memory".to_string(),
+                phase.clone(),
+                trial.classification.clone(),
+            ];
+            if trial.passed {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let pattern = if trial.passed {
+                format!(
+                    "Repeatable command success in {}: '{}' usually completes as {}",
+                    phase, trial.raw_command, trial.classification
+                )
+            } else {
+                format!(
+                    "Repeatable command failure in {}: '{}' usually ends as {}",
+                    phase, trial.raw_command, trial.classification
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(command_trial_intervention(
+                    &trial.classification,
+                    trial.passed,
+                )),
+                tags,
+                strength: if trial.passed {
+                    (0.7 + supporting_runs.len() as f64 * 0.1).min(1.4)
+                } else {
+                    (1.0 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nCommand: {}\nExit code: {}\nClassification: {}\nSummary: {}\nstdout excerpt: {}\nstderr excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                phase,
+                trial.raw_command,
+                trial
+                    .exit_code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "signal".to_string()),
+                trial.classification,
+                trial.summary,
+                truncate_text(&trial.stdout, 200),
+                truncate_text(&trial.stderr, 200),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn consolidate_reasoning_trial_lessons(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: Option<&TargetSourceMetadata>,
+        known_lesson_ids: &mut HashSet<String>,
+        new_lessons: &mut Vec<LessonRecord>,
+    ) -> Result<()> {
+        let Some(current_run) = self.get_run(run_id).await? else {
+            return Ok(());
+        };
+        let current_success = self.run_behavioural_success(run_id).await?;
+        let current_decisions = self.load_run_decision_trials(run_id).await?;
+        let current_checkpoints = self.load_run_checkpoint_trials(run_id).await?;
+        if current_decisions.is_empty() && current_checkpoints.is_empty() {
+            return Ok(());
+        }
+
+        let peer_runs = self
+            .list_runs(40)
+            .await?
+            .into_iter()
+            .filter(|run| run.run_id != run_id && run.product == current_run.product)
+            .collect::<Vec<_>>();
+
+        let mut decision_support = HashMap::<String, Vec<String>>::new();
+        let mut checkpoint_support = HashMap::<String, Vec<String>>::new();
+        for peer_run in peer_runs {
+            let peer_success = self.run_behavioural_success(&peer_run.run_id).await?;
+
+            let mut seen_decisions = HashSet::new();
+            for decision in self.load_run_decision_trials(&peer_run.run_id).await? {
+                let key = decision_trial_pattern_key(&decision, peer_success);
+                if seen_decisions.insert(key.clone()) {
+                    decision_support
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+
+            let mut seen_checkpoints = HashSet::new();
+            for checkpoint in self.load_run_checkpoint_trials(&peer_run.run_id).await? {
+                let key = checkpoint_trial_pattern_key(&checkpoint, peer_success);
+                if seen_checkpoints.insert(key.clone()) {
+                    checkpoint_support
+                        .entry(key)
+                        .or_default()
+                        .push(peer_run.run_id.clone());
+                }
+            }
+        }
+
+        for decision in current_decisions {
+            let key = decision_trial_pattern_key(&decision, current_success);
+            let Some(supporting_runs) = decision_support.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-decision-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "decision-trial".to_string(),
+                "project-memory".to_string(),
+                decision.phase.clone(),
+                decision.agent.clone(),
+                decision.decision_kind.clone(),
+            ];
+            if current_success {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let pattern = if current_success {
+                format!(
+                    "Repeatable successful decision in {} / {}: {} -> {}",
+                    decision.phase, decision.agent, decision.decision_kind, decision.chose
+                )
+            } else {
+                format!(
+                    "Repeatable degraded decision in {} / {}: {} -> {}",
+                    decision.phase, decision.agent, decision.decision_kind, decision.chose
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(decision_trial_intervention(&decision, current_success)),
+                tags,
+                strength: if current_success {
+                    (0.8 + supporting_runs.len() as f64 * 0.1).min(1.5)
+                } else {
+                    (1.0 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nAgent: {}\nDecision kind: {}\nChose: {}\nAlternatives: {}\nJustification excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                decision.phase,
+                decision.agent,
+                decision.decision_kind,
+                decision.chose,
+                if decision.alternatives.is_empty() {
+                    "none".to_string()
+                } else {
+                    decision.alternatives.join(" | ")
+                },
+                truncate_text(&decision.justification, 240),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        for checkpoint in current_checkpoints {
+            let key = checkpoint_trial_pattern_key(&checkpoint, current_success);
+            let Some(supporting_runs) = checkpoint_support.get(&key) else {
+                continue;
+            };
+            if supporting_runs.is_empty() {
+                continue;
+            }
+
+            let lesson_id = format!("lesson-checkpoint-trial-{}", stable_key_fragment(&key));
+            if known_lesson_ids.contains(&lesson_id) {
+                continue;
+            }
+
+            let mut tags = vec![
+                "lesson".to_string(),
+                "checkpoint-trial".to_string(),
+                "project-memory".to_string(),
+                checkpoint.phase.clone(),
+                checkpoint.checkpoint_type.clone(),
+                checkpoint.intent.clone(),
+            ];
+            if current_success {
+                tags.push("success-pattern".to_string());
+            } else {
+                tags.push("failure-pattern".to_string());
+                tags.push("causal".to_string());
+            }
+
+            let decision_shape = decision_json_shape(&checkpoint.decision_json);
+            let pattern = if current_success {
+                format!(
+                    "Repeatable successful checkpoint reply in {} / {}: {} with intent {}",
+                    checkpoint.phase,
+                    checkpoint.agent,
+                    checkpoint.checkpoint_type,
+                    checkpoint.intent
+                )
+            } else {
+                format!(
+                    "Repeatable degraded checkpoint reply in {} / {}: {} with intent {}",
+                    checkpoint.phase,
+                    checkpoint.agent,
+                    checkpoint.checkpoint_type,
+                    checkpoint.intent
+                )
+            };
+            let lesson = LessonRecord {
+                lesson_id,
+                source_episode: None,
+                pattern,
+                intervention: Some(checkpoint_trial_intervention(&checkpoint, current_success)),
+                tags,
+                strength: if current_success {
+                    (0.75 + supporting_runs.len() as f64 * 0.1).min(1.4)
+                } else {
+                    (0.95 + supporting_runs.len() as f64 * 0.15).min(2.0)
+                },
+                recall_count: 0,
+                last_recalled: None,
+                created_at: Utc::now(),
+            };
+            let lesson_body = format!(
+                "Occurrences: {}\nSupporting runs: {}\nPhase: {}\nAgent: {}\nCheckpoint type: {}\nPrompt excerpt: {}\nAnswered by: {}\nIntent: {}\nDecision shape: {}\nAnswer excerpt: {}",
+                supporting_runs.len() + 1,
+                supporting_runs.join(", "),
+                checkpoint.phase,
+                checkpoint.agent,
+                checkpoint.checkpoint_type,
+                truncate_text(&checkpoint.prompt, 200),
+                checkpoint.answered_by,
+                checkpoint.intent,
+                decision_shape,
+                truncate_text(&checkpoint.answer_text, 220),
+            );
+            self.persist_lesson(
+                lesson,
+                lesson_body,
+                target_source,
+                Some(spec_obj),
+                known_lesson_ids,
+                new_lessons,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn load_run_command_trials(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<(String, CommandTrialRecord)>> {
+        let run_dir = self.run_dir(run_id);
+        let mut trials = Vec::new();
+
+        for name in [
+            "build_command_trials.json",
+            "validation_command_trials.json",
+        ] {
+            let path = run_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let raw = match tokio::fs::read_to_string(&path).await {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<CommandTrialReport>(&raw) {
+                Ok(report) => report,
+                Err(_) => continue,
+            };
+            for command in report.commands {
+                trials.push((report.phase.clone(), command));
+            }
+        }
+
+        let retriever_path = run_dir.join("retriever_execution_report.json");
+        if retriever_path.exists() {
+            let raw = tokio::fs::read_to_string(&retriever_path).await?;
+            if let Ok(report) = serde_json::from_str::<RetrieverExecutionArtifact>(&raw) {
+                for command in report.executed_commands {
+                    let outcome = CommandOutcome {
+                        success: command.passed,
+                        code: command.exit_code,
+                        stdout: command.stdout.clone(),
+                        stderr: command.stderr.clone(),
+                    };
+                    trials.push((
+                        "retriever_forge".to_string(),
+                        build_command_trial_record(&command.raw_command, &outcome),
+                    ));
+                }
+            }
+        }
+
+        Ok(trials)
+    }
+
+    async fn load_run_decision_trials(&self, run_id: &str) -> Result<Vec<DecisionTrialSnapshot>> {
+        Ok(self
+            .list_run_decisions(run_id)
+            .await?
+            .into_iter()
+            .map(|decision| DecisionTrialSnapshot {
+                agent: decision.agent,
+                phase: decision.phase,
+                decision_kind: decision.decision_kind,
+                chose: decision.chose,
+                alternatives: decision.alternatives,
+                justification: decision.justification,
+            })
+            .collect())
+    }
+
+    async fn load_run_checkpoint_trials(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<CheckpointTrialSnapshot>> {
+        let checkpoints = self.list_run_checkpoints(run_id).await?;
+        let mut snapshots = Vec::new();
+        for checkpoint in checkpoints {
+            let phase = checkpoint
+                .phase
+                .clone()
+                .unwrap_or_else(|| "interaction".to_string());
+            let agent = checkpoint
+                .agent
+                .clone()
+                .unwrap_or_else(|| "operator".to_string());
+            for answer in checkpoint.answers {
+                let intent = checkpoint_answer_intent(&answer.answer_text, &answer.decision_json);
+                snapshots.push(CheckpointTrialSnapshot {
+                    phase: phase.clone(),
+                    agent: agent.clone(),
+                    checkpoint_type: checkpoint.checkpoint_type.clone(),
+                    prompt: checkpoint.prompt.clone(),
+                    answered_by: answer.answered_by,
+                    answer_text: answer.answer_text,
+                    decision_json: answer.decision_json,
+                    intent,
+                });
+            }
+        }
+        Ok(snapshots)
+    }
+
+    async fn run_behavioural_success(&self, run_id: &str) -> Result<bool> {
+        let attributions = self.list_phase_attributions_for_run(run_id).await?;
+        if attributions.is_empty() {
+            return Ok(self
+                .get_run(run_id)
+                .await?
+                .map(|run| run.status == "completed")
+                .unwrap_or(false));
+        }
+
+        Ok(attributions
+            .iter()
+            .any(|record| record.phase == "validation" && record.outcome == "success")
+            && attributions
+                .iter()
+                .any(|record| record.phase == "hidden_scenarios" && record.outcome == "success"))
     }
 
     async fn count_prior_matching_failed_episodes(
@@ -14520,6 +18546,24 @@ fn build_recommended_guardrails(
     }) {
         guardrails.push("Record each serious attempt with strategy, failure constraint, surviving structure, and reformulation so Coobie can compare retries structurally.".to_string());
     }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command-trial"))
+    {
+        guardrails.push("Treat tool calls as experiments with memory: record the exact command, exit code, stdout, stderr, and correction path so Coobie can distinguish syntax, tooling, and runtime failures.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "decision-trial"))
+    {
+        guardrails.push("Treat planning choices as experiments too: record what was chosen, what alternatives were available, and why, so Coobie can compare reasoning paths across runs.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "checkpoint-trial"))
+    {
+        guardrails.push("When the operator or pack resolves a blocker, preserve the unblock rationale and any decision JSON so future runs can reuse the successful intervention pattern instead of improvising again.".to_string());
+    }
 
     guardrails.dedup();
     guardrails
@@ -14607,6 +18651,54 @@ fn build_required_checks(
             .any(|tag| tag == "dead-end" || tag == "strategy-register")
     }) {
         checks.push("When retrying a recorded dead-end, emit evidence showing what changed relative to the last failed strategy before claiming parity or recovery.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command-trial"))
+    {
+        checks.push("Capture each meaningful command attempt with its exact command text, exit code, stdout, stderr, and whether the next correction changed syntax, tooling, or code-under-test.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "usage_error"))
+    {
+        checks.push("When a command fails with usage-like output or exit code 2, verify flags, argument order, and shell syntax before treating it as a model or product failure.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "command_not_found"))
+    {
+        checks.push("Verify required CLIs are installed and visible on PATH inside the active execution surface before planning retries around them.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "not_executable"))
+    {
+        checks.push("Check execute permissions, shebangs, and interpreter availability before rerunning commands marked not executable.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "decision-trial"))
+    {
+        checks.push("Log each major planning choice with the chosen path, rejected alternatives, and justification so Coobie can compare reasoning trajectories across runs.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "checkpoint-trial"))
+    {
+        checks.push("When resolving blockers, record the checkpoint intent, answer text, and decision-json shape so future runs can distinguish a retry instruction from a scope clarification or risk acceptance.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "retry"))
+    {
+        checks.push("If a blocker is being answered with a retry instruction, capture exactly what changed before unblocking the agent.".to_string());
+    }
+    if relevant_lessons
+        .iter()
+        .any(|lesson| lesson.tags.iter().any(|tag| tag == "accept_risk"))
+    {
+        checks.push("If the operator is accepting risk to unblock progress, emit an explicit evidence note describing the waived concern and surviving mitigation.".to_string());
     }
 
     checks.dedup();
@@ -16025,6 +20117,7 @@ fn build_retriever_context_bundle(
     target_source: &TargetSourceMetadata,
     staged_product: &Path,
     query_terms: &[String],
+    scope: BriefingScope,
 ) -> Result<RetrieverContextBundleArtifact> {
     let harkonnen_dir = staged_product.join(".harkonnen");
     let (context_entries, skill_entries) = discover_repo_local_context_entries(
@@ -16033,6 +20126,8 @@ fn build_retriever_context_bundle(
         Some(spec_obj),
         query_terms,
     )?;
+    let (context_entries, skill_entries) =
+        filter_repo_local_entries_for_scope(&context_entries, &skill_entries, scope);
     let preload_notes =
         build_repo_local_preload_notes(&context_entries, &skill_entries, target_source);
     Ok(RetrieverContextBundleArtifact {
@@ -16041,6 +20136,7 @@ fn build_retriever_context_bundle(
         product: target_source.label.clone(),
         generated_at: Utc::now().to_rfc3339(),
         project_root: staged_product.display().to_string(),
+        briefing_scope: Some(scope),
         context_entries,
         skill_entries,
         preload_notes,
@@ -16302,6 +20398,7 @@ fn render_retriever_context_bundle_markdown(bundle: &RetrieverContextBundleArtif
 - Product: {}
 - Generated at: {}
 - Project root: {}
+- Scope: {}
 
 ## Preload Notes
 {}
@@ -16317,6 +20414,10 @@ fn render_retriever_context_bundle_markdown(bundle: &RetrieverContextBundleArtif
         bundle.product,
         bundle.generated_at,
         bundle.project_root,
+        bundle
+            .briefing_scope
+            .map(|scope| scope.to_string())
+            .unwrap_or_else(|| "unspecified".to_string()),
         render_list(&bundle.preload_notes, "No preload notes were generated."),
         render_list(
             &context_lines,
@@ -16894,6 +20995,14 @@ fn normalize_annotation_review_status(status: &str) -> Result<&'static str> {
         "reviewed" => Ok("reviewed"),
         "approved" => Ok("approved"),
         other => bail!("unsupported evidence annotation status '{}'", other),
+    }
+}
+
+fn normalize_memory_update_review_status(status: &str) -> Result<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "confirm" | "confirmed" | "approve" | "approved" | "accept" | "accepted" => Ok("confirmed"),
+        "reject" | "rejected" | "dismiss" | "dismissed" => Ok("rejected"),
+        other => bail!("unsupported memory update review status '{}'", other),
     }
 }
 
@@ -18677,6 +22786,19 @@ fn render_phase_attributions_markdown(records: &[PhaseAttributionRecord]) -> Str
             }
         ));
         lines.push(format!(
+            "- Briefing scope: {}",
+            record
+                .briefing_scope
+                .map(|scope| scope.to_string())
+                .unwrap_or_else(|| "unspecified".to_string())
+        ));
+        lines.push(format!(
+            "- Briefing budget: {} tokens, used {}, hits {}",
+            record.briefing_token_budget,
+            record.briefing_tokens_used,
+            record.briefing_hits_provided
+        ));
+        lines.push(format!(
             "- Required checks: {}",
             if record.required_checks.is_empty() {
                 "none".to_string()
@@ -18684,6 +22806,31 @@ fn render_phase_attributions_markdown(records: &[PhaseAttributionRecord]) -> Str
                 record.required_checks.join(" | ")
             }
         ));
+        if let Some(alignment) = record.stakeholder_alignment.as_ref() {
+            lines.push(format!(
+                "- Stakeholder alignment: stamped_context={} attitudes={} constraints={} mcp_servers={}",
+                alignment.stamped_context_present,
+                alignment.attitudes_recorded,
+                alignment.constraints_recorded,
+                alignment.mcp_servers_recorded
+            ));
+            lines.push(format!(
+                "- Alignment guardrails: {}",
+                if alignment.alignment_guardrails.is_empty() {
+                    "none".to_string()
+                } else {
+                    alignment.alignment_guardrails.join(" | ")
+                }
+            ));
+            lines.push(format!(
+                "- Alignment checks: {}",
+                if alignment.alignment_checks.is_empty() {
+                    "none".to_string()
+                } else {
+                    alignment.alignment_checks.join(" | ")
+                }
+            ));
+        }
         lines.push(String::new());
     }
     lines.join("\n")
@@ -19024,7 +23171,22 @@ fn format_validation_failure_output(validation: &ValidationSummary) -> String {
         .results
         .iter()
         .filter(|r| !r.passed)
-        .map(|r| format!("[FAILED] {}: {}", r.scenario_id, r.details))
+        .map(|r| {
+            let mut block = format!("[FAILED] {}: {}", r.scenario_id, r.details);
+            if let Some(evidence) = validation.wrong_answer_evidence.get(&r.scenario_id) {
+                if let Some(expected) = evidence.expected.as_ref().filter(|value| !value.is_empty())
+                {
+                    block.push_str(&format!("\nEXPECTED:\n{}", expected));
+                }
+                if let Some(actual) = evidence.actual.as_ref().filter(|value| !value.is_empty()) {
+                    block.push_str(&format!("\nACTUAL:\n{}", actual));
+                }
+                if !evidence.excerpt.trim().is_empty() {
+                    block.push_str(&format!("\nOBSERVED OUTPUT:\n{}", evidence.excerpt.trim()));
+                }
+            }
+            block
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -19049,12 +23211,33 @@ fn validation_result_counts_for_coverage(scenario_id: &str) -> bool {
     ) || scenario_id.starts_with("test_command_")
 }
 
-fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::FailureKind> {
+fn classify_failure_kind(
+    results: &[ScenarioResult],
+    wrong_answer_evidence: &BTreeMap<String, crate::models::WrongAnswerEvidence>,
+) -> Option<crate::models::FailureKind> {
     use crate::models::FailureKind;
     let failing: Vec<&ScenarioResult> = results.iter().filter(|r| !r.passed).collect();
     if failing.is_empty() {
         return None;
     }
+
+    let failure_texts = failing
+        .iter()
+        .map(|result| result.details.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    // Timeout is behavioral rather than language/toolchain specific, so detect
+    // it before scenario-id based compile/test buckets.
+    let is_timeout = failure_texts.iter().any(|details| {
+        details.contains("timed out")
+            || details.contains("timeout")
+            || details.contains("time limit exceeded")
+            || details.contains("terminated_by_signal")
+    });
+    if is_timeout {
+        return Some(FailureKind::Timeout);
+    }
+
     // Compile / build failures: cargo_check, cargo_build, npm_build, etc.
     let is_compile = failing.iter().any(|r| {
         matches!(
@@ -19067,38 +23250,58 @@ fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::Fa
                 | "node_bootstrap"
                 | "python_compile"
         )
+    }) || failure_texts.iter().any(|details| {
+        details.contains("could not compile")
+            || details.contains("compilation failed")
+            || details.contains("compile error")
+            || details.contains("syntaxerror")
+            || details.contains("type error")
+            || details.contains("borrow checker")
     });
     if is_compile {
         return Some(FailureKind::CompileError);
     }
+
+    let has_structured_wrong_answer = failing
+        .iter()
+        .any(|result| wrong_answer_evidence.contains_key(&result.scenario_id));
+    if has_structured_wrong_answer {
+        return Some(FailureKind::WrongAnswer);
+    }
+
     // Wrong-answer: test ran but output didn't match expected
-    // Detected by "expected" / "got" / "assert" patterns in details.
-    let is_wrong_answer = failing.iter().any(|r| {
-        let d = r.details.to_lowercase();
-        (d.contains("expected") && d.contains("got"))
-            || d.contains("assertion failed")
-            || d.contains("assertionerror")
-            || d.contains("expected:")
-            || d.contains("left:")
-            || d.contains("wrong answer")
+    // Detected by common assertion and expected/actual diff patterns.
+    let is_wrong_answer = failure_texts.iter().any(|details| {
+        (details.contains("expected")
+            && (details.contains("got")
+                || details.contains("actual")
+                || details.contains("found")
+                || details.contains("received")))
+            || details.contains("assertion failed")
+            || details.contains("assertionerror")
+            || details.contains("assert_eq")
+            || details.contains("expected:")
+            || details.contains("actual:")
+            || (details.contains("left:") && details.contains("right:"))
+            || details.contains("wrong answer")
+            || details.contains("mismatch")
     });
     if is_wrong_answer {
         return Some(FailureKind::WrongAnswer);
     }
-    // Timeout
-    let is_timeout = failing.iter().any(|r| {
-        let d = r.details.to_lowercase();
-        d.contains("timed out") || d.contains("timeout") || d.contains("time limit exceeded")
-    });
-    if is_timeout {
-        return Some(FailureKind::Timeout);
-    }
+
     // Real test run (not compile) — generic TestFailure
     let is_test = failing.iter().any(|r| {
         matches!(
             r.scenario_id.as_str(),
             "cargo_test" | "npm_test" | "pnpm_test" | "yarn_test" | "go_test" | "python_tests"
         ) || r.scenario_id.starts_with("test_command_")
+    }) || failure_texts.iter().any(|details| {
+        details.contains("[failed]")
+            || details.contains("test failed")
+            || details.contains("tests failed")
+            || details.contains("failed tests")
+            || details.contains("failures:")
     });
     if is_test {
         return Some(FailureKind::TestFailure);
@@ -19106,7 +23309,12 @@ fn classify_failure_kind(results: &[ScenarioResult]) -> Option<crate::models::Fa
     Some(FailureKind::Unknown)
 }
 
-fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
+fn build_validation_summary(
+    results: Vec<ScenarioResult>,
+    real_test_commands: usize,
+    passed_real_test_commands: usize,
+    wrong_answer_evidence: BTreeMap<String, crate::models::WrongAnswerEvidence>,
+) -> ValidationSummary {
     let scored_checks = results
         .iter()
         .filter(|result| validation_result_counts_for_coverage(&result.scenario_id))
@@ -19121,19 +23329,517 @@ fn build_validation_summary(results: Vec<ScenarioResult>) -> ValidationSummary {
     let failure_kind = if all_passed {
         None
     } else {
-        classify_failure_kind(&results)
+        classify_failure_kind(&results, &wrong_answer_evidence)
     };
 
     ValidationSummary {
         passed: all_passed,
         scored_checks,
         passed_scored_checks,
+        real_test_commands,
+        passed_real_test_commands,
         results,
+        wrong_answer_evidence,
         failure_kind,
     }
 }
 
+fn command_outcome_classification(
+    raw_command: &str,
+    outcome: &CommandOutcome,
+) -> (&'static str, String) {
+    if outcome.success {
+        return ("success", "Command completed successfully.".to_string());
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        outcome.stderr.to_ascii_lowercase(),
+        outcome.stdout.to_ascii_lowercase()
+    );
+    let usage_like = combined.contains("unknown option")
+        || combined.contains("unrecognized option")
+        || combined.contains("invalid option")
+        || combined.contains("unexpected argument")
+        || combined.contains("usage:")
+        || combined.contains("syntax error");
+
+    match outcome.code {
+        None => (
+            "terminated_by_signal",
+            format!("Command '{}' ended without an exit code, likely due to a signal.", raw_command),
+        ),
+        Some(126) => (
+            "not_executable",
+            format!("Command '{}' was found but could not be executed.", raw_command),
+        ),
+        Some(127) => (
+            "command_not_found",
+            format!("Command '{}' could not be found on PATH.", raw_command),
+        ),
+        Some(130) => (
+            "interrupted",
+            format!("Command '{}' was interrupted before completion.", raw_command),
+        ),
+        Some(2) => (
+            "usage_error",
+            format!(
+                "Command '{}' returned exit 2, which usually points to shell syntax or CLI usage issues.",
+                raw_command
+            ),
+        ),
+        Some(code) if usage_like => (
+            "usage_error",
+            format!(
+                "Command '{}' returned exit {} with usage-like output, so flags or syntax are likely wrong.",
+                raw_command, code
+            ),
+        ),
+        Some(code) => (
+            "runtime_failure",
+            format!(
+                "Command '{}' returned non-zero exit status {} after executing.",
+                raw_command, code
+            ),
+        ),
+    }
+}
+
+fn build_command_trial_record(raw_command: &str, outcome: &CommandOutcome) -> CommandTrialRecord {
+    let (classification, summary) = command_outcome_classification(raw_command, outcome);
+    CommandTrialRecord {
+        raw_command: raw_command.to_string(),
+        passed: outcome.success,
+        exit_code: outcome.code,
+        classification: classification.to_string(),
+        summary,
+        stdout: outcome.stdout.clone(),
+        stderr: outcome.stderr.clone(),
+    }
+}
+
+fn build_command_trial_report(
+    run_id: &str,
+    spec_id: &str,
+    product: &str,
+    phase: &str,
+    agent: &str,
+    passed: bool,
+    commands: &[CommandTrialRecord],
+) -> CommandTrialReport {
+    let summary = if commands.is_empty() {
+        format!("No command trials were recorded for {} / {}.", phase, agent)
+    } else {
+        format!(
+            "{} command trial(s) recorded for {} / {}; {} passed, {} failed.",
+            commands.len(),
+            phase,
+            agent,
+            commands.iter().filter(|trial| trial.passed).count(),
+            commands.iter().filter(|trial| !trial.passed).count(),
+        )
+    };
+    CommandTrialReport {
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        product: product.to_string(),
+        phase: phase.to_string(),
+        agent: agent.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        passed,
+        summary,
+        commands: commands.to_vec(),
+    }
+}
+
+fn render_command_trial_report_markdown(report: &CommandTrialReport) -> String {
+    let commands = if report.commands.is_empty() {
+        "No command trials recorded.".to_string()
+    } else {
+        report
+            .commands
+            .iter()
+            .map(|trial| {
+                format!(
+                    "### {}\n\n- passed: {}\n- exit_code: {}\n- classification: {}\n- summary: {}\n\nstdout:\n{}\n\nstderr:\n{}",
+                    trial.raw_command,
+                    if trial.passed { "true" } else { "false" },
+                    trial
+                        .exit_code
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "signal".to_string()),
+                    trial.classification,
+                    trial.summary,
+                    if trial.stdout.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        trial.stdout.clone()
+                    },
+                    if trial.stderr.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        trial.stderr.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    format!(
+        "# Command Trial Report\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Phase: {}\n- Agent: {}\n- Generated at: {}\n- Passed: {}\n\n## Summary\n{}\n\n## Commands\n{}",
+        report.run_id,
+        report.spec_id,
+        if report.product.is_empty() {
+            "<unknown>"
+        } else {
+            report.product.as_str()
+        },
+        report.phase,
+        report.agent,
+        report.generated_at,
+        if report.passed { "true" } else { "false" },
+        report.summary,
+        commands,
+    )
+}
+
+fn build_validation_repair_artifact(
+    run_id: &str,
+    spec_id: &str,
+    product: &str,
+    attempts: &[ValidationRepairAttemptRecord],
+) -> ValidationRepairArtifact {
+    ValidationRepairArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        product: product.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        attempts: attempts.to_vec(),
+    }
+}
+
+fn render_validation_repair_markdown(report: &ValidationRepairArtifact) -> String {
+    let attempts = if report.attempts.is_empty() {
+        "No validation repair attempts were recorded.".to_string()
+    } else {
+        report
+            .attempts
+            .iter()
+            .map(|attempt| {
+                format!(
+                    "## Iteration {}\n\n- Outcome: {}\n- Passed after: {}\n- Edits applied: {}\n- Failure kind before: {}\n- Failure kind after: {}\n- Proposal summary: {}\n- Guidance: {}\n\n### Before\n{}\n\n### After\n{}\n\n### Before failing checks\n{}\n\n### After failing checks\n{}\n\n### Proposal rationale\n{}",
+                    attempt.iteration,
+                    attempt.outcome,
+                    if attempt.passed_after { "true" } else { "false" },
+                    attempt.edits_applied,
+                    attempt.failure_kind_before.as_deref().unwrap_or("unknown"),
+                    attempt.failure_kind_after.as_deref().unwrap_or("unknown"),
+                    attempt.proposal_summary,
+                    attempt.guidance_for_next_attempt,
+                    attempt.before_summary,
+                    attempt.after_summary,
+                    render_list(
+                        &attempt.before_failing_checks,
+                        "- No failing checks were recorded before this attempt."
+                    ),
+                    render_list(
+                        &attempt.after_failing_checks,
+                        "- No failing checks were recorded after this attempt."
+                    ),
+                    render_list(
+                        &attempt.proposal_rationale,
+                        "- No rationale was recorded for this proposal."
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    format!(
+        "# Validation Repair Attempts\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Generated at: {}\n\n{}",
+        report.run_id,
+        report.spec_id,
+        if report.product.is_empty() {
+            "<unknown>"
+        } else {
+            report.product.as_str()
+        },
+        report.generated_at,
+        attempts,
+    )
+}
+
+fn command_trial_pattern_key(phase: &str, raw_command: &str, classification: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        phase.to_ascii_lowercase(),
+        normalize_memory_text(raw_command),
+        classification.to_ascii_lowercase()
+    )
+}
+
+fn command_trial_intervention(classification: &str, passed: bool) -> String {
+    if passed {
+        return "Prefer this command shape again when repo tooling matches, but still verify stdout, stderr, and downstream artifacts.".to_string();
+    }
+
+    match classification {
+        "usage_error" => "Treat this as a command-shape problem first: verify flags, argument order, and shell syntax before blaming the model or product code.".to_string(),
+        "command_not_found" => "Verify the required binary is installed and on PATH inside the current execution surface before retrying.".to_string(),
+        "not_executable" => "Check execute permissions, shebangs, and interpreter wiring before retrying.".to_string(),
+        "terminated_by_signal" | "interrupted" => "Inspect operator interrupts, resource limits, or supervisor kills before treating this as a normal runtime failure.".to_string(),
+        _ => "Inspect stdout/stderr and only retry after changing the command, environment, or code-under-test in a traceable way.".to_string(),
+    }
+}
+
+fn decision_trial_pattern_key(decision: &DecisionTrialSnapshot, passed: bool) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        decision.phase.to_ascii_lowercase(),
+        decision.agent.to_ascii_lowercase(),
+        decision.decision_kind.to_ascii_lowercase(),
+        normalize_memory_text(&decision.chose),
+        if passed { "success" } else { "failure" }
+    )
+}
+
+fn decision_trial_intervention(decision: &DecisionTrialSnapshot, passed: bool) -> String {
+    if passed {
+        format!(
+            "Reuse the '{}' choice for '{}' when the same constraints recur, but keep recording the alternatives and justification so the precedent stays inspectable.",
+            decision.chose, decision.decision_kind
+        )
+    } else {
+        format!(
+            "Before repeating '{}' for '{}', reopen the alternatives and challenge the prior justification against the current evidence.",
+            decision.chose, decision.decision_kind
+        )
+    }
+}
+
+fn checkpoint_trial_pattern_key(checkpoint: &CheckpointTrialSnapshot, passed: bool) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        checkpoint.phase.to_ascii_lowercase(),
+        checkpoint.agent.to_ascii_lowercase(),
+        checkpoint.checkpoint_type.to_ascii_lowercase(),
+        checkpoint.intent.to_ascii_lowercase(),
+        decision_json_shape(&checkpoint.decision_json),
+        if passed { "success" } else { "failure" }
+    )
+}
+
+fn checkpoint_trial_intervention(checkpoint: &CheckpointTrialSnapshot, passed: bool) -> String {
+    if passed {
+        format!(
+            "When '{}' blockers recur for {}, start from the '{}' reply pattern and preserve the operator rationale in structured form.",
+            checkpoint.checkpoint_type, checkpoint.agent, checkpoint.intent
+        )
+    } else {
+        format!(
+            "Do not reuse the '{}' reply pattern for '{}' blockers without changing the rationale, scope, or decision payload first.",
+            checkpoint.intent, checkpoint.checkpoint_type
+        )
+    }
+}
+
+fn decision_json_shape(decision_json: &Option<serde_json::Value>) -> String {
+    match decision_json {
+        None => "none".to_string(),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => "empty_object".to_string(),
+        Some(serde_json::Value::Object(map)) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            format!("keys:{}", keys.join("+"))
+        }
+        Some(value) => format!("non_object:{}", value_type_label(value)),
+    }
+}
+
+fn checkpoint_answer_intent(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> String {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if mentions_decision_keyword(decision_json, &["retry", "rerun"]) || lower.contains("retry") {
+        return "retry".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["risk", "waive", "accept"])
+        || lower.contains("accept risk")
+        || lower.contains("waive")
+    {
+        return "accept_risk".to_string();
+    }
+    if lower.contains("clarify")
+        || lower.contains("scope")
+        || lower.contains("narrow")
+        || lower.contains("reframe")
+    {
+        return "clarify_scope".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["approve", "approved"])
+        || lower.contains("approve")
+    {
+        return "approve".to_string();
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &["rollback", "roll back", "restore", "revert"],
+    ) || lower.contains("rollback")
+        || lower.contains("roll back")
+        || lower.contains("restore")
+        || lower.contains("revert")
+    {
+        return "rollback".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["reject", "deny", "denied", "abort"])
+        || lower.contains("reject")
+        || lower.contains("deny")
+        || lower.contains("abort")
+    {
+        return "reject".to_string();
+    }
+    if mentions_decision_keyword(decision_json, &["revise", "revision", "rework"])
+        || lower.contains("revise")
+        || lower.contains("revision")
+        || lower.contains("rework")
+    {
+        return "revise".to_string();
+    }
+    if lower.starts_with("operator unblocked agent") || lower.starts_with("unblock ") {
+        return "unblock_ack".to_string();
+    }
+    if lower.contains("continue") || lower.contains("proceed") {
+        return "continue".to_string();
+    }
+    if trimmed.is_empty() && decision_json.is_some() {
+        return "decision_only".to_string();
+    }
+    if !trimmed.is_empty() && decision_json.is_some() {
+        return "direction_plus_decision".to_string();
+    }
+    if !trimmed.is_empty() {
+        return "direction".to_string();
+    }
+    "acknowledge".to_string()
+}
+
+fn transaction_checkpoint_decision(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> TransactionCheckpointDecision {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if mentions_decision_keyword(
+        decision_json,
+        &["rollback", "roll back", "restore", "revert"],
+    ) || lower.contains("rollback")
+        || lower.contains("roll back")
+        || lower.contains("restore")
+        || lower.contains("revert")
+    {
+        return TransactionCheckpointDecision::Rollback;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &["reject", "rejected", "deny", "denied", "abort", "decline"],
+    ) || lower.contains("reject")
+        || lower.contains("deny")
+        || lower.contains("abort")
+        || lower.contains("decline")
+        || lower.contains("do not apply")
+    {
+        return TransactionCheckpointDecision::Reject;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &[
+            "revise",
+            "revision",
+            "rework",
+            "regenerate",
+            "change",
+            "adjust",
+        ],
+    ) || lower.contains("revise")
+        || lower.contains("revision")
+        || lower.contains("rework")
+        || lower.contains("regenerate")
+        || lower.contains("change the plan")
+        || lower.contains("adjust the plan")
+    {
+        return TransactionCheckpointDecision::Revise;
+    }
+    if mentions_decision_keyword(
+        decision_json,
+        &[
+            "approve", "approved", "accept", "accepted", "proceed", "continue", "apply",
+        ],
+    ) || lower.contains("approve")
+        || lower.contains("accept risk")
+        || lower.contains("proceed")
+        || lower.contains("continue")
+        || lower.contains("apply")
+    {
+        return TransactionCheckpointDecision::Approve;
+    }
+    TransactionCheckpointDecision::Unknown
+}
+
+fn transaction_checkpoint_decision_label(decision: TransactionCheckpointDecision) -> &'static str {
+    match decision {
+        TransactionCheckpointDecision::Approve => "approve",
+        TransactionCheckpointDecision::Reject => "reject",
+        TransactionCheckpointDecision::Revise => "revise",
+        TransactionCheckpointDecision::Rollback => "rollback",
+        TransactionCheckpointDecision::Unknown => "unknown",
+    }
+}
+
+fn transaction_operator_guidance(
+    answer_text: &str,
+    decision_json: &Option<serde_json::Value>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let trimmed = answer_text.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+    if let Some(value) = decision_json {
+        if !value.is_null() && *value != serde_json::json!({}) {
+            parts.push(format!("decision_json={value}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn mentions_decision_keyword(decision_json: &Option<serde_json::Value>, needles: &[&str]) -> bool {
+    let Some(value) = decision_json else {
+        return false;
+    };
+    let haystack = value.to_string().to_ascii_lowercase();
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn value_type_label(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn command_detail(command: &str, outcome: &CommandOutcome) -> String {
+    let (classification, _) = command_outcome_classification(command, outcome);
     let output = if !outcome.stderr.is_empty() {
         outcome.stderr.as_str()
     } else {
@@ -19141,13 +23847,187 @@ fn command_detail(command: &str, outcome: &CommandOutcome) -> String {
     };
     let excerpt = truncate_text(output, 220);
     format!(
-        "{} -> success={} code={:?} {}",
-        command, outcome.success, outcome.code, excerpt
+        "{} -> success={} code={:?} classification={} {}",
+        command, outcome.success, outcome.code, classification, excerpt
     )
 }
 
+fn extract_wrong_answer_evidence(
+    outcome: &CommandOutcome,
+) -> Option<crate::models::WrongAnswerEvidence> {
+    if outcome.success {
+        return None;
+    }
+
+    let combined = match (outcome.stderr.trim(), outcome.stdout.trim()) {
+        ("", "") => return None,
+        ("", stdout) => stdout.to_string(),
+        (stderr, "") => stderr.to_string(),
+        (stderr, stdout) => format!("{stderr}\n{stdout}"),
+    };
+    let lower = combined.to_ascii_lowercase();
+    let judge_like = lower.contains("wrong answer")
+        || lower.contains("expected output")
+        || lower.contains("actual output")
+        || lower.contains("assertion failed")
+        || lower.contains("assertionerror")
+        || lower.contains("assert_eq")
+        || lower.contains("mismatch")
+        || (lower.contains("expected") && lower.contains("actual"))
+        || (lower.contains("expected") && lower.contains("got"))
+        || (lower.contains("expected") && lower.contains("received"))
+        || (lower.contains("left:") && lower.contains("right:"));
+    if !judge_like {
+        return None;
+    }
+
+    let (expected, actual) = extract_wrong_answer_pair(&combined);
+    Some(crate::models::WrongAnswerEvidence {
+        expected,
+        actual,
+        excerpt: truncate_text(&combined, 280),
+    })
+}
+
+fn extract_wrong_answer_pair(text: &str) -> (Option<String>, Option<String>) {
+    if let Some((expected, actual)) = extract_inline_expected_actual(text) {
+        return (Some(expected), Some(actual));
+    }
+
+    let all_labels = [
+        "expected output:",
+        "expected:",
+        "actual output:",
+        "actual:",
+        "got:",
+        "received:",
+        "left:",
+        "right:",
+    ];
+    let expected = extract_labeled_block(
+        text,
+        &["expected output:", "expected:", "right:"],
+        &all_labels,
+    );
+    let actual = extract_labeled_block(
+        text,
+        &["actual output:", "actual:", "got:", "received:", "left:"],
+        &all_labels,
+    );
+    (expected, actual)
+}
+
+fn extract_inline_expected_actual(text: &str) -> Option<(String, String)> {
+    let lower = text.to_ascii_lowercase();
+
+    for expected_marker in ["expected output:", "expected:"] {
+        let Some(expected_start) = lower.find(expected_marker) else {
+            continue;
+        };
+        let expected_value_start = expected_start + expected_marker.len();
+        if let Some((actual_start, actual_marker)) = find_any_marker_after(
+            &lower,
+            &["actual output:", "actual:", "got:", "received:"],
+            expected_value_start,
+        ) {
+            let expected = clean_wrong_answer_value(&text[expected_value_start..actual_start]);
+            let actual = clean_wrong_answer_value(&text[(actual_start + actual_marker.len())..]);
+            if !expected.is_empty() && !actual.is_empty() {
+                return Some((expected, actual));
+            }
+        }
+    }
+
+    if let Some((left_start, left_marker)) = find_any_marker_after(&lower, &["left:"], 0) {
+        if let Some((right_start, right_marker)) =
+            find_any_marker_after(&lower, &["right:"], left_start + left_marker.len())
+        {
+            let actual =
+                clean_wrong_answer_value(&text[(left_start + left_marker.len())..right_start]);
+            let expected = clean_wrong_answer_value(&text[(right_start + right_marker.len())..]);
+            if !expected.is_empty() && !actual.is_empty() {
+                return Some((expected, actual));
+            }
+        }
+    }
+
+    None
+}
+
+fn find_any_marker_after<'a>(
+    lower_text: &str,
+    markers: &'a [&'a str],
+    from: usize,
+) -> Option<(usize, &'a str)> {
+    markers
+        .iter()
+        .filter_map(|marker| {
+            lower_text[from..]
+                .find(marker)
+                .map(|offset| (from + offset, *marker))
+        })
+        .min_by_key(|(index, _)| *index)
+}
+
+fn extract_labeled_block(text: &str, labels: &[&str], all_labels: &[&str]) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let lower_trimmed = trimmed.to_ascii_lowercase();
+        for label in labels {
+            if !lower_trimmed.starts_with(label) {
+                continue;
+            }
+
+            let remainder = clean_wrong_answer_value(&trimmed[label.len()..]);
+            if !remainder.is_empty() {
+                return Some(remainder);
+            }
+
+            let mut block = Vec::new();
+            for next in lines.iter().skip(idx + 1) {
+                let next_trimmed = next.trim();
+                if next_trimmed.is_empty() {
+                    if block.is_empty() {
+                        continue;
+                    }
+                    break;
+                }
+                let next_lower = next_trimmed.to_ascii_lowercase();
+                if all_labels
+                    .iter()
+                    .any(|marker| next_lower.starts_with(marker))
+                {
+                    break;
+                }
+                block.push(next_trimmed.to_string());
+            }
+
+            let joined = clean_wrong_answer_value(&block.join("\n"));
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_wrong_answer_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
 fn format_command_output(command: &str, outcome: &CommandOutcome) -> String {
+    let (classification, summary) = command_outcome_classification(command, outcome);
     let mut sections = vec![format!("$ {}", command)];
+    sections.push(format!("classification: {}", classification));
+    sections.push(format!("summary: {}", summary));
     if !outcome.stdout.is_empty() {
         sections.push(format!("stdout:\n{}", outcome.stdout));
     }
@@ -19156,6 +24036,360 @@ fn format_command_output(command: &str, outcome: &CommandOutcome) -> String {
     }
     sections.push(format!("exit_code: {:?}", outcome.code));
     sections.join("\n\n")
+}
+
+fn build_coobie_preflight_context_target(
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+) -> ContextTarget {
+    ContextTarget {
+        scope: BriefingScope::CoobiePreflight,
+        task_description: format!(
+            "Coobie preflight for spec '{}' targeting '{}': {}",
+            spec_obj.id, target_source.label, spec_obj.title
+        ),
+        token_budget: 900,
+        min_hits: 4,
+        required_sections: vec![
+            ContextSection::ProjectInterview,
+            ContextSection::OperatorModel,
+            ContextSection::SoulIdentity,
+        ],
+    }
+}
+
+fn briefing_scope_for_agent(agent_name: &str) -> Option<BriefingScope> {
+    match agent_name {
+        "coobie" => Some(BriefingScope::CoobiePreflight),
+        "scout" => Some(BriefingScope::ScoutPreflight),
+        "mason" => Some(BriefingScope::MasonPreflight),
+        "piper" => Some(BriefingScope::PiperPreflight),
+        "sable" => Some(BriefingScope::SablePreflight),
+        _ => None,
+    }
+}
+
+fn estimate_briefing_tokens(text: &str) -> u32 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    ((trimmed.chars().count() as u32) + 3) / 4
+}
+
+fn select_budgeted_memory_hits(
+    memory_context: &MemoryContextBundle,
+    target: &ContextTarget,
+) -> BriefingMemorySelection {
+    let mut project_memory_hits = Vec::new();
+    let mut core_memory_hits = Vec::new();
+    let mut memory_hits = Vec::new();
+    let mut tokens_used = 0_u32;
+    let mut hits_provided = 0_usize;
+    let min_hits = target.min_hits as usize;
+    let token_budget = target.token_budget.max(1);
+
+    for (is_project, hit) in memory_context
+        .project_memory_hits
+        .iter()
+        .map(|hit| (true, hit))
+        .chain(
+            memory_context
+                .core_memory_hits
+                .iter()
+                .map(|hit| (false, hit)),
+        )
+    {
+        if hits_provided >= 8 {
+            break;
+        }
+        let shaped_hit = truncate_text(hit, 900);
+        let hit_tokens = estimate_briefing_tokens(&shaped_hit).max(1);
+        let must_include = hits_provided < min_hits;
+        if !must_include && tokens_used.saturating_add(hit_tokens) > token_budget {
+            continue;
+        }
+        tokens_used = tokens_used.saturating_add(hit_tokens);
+        hits_provided += 1;
+        memory_hits.push(shaped_hit.clone());
+        if is_project {
+            project_memory_hits.push(shaped_hit);
+        } else {
+            core_memory_hits.push(shaped_hit);
+        }
+    }
+
+    if memory_hits.is_empty() {
+        let fallback = memory_context
+            .memory_hits
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "No relevant memory context was available.".to_string());
+        let shaped_fallback = truncate_text(&fallback, 900);
+        tokens_used = estimate_briefing_tokens(&shaped_fallback);
+        hits_provided = 1;
+        memory_hits.push(shaped_fallback.clone());
+        project_memory_hits.push(shaped_fallback);
+    }
+
+    BriefingMemorySelection {
+        memory_hits,
+        core_memory_hits,
+        project_memory_hits,
+        tokens_used,
+        hits_provided,
+    }
+}
+
+fn scope_denied_keywords(scope: BriefingScope) -> &'static [&'static str] {
+    match scope {
+        BriefingScope::ScoutPreflight => &[
+            "implementation",
+            "edit rationale",
+            "mason plan",
+            "wrong answer",
+            "validation repair",
+            "hidden scenario",
+            "scenario outcome",
+            "test result",
+        ],
+        BriefingScope::MasonPreflight => &[
+            "hidden scenario",
+            "scenario outcome",
+            "sable rationale",
+            "metric attack",
+        ],
+        BriefingScope::SablePreflight => &[
+            "implementation",
+            "edit rationale",
+            "mason plan",
+            "wrong answer",
+            "validation repair",
+            "build failure",
+            "compile failure",
+            "operator model",
+            "repo purpose",
+            "stakeholder",
+            "project interview",
+            "preferred forge command",
+        ],
+        _ => &[],
+    }
+}
+
+fn scope_preferred_keywords(scope: BriefingScope) -> &'static [&'static str] {
+    match scope {
+        BriefingScope::ScoutPreflight => &[
+            "project-context",
+            "project-scan",
+            "resume-packet",
+            "memory-status",
+            "instructions",
+            "launch-guide",
+            "constraint",
+            "open question",
+            "spec",
+        ],
+        BriefingScope::MasonPreflight => &[
+            "instructions",
+            "launch-guide",
+            "strategy-register",
+            "resume-packet",
+            "workspace",
+            "fix",
+            "build",
+            "implementation",
+        ],
+        BriefingScope::SablePreflight => &["scenario", "attack", "causal", "risk", "spec"],
+        _ => &[],
+    }
+}
+
+fn text_matches_scope_denials(text: &str, scope: BriefingScope) -> bool {
+    let lower = text.to_ascii_lowercase();
+    scope_denied_keywords(scope)
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn score_text_for_scope(text: &str, scope: BriefingScope) -> i32 {
+    let lower = text.to_ascii_lowercase();
+    scope_preferred_keywords(scope)
+        .iter()
+        .filter(|needle| lower.contains(**needle))
+        .count() as i32
+}
+
+fn filter_memory_hits_for_scope(
+    hits: &[String],
+    scope: BriefingScope,
+    limit: usize,
+) -> Vec<String> {
+    let mut scored = hits
+        .iter()
+        .filter(|hit| !text_matches_scope_denials(hit, scope))
+        .map(|hit| (score_text_for_scope(hit, scope), hit.clone()))
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut filtered = scored
+        .into_iter()
+        .map(|(_, hit)| hit)
+        .take(limit)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        filtered = hits.iter().take(limit.max(1)).cloned().collect();
+    }
+    filtered
+}
+
+fn filter_repo_local_entries_for_scope(
+    context_entries: &[RepoLocalContextEntry],
+    skill_entries: &[RepoLocalContextEntry],
+    scope: BriefingScope,
+) -> (Vec<RepoLocalContextEntry>, Vec<RepoLocalContextEntry>) {
+    let filter_entries = |entries: &[RepoLocalContextEntry], limit: usize| {
+        let mut scored = entries
+            .iter()
+            .filter(|entry| {
+                let haystack = format!("{} {} {}", entry.path, entry.label, entry.summary);
+                !text_matches_scope_denials(&haystack, scope)
+            })
+            .map(|entry| {
+                let haystack = format!("{} {} {}", entry.path, entry.label, entry.summary);
+                (
+                    entry.relevance + score_text_for_scope(&haystack, scope) * 10,
+                    entry.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.path.cmp(&right.1.path))
+        });
+        let mut filtered = scored
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .take(limit)
+            .collect::<Vec<_>>();
+        if filtered.is_empty() && !entries.is_empty() && scope != BriefingScope::SablePreflight {
+            filtered = entries.iter().take(limit.max(1)).cloned().collect();
+        }
+        filtered
+    };
+
+    let (context_limit, skill_limit) = match scope {
+        BriefingScope::ScoutPreflight => (8, 4),
+        BriefingScope::MasonPreflight => (10, 6),
+        BriefingScope::SablePreflight => (0, 0),
+        _ => (12, 8),
+    };
+
+    (
+        filter_entries(context_entries, context_limit),
+        filter_entries(skill_entries, skill_limit),
+    )
+}
+
+fn build_scoped_briefing(base: &CoobieBriefing, scope: BriefingScope) -> CoobieBriefing {
+    let mut scoped = base.clone();
+    scoped.briefing_scope = Some(scope);
+    scoped.memory_hits = filter_memory_hits_for_scope(&base.memory_hits, scope, 8);
+    scoped.core_memory_hits = filter_memory_hits_for_scope(&base.core_memory_hits, scope, 4);
+    scoped.project_memory_hits = filter_memory_hits_for_scope(&base.project_memory_hits, scope, 4);
+    scoped.briefing_hits_provided = scoped.memory_hits.len();
+    scoped.briefing_tokens_used = scoped
+        .memory_hits
+        .iter()
+        .map(|hit| estimate_briefing_tokens(hit))
+        .sum();
+
+    match scope {
+        BriefingScope::ScoutPreflight => {
+            scoped.preferred_forge_commands.clear();
+            scoped.forge_evidence_citations.clear();
+            scoped.preferred_forge_outcome_citations.clear();
+            scoped.nearest_evidence_window_citations.clear();
+        }
+        BriefingScope::MasonPreflight => {
+            scoped.resume_packet_summary.truncate(4);
+            scoped.open_questions.truncate(6);
+        }
+        BriefingScope::SablePreflight => {
+            scoped.resume_packet_summary.clear();
+            scoped.resume_packet_risks.clear();
+            scoped.stale_memory_mitigation_plan.clear();
+            scoped.exploration_citations.clear();
+            scoped.strategy_register_citations.clear();
+            scoped.mitigation_history_citations.clear();
+            scoped.forge_evidence_citations.clear();
+            scoped.preferred_forge_outcome_citations.clear();
+            scoped.preferred_forge_commands.clear();
+            scoped.project_components.clear();
+            scoped.operator_model_context = None;
+            scoped.project_interview_context = None;
+            scoped.soul_identity_context = None;
+            scoped.recommended_guardrails.clear();
+            scoped.required_checks.clear();
+            scoped.open_questions.clear();
+        }
+        _ => {}
+    }
+
+    scoped.coobie_response = crate::coobie::render_coobie_briefing_response(&scoped);
+    scoped
+}
+
+fn render_sable_context_summary(briefing: &CoobieBriefing) -> String {
+    let mut lines = Vec::new();
+    if !briefing.prior_causes.is_empty() {
+        lines.push("Prior causes to pressure-test:".to_string());
+        lines.extend(briefing.prior_causes.iter().take(5).map(|cause| {
+            format!(
+                "- {}: {} occurrence(s), {:.0}% scenario pass rate",
+                cause.description,
+                cause.occurrences,
+                cause.scenario_pass_rate * 100.0
+            )
+        }));
+    }
+    if !briefing.pattern_matching_focus.is_empty() {
+        lines.push("Pattern focus:".to_string());
+        lines.extend(
+            briefing
+                .pattern_matching_focus
+                .iter()
+                .take(5)
+                .map(|item| format!("- {item}")),
+        );
+    }
+    if !briefing.causal_chain_focus.is_empty() {
+        lines.push("Causal chains to probe:".to_string());
+        lines.extend(
+            briefing
+                .causal_chain_focus
+                .iter()
+                .take(5)
+                .map(|item| format!("- {item}")),
+        );
+    }
+    if !briefing.application_risks.is_empty() {
+        lines.push("Spec-grounded risks:".to_string());
+        lines.extend(
+            briefing
+                .application_risks
+                .iter()
+                .take(5)
+                .map(|risk| format!("- {risk}")),
+        );
+    }
+    if lines.is_empty() {
+        "No scoped Sable context was available beyond the spec and visible run artifacts."
+            .to_string()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn truncate_text(text: &str, max_len: usize) -> String {
@@ -19205,15 +24439,7 @@ fn spec_needs_api_docs(spec_obj: &Spec, run_artifacts: &[String]) -> bool {
     )
     .to_lowercase();
     let signals = [
-        "api",
-        "endpoint",
-        "rest",
-        "http",
-        "graphql",
-        "webhook",
-        "route",
-        "openapi",
-        "swagger",
+        "api", "endpoint", "rest", "http", "graphql", "webhook", "route", "openapi", "swagger",
     ];
     if signals.iter().any(|signal| spec_text.contains(signal)) {
         return true;
@@ -19240,7 +24466,13 @@ fn render_flint_readme_fallback(
         .map(|summary| format!("{} ({})", summary.passed, summarize_validation(summary)))
         .unwrap_or_else(|| "not recorded".to_string());
     let hidden_summary = hidden_scenarios
-        .map(|summary| format!("{} ({} scenario results)", summary.passed, summary.results.len()))
+        .map(|summary| {
+            format!(
+                "{} ({} scenario results)",
+                summary.passed,
+                summary.results.len()
+            )
+        })
         .unwrap_or_else(|| "not recorded".to_string());
     let twin_summary = twin
         .map(|environment| {
@@ -19305,9 +24537,11 @@ fn render_flint_api_fallback(
         .chain(spec_obj.acceptance_criteria.iter())
         .filter(|line| {
             let lower = line.to_lowercase();
-            ["api", "endpoint", "rest", "http", "graphql", "webhook", "route"]
-                .iter()
-                .any(|signal| lower.contains(signal))
+            [
+                "api", "endpoint", "rest", "http", "graphql", "webhook", "route",
+            ]
+            .iter()
+            .any(|signal| lower.contains(signal))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -19364,10 +24598,7 @@ fn render_flint_api_fallback(
                 )
             })
             .unwrap_or_else(|| "- No validation summary was available.".to_string()),
-        artifacts = render_list(
-            run_artifacts,
-            "- No related run artifacts were available."
-        ),
+        artifacts = render_list(run_artifacts, "- No related run artifacts were available."),
     )
 }
 
@@ -19380,11 +24611,25 @@ fn summarize_validation(validation: &ValidationSummary) -> String {
             validation.passed_scored_checks, validation.scored_checks
         )
     };
+    let real_tests = if validation.real_test_commands == 0 {
+        "no explicit spec.test_commands recorded".to_string()
+    } else {
+        format!(
+            "{} of {} explicit test command(s) passed",
+            validation.passed_real_test_commands, validation.real_test_commands
+        )
+    };
     let failing_checks = validation
         .results
         .iter()
         .filter(|result| !result.passed)
-        .map(|result| format!("{} ({})", result.scenario_id, truncate_text(&result.details, 80)))
+        .map(|result| {
+            format!(
+                "{} ({})",
+                result.scenario_id,
+                truncate_text(&result.details, 80)
+            )
+        })
         .take(3)
         .collect::<Vec<_>>();
     let failure_kind = validation
@@ -19393,13 +24638,95 @@ fn summarize_validation(validation: &ValidationSummary) -> String {
         .map(|kind| format!("{kind:?}"))
         .unwrap_or_else(|| "unknown".to_string());
     if failing_checks.is_empty() {
-        format!("{scored}; failure_kind={failure_kind}")
+        format!("{scored}; {real_tests}; failure_kind={failure_kind}")
     } else {
         format!(
-            "{scored}; failure_kind={failure_kind}; failing checks: {}",
+            "{scored}; {real_tests}; failure_kind={failure_kind}; failing checks: {}",
             failing_checks.join(", ")
         )
     }
+}
+
+fn assess_validation_repair_attempt(
+    iteration: u32,
+    proposal: &MasonEditProposal,
+    edits_applied: usize,
+    before: &ValidationSummary,
+    after: &ValidationSummary,
+) -> ValidationRepairAttemptRecord {
+    let before_failures = validation_failure_labels(before);
+    let after_failures = validation_failure_labels(after);
+    let before_failed = before_failures.len();
+    let after_failed = after_failures.len();
+    let outcome = if after.passed {
+        "resolved"
+    } else if after.passed_real_test_commands > before.passed_real_test_commands
+        || after_failed < before_failed
+    {
+        "improved"
+    } else if after.passed_real_test_commands < before.passed_real_test_commands
+        || after_failed > before_failed
+        || (before.failure_kind == Some(FailureKind::WrongAnswer)
+            && after.failure_kind == Some(FailureKind::CompileError))
+    {
+        "regressed"
+    } else {
+        "stalled"
+    };
+
+    let guidance_for_next_attempt = match outcome {
+        "resolved" => "Previous attempt resolved visible validation; no further retry is needed."
+            .to_string(),
+        "improved" => format!(
+            "Previous attempt improved visible validation from {} failing check(s) to {}. Preserve the working change and target only the remaining failures: {}.",
+            before_failed,
+            after_failed,
+            if after_failures.is_empty() {
+                "none remain".to_string()
+            } else {
+                after_failures.join(", ")
+            }
+        ),
+        "regressed" => format!(
+            "Previous attempt regressed validation from {} failing check(s) to {}. Avoid repeating that strategy and restore the prior passing behavior before chasing new failures.",
+            before_failed, after_failed
+        ),
+        _ => format!(
+            "Previous attempt did not change the failing signal (still {} failing check(s)). Choose a different implementation strategy and do not repeat the same edit pattern.",
+            after_failed
+        ),
+    };
+
+    ValidationRepairAttemptRecord {
+        iteration,
+        proposal_summary: proposal.summary.clone(),
+        proposal_rationale: proposal.rationale.clone(),
+        edits_applied,
+        before_summary: summarize_validation(before),
+        after_summary: summarize_validation(after),
+        failure_kind_before: before.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
+        failure_kind_after: after.failure_kind.as_ref().map(|kind| format!("{kind:?}")),
+        before_failing_checks: before_failures,
+        after_failing_checks: after_failures,
+        outcome: outcome.to_string(),
+        guidance_for_next_attempt,
+        passed_after: after.passed,
+    }
+}
+
+fn validation_failure_labels(validation: &ValidationSummary) -> Vec<String> {
+    validation
+        .results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| {
+            format!(
+                "{} ({})",
+                result.scenario_id,
+                truncate_text(&result.details, 100)
+            )
+        })
+        .collect()
 }
 
 fn list_relative_files(root: &Path, current: &Path) -> Result<Vec<String>> {
@@ -19427,6 +24754,78 @@ fn list_run_directory(run_dir: &Path) -> Result<Vec<String>> {
     let mut files = list_relative_files(run_dir, run_dir)?;
     files.insert(0, format!("run_dir={}", run_dir.display()));
     Ok(files)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() {
+        bail!("copy source not found: {}", source.display());
+    }
+    if !source.is_dir() {
+        bail!("copy source is not a directory: {}", source.display());
+    }
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("creating directory {}", destination.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("reading directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating directory {}", parent.display()))?;
+            }
+            std::fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copying rollback file {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_dir_from_backup(backup_dir: &Path, target_dir: &Path) -> Result<()> {
+    if !backup_dir.exists() {
+        bail!("rollback backup not found: {}", backup_dir.display());
+    }
+    if target_dir.exists() {
+        std::fs::remove_dir_all(target_dir)
+            .with_context(|| format!("removing target directory {}", target_dir.display()))?;
+    }
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating target parent {}", parent.display()))?;
+    }
+    copy_dir_recursive(backup_dir, target_dir)
+}
+
+fn workspace_snapshots_equivalent(
+    expected: &WorkspaceStateSnapshot,
+    actual: &WorkspaceStateSnapshot,
+) -> bool {
+    if expected.file_count != actual.file_count || expected.total_bytes != actual.total_bytes {
+        return false;
+    }
+    let mut expected_files = expected
+        .files
+        .iter()
+        .map(|entry| (&entry.path, entry.size, &entry.hash))
+        .collect::<Vec<_>>();
+    let mut actual_files = actual
+        .files
+        .iter()
+        .map(|entry| (&entry.path, entry.size, &entry.hash))
+        .collect::<Vec<_>>();
+    expected_files.sort();
+    actual_files.sort();
+    expected_files == actual_files
 }
 
 fn is_mason_context_candidate(path: &str) -> bool {
@@ -19862,6 +25261,10 @@ fn checkpoint_type_for_blocker(blocker: &str) -> &'static str {
         "visible_validation_failed" => "needs_validation_review",
         "hidden_scenarios_failed" => "needs_hidden_scenario_review",
         "retriever_forge_failed" => "needs_operator_answer",
+        "transaction_approval_required" => "needs_transaction_approval",
+        "tool_transaction_approval_required" => "needs_tool_transaction_approval",
+        "validation_after_rollback_required" => "needs_validation_review",
+        "transaction_rollback_drift" => "needs_transaction_review",
         _ => "needs_operator_answer",
     }
 }
@@ -19871,6 +25274,10 @@ fn checkpoint_phase_for_blocker(blocker: &str, current_phase: &str) -> Option<St
         "visible_validation_failed" => Some("validation".to_string()),
         "hidden_scenarios_failed" => Some("hidden_scenarios".to_string()),
         "retriever_forge_failed" => Some("retriever_forge".to_string()),
+        "transaction_approval_required" => Some("implementation".to_string()),
+        "tool_transaction_approval_required" => Some("tools".to_string()),
+        "validation_after_rollback_required" => Some("validation".to_string()),
+        "transaction_rollback_drift" => Some("implementation".to_string()),
         _ if current_phase.trim().is_empty() => None,
         _ => Some(current_phase.to_string()),
     }
@@ -19900,6 +25307,10 @@ fn checkpoint_prompt_for_blocker(
         "visible_validation_failed" => "Bramble reported a visible validation failure. Review the evidence and decide whether to rerun, adjust the plan, or explicitly accept the risk.".to_string(),
         "hidden_scenarios_failed" => "Sable found a hidden-scenario failure. Review the scenario evidence and provide an operator decision before treating the run as recovered.".to_string(),
         "retriever_forge_failed" => "Mason's retriever forge packet failed. Provide revised direction or an operator decision before treating this blocker as resolved.".to_string(),
+        "transaction_approval_required" => "Keeper paused the implementation transaction before Mason could apply LLM-authored edits. Review `transaction_implementation.md`, then approve, reject, revise, or roll back the mutation plan before treating this blocker as resolved.".to_string(),
+        "tool_transaction_approval_required" => "Keeper paused before privileged MCP/tool surfaces could be used. Review `tool_transaction.md`, then approve, reject, or revise the tool plan before treating this blocker as resolved.".to_string(),
+        "validation_after_rollback_required" => "Keeper rolled back the implementation transaction to its pre-action backup. Run or approve visible validation again before treating the staged workspace as safe.".to_string(),
+        "transaction_rollback_drift" => "Keeper restored the transaction backup, but the restored staged workspace did not exactly match the original pre-action snapshot. Inspect `transaction_implementation.md` before proceeding.".to_string(),
         _ => format!(
             "Operator review needed for blocker `{}`{}{}.",
             blocker,
@@ -19945,10 +25356,71 @@ fn claim_agent(board: &mut BlackboardState, agent: &str, ownership: &str) {
     board
         .agent_claims
         .insert(agent.to_string(), ownership.to_string());
+    claim_agent_instance(board, agent, agent, ownership, None, None, "phase_claim");
 }
 
 fn release_agent(board: &mut BlackboardState, agent: &str) {
     board.agent_claims.remove(agent);
+    board
+        .agent_instances
+        .retain(|instance| instance.runtime_id != agent);
+}
+
+#[allow(dead_code)]
+fn claim_agent_instance(
+    board: &mut BlackboardState,
+    runtime_id: &str,
+    canonical_role: &str,
+    ownership: &str,
+    provider: Option<&str>,
+    surface: Option<&str>,
+    source: &str,
+) {
+    let now = Utc::now().to_rfc3339();
+    let display_name = dog_display_name(canonical_role).to_string();
+    if let Some(existing) = board
+        .agent_instances
+        .iter_mut()
+        .find(|instance| instance.runtime_id == runtime_id)
+    {
+        existing.canonical_role = canonical_role.to_string();
+        existing.display_name = display_name;
+        existing.ownership = ownership.to_string();
+        existing.status = "active".to_string();
+        existing.provider = provider.map(str::to_string);
+        existing.surface = surface.map(str::to_string);
+        existing.thread_id = board.packchat_thread_id.clone();
+        existing.source = source.to_string();
+        existing.last_heartbeat_at = now;
+        return;
+    }
+
+    board.agent_instances.push(AgentRuntimeState {
+        runtime_id: runtime_id.to_string(),
+        canonical_role: canonical_role.to_string(),
+        display_name,
+        ownership: ownership.to_string(),
+        status: "active".to_string(),
+        provider: provider.map(str::to_string),
+        surface: surface.map(str::to_string),
+        thread_id: board.packchat_thread_id.clone(),
+        source: source.to_string(),
+        last_heartbeat_at: now,
+    });
+}
+
+fn dog_display_name(agent: &str) -> &'static str {
+    match agent {
+        "scout" => "Scout",
+        "mason" => "Mason",
+        "piper" => "Storm",
+        "bramble" => "Bramble",
+        "sable" => "Sable",
+        "ash" => "Ash",
+        "flint" => "Flint",
+        "keeper" => "Bear",
+        _ => "Coobie",
+    }
 }
 
 fn normalize_message_pattern(message: &str) -> String {
@@ -20120,6 +25592,761 @@ fn summarize_episode_state_diff(
     })
 }
 
+fn build_implementation_transaction_boundary(
+    run_id: &str,
+    spec_id: &str,
+    planned_mutation_set: Vec<String>,
+    guardrails: Vec<String>,
+    approval_blockers: Vec<String>,
+    pre_action_snapshot: WorkspaceStateSnapshot,
+) -> TransactionBoundaryArtifact {
+    let approval_state = if approval_blockers.is_empty() {
+        "auto_approved"
+    } else {
+        "operator_review_required"
+    };
+    TransactionBoundaryArtifact {
+        boundary_id: format!("transaction-{run_id}-implementation"),
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        phase: "implementation".to_string(),
+        agent: "mason".to_string(),
+        status: if approval_state == "auto_approved" {
+            "auto_approved".to_string()
+        } else {
+            "open".to_string()
+        },
+        approval_state: approval_state.to_string(),
+        checkpoint_id: None,
+        opened_at: Utc::now().to_rfc3339(),
+        closed_at: None,
+        planned_mutation_set,
+        guardrails,
+        approval_blockers,
+        pre_action_snapshot,
+        post_action_snapshot: None,
+        rollback_backup_path: None,
+        approval_decision: None,
+        operator_guidance: None,
+        approved_by: None,
+        approved_at: None,
+        rollback_note:
+            "Rollback boundary opened before Mason LLM-authored edits; restore the staged workspace to the pre-action snapshot if the mutation is rejected."
+                .to_string(),
+        residual_risk: if approval_state == "auto_approved" {
+            "No approval blockers were present at the transaction boundary.".to_string()
+        } else {
+            "Mutation is paused until the operator resolves the transaction approval checkpoint."
+                .to_string()
+        },
+    }
+}
+
+fn build_tool_transaction_artifact(
+    run_id: &str,
+    spec_id: &str,
+    setup: &crate::setup::SetupConfig,
+    staged_product: &Path,
+    briefing: &CoobieBriefing,
+) -> ToolTransactionArtifact {
+    let mut requested_surfaces = Vec::new();
+
+    if let Some(mcp) = &setup.mcp {
+        for server in &mcp.servers {
+            requested_surfaces.push(assess_mcp_tool_surface(server));
+        }
+        if let Some(self_server) = &mcp.self_server {
+            if self_server.enabled {
+                requested_surfaces.push(ToolSurfaceAssessment {
+                    name: "harkonnen-self".to_string(),
+                    surface_type: "mcp_self".to_string(),
+                    command: format!("mcp serve ({})", self_server.transport),
+                    aliases: vec!["harkonnen_factory_control".to_string()],
+                    risk: if self_server.auth_required.unwrap_or(false) {
+                        "medium".to_string()
+                    } else {
+                        "low".to_string()
+                    },
+                    approval_required: false,
+                    reasons: vec!["local Harkonnen self-MCP transport is configured".to_string()],
+                });
+            }
+        }
+    }
+
+    for command in planned_host_command_surfaces(staged_product) {
+        if command_available(&command) {
+            requested_surfaces.push(assess_host_command_surface(&command));
+        }
+    }
+
+    let approval_blockers = requested_surfaces
+        .iter()
+        .filter(|surface| surface.approval_required)
+        .map(|surface| {
+            format!(
+                "{} ({}) risk={} reasons={}",
+                surface.name,
+                surface.surface_type,
+                surface.risk,
+                surface.reasons.join("; ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let approval_state = if approval_blockers.is_empty() {
+        "auto_approved"
+    } else {
+        "operator_review_required"
+    };
+
+    ToolTransactionArtifact {
+        transaction_id: format!("tool-transaction-{run_id}-tools"),
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        phase: "tools".to_string(),
+        agent: "keeper".to_string(),
+        status: if approval_state == "auto_approved" {
+            "auto_approved".to_string()
+        } else {
+            "open".to_string()
+        },
+        approval_state: approval_state.to_string(),
+        checkpoint_id: None,
+        opened_at: Utc::now().to_rfc3339(),
+        closed_at: None,
+        requested_surfaces,
+        guardrails: briefing.recommended_guardrails.clone(),
+        approval_blockers,
+        rollback_note:
+            "Tool transaction opened before privileged MCP/tool use. No tool invocation has been executed from this boundary yet."
+                .to_string(),
+        residual_risk: if approval_state == "auto_approved" {
+            "Only low-risk read-only/local tool surfaces were identified.".to_string()
+        } else {
+            "Privileged tool/MCP surfaces require operator approval before later tool-bearing phases proceed."
+                .to_string()
+        },
+        approval_decision: None,
+        operator_guidance: None,
+        approved_by: None,
+        approved_at: None,
+    }
+}
+
+fn assess_host_command_surface(command: &str) -> ToolSurfaceAssessment {
+    let normalized = command.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "cargo" | "go" | "python" | "python3" | "pytest" | "make" | "npm" | "pnpm" | "yarn"
+    ) {
+        return ToolSurfaceAssessment {
+            name: command.to_string(),
+            surface_type: "host_command".to_string(),
+            command: command.to_string(),
+            aliases: vec!["local_build_runner".to_string()],
+            risk: "low".to_string(),
+            approval_required: false,
+            reasons: vec![
+                "local build/test tool surface; final approval is enforced per invocation"
+                    .to_string(),
+            ],
+        };
+    }
+
+    ToolSurfaceAssessment {
+        name: command.to_string(),
+        surface_type: "host_command".to_string(),
+        command: command.to_string(),
+        aliases: vec!["external_process".to_string()],
+        risk: "high".to_string(),
+        approval_required: true,
+        reasons: vec![
+            "host command executes an external process outside the model context".to_string(),
+        ],
+    }
+}
+
+fn assess_raw_shell_invocation(raw_command: &str, cwd: &Path) -> ToolInvocationAssessment {
+    let trimmed = raw_command.trim();
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    let first_non_env = tokens
+        .iter()
+        .copied()
+        .find(|token| {
+            !token.is_empty()
+                && !token.starts_with('|')
+                && !token.starts_with('&')
+                && !token.starts_with(';')
+                && !(token.contains('=') && !token.starts_with("./") && !token.starts_with('/'))
+        })
+        .unwrap_or("sh");
+    let idx = tokens
+        .iter()
+        .position(|token| *token == first_non_env)
+        .unwrap_or(0);
+    let args = tokens.iter().skip(idx + 1).copied().collect::<Vec<_>>();
+    let mut assessment = assess_tool_invocation(first_non_env, &args, cwd);
+    assessment.command = trimmed.to_string();
+    assessment
+}
+
+fn assess_tool_invocation(program: &str, args: &[&str], cwd: &Path) -> ToolInvocationAssessment {
+    let program_lower = program.trim().to_ascii_lowercase();
+    let args_joined = args.join(" ");
+    let args_lower = args_joined.to_ascii_lowercase();
+    let command = if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {args_joined}")
+    };
+    let mut reasons = vec!["host command executes an external process".to_string()];
+    let mut approval_required = true;
+    let mut risk = "medium".to_string();
+
+    if matches!(
+        program_lower.as_str(),
+        "true" | "false" | "pwd" | "echo" | "printf"
+    ) {
+        approval_required = false;
+        risk = "low".to_string();
+        reasons = vec!["read-only local shell primitive".to_string()];
+    }
+
+    if program_lower == "git" {
+        let read_only = args_lower.contains("rev-parse")
+            || args_lower.contains("status")
+            || args_lower.contains("diff")
+            || args_lower.contains("log")
+            || args_lower.contains("show");
+        if read_only {
+            approval_required = false;
+            risk = "low".to_string();
+            reasons = vec!["read-only repository metadata command".to_string()];
+        } else {
+            reasons.push("git invocation may mutate repository state".to_string());
+        }
+    }
+
+    let local_build_like = matches!(
+        program_lower.as_str(),
+        "cargo" | "go" | "python" | "python3" | "pytest" | "make" | "npm" | "pnpm" | "yarn"
+    ) && (args_lower.contains("build")
+        || args_lower.contains("test")
+        || args_lower.contains("check")
+        || args_lower.contains("compileall")
+        || args_lower.contains("-m build")
+        || args_lower.contains("run build")
+        || args_lower.contains("run test"));
+    if local_build_like {
+        approval_required = false;
+        risk = "low".to_string();
+        reasons =
+            vec!["local build/test invocation; invocation gateway auto-approved it".to_string()];
+    }
+
+    if args_lower.contains("install")
+        || args_lower.contains("add")
+        || args_lower.contains("publish")
+        || args_lower.contains("push")
+        || args_lower.contains("deploy")
+        || args_lower.contains("login")
+        || args_lower.contains("pull")
+    {
+        risk = "high".to_string();
+        reasons.push("arguments may write remotely or change runtime dependencies".to_string());
+    }
+    if matches!(
+        program_lower.as_str(),
+        "docker" | "npm" | "pnpm" | "yarn" | "npx"
+    ) {
+        reasons.push(
+            "tool can reach containers, package registries, or external package hooks".to_string(),
+        );
+    }
+    if matches!(
+        program_lower.as_str(),
+        "cargo" | "go" | "python" | "python3" | "pytest" | "make" | "npm" | "pnpm" | "yarn"
+    ) && (args_lower.contains("test")
+        || args_lower.contains("check")
+        || args_lower.contains("build")
+        || args_lower.contains("compileall"))
+    {
+        reasons.push(
+            "command runs local build or validation logic inside the staged workspace".to_string(),
+        );
+    }
+
+    ToolInvocationAssessment {
+        surface_type: "host_command".to_string(),
+        tool_name: program.to_string(),
+        command,
+        cwd: cwd.display().to_string(),
+        risk,
+        approval_required,
+        reasons,
+    }
+}
+
+fn assess_mcp_tool_surface(server: &crate::setup::McpServerConfig) -> ToolSurfaceAssessment {
+    let aliases = server.tool_aliases.clone().unwrap_or_default();
+    let mut reasons = Vec::new();
+    let mut approval_required = false;
+    let haystack = format!(
+        "{} {} {} {}",
+        server.name.to_ascii_lowercase(),
+        server.command.to_ascii_lowercase(),
+        server.args.join(" ").to_ascii_lowercase(),
+        aliases.join(" ").to_ascii_lowercase()
+    );
+
+    if aliases.iter().any(|alias| {
+        let alias = alias.to_ascii_lowercase();
+        alias.contains("write") || alias.contains("artifact_writer") || alias.contains("store")
+    }) {
+        approval_required = true;
+        reasons.push("surface can write or persist data".to_string());
+    }
+    if haystack.contains("github")
+        || haystack.contains("brave")
+        || haystack.contains("search")
+        || haystack.contains("fetch")
+        || haystack.contains("http")
+    {
+        approval_required = true;
+        reasons.push("surface can reach networked or external systems".to_string());
+    }
+    if server
+        .env
+        .as_ref()
+        .map(|env| !env.is_empty())
+        .unwrap_or(false)
+        || haystack.contains("token")
+        || haystack.contains("key")
+        || haystack.contains("secret")
+    {
+        approval_required = true;
+        reasons.push("surface may require secrets or environment credentials".to_string());
+    }
+    if server.command != "cargo" && server.command != "harkonnen" && server.command != "builtin" {
+        approval_required = true;
+        reasons.push(format!(
+            "surface launches external command `{}`",
+            server.command
+        ));
+    }
+    if reasons.is_empty() {
+        reasons.push("read-only local metadata surface".to_string());
+    }
+
+    let risk = if approval_required {
+        "high"
+    } else if server.command == "npx" || server.command == "node" {
+        "medium"
+    } else {
+        "low"
+    };
+
+    ToolSurfaceAssessment {
+        name: server.name.clone(),
+        surface_type: "mcp_server".to_string(),
+        command: format!("{} {}", server.command, server.args.join(" "))
+            .trim()
+            .to_string(),
+        aliases,
+        risk: risk.to_string(),
+        approval_required,
+        reasons,
+    }
+}
+
+fn planned_host_command_surfaces(staged_product: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if staged_product.join("Cargo.toml").exists() {
+        commands.push("cargo".to_string());
+    }
+    if staged_product.join("package.json").exists() {
+        commands.push("npm".to_string());
+        commands.push("node".to_string());
+    }
+    if staged_product.join("Dockerfile").exists()
+        || staged_product.join("docker-compose.yml").exists()
+    {
+        commands.push("docker".to_string());
+    }
+    if staged_product.join("pyproject.toml").exists()
+        || staged_product.join("requirements.txt").exists()
+    {
+        if command_available("python3") {
+            commands.push("python3".to_string());
+        } else {
+            commands.push("python".to_string());
+        }
+    }
+    if command_available("openclaw") {
+        commands.push("openclaw".to_string());
+    }
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn finalize_transaction_boundary(
+    boundary: &mut TransactionBoundaryArtifact,
+    mutation_status: &str,
+    post_action_snapshot: WorkspaceStateSnapshot,
+) {
+    let before = serde_json::to_string(&boundary.pre_action_snapshot).ok();
+    let after = serde_json::to_string(&post_action_snapshot).ok();
+    let diff = summarize_episode_state_diff(before.as_deref(), after.as_deref());
+    let diff_summary = diff
+        .as_ref()
+        .map(|value| value.summary.clone())
+        .unwrap_or_else(|| "workspace diff unavailable".to_string());
+
+    boundary.closed_at = Some(Utc::now().to_rfc3339());
+    boundary.post_action_snapshot = Some(post_action_snapshot);
+    boundary.status = match mutation_status {
+        "applied" => "committed".to_string(),
+        "no_changes" | "skipped" => "closed_without_changes".to_string(),
+        "blocked" | "failed" => "aborted".to_string(),
+        other => format!("closed_{other}"),
+    };
+    boundary.rollback_note = format!(
+        "Transaction closed with Mason edit status '{mutation_status}'. Workspace delta: {diff_summary}. To roll back, restore files listed in the pre-action snapshot or discard the staged workspace."
+    );
+    boundary.residual_risk = match diff {
+        Some(value)
+            if !value.added_files.is_empty()
+                || !value.modified_files.is_empty()
+                || !value.removed_files.is_empty() =>
+        {
+            format!(
+                "Review changed files before promotion: added={}, modified={}, removed={}.",
+                value.added_files.len(),
+                value.modified_files.len(),
+                value.removed_files.len()
+            )
+        }
+        Some(_) => "No staged workspace file changes were detected.".to_string(),
+        None => "Workspace diff could not be computed from transaction snapshots.".to_string(),
+    };
+}
+
+fn render_transaction_boundary_markdown(boundary: &TransactionBoundaryArtifact) -> String {
+    let planned = if boundary.planned_mutation_set.is_empty() {
+        "- <none declared>".to_string()
+    } else {
+        boundary
+            .planned_mutation_set
+            .iter()
+            .map(|path| format!("- {}", path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let blockers = if boundary.approval_blockers.is_empty() {
+        "- none".to_string()
+    } else {
+        boundary
+            .approval_blockers
+            .iter()
+            .map(|blocker| format!("- {}", blocker))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guardrails = if boundary.guardrails.is_empty() {
+        "- none".to_string()
+    } else {
+        boundary
+            .guardrails
+            .iter()
+            .take(12)
+            .map(|guardrail| format!("- {}", guardrail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let checkpoint = boundary.checkpoint_id.as_deref().unwrap_or("none");
+    let rollback_backup = boundary.rollback_backup_path.as_deref().unwrap_or("none");
+    let approval_decision = boundary.approval_decision.as_deref().unwrap_or("none");
+    let approved_by = boundary.approved_by.as_deref().unwrap_or("none");
+    let approved_at = boundary.approved_at.as_deref().unwrap_or("none");
+    let operator_guidance = boundary
+        .operator_guidance
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none");
+    let post_snapshot = boundary
+        .post_action_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            format!(
+                "{} file(s), {} bytes",
+                snapshot.file_count, snapshot.total_bytes
+            )
+        })
+        .unwrap_or_else(|| "not captured yet".to_string());
+
+    format!(
+        "# Transaction Boundary: Implementation\n\n\
+         - Boundary: {}\n\
+         - Run: {}\n\
+         - Spec: {}\n\
+         - Phase: {}\n\
+         - Agent: {}\n\
+         - Status: {}\n\
+         - Approval state: {}\n\
+         - Approval decision: {}\n\
+         - Approved by: {}\n\
+         - Approved at: {}\n\
+         - Rollback backup: {}\n\
+         - Checkpoint: {}\n\
+         - Opened: {}\n\
+         - Closed: {}\n\n\
+         ## Operator Guidance\n{}\n\n\
+         ## Planned Mutation Set\n{}\n\n\
+         ## Approval Blockers\n{}\n\n\
+         ## Guardrails\n{}\n\n\
+         ## Snapshots\n\
+         - Pre-action: {} file(s), {} bytes\n\
+         - Post-action: {}\n\n\
+         ## Rollback Note\n{}\n\n\
+         ## Residual Risk\n{}\n",
+        boundary.boundary_id,
+        boundary.run_id,
+        boundary.spec_id,
+        boundary.phase,
+        boundary.agent,
+        boundary.status,
+        boundary.approval_state,
+        approval_decision,
+        approved_by,
+        approved_at,
+        rollback_backup,
+        checkpoint,
+        boundary.opened_at,
+        boundary.closed_at.as_deref().unwrap_or("open"),
+        operator_guidance,
+        planned,
+        blockers,
+        guardrails,
+        boundary.pre_action_snapshot.file_count,
+        boundary.pre_action_snapshot.total_bytes,
+        post_snapshot,
+        boundary.rollback_note,
+        boundary.residual_risk,
+    )
+}
+
+fn render_tool_transaction_markdown(transaction: &ToolTransactionArtifact) -> String {
+    let checkpoint = transaction.checkpoint_id.as_deref().unwrap_or("none");
+    let approval_decision = transaction.approval_decision.as_deref().unwrap_or("none");
+    let approved_by = transaction.approved_by.as_deref().unwrap_or("none");
+    let approved_at = transaction.approved_at.as_deref().unwrap_or("none");
+    let operator_guidance = transaction
+        .operator_guidance
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none");
+    let surfaces = if transaction.requested_surfaces.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .requested_surfaces
+            .iter()
+            .map(|surface| {
+                format!(
+                    "- `{}` [{}] risk={} approval_required={} aliases={} reasons={}",
+                    surface.name,
+                    surface.surface_type,
+                    surface.risk,
+                    surface.approval_required,
+                    if surface.aliases.is_empty() {
+                        "none".to_string()
+                    } else {
+                        surface.aliases.join(", ")
+                    },
+                    surface.reasons.join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let blockers = if transaction.approval_blockers.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .approval_blockers
+            .iter()
+            .map(|blocker| format!("- {}", blocker))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guardrails = if transaction.guardrails.is_empty() {
+        "- none".to_string()
+    } else {
+        transaction
+            .guardrails
+            .iter()
+            .take(12)
+            .map(|guardrail| format!("- {}", guardrail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "# Tool Transaction Boundary\n\n\
+         - Transaction: {}\n\
+         - Run: {}\n\
+         - Spec: {}\n\
+         - Phase: {}\n\
+         - Agent: {}\n\
+         - Status: {}\n\
+         - Approval state: {}\n\
+         - Approval decision: {}\n\
+         - Approved by: {}\n\
+         - Approved at: {}\n\
+         - Checkpoint: {}\n\
+         - Opened: {}\n\
+         - Closed: {}\n\n\
+         ## Operator Guidance\n{}\n\n\
+         ## Requested Surfaces\n{}\n\n\
+         ## Approval Blockers\n{}\n\n\
+         ## Guardrails\n{}\n\n\
+         ## Rollback Note\n{}\n\n\
+         ## Residual Risk\n{}\n",
+        transaction.transaction_id,
+        transaction.run_id,
+        transaction.spec_id,
+        transaction.phase,
+        transaction.agent,
+        transaction.status,
+        transaction.approval_state,
+        approval_decision,
+        approved_by,
+        approved_at,
+        checkpoint,
+        transaction.opened_at,
+        transaction.closed_at.as_deref().unwrap_or("open"),
+        operator_guidance,
+        surfaces,
+        blockers,
+        guardrails,
+        transaction.rollback_note,
+        transaction.residual_risk,
+    )
+}
+
+fn render_tool_invocation_markdown(artifact: &ToolInvocationArtifact) -> String {
+    let invocations = if artifact.invocations.is_empty() {
+        "- none".to_string()
+    } else {
+        artifact
+            .invocations
+            .iter()
+            .map(|record| {
+                format!(
+                    "- `{}` phase={} agent={} risk={} approval_required={} approval_state={} allowed={} success={} exit_code={} reasons={}",
+                    record.command,
+                    record.phase,
+                    record.agent,
+                    record.risk,
+                    record.approval_required,
+                    record.approval_state,
+                    record.allowed,
+                    record
+                        .success
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "pending".to_string()),
+                    record
+                        .exit_code
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    if record.reasons.is_empty() {
+                        "none".to_string()
+                    } else {
+                        record.reasons.join("; ")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Tool Invocation Gateway\n\n\
+         - Run: {}\n\
+         - Generated: {}\n\
+         - Invocation count: {}\n\n\
+         ## Invocations\n{}\n",
+        artifact.run_id,
+        artifact.generated_at,
+        artifact.invocations.len(),
+        invocations,
+    )
+}
+
+fn preview_text(value: &str, limit: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let mut preview = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    Some(preview)
+}
+
+fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBriefing {
+    CoobieBriefing {
+        spec_id: spec
+            .map(|value| value.id.clone())
+            .unwrap_or_else(|| "unknown-spec".to_string()),
+        product: run_id.to_string(),
+        query_terms: Vec::new(),
+        domain_signals: Vec::new(),
+        prior_report_count: 0,
+        memory_hits: Vec::new(),
+        core_memory_hits: Vec::new(),
+        project_memory_hits: Vec::new(),
+        resume_packet_summary: Vec::new(),
+        resume_packet_risks: Vec::new(),
+        stale_memory_mitigation_plan: Vec::new(),
+        exploration_citations: Vec::new(),
+        strategy_register_citations: Vec::new(),
+        mitigation_history_citations: Vec::new(),
+        evidence_pattern_exemplar_citations: Vec::new(),
+        evidence_causal_exemplar_citations: Vec::new(),
+        nearest_evidence_window_citations: Vec::new(),
+        pattern_matching_focus: Vec::new(),
+        causal_chain_focus: Vec::new(),
+        forge_evidence_citations: Vec::new(),
+        preferred_forge_outcome_citations: Vec::new(),
+        preferred_forge_commands: Vec::new(),
+        relevant_lessons: Vec::new(),
+        prior_causes: Vec::new(),
+        project_components: Vec::new(),
+        scenario_blueprint: None,
+        project_memory_root: None,
+        briefing_scope: Some(BriefingScope::OperatorQuery),
+        briefing_task_description: "Invocation gateway fallback".to_string(),
+        target_token_budget: 0,
+        briefing_tokens_used: 0,
+        briefing_hits_provided: 0,
+        required_sections_applied: Vec::new(),
+        application_risks: Vec::new(),
+        environment_risks: Vec::new(),
+        regulatory_considerations: Vec::new(),
+        operator_model_context: None,
+        project_interview_context: None,
+        soul_identity_context: None,
+        recommended_guardrails: Vec::new(),
+        required_checks: Vec::new(),
+        open_questions: Vec::new(),
+        coobie_response: "Invocation gateway fallback briefing".to_string(),
+        generated_at: Utc::now(),
+    }
+}
+
 fn pearl_hierarchy_for_causal_link(link_type: &str) -> PearlHierarchyLevel {
     match link_type.trim().to_ascii_lowercase().as_str() {
         "caused" | "contributed_to" | "failure_triggered" => PearlHierarchyLevel::Interventional,
@@ -20236,6 +26463,63 @@ fn next_interview_layer(current: &str) -> Option<&'static str> {
     match current {
         "operating_rhythms" => Some("recurring_decisions"),
         _ => None,
+    }
+}
+
+fn operator_model_checkpoint_lines(summary_md: &str) -> Vec<String> {
+    summary_md
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches("- ")
+                .trim_start_matches("* ")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.eq_ignore_ascii_case("no durable facts recorded")
+        })
+        .collect()
+}
+
+fn collect_commissioning_brief_signals(
+    lines: &[String],
+    preferred_tools: &mut Vec<String>,
+    risk_tolerances: &mut Vec<String>,
+) {
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if [
+            "tool", "prefer", "use ", "uses ", "aws", "cloud", "github", "slack", "mcp",
+            "database", "local", "terminal",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        {
+            push_unique_limited(preferred_tools, line.clone(), 8);
+        }
+        if [
+            "risk",
+            "toler",
+            "avoid",
+            "never",
+            "must",
+            "approval",
+            "approve",
+            "escalat",
+            "boundary",
+            "guardrail",
+            "do not",
+            "don't",
+            "rollback",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        {
+            push_unique_limited(risk_tolerances, line.clone(), 8);
+        }
     }
 }
 
@@ -20398,12 +26682,181 @@ fn apply_operator_model_preflight_guidance(
             "Operator dependency to confirm before execution — {dependency}"
         ));
     }
+    for tool in context.preferred_tools.iter().take(3) {
+        recommended_guardrails.push(format!("Operator preferred tool posture — {tool}"));
+    }
+    for tolerance in context.risk_tolerances.iter().take(3) {
+        required_checks.push(format!("Operator risk tolerance — {tolerance}"));
+    }
     for question in context.open_questions.iter().take(3) {
         open_questions.push(format!("Operator-model follow-up — {question}"));
     }
     recommended_guardrails.dedup();
     required_checks.dedup();
     open_questions.dedup();
+}
+
+fn build_project_interview_query_terms(context: &ProjectInterviewContext) -> Vec<String> {
+    let mut terms = Vec::new();
+    for value in [
+        context.repo_name.as_str(),
+        context.repo_purpose.as_str(),
+        context.operator_intent.as_str(),
+        context.environment.as_str(),
+        context.vertical.as_str(),
+    ] {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            terms.push(trimmed.to_string());
+        }
+    }
+    terms.extend(context.domains.iter().cloned());
+    terms.extend(context.attitudes.iter().cloned());
+    terms.extend(context.constraints.iter().cloned());
+    terms.extend(context.skill_sources.iter().cloned());
+    terms.extend(context.mcp_servers.iter().cloned());
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for term in terms {
+        let trimmed = term.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            unique.push(trimmed.to_string());
+        }
+    }
+    unique
+}
+
+fn apply_project_interview_preflight_guidance(
+    context: &ProjectInterviewContext,
+    required_checks: &mut Vec<String>,
+    recommended_guardrails: &mut Vec<String>,
+    open_questions: &mut Vec<String>,
+) {
+    if !context.repo_purpose.trim().is_empty() {
+        recommended_guardrails.push(format!(
+            "Stamped project purpose — keep implementation choices legible against this purpose: {}",
+            context.repo_purpose
+        ));
+    }
+    if !context.operator_intent.trim().is_empty() {
+        required_checks.push(format!(
+            "Stamped project stakes — before execution, confirm the plan protects what matters here: {}",
+            context.operator_intent
+        ));
+    }
+    if !context.environment.trim().is_empty() {
+        recommended_guardrails.push(format!(
+            "Stamped environment context — prefer assumptions that fit the declared environment: {}",
+            context.environment
+        ));
+    }
+    if !context.vertical.trim().is_empty() {
+        recommended_guardrails.push(format!(
+            "Stamped project vertical — preserve posture appropriate to '{}', not a generic software-only default.",
+            context.vertical
+        ));
+    }
+    if !context.domains.is_empty() {
+        recommended_guardrails.push(format!(
+            "Stamped project domains — keep solutions grounded in these domains: {}",
+            context.domains.join(", ")
+        ));
+    }
+    for constraint in context.constraints.iter().take(4) {
+        required_checks.push(format!("Stamped repo prohibition — {constraint}"));
+    }
+    for attitude in context.attitudes.iter().take(4) {
+        required_checks.push(format!(
+            "Stakeholder alignment check — before proposing architecture or tooling changes, confirm the plan respects this recorded posture: {attitude}"
+        ));
+    }
+    if !context.skill_sources.is_empty() {
+        recommended_guardrails.push(format!(
+            "Stamped skill sources exist ({}) — prefer established repo/project workflows before inventing a fresh one.",
+            context.skill_sources.join(", ")
+        ));
+    }
+    if !context.mcp_servers.is_empty() {
+        required_checks.push(format!(
+            "Stamped MCP surface check — prefer configured MCP servers where they cover the task: {}",
+            context.mcp_servers.join(", ")
+        ));
+    }
+    if !context.attitudes.is_empty() || !context.operator_intent.trim().is_empty() {
+        open_questions.push(
+            "Project posture question — does the current plan respect the recorded human and organizational attitudes, not just the technical spec?"
+                .to_string(),
+        );
+    }
+    recommended_guardrails.dedup();
+    required_checks.dedup();
+    open_questions.dedup();
+}
+
+fn select_alignment_lines(values: &[String], prefixes: &[&str]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))
+        .cloned()
+        .collect()
+}
+
+fn build_stakeholder_alignment_summary(
+    briefing: &CoobieBriefing,
+) -> Option<StakeholderAlignmentSummary> {
+    let context = briefing.project_interview_context.as_ref()?;
+
+    Some(StakeholderAlignmentSummary {
+        stamped_context_present: true,
+        repo_purpose: context.repo_purpose.trim().to_string(),
+        operator_intent: context.operator_intent.trim().to_string(),
+        environment: context.environment.trim().to_string(),
+        vertical: context.vertical.trim().to_string(),
+        attitudes_recorded: context.attitudes.len(),
+        constraints_recorded: context.constraints.len(),
+        skill_sources_recorded: context.skill_sources.len(),
+        mcp_servers_recorded: context.mcp_servers.len(),
+        alignment_guardrails: select_alignment_lines(
+            &briefing.recommended_guardrails,
+            &[
+                "Stamped project purpose",
+                "Stamped environment context",
+                "Stamped project vertical",
+                "Stamped project domains",
+                "Stamped skill sources exist",
+            ],
+        ),
+        alignment_checks: select_alignment_lines(
+            &briefing.required_checks,
+            &[
+                "Stamped project stakes",
+                "Stamped repo prohibition",
+                "Stakeholder alignment check",
+                "Stamped MCP surface check",
+            ],
+        ),
+        alignment_open_questions: select_alignment_lines(
+            &briefing.open_questions,
+            &["Project posture question"],
+        ),
+    })
+}
+
+fn phase_to_calvin_chamber(phase: &str) -> crate::calvin_client::Chamber {
+    match phase {
+        "memory" => crate::calvin_client::Chamber::Episteme,
+        "intake" => crate::calvin_client::Chamber::Mythos,
+        "workspace" | "implementation" | "tools" | "retriever_forge" | "artifacts" => {
+            crate::calvin_client::Chamber::Praxis
+        }
+        "validation" | "hidden_scenarios" => crate::calvin_client::Chamber::Logos,
+        "twin" => crate::calvin_client::Chamber::Ethos,
+        _ => crate::calvin_client::Chamber::Episteme,
+    }
 }
 
 fn build_coobie_soul_identity_context() -> SoulIdentityContext {
@@ -21009,4 +27462,973 @@ fn render_twin_compose_yaml(specs: &[TwinServiceSpec]) -> String {
         }
     }
     yaml
+}
+
+fn structured_benchmark_intent(spec_obj: &Spec) -> Option<IntentPackage> {
+    let harness = spec_obj.worker_harness.as_ref()?;
+    let adapter = harness.adapter.trim();
+    let profile = harness.profile.trim();
+    let is_devbench = adapter == "devbench_harkonnen_adapter" || profile == "devbench_scaffold";
+    if !is_devbench {
+        return None;
+    }
+
+    let component = spec_obj.project_components.first();
+    let target_label = component
+        .map(|entry| entry.name.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("benchmark target");
+    let mut ambiguity_notes = Vec::new();
+    if spec_obj.test_commands.is_empty() {
+        ambiguity_notes.push(
+            "DevBench scaffold did not provide visible validation commands; validation may be partial."
+                .to_string(),
+        );
+    }
+    if spec_obj.outputs.is_empty() {
+        ambiguity_notes
+            .push("Structured benchmark spec does not list expected outputs yet.".to_string());
+    }
+
+    let mut recommended_steps = vec![
+        "Read the repo_config-derived inputs and worker harness contract before editing.".to_string(),
+        "Keep changes scoped to the benchmark-owned repository component and task boundaries."
+            .to_string(),
+        "Implement the smallest task-complete change set that satisfies the declared acceptance criteria."
+            .to_string(),
+    ];
+    if !spec_obj.test_commands.is_empty() {
+        recommended_steps.push(
+            "Run the visible validation commands declared in `spec.test_commands` before hidden-scenario work."
+                .to_string(),
+        );
+    }
+    if !harness.return_artifacts.is_empty() {
+        recommended_steps.push(format!(
+            "Package the expected worker artifacts: {}.",
+            harness.return_artifacts.join(", ")
+        ));
+    }
+
+    Some(IntentPackage {
+        spec_id: spec_obj.id.clone(),
+        summary: format!(
+            "Execute the structured DevBench task for {} using the repo_config-grounded harness.",
+            target_label
+        ),
+        ambiguity_notes,
+        recommended_steps,
+    })
+}
+
+fn build_run_timing_report(
+    run: &RunRecord,
+    episodes: &[EpisodeRecord],
+    generated_at: chrono::DateTime<Utc>,
+) -> RunTimingReport {
+    let mut phase_durations = Vec::new();
+    for episode in episodes {
+        let duration_ms = episode_duration_ms(episode, run.updated_at);
+        if let Some(existing) = phase_durations
+            .iter_mut()
+            .find(|entry: &&mut crate::models::RunPhaseTiming| entry.phase == episode.phase)
+        {
+            existing.episode_count += 1;
+            existing.duration_ms = existing.duration_ms.saturating_add(duration_ms);
+        } else {
+            phase_durations.push(crate::models::RunPhaseTiming {
+                phase: episode.phase.clone(),
+                episode_count: 1,
+                duration_ms,
+            });
+        }
+    }
+
+    let memory_duration_ms = sum_phase_durations(&phase_durations, &["memory"]);
+    let intake_duration_ms = sum_phase_durations(&phase_durations, &["intake"]);
+    let implementation_duration_ms = sum_phase_durations(
+        &phase_durations,
+        &[
+            "workspace",
+            "implementation",
+            "build",
+            "tools",
+            "retriever_forge",
+        ],
+    );
+    let validation_duration_ms = sum_phase_durations(
+        &phase_durations,
+        &["twin", "validation", "hidden_scenarios"],
+    );
+    let total_duration_ms = positive_duration_ms(run.created_at, run.updated_at);
+    let tracked_duration_ms = memory_duration_ms
+        .saturating_add(intake_duration_ms)
+        .saturating_add(implementation_duration_ms)
+        .saturating_add(validation_duration_ms);
+    let other_duration_ms = total_duration_ms.saturating_sub(tracked_duration_ms);
+
+    RunTimingReport {
+        run_id: run.run_id.clone(),
+        total_duration_ms,
+        memory_duration_ms,
+        intake_duration_ms,
+        implementation_duration_ms,
+        validation_duration_ms,
+        other_duration_ms,
+        phase_durations,
+        generated_at,
+    }
+}
+
+fn episode_duration_ms(episode: &EpisodeRecord, fallback_end: chrono::DateTime<Utc>) -> u64 {
+    let end = episode.ended_at.unwrap_or(fallback_end);
+    positive_duration_ms(episode.started_at, end)
+}
+
+fn positive_duration_ms(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> u64 {
+    end.signed_duration_since(start).num_milliseconds().max(0) as u64
+}
+
+fn sum_phase_durations(phase_durations: &[crate::models::RunPhaseTiming], phases: &[&str]) -> u64 {
+    phase_durations
+        .iter()
+        .filter(|entry| phases.iter().any(|phase| *phase == entry.phase))
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.duration_ms))
+}
+
+fn render_run_timing_markdown(report: &RunTimingReport) -> String {
+    let mut lines = vec![
+        "# Run Timing".to_string(),
+        String::new(),
+        format!("- Total duration: {} ms", report.total_duration_ms),
+        format!("- Memory: {} ms", report.memory_duration_ms),
+        format!("- Intake: {} ms", report.intake_duration_ms),
+        format!("- Implementation: {} ms", report.implementation_duration_ms),
+        format!("- Validation: {} ms", report.validation_duration_ms),
+        format!("- Other: {} ms", report.other_duration_ms),
+        String::new(),
+        "## Phase Durations".to_string(),
+    ];
+
+    if report.phase_durations.is_empty() {
+        lines.push(String::new());
+        lines.push("- No episode timing data recorded.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    for phase in &report.phase_durations {
+        lines.push(format!(
+            "- {}: {} ms across {} episode(s)",
+            phase.phase, phase.duration_ms, phase.episode_count
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    fn sample_run(run_id: &str) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            spec_id: "spec".to_string(),
+            product: "product".to_string(),
+            status: "completed".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 12).unwrap(),
+        }
+    }
+
+    fn sample_episode(
+        phase: &str,
+        started_at: chrono::DateTime<Utc>,
+        duration_secs: i64,
+    ) -> EpisodeRecord {
+        EpisodeRecord {
+            episode_id: format!("{phase}-episode"),
+            run_id: "run-1".to_string(),
+            phase: phase.to_string(),
+            goal: phase.to_string(),
+            outcome: Some("success".to_string()),
+            confidence: Some(1.0),
+            started_at,
+            ended_at: Some(started_at + Duration::seconds(duration_secs)),
+            state_before: None,
+            state_after: None,
+        }
+    }
+
+    fn sample_briefing() -> CoobieBriefing {
+        CoobieBriefing {
+            spec_id: "spec-1".to_string(),
+            product: "product".to_string(),
+            query_terms: Vec::new(),
+            domain_signals: Vec::new(),
+            prior_report_count: 0,
+            memory_hits: Vec::new(),
+            core_memory_hits: Vec::new(),
+            project_memory_hits: Vec::new(),
+            resume_packet_summary: Vec::new(),
+            resume_packet_risks: Vec::new(),
+            stale_memory_mitigation_plan: Vec::new(),
+            exploration_citations: Vec::new(),
+            strategy_register_citations: Vec::new(),
+            mitigation_history_citations: Vec::new(),
+            evidence_pattern_exemplar_citations: Vec::new(),
+            evidence_causal_exemplar_citations: Vec::new(),
+            nearest_evidence_window_citations: Vec::new(),
+            pattern_matching_focus: Vec::new(),
+            causal_chain_focus: Vec::new(),
+            forge_evidence_citations: Vec::new(),
+            preferred_forge_outcome_citations: Vec::new(),
+            preferred_forge_commands: Vec::new(),
+            relevant_lessons: Vec::new(),
+            prior_causes: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            project_memory_root: None,
+            briefing_scope: Some(BriefingScope::CoobiePreflight),
+            briefing_task_description: "sample briefing".to_string(),
+            target_token_budget: 900,
+            briefing_tokens_used: 0,
+            briefing_hits_provided: 0,
+            required_sections_applied: Vec::new(),
+            application_risks: Vec::new(),
+            environment_risks: Vec::new(),
+            regulatory_considerations: Vec::new(),
+            operator_model_context: None,
+            project_interview_context: None,
+            soul_identity_context: None,
+            recommended_guardrails: Vec::new(),
+            required_checks: Vec::new(),
+            open_questions: Vec::new(),
+            coobie_response: String::new(),
+            generated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn build_scoped_briefing_filters_scout_and_sable_context() {
+        let mut briefing = sample_briefing();
+        briefing.memory_hits = vec![
+            "Spec history: prior auth flow ambiguity".to_string(),
+            "Implementation note: Mason edited login handler".to_string(),
+            "Hidden scenario outcome: stale token replay".to_string(),
+        ];
+        briefing.core_memory_hits = briefing.memory_hits.clone();
+        briefing.project_memory_hits = briefing.memory_hits.clone();
+        briefing.preferred_forge_commands = vec!["cargo test -q".to_string()];
+        briefing.operator_model_context = Some(OperatorModelContext {
+            profile_id: "profile-1".to_string(),
+            scope: crate::models::OperatorModelScope::Project,
+            display_name: "Operator".to_string(),
+            project_root: None,
+            source_thread_id: None,
+            summary: "prefers careful rollouts".to_string(),
+            operating_rhythms: Vec::new(),
+            guardrails: Vec::new(),
+            escalation_rules: Vec::new(),
+            dependencies: Vec::new(),
+            preferred_tools: Vec::new(),
+            risk_tolerances: Vec::new(),
+            open_questions: Vec::new(),
+            transcript_excerpt: Vec::new(),
+        });
+        briefing.project_interview_context = Some(ProjectInterviewContext {
+            repo_name: "repo".to_string(),
+            repo_purpose: "replace incumbent platform".to_string(),
+            operator_intent: "reduce risk".to_string(),
+            ..Default::default()
+        });
+        briefing.recommended_guardrails = vec!["Guardrail".to_string()];
+        briefing.required_checks = vec!["Check".to_string()];
+
+        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let sable = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
+
+        assert_eq!(scout.briefing_scope, Some(BriefingScope::ScoutPreflight));
+        assert!(scout
+            .memory_hits
+            .iter()
+            .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+        assert!(scout.preferred_forge_commands.is_empty());
+
+        assert_eq!(sable.briefing_scope, Some(BriefingScope::SablePreflight));
+        assert!(sable.operator_model_context.is_none());
+        assert!(sable.project_interview_context.is_none());
+        assert!(sable.recommended_guardrails.is_empty());
+        assert!(sable.required_checks.is_empty());
+        assert!(sable
+            .memory_hits
+            .iter()
+            .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+    }
+
+    #[test]
+    fn filter_repo_local_entries_for_scope_hides_sable_context() {
+        let context_entries = vec![
+            RepoLocalContextEntry {
+                label: "project context".to_string(),
+                path: "/tmp/.harkonnen/project-context.md".to_string(),
+                category: "context".to_string(),
+                scope: "project".to_string(),
+                summary: "project interview and stakeholder attitudes".to_string(),
+                relevance: 30,
+            },
+            RepoLocalContextEntry {
+                label: "implementation notes".to_string(),
+                path: "/tmp/.harkonnen/contexts/implementation-notes.md".to_string(),
+                category: "context".to_string(),
+                scope: "contexts".to_string(),
+                summary: "implementation rationale and edit history".to_string(),
+                relevance: 40,
+            },
+        ];
+        let skill_entries = vec![RepoLocalContextEntry {
+            label: "forge".to_string(),
+            path: "/tmp/.harkonnen/skills/forge.md".to_string(),
+            category: "skill".to_string(),
+            scope: "skills".to_string(),
+            summary: "implementation helper".to_string(),
+            relevance: 20,
+        }];
+
+        let (scout_context, scout_skills) = filter_repo_local_entries_for_scope(
+            &context_entries,
+            &skill_entries,
+            BriefingScope::ScoutPreflight,
+        );
+        let (sable_context, sable_skills) = filter_repo_local_entries_for_scope(
+            &context_entries,
+            &skill_entries,
+            BriefingScope::SablePreflight,
+        );
+
+        assert!(!scout_context.is_empty());
+        assert!(scout_context
+            .iter()
+            .all(|entry| !entry.label.contains("implementation")));
+        assert!(!scout_skills.is_empty());
+        assert!(sable_context.is_empty());
+        assert!(sable_skills.is_empty());
+    }
+
+    #[test]
+    fn structured_benchmark_intent_recognizes_devbench_specs() {
+        let spec = Spec {
+            id: "devbench-readtime-implementation".to_string(),
+            title: "DevBench readtime Implementation".to_string(),
+            purpose: "implement the benchmark task".to_string(),
+            scope: vec!["implement the required files".to_string()],
+            constraints: vec!["keep changes bounded".to_string()],
+            inputs: vec!["repo_config".to_string()],
+            outputs: vec!["artifact".to_string()],
+            acceptance_criteria: vec!["tests pass".to_string()],
+            forbidden_behaviors: vec!["edit hidden eval assets".to_string()],
+            rollback_requirements: vec!["reversible".to_string()],
+            dependencies: vec!["python".to_string()],
+            performance_expectations: vec!["visible validation is runnable".to_string()],
+            security_expectations: vec!["local only".to_string()],
+            twin_services: Vec::new(),
+            project_components: vec![crate::models::ProjectComponent {
+                name: "readtime".to_string(),
+                role: "code_under_test".to_string(),
+                kind: "devbench_python_repo".to_string(),
+                path: "/tmp/readtime".to_string(),
+                owner: "devbench_dataset".to_string(),
+                notes: Vec::new(),
+                interfaces: vec!["python".to_string()],
+            }],
+            scenario_blueprint: None,
+            worker_harness: Some(WorkerHarnessConfig {
+                adapter: "devbench_harkonnen_adapter".to_string(),
+                profile: "devbench_scaffold".to_string(),
+                allowed_components: vec!["readtime".to_string()],
+                denied_paths: vec!["factory/scenarios".to_string()],
+                visible_success_conditions: vec!["tests pass".to_string()],
+                return_artifacts: vec!["changed_files".to_string(), "execution_log".to_string()],
+                max_iterations: Some(6),
+                continuity_file: Some("trail-state.json".to_string()),
+                llm_edits: true,
+                git_branch: false,
+            }),
+            test_commands: vec!["pytest -q".to_string()],
+        };
+
+        let intent = structured_benchmark_intent(&spec).expect("expected fast-path intent");
+        assert_eq!(intent.spec_id, spec.id);
+        assert!(intent.summary.contains("DevBench"));
+        assert!(intent
+            .recommended_steps
+            .iter()
+            .any(|step| step.contains("spec.test_commands")));
+    }
+
+    #[test]
+    fn build_run_timing_report_aggregates_requested_buckets() {
+        let run = sample_run("run-1");
+        let started_at = run.created_at;
+        let episodes = vec![
+            sample_episode("memory", started_at, 1),
+            sample_episode("intake", started_at + Duration::seconds(1), 2),
+            sample_episode("workspace", started_at + Duration::seconds(3), 1),
+            sample_episode("implementation", started_at + Duration::seconds(4), 3),
+            sample_episode("build", started_at + Duration::seconds(7), 1),
+            sample_episode("validation", started_at + Duration::seconds(8), 2),
+            sample_episode("hidden_scenarios", started_at + Duration::seconds(10), 1),
+        ];
+
+        let report = build_run_timing_report(&run, &episodes, run.updated_at);
+        assert_eq!(report.total_duration_ms, 12_000);
+        assert_eq!(report.memory_duration_ms, 1_000);
+        assert_eq!(report.intake_duration_ms, 2_000);
+        assert_eq!(report.implementation_duration_ms, 5_000);
+        assert_eq!(report.validation_duration_ms, 3_000);
+        assert_eq!(report.other_duration_ms, 1_000);
+        assert_eq!(report.phase_durations.len(), 7);
+    }
+
+    #[test]
+    fn command_outcome_classifies_success() {
+        let outcome = CommandOutcome {
+            success: true,
+            code: Some(0),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+        };
+        let (classification, _) = command_outcome_classification("cargo test", &outcome);
+        assert_eq!(classification, "success");
+    }
+
+    #[test]
+    fn command_outcome_classifies_usage_error_from_exit_two() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(2),
+            stdout: String::new(),
+            stderr: "sh: syntax error near unexpected token".to_string(),
+        };
+        let (classification, _) = command_outcome_classification("sh -lc bad(", &outcome);
+        assert_eq!(classification, "usage_error");
+    }
+
+    #[test]
+    fn command_outcome_classifies_usage_error_from_cli_output() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "error: unknown option '--project-context'".to_string(),
+        };
+        let (classification, _) =
+            command_outcome_classification("claude --project-context", &outcome);
+        assert_eq!(classification, "usage_error");
+    }
+
+    #[test]
+    fn validation_summary_classifies_wrong_answer_diff() {
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "Command failed (runtime_failure): expected: 42 actual: 41".to_string(),
+            }],
+            1,
+            0,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            summary.failure_kind,
+            Some(crate::models::FailureKind::WrongAnswer)
+        );
+        assert!(has_real_test_failure(&summary));
+        assert!(format_validation_failure_output(&summary).contains("[FAILED] test_command_1"));
+        assert_eq!(summary.real_test_commands, 1);
+        assert_eq!(summary.passed_real_test_commands, 0);
+    }
+
+    #[test]
+    fn validation_summary_classifies_compile_error_from_output() {
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "SyntaxError: invalid syntax while importing module".to_string(),
+            }],
+            1,
+            0,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            summary.failure_kind,
+            Some(crate::models::FailureKind::CompileError)
+        );
+    }
+
+    #[test]
+    fn validation_summary_classifies_timeout_before_test_failure() {
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "cargo_test".to_string(),
+                passed: false,
+                details: "Command terminated_by_signal after timeout".to_string(),
+            }],
+            0,
+            0,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            summary.failure_kind,
+            Some(crate::models::FailureKind::Timeout)
+        );
+    }
+
+    #[test]
+    fn validation_summary_classifies_generic_test_failure() {
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "cargo_test".to_string(),
+                passed: false,
+                details: "test failed: process exited with status 1".to_string(),
+            }],
+            0,
+            0,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            summary.failure_kind,
+            Some(crate::models::FailureKind::TestFailure)
+        );
+    }
+
+    #[test]
+    fn validation_summary_tracks_explicit_real_test_counts() {
+        let summary = build_validation_summary(
+            vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: true,
+                    details: "ok".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "failed".to_string(),
+                },
+            ],
+            2,
+            1,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(summary.real_test_commands, 2);
+        assert_eq!(summary.passed_real_test_commands, 1);
+    }
+
+    #[test]
+    fn extract_wrong_answer_evidence_parses_expected_and_actual_blocks() {
+        let outcome = CommandOutcome {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "Wrong answer\nExpected output:\n8\nActual output:\n7".to_string(),
+        };
+
+        let evidence = extract_wrong_answer_evidence(&outcome).unwrap();
+        assert_eq!(evidence.expected.as_deref(), Some("8"));
+        assert_eq!(evidence.actual.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn format_validation_failure_output_includes_structured_wrong_answer_evidence() {
+        let mut wrong_answer_evidence = BTreeMap::new();
+        wrong_answer_evidence.insert(
+            "test_command_1".to_string(),
+            crate::models::WrongAnswerEvidence {
+                expected: Some("42".to_string()),
+                actual: Some("41".to_string()),
+                excerpt: "expected: 42 actual: 41".to_string(),
+            },
+        );
+
+        let summary = build_validation_summary(
+            vec![ScenarioResult {
+                scenario_id: "test_command_1".to_string(),
+                passed: false,
+                details: "Command failed (runtime_failure): expected: 42 actual: 41".to_string(),
+            }],
+            1,
+            0,
+            wrong_answer_evidence,
+        );
+
+        let formatted = format_validation_failure_output(&summary);
+        assert!(formatted.contains("EXPECTED:\n42"));
+        assert!(formatted.contains("ACTUAL:\n41"));
+        assert!(formatted.contains("OBSERVED OUTPUT:"));
+    }
+
+    #[test]
+    fn assess_validation_repair_attempt_marks_improvement_when_failures_drop() {
+        let before = ValidationSummary {
+            passed: false,
+            scored_checks: 0,
+            passed_scored_checks: 0,
+            real_test_commands: 2,
+            passed_real_test_commands: 0,
+            results: vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: false,
+                    details: "expected 1 got 0".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "expected 2 got 0".to_string(),
+                },
+            ],
+            wrong_answer_evidence: BTreeMap::new(),
+            failure_kind: Some(FailureKind::WrongAnswer),
+        };
+        let after = ValidationSummary {
+            passed: false,
+            scored_checks: 0,
+            passed_scored_checks: 0,
+            real_test_commands: 2,
+            passed_real_test_commands: 1,
+            results: vec![
+                ScenarioResult {
+                    scenario_id: "test_command_1".to_string(),
+                    passed: true,
+                    details: "ok".to_string(),
+                },
+                ScenarioResult {
+                    scenario_id: "test_command_2".to_string(),
+                    passed: false,
+                    details: "expected 2 got 1".to_string(),
+                },
+            ],
+            wrong_answer_evidence: BTreeMap::new(),
+            failure_kind: Some(FailureKind::WrongAnswer),
+        };
+        let proposal = MasonEditProposal {
+            summary: "Fix edge-case handling".to_string(),
+            rationale: vec!["The first case now passes.".to_string()],
+            edits: Vec::new(),
+        };
+
+        let attempt = assess_validation_repair_attempt(1, &proposal, 1, &before, &after);
+        assert_eq!(attempt.outcome, "improved");
+        assert!(attempt
+            .guidance_for_next_attempt
+            .contains("target only the remaining failures"));
+    }
+
+    #[test]
+    fn render_validation_repair_markdown_includes_attempt_guidance() {
+        let artifact = ValidationRepairArtifact {
+            run_id: "run-1".to_string(),
+            spec_id: "spec-1".to_string(),
+            product: "product".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            attempts: vec![ValidationRepairAttemptRecord {
+                iteration: 1,
+                proposal_summary: "Fix sum logic".to_string(),
+                proposal_rationale: vec!["The loop skipped the final value.".to_string()],
+                edits_applied: 1,
+                before_summary: "before".to_string(),
+                after_summary: "after".to_string(),
+                failure_kind_before: Some("WrongAnswer".to_string()),
+                failure_kind_after: Some("WrongAnswer".to_string()),
+                before_failing_checks: vec!["test_command_1 (expected 8 got 7)".to_string()],
+                after_failing_checks: vec!["test_command_1 (expected 8 got 7)".to_string()],
+                outcome: "stalled".to_string(),
+                guidance_for_next_attempt: "Previous attempt did not change the failing signal."
+                    .to_string(),
+                passed_after: false,
+            }],
+        };
+
+        let markdown = render_validation_repair_markdown(&artifact);
+        assert!(markdown.contains("# Validation Repair Attempts"));
+        assert!(markdown.contains("Outcome: stalled"));
+        assert!(markdown.contains("Previous attempt did not change the failing signal."));
+    }
+
+    #[test]
+    fn commissioning_brief_signal_collection_extracts_tools_and_risk() {
+        let lines = vec![
+            "Prefer AWS for deployment tooling when the department already owns it.".to_string(),
+            "Do not move regulated data to cloud services without approval.".to_string(),
+            "Weekly release reviews happen every Friday morning.".to_string(),
+        ];
+        let mut preferred_tools = Vec::new();
+        let mut risk_tolerances = Vec::new();
+
+        collect_commissioning_brief_signals(&lines, &mut preferred_tools, &mut risk_tolerances);
+
+        assert!(preferred_tools
+            .iter()
+            .any(|item| item.contains("Prefer AWS")));
+        assert!(risk_tolerances
+            .iter()
+            .any(|item| item.contains("regulated data")));
+    }
+
+    #[test]
+    fn operator_model_preflight_uses_preferred_tools_and_risk_tolerances() {
+        let context = OperatorModelContext {
+            display_name: "sample repo".to_string(),
+            summary: "Operator prefers narrow reviewed changes.".to_string(),
+            preferred_tools: vec!["Use GitHub issues as the work queue.".to_string()],
+            risk_tolerances: vec![
+                "Escalate before replacing department-owned software.".to_string()
+            ],
+            ..OperatorModelContext::default()
+        };
+        let mut required_checks = Vec::new();
+        let mut guardrails = Vec::new();
+        let mut open_questions = Vec::new();
+
+        apply_operator_model_preflight_guidance(
+            &context,
+            &mut required_checks,
+            &mut guardrails,
+            &mut open_questions,
+        );
+
+        assert!(guardrails.iter().any(|item| item.contains("GitHub issues")));
+        assert!(required_checks
+            .iter()
+            .any(|item| item.contains("replacing department-owned software")));
+    }
+
+    #[test]
+    fn implementation_transaction_boundary_requires_review_when_blocked() {
+        let boundary = build_implementation_transaction_boundary(
+            "run-1",
+            "spec-1",
+            vec!["src/lib.rs".to_string()],
+            vec!["Do not touch production config".to_string()],
+            vec!["Plan repeats known dead end".to_string()],
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 12,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 12,
+                    hash: "1111111111111111".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:00Z".to_string(),
+            },
+        );
+
+        assert_eq!(boundary.approval_state, "operator_review_required");
+        assert_eq!(boundary.status, "open");
+        assert!(
+            render_transaction_boundary_markdown(&boundary).contains("Plan repeats known dead end")
+        );
+    }
+
+    #[test]
+    fn implementation_transaction_boundary_finalizes_with_residual_risk() {
+        let mut boundary = build_implementation_transaction_boundary(
+            "run-1",
+            "spec-1",
+            vec!["src/lib.rs".to_string()],
+            Vec::new(),
+            Vec::new(),
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 12,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 12,
+                    hash: "1111111111111111".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:00Z".to_string(),
+            },
+        );
+
+        finalize_transaction_boundary(
+            &mut boundary,
+            "applied",
+            WorkspaceStateSnapshot {
+                file_count: 1,
+                total_bytes: 18,
+                files: vec![WorkspaceFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    size: 18,
+                    hash: "2222222222222222".to_string(),
+                }],
+                captured_at: "2026-04-22T00:00:01Z".to_string(),
+            },
+        );
+
+        assert_eq!(boundary.status, "committed");
+        assert!(boundary.rollback_note.contains("Workspace delta"));
+        assert!(boundary.residual_risk.contains("modified=1"));
+    }
+
+    #[test]
+    fn transaction_checkpoint_decision_parses_operator_outcomes() {
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Approved, proceed with the Mason patch.",
+                &Some(serde_json::json!({"decision": "approve"})),
+            ),
+            TransactionCheckpointDecision::Approve
+        );
+        assert_eq!(
+            transaction_checkpoint_decision("Reject this mutation.", &None),
+            TransactionCheckpointDecision::Reject
+        );
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Revise the plan before applying.",
+                &Some(serde_json::json!({"decision": "revision_requested"})),
+            ),
+            TransactionCheckpointDecision::Revise
+        );
+        assert_eq!(
+            transaction_checkpoint_decision(
+                "Roll back to the pre-action snapshot.",
+                &Some(serde_json::json!({"decision": "rollback"})),
+            ),
+            TransactionCheckpointDecision::Rollback
+        );
+    }
+
+    #[test]
+    fn transaction_rollback_restore_replaces_target_from_backup() {
+        let base = std::env::temp_dir().join(format!("harkonnen-rollback-test-{}", Uuid::new_v4()));
+        let backup = base.join("backup");
+        let target = base.join("target");
+        std::fs::create_dir_all(backup.join("src")).expect("create backup");
+        std::fs::create_dir_all(target.join("src")).expect("create target");
+        std::fs::write(backup.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }\n")
+            .expect("write backup file");
+        std::fs::write(target.join("src/lib.rs"), "pub fn answer() -> i32 { 41 }\n")
+            .expect("write target file");
+        std::fs::write(target.join("src/extra.rs"), "// should disappear\n")
+            .expect("write extra file");
+
+        restore_dir_from_backup(&backup, &target).expect("restore backup");
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("src/lib.rs")).expect("read restored file"),
+            "pub fn answer() -> i32 { 42 }\n"
+        );
+        assert!(!target.join("src/extra.rs").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn tool_transaction_requires_review_for_write_or_network_surfaces() {
+        let setup = crate::setup::SetupConfig {
+            setup: crate::setup::SetupMeta {
+                name: "test".to_string(),
+                template: None,
+                role: None,
+                organization: None,
+                platform: "linux".to_string(),
+                anythingllm: None,
+                openclaw: None,
+            },
+            machine: None,
+            providers: crate::setup::ProvidersConfig {
+                default: "claude".to_string(),
+                claude: None,
+                gemini: None,
+                codex: None,
+                extras: std::collections::HashMap::new(),
+            },
+            routing: None,
+            mcp: Some(crate::setup::McpConfig {
+                servers: vec![
+                    crate::setup::McpServerConfig {
+                        name: "filesystem".to_string(),
+                        command: "npx".to_string(),
+                        args: vec!["@modelcontextprotocol/server-filesystem".to_string()],
+                        env: None,
+                        tool_aliases: Some(vec![
+                            "filesystem_read".to_string(),
+                            "workspace_write".to_string(),
+                        ]),
+                    },
+                    crate::setup::McpServerConfig {
+                        name: "sqlite".to_string(),
+                        command: "builtin".to_string(),
+                        args: Vec::new(),
+                        env: None,
+                        tool_aliases: Some(vec!["db_read".to_string()]),
+                    },
+                ],
+                self_server: None,
+            }),
+            calvin_archive: Default::default(),
+        };
+        let staged = std::env::temp_dir().join(format!("harkonnen-tool-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&staged).expect("create staged dir");
+        let artifact =
+            build_tool_transaction_artifact("run-1", "spec-1", &setup, &staged, &sample_briefing());
+
+        assert_eq!(artifact.approval_state, "operator_review_required");
+        assert!(artifact
+            .approval_blockers
+            .iter()
+            .any(|blocker| blocker.contains("filesystem")));
+        assert!(render_tool_transaction_markdown(&artifact).contains("workspace_write"));
+        let _ = std::fs::remove_dir_all(staged);
+    }
+
+    #[test]
+    fn tool_invocation_auto_approves_local_build_commands() {
+        let assessment =
+            assess_tool_invocation("cargo", &["test", "--quiet"], Path::new("/tmp/workspace"));
+        assert!(!assessment.approval_required);
+        assert_eq!(assessment.risk, "low");
+    }
+
+    #[test]
+    fn tool_invocation_requires_review_for_dependency_or_remote_mutation() {
+        let assessment = assess_tool_invocation("npm", &["install"], Path::new("/tmp/workspace"));
+        assert!(assessment.approval_required);
+        assert_eq!(assessment.risk, "high");
+    }
+
+    #[test]
+    fn checkpoint_answer_intent_detects_retry() {
+        let intent = checkpoint_answer_intent(
+            "Please retry after fixing the command flags",
+            &Some(serde_json::json!({"action": "retry"})),
+        );
+        assert_eq!(intent, "retry");
+    }
+
+    #[test]
+    fn checkpoint_answer_intent_detects_direction_plus_decision() {
+        let intent = checkpoint_answer_intent(
+            "Proceed, but keep the scope narrow.",
+            &Some(serde_json::json!({"approved": true, "scope": "narrow"})),
+        );
+        assert_eq!(intent, "clarify_scope");
+    }
+
+    #[test]
+    fn decision_json_shape_sorts_keys() {
+        let shape = decision_json_shape(&Some(serde_json::json!({
+            "scope": "narrow",
+            "approved": true
+        })));
+        assert_eq!(shape, "keys:approved+scope");
+    }
 }

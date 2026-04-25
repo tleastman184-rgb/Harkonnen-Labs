@@ -1,0 +1,105 @@
+id: bramble-real-tests-smoke
+title: Bramble Real Test Execution Smoke
+purpose: >
+  Verify that Bramble executes real test commands against Mason's output and
+  populates ValidationSummary from actual exit codes — not stubs or scenario
+  results. This spec is the Phase 2 completion gate: validation_passed must
+  reflect real test output. The implementation task is a simple Rust function
+  so the test command is deterministic and the pass/fail signal is unambiguous.
+scope:
+  - implement a single Rust function: parse_semver(input: &str) -> Option<(u32, u32, u32)>
+  - the function parses "MAJOR.MINOR.PATCH" strings and returns None for invalid input
+  - run cargo test to validate against the provided test suite
+  - report real exit code and coverage signal to Coobie episode
+constraints:
+  - do not modify the test file
+  - test_commands must be used by Bramble, not skipped
+  - validation_passed must reflect the actual cargo test exit code
+  - implementation must be in a staged workspace; do not touch production src/
+inputs:
+  - test suite at test_commands path
+  - spec acceptance criteria
+outputs:
+  - implementation artifact (src/semver.rs or equivalent)
+  - ValidationSummary with real exit code and failure_kind if failed
+  - test_coverage_score fed to Coobie episode
+  - run report with validation_passed matching actual test result
+acceptance_criteria:
+  - cargo test exits 0 and validation_passed=true in the run summary
+  - failure_kind is absent or None when tests pass
+  - test_coverage_score is a numeric value (not null) in the Coobie episode
+  - ValidationSummary.exit_code matches the actual cargo test exit code
+  - no test fixture was modified by Mason
+forbidden_behaviors:
+  - setting validation_passed=true while any test is failing
+  - fabricating a coverage score without running coverage instrumentation
+  - modifying test/semver_test.rs to make tests pass
+  - running tests outside the staged workspace
+rollback_requirements:
+  - staged workspace is cleaned on failure; production src/ is never touched
+dependencies:
+  - rust
+  - cargo
+performance_expectations:
+  - cargo test should complete in under 30 seconds on any machine in scope
+security_expectations:
+  - no network calls; all dependencies resolved from local cargo registry or cache
+test_commands:
+  - cargo test --manifest-path {{workspace_path}}/Cargo.toml -- semver
+project_components:
+  - name: implementation_target
+    role: code_under_test
+    kind: source_file
+    path: src/semver.rs
+    notes:
+      - Mason writes this file
+      - must not exist before the run; Mason creates it
+  - name: test_suite
+    role: test_fixture
+    kind: source_file
+    path: tests/semver_test.rs
+    notes:
+      - read-only; provided below as inline fixture content
+      - Mason must not modify this file
+test_fixture_inline:
+  path: tests/semver_test.rs
+  content: |
+    use harkonnen_smoke::semver::parse_semver;
+
+    #[test]
+    fn parses_valid_semver() {
+        assert_eq!(parse_semver("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("0.0.1"), Some((0, 0, 1)));
+        assert_eq!(parse_semver("10.20.300"), Some((10, 20, 300)));
+    }
+
+    #[test]
+    fn rejects_invalid_semver() {
+        assert_eq!(parse_semver("1.2"), None);
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("1.2.3.4"), None);
+        assert_eq!(parse_semver(""), None);
+        assert_eq!(parse_semver("1.2.three"), None);
+    }
+
+    #[test]
+    fn handles_leading_zeros() {
+        // Leading zeros in numeric segments should parse as the numeric value
+        assert_eq!(parse_semver("01.02.03"), Some((1, 2, 3)));
+    }
+scenario_blueprint:
+  pattern: bramble_real_test_execution
+  objective: >
+    Verify Bramble runs real tests and ValidationSummary reflects actual exit
+    codes. This scenario has a deterministic pass condition: cargo test must
+    exit 0, validation_passed must be true, and test_coverage_score must be
+    a real numeric value in the episode record.
+  code_under_test:
+    - src/semver.rs
+  test_commands:
+    - cargo test --manifest-path {{workspace_path}}/Cargo.toml -- semver
+  required_artifacts:
+    - validation.json
+  required_episode_fields:
+    - test_coverage_score
+    - failure_kind

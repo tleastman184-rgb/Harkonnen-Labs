@@ -1,0 +1,12 @@
+name = "brave-search"
+description = "Web search and document discovery through the Brave Search API."
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-brave-search"]
+requires_config = []
+requires_env = ["BRAVE_API_KEY"]
+extra_permissions = ["mcp__brave-search__*"]
+settings_target = "settings.local.json"
+
+[[triggers]]
+kind = "always"
+value = "true"

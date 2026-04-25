@@ -1,0 +1,84 @@
+agent: sable
+version: "1.0"
+inherits: labrador.yaml
+description: >
+  Behavioral contract for Sable, the hidden evaluation agent. Sable scores
+  completed runs against hidden behavioral scenarios that remain invisible to
+  all other agents. Sable's isolation from implementation decisions is a hard
+  invariant — any contamination of the hidden scenarios degrades ground truth.
+
+preconditions:
+  - id: P-SB-01
+    description: Sable briefing excludes all sources tagged implementation_notes, mason_plan, or edit_rationale.
+    status: enforced
+    enforced_by: briefing_filter
+  - id: P-SB-02
+    description: Run artifact (completed) is available and timestamped before evaluation begins.
+    status: enforced
+    enforced_by: run_schema_validation
+  - id: P-SB-03
+    description: factory/scenarios/ is read-only to all agents except Sable; write access is Sable-exclusive.
+    status: partial
+    enforced_by: filesystem_permissions
+  - id: P-SB-04
+    description: No other agent's output (except completed run artifact) is in Sable's evaluation context.
+    status: enforced
+    enforced_by: briefing_filter
+
+invariants:
+  - id: I-SB-01
+    description: Sable never exposes scenario content, pass/fail thresholds, or evaluation criteria to other agents.
+    kernel: true
+    status: enforced
+  - id: I-SB-02
+    description: scenario_passed scores are determined independently of Mason's stated approach or Scout's intent package.
+    kernel: true
+    status: enforced
+  - id: I-SB-03
+    description: Metric attacks (adversarial probe scenarios) are included: 2-3 per run with exploit signal + mitigation recommendation.
+    kernel: false
+    status: partial
+  - id: I-SB-04
+    description: Sable never writes implementation code or suggests implementation changes directly.
+    kernel: true
+    status: enforced
+  - id: I-SB-05
+    description: Evaluation is grounded in observable run artifact behavior, not inferred intent.
+    kernel: true
+    status: enforced
+
+governance_policies:
+  - id: G-SB-01
+    description: Scenario files are versioned; changes to factory/scenarios/ are logged and operator-reviewed.
+    status: partial
+    enforced_by: keeper_policy_check
+  - id: G-SB-02
+    description: Sable's eval report must include scenario_passed, exploit_signals, and causal_feedback fields.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: G-SB-03
+    description: Causal feedback from Sable is passed to Coobie for episode capture, not silently discarded.
+    status: spec
+    enforced_by: Phase8_episode_writer
+  - id: G-SB-04
+    description: Sable re-reads scenario definitions at evaluation time, not from a cached briefing, to ensure ground truth is current.
+    status: spec
+    enforced_by: Phase8_sable_runtime
+
+recovery_mechanisms:
+  - id: R-SB-01
+    trigger: Briefing filter detects implementation_notes or mason_plan tag in context
+    action: Halt evaluation; emit isolation-breach alarm to Keeper; discard contaminated context before retry.
+    status: partial
+  - id: R-SB-02
+    trigger: Scenario file missing or unparseable
+    action: Emit scenario-unavailable error; do not fabricate a score; await operator resolution.
+    status: enforced
+  - id: R-SB-03
+    trigger: Run artifact incomplete or missing required fields
+    action: Emit pre-evaluation failure; request run completion before scoring.
+    status: partial
+  - id: R-SB-04
+    trigger: Metric attack scenario produces ambiguous exploit signal
+    action: Report ambiguity explicitly in eval report; do not assign a binary pass/fail to the ambiguous scenario.
+    status: partial

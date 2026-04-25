@@ -1,0 +1,131 @@
+id: bramble-coverage-signal
+title: Bramble Coverage Signal to Coobie Episode
+purpose: >
+  Verify that Bramble's test_coverage_score flows correctly into the Coobie
+  episode record after a passing run. This is the second Phase 2 gate: once
+  real exit codes are working, the coverage signal must reach Coobie so that
+  causal analysis can pattern-match on coverage as a run quality dimension.
+  The implementation task is a small utility module with multiple functions so
+  coverage instrumentation has a meaningful signal to measure.
+scope:
+  - implement a Rust module: stats.rs with three functions
+    - mean(values: &[f64]) -> Option<f64>
+    - median(values: &[f64]) -> Option<f64>
+    - stddev(values: &[f64]) -> Option<f64>
+  - run cargo test with coverage instrumentation (llvm-cov or tarpaulin)
+  - test_coverage_score must appear as a numeric value in the Coobie episode
+constraints:
+  - do not modify the test file
+  - test_coverage_score must be derived from real coverage instrumentation, not estimated
+  - if coverage tooling is unavailable, emit a gap note in ValidationSummary rather than
+    fabricating a score
+  - all three functions must be tested; partial coverage should produce score < 1.0
+inputs:
+  - test suite (provided inline)
+  - spec acceptance criteria
+outputs:
+  - implementation artifact (src/stats.rs)
+  - ValidationSummary with real exit code and test_coverage_score
+  - Coobie episode record with test_coverage_score populated
+  - run report with coverage signal visible
+acceptance_criteria:
+  - cargo test exits 0 and validation_passed=true
+  - test_coverage_score is a numeric value (0.0 to 1.0) in the Coobie episode record
+  - if coverage tooling is unavailable, ValidationSummary contains an explicit coverage_gap note
+  - all three functions (mean, median, stddev) are present in the implementation
+  - stddev of an empty slice returns None, not a panic
+forbidden_behaviors:
+  - fabricating a coverage score without running coverage tooling
+  - setting test_coverage_score=1.0 without evidence from a coverage run
+  - panicking on empty input (must return None gracefully)
+  - modifying the test file
+rollback_requirements:
+  - staged workspace cleaned on failure
+dependencies:
+  - rust
+  - cargo
+  - cargo-llvm-cov or cargo-tarpaulin (optional; gap note emitted if absent)
+performance_expectations:
+  - cargo test completes in under 30 seconds
+  - coverage instrumentation adds at most 60 seconds overhead
+security_expectations:
+  - no network calls; local cargo registry only
+test_commands:
+  - cargo llvm-cov --manifest-path {{workspace_path}}/Cargo.toml -- stats
+  - cargo test --manifest-path {{workspace_path}}/Cargo.toml -- stats
+coverage_command_fallback: cargo test  # used if llvm-cov is unavailable; emit coverage_gap
+project_components:
+  - name: implementation_target
+    role: code_under_test
+    kind: source_file
+    path: src/stats.rs
+    notes:
+      - Mason writes this file; must implement mean, median, stddev
+  - name: test_suite
+    role: test_fixture
+    kind: source_file
+    path: tests/stats_test.rs
+    notes:
+      - read-only
+test_fixture_inline:
+  path: tests/stats_test.rs
+  content: |
+    use harkonnen_smoke::stats::{mean, median, stddev};
+
+    #[test]
+    fn mean_basic() {
+        assert_eq!(mean(&[1.0, 2.0, 3.0]), Some(2.0));
+        assert_eq!(mean(&[]), None);
+    }
+
+    #[test]
+    fn median_odd() {
+        let mut v = vec![3.0, 1.0, 2.0];
+        assert_eq!(median(&mut v), Some(2.0));
+    }
+
+    #[test]
+    fn median_even() {
+        let mut v = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(median(&mut v), Some(2.5));
+    }
+
+    #[test]
+    fn median_empty() {
+        let mut v: Vec<f64> = vec![];
+        assert_eq!(median(&mut v), None);
+    }
+
+    #[test]
+    fn stddev_basic() {
+        // stddev of [2, 4, 4, 4, 5, 5, 7, 9] ≈ 2.0
+        let v = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let s = stddev(&v).unwrap();
+        assert!((s - 2.0).abs() < 0.001, "stddev was {}", s);
+    }
+
+    #[test]
+    fn stddev_single_element() {
+        assert_eq!(stddev(&[42.0]), Some(0.0));
+    }
+
+    #[test]
+    fn stddev_empty() {
+        assert_eq!(stddev(&[]), None);
+    }
+scenario_blueprint:
+  pattern: bramble_coverage_signal
+  objective: >
+    Verify that test_coverage_score reaches the Coobie episode record as a
+    real numeric value after a passing run with coverage instrumentation.
+    If instrumentation is unavailable, verify that ValidationSummary contains
+    an explicit coverage_gap note rather than a fabricated score.
+  code_under_test:
+    - src/stats.rs
+  test_commands:
+    - cargo llvm-cov -- stats
+    - cargo test -- stats
+  required_artifacts:
+    - validation.json
+  required_episode_fields:
+    - test_coverage_score

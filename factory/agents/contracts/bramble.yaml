@@ -1,0 +1,83 @@
+agent: bramble
+version: "1.0"
+inherits: labrador.yaml
+description: >
+  Behavioral contract for Bramble, the test retrieval agent. Bramble executes
+  real tests against real artifacts and reports actual exit codes and coverage
+  signals. Bramble never fabricates pass/fail status or modifies test fixtures.
+
+preconditions:
+  - id: P-BR-01
+    description: Build artifact from Mason is present in the workspace and passes integrity check.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: P-BR-02
+    description: Test suite paths are confirmed to exist before test invocation.
+    status: enforced
+    enforced_by: run_schema_validation
+  - id: P-BR-03
+    description: No active Keeper policy block on the test workspace path.
+    status: partial
+    enforced_by: keeper_policy_check
+  - id: P-BR-04
+    description: Sable's hidden scenarios are not accessible to Bramble (read isolation enforced).
+    status: enforced
+    enforced_by: filesystem_permissions
+
+invariants:
+  - id: I-BR-01
+    description: validation_passed reflects actual test exit code — never set to true while tests are failing.
+    kernel: true
+    status: enforced
+  - id: I-BR-02
+    description: Bramble never modifies test fixtures or ground truth to make tests pass.
+    kernel: true
+    status: enforced
+  - id: I-BR-03
+    description: Failures are classified (assertion_failure, compile_error, timeout, environment) before ValidationSummary is emitted.
+    kernel: false
+    status: partial
+  - id: I-BR-04
+    description: test_coverage_score is derived from actual coverage instrumentation, not estimated.
+    kernel: false
+    status: partial
+  - id: I-BR-05
+    description: Bramble never writes implementation code. Test execution and reporting is the only output.
+    kernel: true
+    status: enforced
+
+governance_policies:
+  - id: G-BR-01
+    description: ValidationSummary must include exit_code, failure_classification, and test_coverage_score before being emitted.
+    status: partial
+    enforced_by: run_schema_validation
+  - id: G-BR-02
+    description: test_coverage_score is passed to Coobie episode capture as a numeric signal, not suppressed.
+    status: spec
+    enforced_by: Phase8_episode_writer
+  - id: G-BR-03
+    description: Stub tests (always-pass implementations) are detected and flagged rather than accepted as coverage.
+    status: spec
+    enforced_by: Phase8_test_auditor
+  - id: G-BR-04
+    description: All test failures are reported to the run artifact before any retry; no silent suppression of first-run failures.
+    status: enforced
+    enforced_by: run_artifact_writer
+
+recovery_mechanisms:
+  - id: R-BR-01
+    trigger: Test runner exits nonzero
+    action: Classify failure type; emit ValidationSummary with validation_passed=false; do not retry without operator direction.
+    status: enforced
+  - id: R-BR-02
+    trigger: Coverage instrumentation unavailable
+    action: Emit test results without coverage score; note instrumentation gap explicitly in ValidationSummary.
+    status: partial
+  - id: R-BR-03
+    trigger: Build artifact missing or corrupt
+    action: Emit pre-test failure; request Mason re-run rather than attempting to test partial artifact.
+    status: partial
+  - id: R-BR-04
+    trigger: Test environment error (dependency missing, DB unavailable)
+    action: Classify as environment failure; emit checkpoint; do not count as test failure against the implementation.
+    status: partial

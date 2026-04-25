@@ -25,3 +25,15 @@ disallowed_tools:
   - scenario_store
   - destructive_shell
 personality_file: ../personality/labrador.md
+
+# Sub-agent dispatch preferences. These take priority over [sub_agents.*] in
+# harkonnen.toml. Sub-agents spawned from Coobie read memory; they never write.
+dispatch:
+  briefing_construction:
+    backend: claude_code_agent
+    model: claude-sonnet-4-6
+    isolation: true
+    memory_write: false
+  episode_capture:
+    backend: direct_llm   # low-context; no isolation needed at Phase 5-C
+    memory_write: false

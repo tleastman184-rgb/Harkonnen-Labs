@@ -579,6 +579,7 @@ pub async fn sable_generate_and_evaluate(
     validation: &ValidationSummary,
     twin: &TwinEnvironment,
     agent_executions: &[AgentExecution],
+    sable_context: Option<&str>,
     run_dir: &Path,
 ) -> Option<(HiddenScenarioSummary, String)> {
     let provider = llm::build_provider("sable", "claude-opus", setup)?;
@@ -621,10 +622,12 @@ Be adversarial: check that the spec's core acceptance criteria are actually met,
 RUN STATUS: {run_status}\n\
 RUN ATTEMPT: {run_attempt}\n\n\
 VISIBLE VALIDATION:\n```json\n{validation_summary}```\n\n\
+SABLE CONTEXT:\n{context_block}\n\n\
 AGENTS THAT RAN: {agents_list}\n\n\
 AVAILABLE ARTIFACTS:\n{artifact_list}\n\n\
 Generate hidden scenarios that verify the spec's acceptance criteria were genuinely met. \
 Focus on what could pass visible validation but still fail the spec's intent.",
+        context_block = sable_context.unwrap_or("No additional scoped Sable context was supplied."),
         agents_list = agents_ran.join(", "),
         artifact_list = artifacts
             .iter()
