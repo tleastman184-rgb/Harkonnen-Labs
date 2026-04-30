@@ -813,6 +813,10 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
             get(get_plan_completion_audit),
         )
         .route(
+            "/api/runs/:id/behavioral-change",
+            get(get_behavioral_change_report),
+        )
+        .route(
             "/api/runs/:id/context-utilization",
             get(get_context_utilization),
         )
@@ -1816,6 +1820,27 @@ async fn get_plan_completion_audit(
                 Json(serde_json::json!({
                     "run_id": id,
                     "audit": audit,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_behavioral_change_report(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.load_behavioral_change_report(&id).await {
+            Ok(report) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "report": report,
                 })),
             )
                 .into_response(),

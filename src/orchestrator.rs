@@ -255,6 +255,45 @@ struct PlanCompletionAuditArtifact {
     items: Vec<PlanCompletionAuditItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralPriorRevisionCandidate {
+    candidate_id: String,
+    source_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+    retention_class: String,
+    source_authority: String,
+    content_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BehavioralChangeMetrics {
+    checkpoint_count: usize,
+    clarification_count: usize,
+    validation_repair_attempts: usize,
+    retry_count: usize,
+    plan_audit_unresolved_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hidden_scenarios_passed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralChangeReportArtifact {
+    schema: String,
+    run_id: String,
+    spec_id: String,
+    product: String,
+    final_status: String,
+    generated_at: String,
+    status: String,
+    summary: String,
+    metrics: BehavioralChangeMetrics,
+    #[serde(default)]
+    prior_revision_candidates: Vec<BehavioralPriorRevisionCandidate>,
+}
+
 #[derive(Debug, Clone)]
 struct BrambleTestHarnessResult {
     results: Vec<ScenarioResult>,
@@ -2050,6 +2089,31 @@ impl AppContext {
                 self.try_record_calvin_prediction_result(run_id, final_status, None)
                     .await;
                 self.try_process_memory_candidates_on_close(run_id).await;
+                if let Err(report_error) = self
+                    .write_behavioral_change_report_for_run(
+                        run_id,
+                        &prepared.spec_obj,
+                        &prepared.target_source,
+                        final_status,
+                        Some(&output.validation),
+                        Some(&output.hidden_scenarios),
+                        &audit,
+                        &output.run_dir,
+                    )
+                    .await
+                {
+                    let _ = self
+                        .record_event(
+                            run_id,
+                            None,
+                            "memory",
+                            "coobie",
+                            "warning",
+                            &format!("Behavioral-change report skipped: {report_error}"),
+                            &prepared.log_path,
+                        )
+                        .await;
+                }
                 self.finalize_blackboard(final_status, &output.run_dir)
                     .await?;
                 self.write_run_timing_artifact(run_id, &output.run_dir)
@@ -2093,6 +2157,31 @@ impl AppContext {
                             "orchestrator",
                             "warning",
                             &format!("Plan completion audit skipped: {audit_error}"),
+                            &prepared.log_path,
+                        )
+                        .await;
+                }
+                if let Err(report_error) = self
+                    .write_behavioral_change_report_for_run(
+                        run_id,
+                        &prepared.spec_obj,
+                        &prepared.target_source,
+                        "failed",
+                        None,
+                        None,
+                        &audit,
+                        &run_dir,
+                    )
+                    .await
+                {
+                    let _ = self
+                        .record_event(
+                            run_id,
+                            None,
+                            "memory",
+                            "coobie",
+                            "warning",
+                            &format!("Behavioral-change report skipped: {report_error}"),
                             &prepared.log_path,
                         )
                         .await;
@@ -9919,6 +10008,161 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             .with_context(|| format!("parsing {}", path.display()))
     }
 
+    async fn write_behavioral_change_report_for_run(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        final_status: &str,
+        validation: Option<&ValidationSummary>,
+        hidden_scenarios: Option<&HiddenScenarioSummary>,
+        audit: &PlanCompletionAuditArtifact,
+        run_dir: &Path,
+    ) -> Result<()> {
+        let candidates = self.chat.list_memory_candidates_for_run(run_id).await?;
+        let prior_revision_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.learning_intent == "prior_revision_target")
+            .map(behavioral_prior_revision_candidate)
+            .collect::<Vec<_>>();
+        let (checkpoint_count, clarification_count) = self.run_checkpoint_counts(run_id).await?;
+        let validation_repair_attempts = load_validation_repair_attempt_count(run_dir).await?;
+        let metrics = BehavioralChangeMetrics {
+            checkpoint_count,
+            clarification_count,
+            validation_repair_attempts,
+            retry_count: validation_repair_attempts,
+            plan_audit_unresolved_count: audit.unresolved_count,
+            validation_passed: validation.map(|summary| summary.passed),
+            hidden_scenarios_passed: hidden_scenarios.map(|summary| summary.passed),
+        };
+        let report = build_behavioral_change_report(
+            run_id,
+            spec_obj,
+            target_source,
+            final_status,
+            metrics,
+            prior_revision_candidates,
+        );
+        self.write_behavioral_change_report(run_dir, &report).await
+    }
+
+    async fn run_checkpoint_counts(&self, run_id: &str) -> Result<(usize, usize)> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS checkpoint_count,
+                SUM(CASE
+                    WHEN lower(checkpoint_type) LIKE '%clarif%'
+                      OR lower(prompt) LIKE '%clarif%'
+                      OR lower(prompt) LIKE '%ambigu%'
+                    THEN 1 ELSE 0 END
+                ) AS clarification_count
+            FROM run_checkpoints
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let checkpoint_count: i64 = row.get("checkpoint_count");
+        let clarification_count: Option<i64> = row.get("clarification_count");
+        Ok((
+            checkpoint_count.max(0) as usize,
+            clarification_count.unwrap_or(0).max(0) as usize,
+        ))
+    }
+
+    async fn write_behavioral_change_report(
+        &self,
+        run_dir: &Path,
+        report: &BehavioralChangeReportArtifact,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir)
+            .await
+            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
+        self.write_json_file(&run_dir.join("behavioral_change_report.json"), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("behavioral_change_report.md"),
+            render_behavioral_change_report_markdown(report),
+        )
+        .await?;
+        self.insert_behavioral_change_report(report).await?;
+        let mut board = self.blackboard.write().await;
+        push_unique(&mut board.artifact_refs, "behavioral_change_report.json");
+        push_unique(&mut board.artifact_refs, "behavioral_change_report.md");
+        Ok(())
+    }
+
+    async fn insert_behavioral_change_report(
+        &self,
+        report: &BehavioralChangeReportArtifact,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO behavioral_change_reports (
+                report_id, run_id, spec_id, status, summary, metrics_json,
+                prior_revision_candidates_json, artifact_json, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(run_id) DO UPDATE SET
+                spec_id = excluded.spec_id,
+                status = excluded.status,
+                summary = excluded.summary,
+                metrics_json = excluded.metrics_json,
+                prior_revision_candidates_json = excluded.prior_revision_candidates_json,
+                artifact_json = excluded.artifact_json,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(format!("behavioral-change-{}", report.run_id))
+        .bind(&report.run_id)
+        .bind(&report.spec_id)
+        .bind(&report.status)
+        .bind(&report.summary)
+        .bind(serde_json::to_string(&report.metrics)?)
+        .bind(serde_json::to_string(&report.prior_revision_candidates)?)
+        .bind(serde_json::to_string(report)?)
+        .bind(&report.generated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_behavioral_change_report(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact_json
+            FROM behavioral_change_reports
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            let raw: String = row.get("artifact_json");
+            return serde_json::from_str(&raw)
+                .map(Some)
+                .with_context(|| format!("parsing behavioral_change_reports for {run_id}"));
+        }
+
+        let path = self.run_dir(run_id).join("behavioral_change_report.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
     pub async fn insert_code_review_learning_records(
         &self,
         records: &[CodeReviewLearningRecord],
@@ -16617,6 +16861,8 @@ Return JSON only.",
             status: "pending".to_string(),
             content_json: contract,
             edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: Vec::new(),
             confidence: candidate.importance_score,
             label,
             created_at: Utc::now(),
@@ -16710,6 +16956,8 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(&lesson).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: 0.8,
                 label,
                 created_at: Utc::now(),
@@ -16762,6 +17010,8 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(&lesson).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: attr.confidence.unwrap_or(0.5),
                 label,
                 created_at: Utc::now(),
@@ -16794,7 +17044,65 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(hypothesis).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: hypothesis.confidence as f64,
+                label,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            };
+            self.insert_consolidation_candidate(&candidate).await?;
+            candidates.push(candidate);
+        }
+
+        // ── Elevated schema-revision proposals ──
+        //
+        // These are deliberately stricter than single-run lessons. A schema
+        // revision changes how a class of situations is categorized, so it
+        // requires cross-episode evidence before the Workbench can even keep it.
+        let memory_candidates = self.chat.list_memory_candidates_for_run(run_id).await?;
+        for memory_candidate in memory_candidates
+            .iter()
+            .filter(|candidate| candidate.learning_intent == "prior_revision_target")
+        {
+            let basis = self
+                .schema_revision_pattern_basis(memory_candidate, 12)
+                .await?;
+            if !schema_revision_pattern_basis_is_valid(&basis) {
+                continue;
+            }
+            let candidate_id = format!(
+                "schema-revision-{}",
+                memory_candidate
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or(&memory_candidate.candidate_id)
+            );
+            let candidate_id = normalize_consolidation_candidate_id(&candidate_id);
+            if self.candidate_exists(&candidate_id).await? {
+                continue;
+            }
+            let proposal = build_schema_revision_proposal(memory_candidate, &basis);
+            let label = format!(
+                "[schema revision] {}",
+                truncate_text(
+                    proposal
+                        .get("compiled_claim")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("prior-revision pattern"),
+                    96
+                )
+            );
+            let candidate = ConsolidationCandidate {
+                candidate_id,
+                run_id: run_id.to_string(),
+                kind: "schema_revision".to_string(),
+                status: "pending".to_string(),
+                content_json: proposal,
+                edited_json: None,
+                review_class: "elevated".to_string(),
+                pattern_basis: basis,
+                confidence: 0.72,
                 label,
                 created_at: Utc::now(),
                 reviewed_at: None,
@@ -16816,7 +17124,7 @@ Return JSON only.",
         let rows = sqlx::query(
             r#"
             SELECT candidate_id, run_id, kind, status, content_json, edited_json,
-                   confidence, label, created_at, reviewed_at
+                   review_class, pattern_basis_json, confidence, label, created_at, reviewed_at
             FROM consolidation_candidates
             WHERE run_id = ?1
             ORDER BY confidence DESC, created_at ASC
@@ -16840,6 +17148,11 @@ Return JSON only.",
                 edited_json: row
                     .get::<Option<String>, _>("edited_json")
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                review_class: row.get::<String, _>("review_class"),
+                pattern_basis: row
+                    .get::<Option<String>, _>("pattern_basis_json")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
                 confidence: row.get::<f64, _>("confidence"),
                 label: row.get::<String, _>("label"),
                 created_at: chrono::DateTime::parse_from_rfc3339(
@@ -16856,6 +17169,56 @@ Return JSON only.",
         Ok(out)
     }
 
+    async fn load_consolidation_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Option<ConsolidationCandidate>> {
+        let row = sqlx::query(
+            r#"
+            SELECT candidate_id, run_id, kind, status, content_json, edited_json,
+                   review_class, pattern_basis_json, confidence, label, created_at, reviewed_at
+            FROM consolidation_candidates
+            WHERE candidate_id = ?1
+            "#,
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ConsolidationCandidate {
+            candidate_id: row.get::<String, _>("candidate_id"),
+            run_id: row.get::<String, _>("run_id"),
+            kind: row.get::<String, _>("kind"),
+            status: row.get::<String, _>("status"),
+            content_json: row
+                .get::<Option<String>, _>("content_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            edited_json: row
+                .get::<Option<String>, _>("edited_json")
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            review_class: row.get::<String, _>("review_class"),
+            pattern_basis: row
+                .get::<Option<String>, _>("pattern_basis_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            confidence: row.get::<f64, _>("confidence"),
+            label: row.get::<String, _>("label"),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                row.get::<String, _>("created_at").as_str(),
+            )?
+            .with_timezone(&Utc),
+            reviewed_at: row
+                .get::<Option<String>, _>("reviewed_at")
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()?
+                .map(|dt| dt.with_timezone(&Utc)),
+        }))
+    }
+
     /// Set a candidate's status to `"kept"` or `"discarded"`.
     pub async fn review_consolidation_candidate(
         &self,
@@ -16864,6 +17227,13 @@ Return JSON only.",
     ) -> Result<()> {
         if status != "kept" && status != "discarded" {
             bail!("invalid consolidation status: {status}; must be 'kept' or 'discarded'");
+        }
+        if status == "kept" {
+            let candidate = self
+                .load_consolidation_candidate(candidate_id)
+                .await?
+                .with_context(|| format!("consolidation candidate not found: {candidate_id}"))?;
+            validate_consolidation_candidate_for_keep(&candidate)?;
         }
         sqlx::query(
             "UPDATE consolidation_candidates SET status = ?2, reviewed_at = ?3 WHERE candidate_id = ?1",
@@ -16882,6 +17252,12 @@ Return JSON only.",
         candidate_id: &str,
         edited_json: serde_json::Value,
     ) -> Result<()> {
+        let mut candidate = self
+            .load_consolidation_candidate(candidate_id)
+            .await?
+            .with_context(|| format!("consolidation candidate not found: {candidate_id}"))?;
+        candidate.edited_json = Some(edited_json.clone());
+        validate_consolidation_candidate_for_keep(&candidate)?;
         let json_str = serde_json::to_string(&edited_json)?;
         sqlx::query(
             r#"UPDATE consolidation_candidates
@@ -16921,8 +17297,9 @@ Return JSON only.",
                 continue;
             }
             if candidate.kind != "lesson" {
-                // causal_link / pattern candidates are stored in their own
-                // tables (causal_hypotheses) — not lesson memory.
+                // causal_link / pattern / schema_revision candidates are not
+                // promoted into lesson memory. Schema revisions require a later
+                // governed Ethos/Calvin integration path.
                 continue;
             }
 
@@ -16999,6 +17376,86 @@ Return JSON only.",
         Ok(row.is_some())
     }
 
+    async fn schema_revision_pattern_basis(
+        &self,
+        seed: &crate::chat::MemoryCandidate,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let dedupe_key = seed
+            .dedupe_key
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| memory_candidate_dedupe_key(seed));
+        if dedupe_key.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT candidate_id, source_event_id, run_id, spec_id, message_id,
+                   agent, role, raw_payload, distilled_content,
+                   evidence_refs, created_at
+            FROM memory_candidates
+            WHERE learning_intent = 'prior_revision_target'
+              AND dedupe_key = ?1
+              AND status NOT IN ('discarded', 'ignored_ephemeral')
+            ORDER BY created_at ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(&dedupe_key)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut seen_runs = BTreeSet::new();
+        let mut basis = Vec::new();
+        for row in rows {
+            let run_id = row.get::<Option<String>, _>("run_id");
+            let Some(run_id_value) = run_id.as_deref().filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            if !seen_runs.insert(run_id_value.to_string()) {
+                continue;
+            }
+            let raw_payload = row
+                .get::<Option<String>, _>("raw_payload")
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .unwrap_or_default();
+            let content = row
+                .get::<Option<String>, _>("distilled_content")
+                .or_else(|| {
+                    raw_payload
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    raw_payload
+                        .get("content_preview")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            basis.push(serde_json::json!({
+                "run_id": run_id_value,
+                "spec_id": row.get::<Option<String>, _>("spec_id"),
+                "candidate_id": row.get::<String, _>("candidate_id"),
+                "source_event_id": row.get::<String, _>("source_event_id"),
+                "message_id": row.get::<Option<String>, _>("message_id"),
+                "agent": row.get::<Option<String>, _>("agent"),
+                "role": row.get::<String, _>("role"),
+                "evidence_refs": row
+                    .get::<Option<String>, _>("evidence_refs")
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                "content_preview": truncate_text(&content, 240),
+                "created_at": row.get::<String, _>("created_at"),
+            }));
+        }
+        Ok(basis)
+    }
+
     async fn insert_consolidation_candidate(
         &self,
         candidate: &ConsolidationCandidate,
@@ -17006,8 +17463,8 @@ Return JSON only.",
         sqlx::query(
             r#"INSERT OR IGNORE INTO consolidation_candidates
                (candidate_id, run_id, kind, status, content_json, edited_json,
-                confidence, label, created_at, reviewed_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                review_class, pattern_basis_json, confidence, label, created_at, reviewed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
         )
         .bind(&candidate.candidate_id)
         .bind(&candidate.run_id)
@@ -17021,6 +17478,8 @@ Return JSON only.",
                 .map(|v| serde_json::to_string(v))
                 .transpose()?,
         )
+        .bind(&candidate.review_class)
+        .bind(serde_json::to_string(&candidate.pattern_basis)?)
         .bind(candidate.confidence)
         .bind(&candidate.label)
         .bind(candidate.created_at.to_rfc3339())
@@ -24660,6 +25119,228 @@ fn render_plan_completion_audit_markdown(audit: &PlanCompletionAuditArtifact) ->
     )
 }
 
+fn behavioral_prior_revision_candidate(
+    candidate: &crate::chat::MemoryCandidate,
+) -> BehavioralPriorRevisionCandidate {
+    BehavioralPriorRevisionCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        source_event_id: candidate.source_event_id.clone(),
+        message_id: candidate.message_id.clone(),
+        retention_class: candidate.retention_class.clone(),
+        source_authority: candidate.source_authority.clone(),
+        content_preview: memory_candidate_preview(candidate, 220),
+    }
+}
+
+fn build_behavioral_change_report(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    final_status: &str,
+    metrics: BehavioralChangeMetrics,
+    prior_revision_candidates: Vec<BehavioralPriorRevisionCandidate>,
+) -> BehavioralChangeReportArtifact {
+    let status = if prior_revision_candidates.is_empty() {
+        "no_prior_revision"
+    } else if final_status == "completed"
+        && metrics.plan_audit_unresolved_count == 0
+        && metrics.validation_passed.unwrap_or(true)
+        && metrics.hidden_scenarios_passed.unwrap_or(true)
+    {
+        "possible_shift"
+    } else {
+        "stored_not_learned_pending"
+    };
+    let summary = match status {
+        "no_prior_revision" => {
+            "No prior-revision memory candidates were present for this run.".to_string()
+        }
+        "possible_shift" => format!(
+            "{} prior-revision candidate(s) were present and the run closed cleanly; later calibrated scoring can test whether behavior actually shifted.",
+            prior_revision_candidates.len()
+        ),
+        _ => format!(
+            "{} prior-revision candidate(s) were present, but unresolved evidence remains before Harkonnen should claim learning.",
+            prior_revision_candidates.len()
+        ),
+    };
+
+    BehavioralChangeReportArtifact {
+        schema: "harkonnen.behavioral_change_report.v1".to_string(),
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        final_status: final_status.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        status: status.to_string(),
+        summary,
+        metrics,
+        prior_revision_candidates,
+    }
+}
+
+fn render_behavioral_change_report_markdown(report: &BehavioralChangeReportArtifact) -> String {
+    let prior_revision_candidates = if report.prior_revision_candidates.is_empty() {
+        "- None.".to_string()
+    } else {
+        report
+            .prior_revision_candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "- {} ({}, {})\n  Source: {}\n  Preview: {}",
+                    candidate.candidate_id,
+                    candidate.retention_class,
+                    candidate.source_authority,
+                    candidate.source_event_id,
+                    candidate.content_preview
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "# Behavioral Change Report\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Final status: {}\n- Generated at: {}\n- Status: {}\n\n{}\n\n## Metrics\n\n- Checkpoints: {}\n- Clarifications: {}\n- Validation repair attempts: {}\n- Retry count: {}\n- Plan audit unresolved: {}\n- Validation passed: {}\n- Hidden scenarios passed: {}\n\n## Prior Revision Candidates\n{}",
+        report.run_id,
+        report.spec_id,
+        report.product,
+        report.final_status,
+        report.generated_at,
+        report.status,
+        report.summary,
+        report.metrics.checkpoint_count,
+        report.metrics.clarification_count,
+        report.metrics.validation_repair_attempts,
+        report.metrics.retry_count,
+        report.metrics.plan_audit_unresolved_count,
+        render_optional_bool(report.metrics.validation_passed),
+        render_optional_bool(report.metrics.hidden_scenarios_passed),
+        prior_revision_candidates,
+    )
+}
+
+fn render_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn memory_candidate_preview(candidate: &crate::chat::MemoryCandidate, max_chars: usize) -> String {
+    let content = candidate
+        .distilled_content
+        .clone()
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| candidate.operation.clone());
+    truncate_text(&content, max_chars)
+}
+
+fn build_schema_revision_proposal(
+    candidate: &crate::chat::MemoryCandidate,
+    pattern_basis: &[serde_json::Value],
+) -> serde_json::Value {
+    let claim = memory_candidate_preview(candidate, 360);
+    serde_json::json!({
+        "schema": "harkonnen.schema_revision_proposal.v1",
+        "candidate_type": "schema_revision",
+        "compiled_claim": claim,
+        "source_candidate_id": candidate.candidate_id,
+        "source_event_id": candidate.source_event_id,
+        "source_authority": candidate.source_authority,
+        "retention_class": candidate.retention_class,
+        "learning_intent": candidate.learning_intent,
+        "pattern_basis": pattern_basis,
+        "minimum_basis_required": 3,
+        "distinct_run_basis_required": true,
+        "single_run_disallowed": true,
+        "operator_endorsement_required": true,
+        "review_class": "elevated",
+        "integration_recommendation": "Submit to the governed Consolidation Workbench as a schema-level proposal; do not promote from a single run.",
+    })
+}
+
+fn validate_consolidation_candidate_for_keep(candidate: &ConsolidationCandidate) -> Result<()> {
+    if candidate.kind != "schema_revision" {
+        return Ok(());
+    }
+    let content = candidate
+        .edited_json
+        .as_ref()
+        .unwrap_or(&candidate.content_json);
+    let basis = content
+        .get("pattern_basis")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| candidate.pattern_basis.clone());
+    if !schema_revision_pattern_basis_is_valid(&basis) {
+        bail!(
+            "schema_revision candidates require pattern_basis from at least 3 distinct runs before they can be kept"
+        );
+    }
+    if content
+        .get("operator_endorsement_required")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        bail!("schema_revision candidates must require operator_endorsement_required=true");
+    }
+    Ok(())
+}
+
+fn schema_revision_pattern_basis_is_valid(pattern_basis: &[serde_json::Value]) -> bool {
+    let distinct_runs = pattern_basis
+        .iter()
+        .filter_map(|entry| entry.get("run_id").and_then(serde_json::Value::as_str))
+        .filter(|run_id| !run_id.trim().is_empty())
+        .collect::<BTreeSet<_>>();
+    pattern_basis.len() >= 3 && distinct_runs.len() >= 3
+}
+
+fn normalize_consolidation_candidate_id(value: &str) -> String {
+    let normalized = normalize_text_key(value)
+        .split_whitespace()
+        .take(18)
+        .collect::<Vec<_>>()
+        .join("-");
+    if normalized.is_empty() {
+        format!("candidate-{}", Uuid::new_v4())
+    } else {
+        normalized
+    }
+}
+
+async fn load_validation_repair_attempt_count(run_dir: &Path) -> Result<usize> {
+    let path = run_dir.join("validation_repair_attempts.json");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed
+        .get("attempts")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0))
+}
+
 fn code_review_learning_records_from_validation_repair(
     report: &ValidationRepairArtifact,
 ) -> Vec<CodeReviewLearningRecord> {
@@ -30439,6 +31120,133 @@ mod tests {
             .iter()
             .any(|item| item.item_id == "core.visible_validation"
                 && item.evidence_refs.contains(&"validation.json".to_string())));
+    }
+
+    #[test]
+    fn behavioral_change_report_marks_possible_shift_only_for_clean_prior_revision_runs() {
+        let spec = Spec {
+            id: "spec-learning".to_string(),
+            title: "Learning spec".to_string(),
+            purpose: "Prove behavioral-change report status".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: Vec::new(),
+            performance_expectations: Vec::new(),
+            security_expectations: Vec::new(),
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        };
+        let target = TargetSourceMetadata {
+            label: "product".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "product".to_string(),
+            git: None,
+        };
+        let candidate = BehavioralPriorRevisionCandidate {
+            candidate_id: "candidate-1".to_string(),
+            source_event_id: "event-1".to_string(),
+            message_id: Some("msg-1".to_string()),
+            retention_class: "shared_recall".to_string(),
+            source_authority: "operator".to_string(),
+            content_preview: "always use latest stable versions".to_string(),
+        };
+        let clean = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics {
+                plan_audit_unresolved_count: 0,
+                validation_passed: Some(true),
+                hidden_scenarios_passed: Some(true),
+                ..BehavioralChangeMetrics::default()
+            },
+            vec![candidate.clone()],
+        );
+        assert_eq!(clean.status, "possible_shift");
+        assert!(
+            render_behavioral_change_report_markdown(&clean).contains("Behavioral Change Report")
+        );
+
+        let unresolved = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics {
+                plan_audit_unresolved_count: 1,
+                validation_passed: Some(true),
+                hidden_scenarios_passed: Some(true),
+                ..BehavioralChangeMetrics::default()
+            },
+            vec![candidate],
+        );
+        assert_eq!(unresolved.status, "stored_not_learned_pending");
+
+        let no_prior_revision = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics::default(),
+            Vec::new(),
+        );
+        assert_eq!(no_prior_revision.status, "no_prior_revision");
+    }
+
+    #[test]
+    fn schema_revision_requires_three_distinct_run_basis_items() {
+        let weak_basis = vec![
+            serde_json::json!({"run_id": "run-1", "candidate_id": "a"}),
+            serde_json::json!({"run_id": "run-1", "candidate_id": "b"}),
+            serde_json::json!({"run_id": "run-2", "candidate_id": "c"}),
+        ];
+        assert!(!schema_revision_pattern_basis_is_valid(&weak_basis));
+
+        let strong_basis = vec![
+            serde_json::json!({"run_id": "run-1", "candidate_id": "a"}),
+            serde_json::json!({"run_id": "run-2", "candidate_id": "b"}),
+            serde_json::json!({"run_id": "run-3", "candidate_id": "c"}),
+        ];
+        assert!(schema_revision_pattern_basis_is_valid(&strong_basis));
+
+        let candidate = ConsolidationCandidate {
+            candidate_id: "schema-revision-test".to_string(),
+            run_id: "run-3".to_string(),
+            kind: "schema_revision".to_string(),
+            status: "pending".to_string(),
+            content_json: serde_json::json!({
+                "schema": "harkonnen.schema_revision_proposal.v1",
+                "operator_endorsement_required": true,
+                "pattern_basis": strong_basis,
+            }),
+            edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: Vec::new(),
+            confidence: 0.72,
+            label: "[schema revision] test".to_string(),
+            created_at: Utc::now(),
+            reviewed_at: None,
+        };
+        assert!(validate_consolidation_candidate_for_keep(&candidate).is_ok());
+
+        let invalid = ConsolidationCandidate {
+            content_json: serde_json::json!({
+                "schema": "harkonnen.schema_revision_proposal.v1",
+                "operator_endorsement_required": true,
+                "pattern_basis": weak_basis,
+            }),
+            ..candidate
+        };
+        assert!(validate_consolidation_candidate_for_keep(&invalid).is_err());
     }
 
     #[test]

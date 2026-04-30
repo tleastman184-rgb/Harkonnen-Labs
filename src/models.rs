@@ -1074,7 +1074,7 @@ pub struct CounterfactualOutcome {
 pub struct ConsolidationCandidate {
     pub candidate_id: String,
     pub run_id: String,
-    /// `"lesson"` | `"causal_link"` | `"pattern"`
+    /// `"lesson"` | `"causal_link"` | `"pattern"` | `"schema_revision"`
     pub kind: String,
     /// `"pending"` | `"kept"` | `"discarded"`
     pub status: String,
@@ -1083,12 +1083,22 @@ pub struct ConsolidationCandidate {
     /// If the operator edited the content, this holds the edited version.
     #[serde(default)]
     pub edited_json: Option<serde_json::Value>,
+    /// `"standard"` | `"elevated"`; schema revisions require elevated review.
+    #[serde(default = "default_consolidation_review_class")]
+    pub review_class: String,
+    /// Cross-episode evidence basis for elevated pattern/schema proposals.
+    #[serde(default)]
+    pub pattern_basis: Vec<serde_json::Value>,
     pub confidence: f64,
     /// Human-readable one-liner shown in the Workbench card.
     pub label: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub reviewed_at: Option<DateTime<Utc>>,
+}
+
+fn default_consolidation_review_class() -> String {
+    "standard".to_string()
 }
 
 /// A causal pattern that has fired on consecutive runs of the same spec.

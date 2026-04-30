@@ -136,10 +136,32 @@ function LearningRecord({ record }) {
   );
 }
 
+function BehavioralCandidate({ candidate }) {
+  return (
+    <div style={{
+      padding: '9px 10px',
+      borderRadius: 7,
+      border: '1px solid rgba(255,255,255,0.08)',
+      background: '#191d1f',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
+        <div style={{ color: '#d8d3ca', fontSize: 13, fontWeight: 750 }}>
+          {candidate?.candidate_id || 'prior revision'}
+        </div>
+        <Chip label={candidate?.source_authority || 'agent_observation'} />
+      </div>
+      <div style={{ color: '#c9c1b4', fontSize: 12, lineHeight: 1.45 }}>
+        {candidate?.content_preview || 'No preview recorded.'}
+      </div>
+    </div>
+  );
+}
+
 export default function RunReviewPanel({ runId }) {
   const [audit, setAudit] = useState(null);
   const [learning, setLearning] = useState(null);
   const [context, setContext] = useState(null);
+  const [behavioral, setBehavioral] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -148,22 +170,26 @@ export default function RunReviewPanel({ runId }) {
     setLoading(true);
     setError('');
     try {
-      const [auditResponse, learningResponse, contextResponse] = await Promise.all([
+      const [auditResponse, learningResponse, contextResponse, behavioralResponse] = await Promise.all([
         fetch(`${API_BASE}/runs/${runId}/plan-completion-audit`),
         fetch(`${API_BASE}/runs/${runId}/code-review-learning`),
         fetch(`${API_BASE}/runs/${runId}/context-utilization`),
+        fetch(`${API_BASE}/runs/${runId}/behavioral-change`),
       ]);
       if (!auditResponse.ok) throw new Error(`audit ${auditResponse.status} ${auditResponse.statusText}`);
       if (!learningResponse.ok) throw new Error(`review ${learningResponse.status} ${learningResponse.statusText}`);
       if (!contextResponse.ok) throw new Error(`context ${contextResponse.status} ${contextResponse.statusText}`);
-      const [auditJson, learningJson, contextJson] = await Promise.all([
+      if (!behavioralResponse.ok) throw new Error(`behavioral ${behavioralResponse.status} ${behavioralResponse.statusText}`);
+      const [auditJson, learningJson, contextJson, behavioralJson] = await Promise.all([
         auditResponse.json(),
         learningResponse.json(),
         contextResponse.json(),
+        behavioralResponse.json(),
       ]);
       setAudit(auditJson.audit || null);
       setLearning(learningJson);
       setContext(contextJson);
+      setBehavioral(behavioralJson.report || null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -179,6 +205,8 @@ export default function RunReviewPanel({ runId }) {
   const statusTone = unresolved > 0 ? 'warn' : audit ? 'good' : 'neutral';
   const pullRecords = context?.pull_records || [];
   const contextSummary = context?.summary || {};
+  const behavioralMetrics = behavioral?.metrics || {};
+  const priorRevisionCandidates = behavioral?.prior_revision_candidates || [];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -199,6 +227,7 @@ export default function RunReviewPanel({ runId }) {
         <StatTile label="Audit items" value={items.length} tone={audit ? 'neutral' : 'warn'} />
         <StatTile label="Unresolved" value={unresolved} tone={statusTone} />
         <StatTile label="Review records" value={learning?.total ?? records.length} tone={records.length ? 'good' : 'neutral'} />
+        <StatTile label="Prior revisions" value={priorRevisionCandidates.length} tone={priorRevisionCandidates.length ? 'warn' : 'neutral'} />
         <StatTile label="Memory pulls" value={contextSummary.mid_task_pull_count ?? pullRecords.length} tone={pullRecords.length ? 'good' : 'neutral'} />
         <StatTile
           label="Utilization"
@@ -206,6 +235,39 @@ export default function RunReviewPanel({ runId }) {
           tone={contextSummary.utilization_status === 'low' ? 'warn' : contextSummary.utilization_status === 'healthy' ? 'good' : 'neutral'}
         />
       </div>
+
+      <section style={{
+        border: '1px solid rgba(255,255,255,0.08)',
+        background: '#151819',
+        borderRadius: 8,
+        padding: '11px',
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 9 }}>
+          <div>
+            <div style={{ color: '#d8d3ca', fontSize: 14, fontWeight: 780 }}>Behavioral change</div>
+            <div style={{ color: '#8f99a8', fontSize: 12, marginTop: 3 }}>
+              {behavioral?.summary || (loading ? 'Loading...' : 'No behavioral-change report recorded for this run.')}
+            </div>
+          </div>
+          {behavioral?.status && <Chip label={behavioral.status} />}
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+          <Chip label={`checkpoints ${behavioralMetrics.checkpoint_count ?? 0}`} />
+          <Chip label={`clarifications ${behavioralMetrics.clarification_count ?? 0}`} />
+          <Chip label={`repairs ${behavioralMetrics.validation_repair_attempts ?? 0}`} />
+          <Chip label={`unresolved ${behavioralMetrics.plan_audit_unresolved_count ?? 0}`} />
+        </div>
+        {priorRevisionCandidates.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {priorRevisionCandidates.slice(0, 5).map((candidate) => (
+              <BehavioralCandidate key={candidate.candidate_id} candidate={candidate} />
+            ))}
+            {priorRevisionCandidates.length > 5 && (
+              <div style={{ color: '#8f99a8', fontSize: 12 }}>+{priorRevisionCandidates.length - 5} more prior-revision candidates</div>
+            )}
+          </div>
+        )}
+      </section>
 
       <section style={{
         border: '1px solid rgba(255,255,255,0.08)',

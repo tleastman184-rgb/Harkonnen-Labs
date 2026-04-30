@@ -2,8 +2,20 @@ import React, { useEffect, useState, useCallback } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3057/api';
 
-const KIND_LABEL = { lesson: 'Lesson', causal_link: 'Causal Link', pattern: 'Pattern' };
-const KIND_COLOR = { lesson: '#c4922a', causal_link: '#4a9eff', pattern: '#9c6fde' };
+const KIND_LABEL = {
+  lesson: 'Lesson',
+  causal_link: 'Causal Link',
+  pattern: 'Pattern',
+  calvin_promotion: 'Calvin',
+  schema_revision: 'Schema Revision',
+};
+const KIND_COLOR = {
+  lesson: '#c4922a',
+  causal_link: '#4a9eff',
+  pattern: '#9c6fde',
+  calvin_promotion: '#df9f63',
+  schema_revision: '#f07f62',
+};
 
 const STATUS_CHIP = {
   pending:   { bg: 'rgba(255,255,255,0.07)', color: '#aaa',    label: 'Pending' },
@@ -63,6 +75,8 @@ function CandidateCard({ candidate, onKeep, onDiscard, onEdit, busy }) {
   }
 
   const isBusy = busy === candidate.candidate_id;
+  const elevated = candidate.review_class === 'elevated' || candidate.kind === 'schema_revision';
+  const patternBasis = candidate.pattern_basis || candidate.content_json?.pattern_basis || [];
 
   return (
     <div style={{
@@ -91,6 +105,22 @@ function CandidateCard({ candidate, onKeep, onDiscard, onEdit, busy }) {
         </div>
         <StatusChip status={candidate.status} />
       </div>
+
+      {elevated && (
+        <div style={{
+          marginBottom: 8,
+          padding: '6px 8px',
+          borderRadius: 6,
+          border: '1px solid rgba(240,127,98,0.24)',
+          background: 'rgba(240,127,98,0.08)',
+          color: '#f4b1a2',
+          fontSize: 11,
+          lineHeight: 1.35,
+        }}>
+          Elevated review · {patternBasis.length} basis item{patternBasis.length === 1 ? '' : 's'}
+          {candidate.kind === 'schema_revision' ? ' · requires 3 distinct runs' : ''}
+        </div>
+      )}
 
       <ConfidenceBar value={candidate.confidence} />
 

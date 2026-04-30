@@ -13,6 +13,9 @@ attribute uuid, value string;
 attribute name, value string;
 attribute narrative_summary, value string;
 attribute confidence, value double;
+attribute prior-confidence, value double;
+attribute evidence-ids, value string;
+attribute revision-type, value string;
 attribute scope, value string;
 attribute revision_reason, value string;
 attribute preservation_note, value string;
@@ -254,6 +257,9 @@ relation preserved,
 relation revised_into,
   owns revision_reason,
   owns preservation_note,
+  owns prior-confidence,
+  owns evidence-ids,
+  owns revision-type,
   relates prior,
   relates next;
 

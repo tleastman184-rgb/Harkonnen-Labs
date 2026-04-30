@@ -28,12 +28,54 @@ pub enum Chamber {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionType {
+    FastLoop,
+    MediumLoop,
+    SchemaRevision,
+    PolicyChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeliefRevision {
     pub belief_id: String,
+    pub prior_confidence: f64,
     pub revised_summary: String,
     pub new_confidence: f64,
     pub revision_reason: String,
+    pub evidence_ids: Vec<String>,
+    pub revision_type: RevisionType,
     pub preservation_note: Option<String>,
+}
+
+impl BeliefRevision {
+    pub fn validate(&self) -> Result<()> {
+        validate_confidence("prior_confidence", self.prior_confidence)?;
+        validate_confidence("new_confidence", self.new_confidence)?;
+        if self.evidence_ids.is_empty() {
+            anyhow::bail!("BeliefRevision requires at least one evidence_id");
+        }
+        let min_evidence = match self.revision_type {
+            RevisionType::FastLoop | RevisionType::PolicyChange => 1,
+            RevisionType::MediumLoop | RevisionType::SchemaRevision => 3,
+        };
+        if self.evidence_ids.len() < min_evidence {
+            anyhow::bail!(
+                "{:?} BeliefRevision requires at least {} evidence_ids",
+                self.revision_type,
+                min_evidence
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_confidence(label: &str, value: f64) -> Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        anyhow::bail!("{label} must be finite and in 0.0..=1.0")
+    }
 }
 
 /// Coobie's pre-run epistemic claim about what will happen in this run.
@@ -167,6 +209,7 @@ impl CalvinClient {
     }
 
     pub async fn revise_belief(&self, run_id: &str, rev: &BeliefRevision) -> Result<()> {
+        rev.validate()?;
         self.client
             .post(format!("{}/runs/{run_id}/beliefs", self.base_url))
             .json(rev)
@@ -364,5 +407,56 @@ pub async fn try_connect(config: &CalvinConfig) -> Option<CalvinClient> {
             tracing::warn!("Calvin Archive disabled — client init failed: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BeliefRevision, RevisionType};
+
+    fn revision(revision_type: RevisionType, evidence_ids: Vec<&str>) -> BeliefRevision {
+        BeliefRevision {
+            belief_id: "belief-1".to_string(),
+            prior_confidence: 0.4,
+            revised_summary: "Updated belief".to_string(),
+            new_confidence: 0.8,
+            revision_reason: "New evidence arrived.".to_string(),
+            evidence_ids: evidence_ids.into_iter().map(str::to_string).collect(),
+            revision_type,
+            preservation_note: None,
+        }
+    }
+
+    #[test]
+    fn belief_revision_requires_computable_confidence_and_evidence() {
+        assert!(revision(RevisionType::FastLoop, vec!["experience-1"])
+            .validate()
+            .is_ok());
+
+        let mut missing_prior = revision(RevisionType::FastLoop, vec!["experience-1"]);
+        missing_prior.prior_confidence = f64::NAN;
+        assert!(missing_prior.validate().is_err());
+
+        assert!(revision(RevisionType::FastLoop, Vec::new())
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn medium_loop_and_schema_revision_require_cross_episode_evidence() {
+        assert!(revision(RevisionType::MediumLoop, vec!["e1", "e2"])
+            .validate()
+            .is_err());
+        assert!(revision(RevisionType::MediumLoop, vec!["e1", "e2", "e3"])
+            .validate()
+            .is_ok());
+        assert!(revision(RevisionType::SchemaRevision, vec!["e1", "e2"])
+            .validate()
+            .is_err());
+        assert!(
+            revision(RevisionType::SchemaRevision, vec!["e1", "e2", "e3"])
+                .validate()
+                .is_ok()
+        );
     }
 }

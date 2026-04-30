@@ -110,8 +110,15 @@ async fn revise_belief(
     Path(_run_id): Path<String>,
     Json(rev): Json<BeliefRevision>,
 ) -> impl IntoResponse {
+    if let Err(e) = rev.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     match state.archive.revise_belief(&rev).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => StatusCode::CREATED.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

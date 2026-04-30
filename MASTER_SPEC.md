@@ -417,6 +417,14 @@ pub trait Consolidator {
 
 **`decision_influence_score` calibration** — the score cannot be correctly computed from retrieval frequency alone. Add a calibrated exclusion signal: with configurable probability, randomly exclude an eligible briefing hit from the active set for a comparable run and track whether outcomes differ. The statistical difference in outcome rate over N exclusions becomes the influence score. Without this, `stored_not_learned` detection will be systematically wrong on high-frequency, low-influence lessons.
 
+**Coobie operational modes** — Coobie conflates three computationally distinct operations that live at different levels of Pearl's causal hierarchy. Conflating them in one dispatch path allows the system to appear causally sophisticated while silently executing only associational recall. The three modes are non-interchangeable:
+
+- `coobie_retrieve(query, scope, token_budget)` — **associational level**. Pure read from OB1 + SQLite. No TypeDB or causal graph query. Returns ranked hits. Always available regardless of archive readiness.
+- `coobie_intervene(hypothesis, held_fixed: Vec<String>)` — **interventional level**. Given `do(X=x)`, query the TypeDB causal graph for the predicted distribution of Y holding the do-set fixed. Returns `CausalInterventionResult { estimated_effect_delta, confounders, epistemic_warrant, confidence }`. Requires TypeDB live (Phase 6+). Degrades gracefully to `coobie_retrieve` with a `warrant_gap: true` annotation — it must never substitute retrieval results as if they were intervention-level claims.
+- `coobie_continuity_check(agent_name, baseline_snapshot_id)` — **counterfactual level**. Load the agent's current trait/value-commitment vector from the Calvin Archive and compare it against a named `continuity-snapshot`. Returns `ContinuityCheckResult { per_invariant_drift_scores, labrador_kernel_intact, divergent_traits, anchoring_experiences }`. Requires TypeDB and a baseline snapshot.
+
+Each mode is dispatchable as a distinct `SubAgentDispatcher` task type. The dispatcher logs which mode was actually executed (vs. which was requested) in `agent_traces`. A `coobie_intervene` that silently degraded to `coobie_retrieve` must be flagged as such in the trace rather than presented as an interventional result.
+
 ---
 
 ## Part 5 — The Calvin Archive
@@ -800,6 +808,10 @@ src/calvin_archive/
 10. Do not let provider or model swaps erase identity continuity if the package and graph persist.
 11. Do not let the archive grow without a governed exit path. Retention tiers are not an optional optimization; they are an architectural requirement for long-lived systems.
 12. Do not treat the soul package reconciliation direction as obvious. Specify explicitly whether `SOUL.md` is authoritative over the archive or derived from it, and codify the recovery procedure for when they diverge.
+13. Do not use fire-and-forget semantics for archive writes. The claim "canonical truth lives in the typed graph" is incoherent if write failures are silently swallowed. All Calvin writes must go through a durable local queue before being forwarded to harmony; the queue processor handles retry; the `calvin_write_log` entry is written only on confirmed persistence. Health check, write, and read timeouts are separate configuration values with separate defaults.
+14. Do not treat `BeliefRevision` as a prose annotation. A revision that does not carry `prior_confidence: f64` is unmeasurable as a calibration event. A revision that does not carry `evidence_ids: Vec<String>` linking to specific `ArchiveExperience` records is unverifiable as evidence-driven updating and indistinguishable from drift. A revision without `revision_type: RevisionType` cannot be routed to the correct governance loop. These three fields are required for any revision that enters canonical Episteme state.
+15. Do not allow `check_adaptation_safe` to return a 1-bit result. The Meta-Governor Decision Procedure (P8-P9) requires a structured `AdaptationAudit` — which invariants were checked, which were violated, what the `IntegrationDecision` is, what the `quarantine_reason` is if applicable, and a `candidate_id` referencing the `integration-candidate` written to the archive. A boolean discards all audit evidence and breaks the traceability requirement in constraint 6.
+16. Do not label a causal link at a Pearl level without supplying the fields that level requires. Associational links need `(cause_id, effect_id, confidence)`. Interventional links additionally need `held_fixed: Vec<String>` and `estimated_effect_delta: f64`. Counterfactual links additionally need `actual_trace_id: String` and `hypothetical_intervention: String`. Absent required fields, the link must be recorded at the highest warranted level with a `warrant_gap` annotation — not at the claimed level.
 
 ### Calvin Archive Bootstrapping Protocol (P8-P14)
 

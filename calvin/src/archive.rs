@@ -29,12 +29,54 @@ pub(crate) enum Chamber {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RevisionType {
+    FastLoop,
+    MediumLoop,
+    SchemaRevision,
+    PolicyChange,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct BeliefRevision {
     pub belief_id: String,
+    pub prior_confidence: f64,
     pub revised_summary: String,
     pub new_confidence: f64,
     pub revision_reason: String,
+    pub evidence_ids: Vec<String>,
+    pub revision_type: RevisionType,
     pub preservation_note: Option<String>,
+}
+
+impl BeliefRevision {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_confidence("prior_confidence", self.prior_confidence)?;
+        validate_confidence("new_confidence", self.new_confidence)?;
+        if self.evidence_ids.is_empty() {
+            anyhow::bail!("BeliefRevision requires at least one evidence_id");
+        }
+        let min_evidence = match self.revision_type {
+            RevisionType::FastLoop | RevisionType::PolicyChange => 1,
+            RevisionType::MediumLoop | RevisionType::SchemaRevision => 3,
+        };
+        if self.evidence_ids.len() < min_evidence {
+            anyhow::bail!(
+                "{:?} BeliefRevision requires at least {} evidence_ids",
+                self.revision_type,
+                min_evidence
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_confidence(label: &str, value: f64) -> Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        anyhow::bail!("{label} must be finite and in 0.0..=1.0")
+    }
 }
 
 pub(crate) struct ArchiveStore {
@@ -193,8 +235,11 @@ impl ArchiveStore {
     }
 
     pub(crate) async fn revise_belief(&self, rev: &BeliefRevision) -> Result<()> {
+        rev.validate()?;
         let new_id = Uuid::new_v4().to_string();
         let preservation = rev.preservation_note.as_deref().unwrap_or("");
+        let evidence_ids = rev.evidence_ids.join(",");
+        let revision_type = revision_type_label(&rev.revision_type);
         let tx = self
             .driver
             .transaction(&self.db_name, TransactionType::Write)
@@ -207,12 +252,19 @@ impl ArchiveStore {
                 has narrative_summary "{summary}",
                 has confidence {conf};
                (prior: $old, next: $new) isa revised_into,
+                has prior-confidence {prior_conf},
+                has evidence-ids "{evidence_ids}",
+                has revision-type "{revision_type}",
                 has revision_reason "{reason}",
                 has preservation_note "{preservation}";"#,
             old_id = rev.belief_id,
             summary = escape_tql(&rev.revised_summary),
             conf = rev.new_confidence,
+            prior_conf = rev.prior_confidence,
+            evidence_ids = escape_tql(&evidence_ids),
+            revision_type = revision_type,
             reason = escape_tql(&rev.revision_reason),
+            preservation = escape_tql(preservation),
         );
         tx.query(&tql).await.context("revise_belief query")?;
         tx.commit().await?;
@@ -608,4 +660,53 @@ impl ArchiveStore {
 
 fn escape_tql(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn revision_type_label(value: &RevisionType) -> &'static str {
+    match value {
+        RevisionType::FastLoop => "fast_loop",
+        RevisionType::MediumLoop => "medium_loop",
+        RevisionType::SchemaRevision => "schema_revision",
+        RevisionType::PolicyChange => "policy_change",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BeliefRevision, RevisionType};
+
+    fn revision(revision_type: RevisionType, evidence_ids: Vec<&str>) -> BeliefRevision {
+        BeliefRevision {
+            belief_id: "belief-1".to_string(),
+            prior_confidence: 0.5,
+            revised_summary: "Updated belief".to_string(),
+            new_confidence: 0.75,
+            revision_reason: "Evidence changed the calibrated belief.".to_string(),
+            evidence_ids: evidence_ids.into_iter().map(str::to_string).collect(),
+            revision_type,
+            preservation_note: Some("Preserves truth-seeking.".to_string()),
+        }
+    }
+
+    #[test]
+    fn belief_revision_validation_rejects_unmeasurable_updates() {
+        let mut invalid = revision(RevisionType::FastLoop, vec!["experience-1"]);
+        invalid.prior_confidence = 1.2;
+        assert!(invalid.validate().is_err());
+        assert!(revision(RevisionType::FastLoop, Vec::new())
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn schema_revision_requires_at_least_three_evidence_ids() {
+        assert!(revision(RevisionType::SchemaRevision, vec!["e1", "e2"])
+            .validate()
+            .is_err());
+        assert!(
+            revision(RevisionType::SchemaRevision, vec!["e1", "e2", "e3"])
+                .validate()
+                .is_ok()
+        );
+    }
 }

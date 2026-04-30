@@ -810,6 +810,8 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'kept' | 'discarded'
             content_json    TEXT NOT NULL DEFAULT '{}',
             edited_json     TEXT,            -- operator-edited content, NULL = use content_json
+            review_class    TEXT NOT NULL DEFAULT 'standard',
+            pattern_basis_json TEXT NOT NULL DEFAULT '[]',
             confidence      REAL NOT NULL DEFAULT 0.5,
             label           TEXT NOT NULL DEFAULT '',
             created_at      TEXT NOT NULL,
@@ -818,6 +820,22 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "consolidation_candidates",
+        "review_class",
+        "ALTER TABLE consolidation_candidates ADD COLUMN review_class TEXT NOT NULL DEFAULT 'standard'",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "consolidation_candidates",
+        "pattern_basis_json",
+        "ALTER TABLE consolidation_candidates ADD COLUMN pattern_basis_json TEXT NOT NULL DEFAULT '[]'",
+    )
     .await?;
 
     sqlx::query(
@@ -1104,6 +1122,34 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         r#"
         CREATE UNIQUE INDEX IF NOT EXISTS idx_code_review_learning_records_fingerprint
         ON code_review_learning_records (run_id, finding_fingerprint)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Phase 5b: Behavioral-change reports ─────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS behavioral_change_reports (
+            report_id                       TEXT PRIMARY KEY,
+            run_id                          TEXT NOT NULL UNIQUE,
+            spec_id                         TEXT NOT NULL,
+            status                          TEXT NOT NULL,
+            summary                         TEXT NOT NULL,
+            metrics_json                    TEXT NOT NULL DEFAULT '{}',
+            prior_revision_candidates_json  TEXT NOT NULL DEFAULT '[]',
+            artifact_json                   TEXT NOT NULL DEFAULT '{}',
+            created_at                      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_behavioral_change_reports_status
+        ON behavioral_change_reports (status, created_at)
         "#,
     )
     .execute(&pool)

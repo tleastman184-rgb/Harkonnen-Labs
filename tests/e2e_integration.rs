@@ -312,9 +312,12 @@ mod calvin {
             .post(format!("{url}/runs/{run_id}/beliefs"))
             .json(&json!({
                 "belief_id": "belief-coobie-thin_evidence_requires_explicit_checks",
+                "prior_confidence": 0.72,
                 "revised_summary": "Explicit checks must include a schema diff when TypeDB is involved.",
                 "new_confidence": 0.98,
                 "revision_reason": "TypeDB schema mismatch caused a silent failure in run-xyz.",
+                "evidence_ids": ["experience-run-xyz-schema-mismatch"],
+                "revision_type": "fast_loop",
                 "preservation_note": "Preserves truth-seeking and signals-uncertainty traits."
             }))
             .send()
