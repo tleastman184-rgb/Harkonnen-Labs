@@ -570,6 +570,7 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             dedupe_key        TEXT,
             importance_score  REAL NOT NULL DEFAULT 0.0,
             retention_class   TEXT NOT NULL DEFAULT 'working',
+            learning_intent   TEXT NOT NULL DEFAULT 'awareness_only',
             sensitivity_label TEXT NOT NULL DEFAULT 'normal',
             evidence_refs     TEXT NOT NULL DEFAULT '[]',
             causality_json    TEXT NOT NULL DEFAULT '{}',
@@ -589,6 +590,14 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         "memory_candidates",
         "dedupe_key",
         "ALTER TABLE memory_candidates ADD COLUMN dedupe_key TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_candidates",
+        "learning_intent",
+        "ALTER TABLE memory_candidates ADD COLUMN learning_intent TEXT NOT NULL DEFAULT 'awareness_only'",
     )
     .await?;
 

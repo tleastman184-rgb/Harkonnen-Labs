@@ -41,6 +41,23 @@ function StatusChip({ status }) {
   );
 }
 
+function LearningIntentChip({ intent }) {
+  const priorRevision = intent === 'prior_revision_target';
+  return (
+    <span style={{
+      padding: '2px 7px',
+      borderRadius: 6,
+      fontSize: 11,
+      fontWeight: 650,
+      color: priorRevision ? '#df9f63' : '#8f99a8',
+      background: priorRevision ? 'rgba(223,159,99,0.12)' : 'rgba(255,255,255,0.05)',
+      whiteSpace: 'nowrap',
+    }}>
+      {priorRevision ? 'Prior revision' : 'Awareness'}
+    </span>
+  );
+}
+
 function CountTile({ label, value, tone = 'neutral' }) {
   const color = tone === 'warn' ? '#e0b34f' : tone === 'good' ? '#64c27b' : '#d8d3ca';
   return (
@@ -338,6 +355,7 @@ export default function MemoryCandidatesPanel({ runId }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
               <StatusChip status={candidate.status} />
               <span style={{ color: '#8f99a8', fontSize: 11 }}>{candidate.retention_class}</span>
+              <LearningIntentChip intent={candidate.learning_intent} />
               <span style={{ color: '#8f99a8', fontSize: 11 }}>{candidate.source_authority || 'agent_observation'}</span>
               <span style={{ color: '#8f99a8', fontSize: 11 }}>{candidate.agent || candidate.role}</span>
             </div>

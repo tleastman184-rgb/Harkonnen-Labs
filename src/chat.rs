@@ -251,6 +251,7 @@ pub struct MemoryCandidate {
     pub dedupe_key: Option<String>,
     pub importance_score: f64,
     pub retention_class: String,
+    pub learning_intent: String,
     pub sensitivity_label: String,
     pub evidence_refs: Value,
     pub source_authority: String,
@@ -995,7 +996,7 @@ impl ChatStore {
             r#"
             SELECT candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
                    agent_runtime_id, agent, role, operation, raw_payload, distilled_content, dedupe_key,
-                   importance_score, retention_class, sensitivity_label, evidence_refs,
+                   importance_score, retention_class, learning_intent, sensitivity_label, evidence_refs,
                    causality_json, status, openbrain_ref, calvin_contract_json, created_at,
                    processed_at
             FROM memory_candidates
@@ -1020,7 +1021,7 @@ impl ChatStore {
                 r#"
                 SELECT candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
                        agent_runtime_id, agent, role, operation, raw_payload, distilled_content, dedupe_key,
-                       importance_score, retention_class, sensitivity_label, evidence_refs,
+                       importance_score, retention_class, learning_intent, sensitivity_label, evidence_refs,
                        causality_json, status, openbrain_ref, calvin_contract_json, created_at,
                        processed_at
                 FROM memory_candidates
@@ -1038,7 +1039,7 @@ impl ChatStore {
                 r#"
                 SELECT candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
                        agent_runtime_id, agent, role, operation, raw_payload, distilled_content, dedupe_key,
-                       importance_score, retention_class, sensitivity_label, evidence_refs,
+                       importance_score, retention_class, learning_intent, sensitivity_label, evidence_refs,
                        causality_json, status, openbrain_ref, calvin_contract_json, created_at,
                        processed_at
                 FROM memory_candidates
@@ -1246,6 +1247,7 @@ impl ChatStore {
         }
 
         let retention_class = classify_memory_retention(event, content);
+        let learning_intent = classify_memory_learning_intent(content, &retention_class);
         let sensitivity_label = classify_memory_sensitivity(content);
         let importance_score = score_memory_importance(event, content, &retention_class);
         let evidence_refs = memory_candidate_evidence_refs(event);
@@ -1267,11 +1269,11 @@ impl ChatStore {
                 (candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
                  agent_runtime_id, agent, role, operation, raw_payload, distilled_content,
                  dedupe_key,
-                 importance_score, retention_class, sensitivity_label, evidence_refs,
+                 importance_score, retention_class, learning_intent, sensitivity_label, evidence_refs,
                  causality_json, status, openbrain_ref, calvin_contract_json, created_at,
                  processed_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                    ?13, ?14, ?15, ?16, ?17, 'pending', NULL, ?18, ?19, NULL)
+                    ?13, ?14, ?15, ?16, ?17, ?18, 'pending', NULL, ?19, ?20, NULL)
             "#,
         )
         .bind(format!("memcand-{message_id}"))
@@ -1288,6 +1290,7 @@ impl ChatStore {
         .bind(memory_candidate_dedupe_key(content))
         .bind(importance_score)
         .bind(retention_class)
+        .bind(learning_intent)
         .bind(sensitivity_label)
         .bind(serde_json::to_string(&evidence_refs)?)
         .bind(serde_json::to_string(&causality_json)?)
@@ -2181,6 +2184,28 @@ fn classify_memory_sensitivity(content: &str) -> &'static str {
     }
 }
 
+fn classify_memory_learning_intent(content: &str, retention_class: &str) -> &'static str {
+    let normalized = normalize_retrieval_text(content);
+    if retention_class == "working" {
+        return "awareness_only";
+    }
+    if normalized.contains("prior revision target")
+        || normalized.contains("change how you")
+        || normalized.contains("change how harkonnen")
+        || normalized.contains("from now on")
+        || normalized.contains("always use")
+        || normalized.contains("always prefer")
+        || normalized.contains("never use")
+        || normalized.contains("default to")
+        || normalized.contains("use latest")
+        || normalized.contains("not the other way around")
+    {
+        "prior_revision_target"
+    } else {
+        "awareness_only"
+    }
+}
+
 fn memory_candidate_dedupe_key(content: &str) -> String {
     normalize_retrieval_text(content)
         .split_whitespace()
@@ -2610,6 +2635,7 @@ fn parse_memory_candidate(row: sqlx::sqlite::SqliteRow) -> Result<MemoryCandidat
         dedupe_key: row.get("dedupe_key"),
         importance_score: row.get("importance_score"),
         retention_class: row.get("retention_class"),
+        learning_intent: row.get("learning_intent"),
         sensitivity_label: row.get("sensitivity_label"),
         evidence_refs,
         source_authority,
@@ -2734,6 +2760,38 @@ mod tests {
         assert_eq!(
             memory_candidate_dedupe_key("Remember this: OB1 is default!"),
             memory_candidate_dedupe_key("remember this ob1 is default")
+        );
+    }
+
+    #[test]
+    fn learning_intent_defaults_to_awareness_unless_revision_is_explicit() {
+        assert_eq!(
+            classify_memory_learning_intent(
+                "remember this: OB1 is useful context",
+                "shared_recall"
+            ),
+            "awareness_only"
+        );
+        assert_eq!(
+            classify_memory_learning_intent(
+                "remember this: always use the latest stable Rust unless there is a fundamental reason not to",
+                "shared_recall",
+            ),
+            "prior_revision_target"
+        );
+        assert_eq!(
+            classify_memory_learning_intent(
+                "from now on, Twilight Bark is a dependency of Harkonnen Labs, not the other way around",
+                "calvin_candidate",
+            ),
+            "prior_revision_target"
+        );
+        assert_eq!(
+            classify_memory_learning_intent(
+                "always use this only for the current scratch task",
+                "working"
+            ),
+            "awareness_only"
         );
     }
 
@@ -3385,6 +3443,7 @@ mod tests {
                 dedupe_key TEXT,
                 importance_score REAL NOT NULL DEFAULT 0.0,
                 retention_class TEXT NOT NULL DEFAULT 'working',
+                learning_intent TEXT NOT NULL DEFAULT 'awareness_only',
                 sensitivity_label TEXT NOT NULL DEFAULT 'normal',
                 evidence_refs TEXT NOT NULL DEFAULT '[]',
                 causality_json TEXT NOT NULL DEFAULT '{}',
