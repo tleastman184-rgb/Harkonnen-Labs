@@ -142,23 +142,35 @@ pub struct MetricsSnapshot {
 #[derive(Debug, Clone)]
 pub struct CalvinClient {
     base_url: String,
-    client: Client,
+    health_client: Client,
+    read_client: Client,
+    write_client: Client,
 }
 
 impl CalvinClient {
     pub fn new(config: &CalvinConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(500))
+        let health_client = Client::builder()
+            .timeout(Duration::from_millis(config.health_timeout_ms))
             .build()
-            .context("building CalvinClient")?;
+            .context("building CalvinClient health client")?;
+        let read_client = Client::builder()
+            .timeout(Duration::from_millis(config.read_timeout_ms))
+            .build()
+            .context("building CalvinClient read client")?;
+        let write_client = Client::builder()
+            .timeout(Duration::from_millis(config.write_timeout_ms))
+            .build()
+            .context("building CalvinClient write client")?;
         Ok(Self {
             base_url: config.harmony_url.trim_end_matches('/').to_string(),
-            client,
+            health_client,
+            read_client,
+            write_client,
         })
     }
 
     pub async fn health_check(&self) -> bool {
-        self.client
+        self.health_client
             .get(format!("{}/health", self.base_url))
             .send()
             .await
@@ -168,7 +180,7 @@ impl CalvinClient {
 
     pub async fn status(&self) -> Result<serde_json::Value> {
         let resp = self
-            .client
+            .read_client
             .get(format!("{}/status", self.base_url))
             .send()
             .await
@@ -189,7 +201,7 @@ impl CalvinClient {
             "provider": provider,
             "model": model,
         });
-        self.client
+        self.write_client
             .post(format!("{}/runs", self.base_url))
             .json(&body)
             .send()
@@ -199,7 +211,7 @@ impl CalvinClient {
     }
 
     pub async fn record_experience(&self, run_id: &str, exp: &ArchiveExperience) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!("{}/runs/{run_id}/experiences", self.base_url))
             .json(exp)
             .send()
@@ -210,7 +222,7 @@ impl CalvinClient {
 
     pub async fn revise_belief(&self, run_id: &str, rev: &BeliefRevision) -> Result<()> {
         rev.validate()?;
-        self.client
+        self.write_client
             .post(format!("{}/runs/{run_id}/beliefs", self.base_url))
             .json(rev)
             .send()
@@ -221,7 +233,7 @@ impl CalvinClient {
 
     pub async fn close_run(&self, run_id: &str, outcome: &str) -> Result<()> {
         let body = serde_json::json!({"outcome": outcome});
-        self.client
+        self.write_client
             .patch(format!("{}/runs/{run_id}/close", self.base_url))
             .json(&body)
             .send()
@@ -231,7 +243,7 @@ impl CalvinClient {
     }
 
     pub async fn record_prediction(&self, pred: &RunPrediction) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!(
                 "{}/runs/{}/predictions",
                 self.base_url, pred.run_id
@@ -253,7 +265,7 @@ impl CalvinClient {
     }
 
     pub async fn record_prediction_result(&self, outcome: &PredictionOutcome) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!(
                 "{}/runs/{}/prediction-result",
                 self.base_url, outcome.run_id
@@ -275,7 +287,7 @@ impl CalvinClient {
 
     pub async fn get_prediction(&self, run_id: &str) -> Result<Option<serde_json::Value>> {
         let resp = self
-            .client
+            .read_client
             .get(format!("{}/runs/{run_id}/predictions", self.base_url))
             .send()
             .await
@@ -294,7 +306,7 @@ impl CalvinClient {
         pearl_level: &str,
         confidence: f64,
     ) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!("{}/runs/{run_id}/causal-links", self.base_url))
             .json(&serde_json::json!({
                 "cause_episode_id": cause_episode_id,
@@ -309,7 +321,7 @@ impl CalvinClient {
     }
 
     pub async fn update_agent_status(&self, agent_name: &str, status: &str) -> Result<()> {
-        self.client
+        self.write_client
             .patch(format!("{}/agents/{agent_name}/status", self.base_url))
             .json(&serde_json::json!({"status": status}))
             .send()
@@ -320,7 +332,7 @@ impl CalvinClient {
 
     pub async fn get_kernel_traits(&self, agent_name: &str) -> Result<Vec<String>> {
         let resp = self
-            .client
+            .read_client
             .get(format!("{}/agents/{agent_name}/traits", self.base_url))
             .send()
             .await
@@ -330,7 +342,7 @@ impl CalvinClient {
 
     pub async fn get_active_beliefs(&self, agent_name: &str) -> Result<Vec<String>> {
         let resp = self
-            .client
+            .read_client
             .get(format!("{}/agents/{agent_name}/beliefs", self.base_url))
             .send()
             .await
@@ -345,7 +357,7 @@ impl CalvinClient {
     ) -> Result<bool> {
         let body = serde_json::json!({"adaptation_summary": adaptation_summary});
         let resp = self
-            .client
+            .read_client
             .post(format!("{}/agents/{agent_name}/check", self.base_url))
             .json(&body)
             .send()
@@ -357,7 +369,7 @@ impl CalvinClient {
 
     pub async fn get_metrics(&self, agent_name: &str) -> Result<MetricsSnapshot> {
         let resp = self
-            .client
+            .read_client
             .get(format!("{}/agents/{agent_name}/metrics", self.base_url))
             .send()
             .await
@@ -366,7 +378,7 @@ impl CalvinClient {
     }
 
     pub async fn write_event(&self, evt: &TelemetryEvent) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!("{}/telemetry", self.base_url))
             .json(evt)
             .send()
@@ -376,7 +388,7 @@ impl CalvinClient {
     }
 
     pub async fn write_events_batch(&self, evts: &[TelemetryEvent]) -> Result<()> {
-        self.client
+        self.write_client
             .post(format!("{}/telemetry/batch", self.base_url))
             .json(&evts)
             .send()
@@ -412,7 +424,8 @@ pub async fn try_connect(config: &CalvinConfig) -> Option<CalvinClient> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BeliefRevision, RevisionType};
+    use super::{BeliefRevision, CalvinClient, RevisionType};
+    use crate::setup::CalvinConfig;
 
     fn revision(revision_type: RevisionType, evidence_ids: Vec<&str>) -> BeliefRevision {
         BeliefRevision {
@@ -425,6 +438,18 @@ mod tests {
             revision_type,
             preservation_note: None,
         }
+    }
+
+    #[test]
+    fn client_builds_with_independent_timeout_profile() {
+        let config = CalvinConfig {
+            health_timeout_ms: 250,
+            read_timeout_ms: 1_500,
+            write_timeout_ms: 7_500,
+            ..CalvinConfig::default()
+        };
+
+        assert!(CalvinClient::new(&config).is_ok());
     }
 
     #[test]

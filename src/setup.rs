@@ -101,16 +101,46 @@ pub struct RoutingConfig {
     pub agents: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CalvinConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_calvin_url")]
     pub harmony_url: String,
+    #[serde(default = "default_calvin_health_timeout_ms")]
+    pub health_timeout_ms: u64,
+    #[serde(default = "default_calvin_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    #[serde(default = "default_calvin_read_timeout_ms")]
+    pub read_timeout_ms: u64,
 }
 
 fn default_calvin_url() -> String {
     "http://localhost:7171".to_string()
+}
+
+fn default_calvin_health_timeout_ms() -> u64 {
+    500
+}
+
+fn default_calvin_write_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_calvin_read_timeout_ms() -> u64 {
+    2_000
+}
+
+impl Default for CalvinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            harmony_url: default_calvin_url(),
+            health_timeout_ms: default_calvin_health_timeout_ms(),
+            write_timeout_ms: default_calvin_write_timeout_ms(),
+            read_timeout_ms: default_calvin_read_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -659,4 +689,20 @@ fn detected_username() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("USERNAME").ok())
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CalvinConfig;
+
+    #[test]
+    fn calvin_config_defaults_keep_health_reads_and_writes_separate() {
+        let config = CalvinConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.harmony_url, "http://localhost:7171");
+        assert_eq!(config.health_timeout_ms, 500);
+        assert_eq!(config.read_timeout_ms, 2_000);
+        assert_eq!(config.write_timeout_ms, 5_000);
+    }
 }

@@ -624,6 +624,8 @@ Each variant is a typed `reqwest` call to the provider's REST API. `SubAgentBack
 - **Separated timeouts** — health check timeout remains 500 ms. Write operations use a separate configurable timeout (default 5 s). Read operations (`get_prediction`, `get_kernel_traits`, `get_active_beliefs`) use a third configurable timeout (default 2 s). The three behaviours are independent; a slow write does not affect health polling.
 - **Error propagation on write** — write methods return `Result<()>` with the queue-write error if SQLite fails. The harmony send errors are handled by the queue processor, not the caller. The orchestrator's Calvin integration points (`try_close_calvin_run`, `try_open_calvin_run`) already wrap errors with `tracing::warn!` — extend this to all write paths so no silent drop is possible.
 
+**Separated timeout slice shipped 2026-04-30:** `CalvinConfig` now carries independent `health_timeout_ms` (default 500), `read_timeout_ms` (default 2000), and `write_timeout_ms` (default 5000). `CalvinClient` builds separate reqwest clients for health probes, archive reads, and archive writes, so slow archive writes no longer inherit the health-check timeout or interfere with health polling. Regression coverage proves the default profile and custom client construction.
+
 **Done when:** a harmony outage during a run produces `retry_pending` entries in `calvin_write_queue`, not silent loss; the queue drains automatically when harmony recovers; `cargo run -- setup check` reports write-queue depth and pending-confirmation count alongside archive health status.
 
 ---
