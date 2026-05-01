@@ -626,6 +626,14 @@ Each variant is a typed `reqwest` call to the provider's REST API. `SubAgentBack
 
 **Separated timeout slice shipped 2026-04-30:** `CalvinConfig` now carries independent `health_timeout_ms` (default 500), `read_timeout_ms` (default 2000), and `write_timeout_ms` (default 5000). `CalvinClient` builds separate reqwest clients for health probes, archive reads, and archive writes, so slow archive writes no longer inherit the health-check timeout or interfere with health polling. Regression coverage proves the default profile and custom client construction.
 
+**Durable write queue slice shipped 2026-04-30:** Harkonnen now creates a local `calvin_write_queue` table and all Calvin archive write methods enqueue durable rows when the client is bootstrapped with SQLite. A background processor drains pending/retry rows to harmony, marks successful writes `confirmed`, and applies bounded exponential backoff on failures. `setup check` reports pending, retry-pending, pending-confirmation, and confirmed queue counts so archive health includes write-loss risk, not only harmony reachability.
+
+**Outage enqueue slice shipped 2026-05-01:** Calvin enablement no longer depends on harmony being reachable at bootstrap. When `calvin_archive.enabled = true` and the local SQLite queue initializes, Harkonnen keeps a Calvin client alive, accepts archive writes into `calvin_write_queue`, and lets the background drainer retry until harmony returns. This closes the pre-run outage hole where `app.calvin = None` would otherwise skip archive writes entirely.
+
+**Archive status queue visibility shipped 2026-05-01:** `harkonnen archive status` now reports harmony reachability and local write-queue state together. The status output includes pending, retry-pending, pending-confirmation, confirmed counts, oldest pending write time, next retry time, and last write error, so archive outages are visible as durable backlog rather than only as sidecar reachability failures.
+
+**Pearl-level causal payload enforcement shipped 2026-05-01:** Calvin causal links now carry structural payload fields for Pearl-level warrant: `held_fixed`, `estimated_effect_delta`, `actual_trace_id`, `hypothetical_intervention`, `epistemic_warrant`, and `warrant_gap`. Harkonnen keeps the existing associational convenience call, but structural causal-link payloads are normalized before enqueue/send: interventional claims require do-set fields and effect delta; counterfactual claims additionally require actual trace and hypothetical intervention. Under-supported higher-level claims are recorded at the highest warranted level with `warrant_gap = true` instead of being stored as cosmetic Pearl labels.
+
 **Done when:** a harmony outage during a run produces `retry_pending` entries in `calvin_write_queue`, not silent loss; the queue drains automatically when harmony recovers; `cargo run -- setup check` reports write-queue depth and pending-confirmation count alongside archive health status.
 
 ---
@@ -1582,6 +1590,18 @@ Every reportable benchmark claim should include:
 ## Deferred Until Fully Working
 
 These are useful capabilities, but they must not block the current path to a fully working Harkonnen loop. Revisit them only after the PackChat -> OB1 -> Calvin memory chain, learning-loop closure, run health, MCP prompt surface, provider routing, and TypeDB-backed causal query path are productive.
+
+### Constraint-polytope exploration (Avis-Fukuda / Double Description)
+
+The standalone `src/double_description.rs` module implements a bounded `f64` Double Description core for half-space intersection. Keep this as exploratory math until Harkonnen has a concrete use for constraint-polytopes in governance, adaptation safety, or causal feasibility checks.
+
+Potential future uses:
+
+- Test whether a proposed policy, identity, or adaptation constraint leaves a non-empty feasible region.
+- Give the Meta-Governor a geometric feasibility check before accepting new invariants.
+- Model bounded causal or benchmark constraints where a vertex representation is more useful than a prose rule.
+
+Do not wire this into Phase 5b, PackChat, OB1, Calvin write integrity, or the TypeDB causal path until the end-to-end system is productive. If no Harkonnen caller emerges, move the module to a standalone crate or external scratch space.
 
 ### Scanned document ingestion (`pdfium-render` + vision/OCR)
 

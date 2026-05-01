@@ -13,6 +13,7 @@ mod config;
 mod coobie;
 mod coobie_palace;
 mod db;
+mod double_description;
 mod embeddings;
 mod frames;
 mod helmet;

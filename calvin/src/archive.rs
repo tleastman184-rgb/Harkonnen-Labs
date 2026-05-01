@@ -49,6 +49,95 @@ pub(crate) struct BeliefRevision {
     pub preservation_note: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PearlLevel {
+    #[serde(alias = "Associational")]
+    Associational,
+    #[serde(alias = "Interventional")]
+    Interventional,
+    #[serde(alias = "Counterfactual")]
+    Counterfactual,
+}
+
+impl PearlLevel {
+    pub(crate) fn as_label(&self) -> &'static str {
+        match self {
+            Self::Associational => "Associational",
+            Self::Interventional => "Interventional",
+            Self::Counterfactual => "Counterfactual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CausalLinkPayload {
+    pub cause_episode_id: String,
+    pub effect_episode_id: String,
+    pub pearl_level: PearlLevel,
+    pub confidence: f64,
+    #[serde(default)]
+    pub held_fixed: Vec<String>,
+    pub estimated_effect_delta: Option<f64>,
+    pub actual_trace_id: Option<String>,
+    pub hypothetical_intervention: Option<String>,
+    #[serde(default)]
+    pub warrant_gap: bool,
+    pub epistemic_warrant: Option<PearlLevel>,
+}
+
+impl CausalLinkPayload {
+    pub(crate) fn normalized(mut self) -> Result<Self> {
+        validate_confidence("causal_link.confidence", self.confidence)?;
+        if self.cause_episode_id.trim().is_empty() {
+            anyhow::bail!("CausalLinkPayload requires cause_episode_id");
+        }
+        if self.effect_episode_id.trim().is_empty() {
+            anyhow::bail!("CausalLinkPayload requires effect_episode_id");
+        }
+        let requested = self.pearl_level.clone();
+        let warranted = if self.has_counterfactual_fields() {
+            PearlLevel::Counterfactual
+        } else if self.has_interventional_fields() {
+            PearlLevel::Interventional
+        } else {
+            PearlLevel::Associational
+        };
+        if pearl_rank(&warranted) < pearl_rank(&requested) {
+            self.pearl_level = warranted.clone();
+            self.warrant_gap = true;
+        }
+        self.epistemic_warrant = Some(warranted);
+        Ok(self)
+    }
+
+    fn has_interventional_fields(&self) -> bool {
+        !self.held_fixed.is_empty() && self.estimated_effect_delta.is_some()
+    }
+
+    fn has_counterfactual_fields(&self) -> bool {
+        self.has_interventional_fields()
+            && self
+                .actual_trace_id
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            && self
+                .hypothetical_intervention
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+    }
+}
+
+fn pearl_rank(level: &PearlLevel) -> u8 {
+    match level {
+        PearlLevel::Associational => 0,
+        PearlLevel::Interventional => 1,
+        PearlLevel::Counterfactual => 2,
+    }
+}
+
 impl BeliefRevision {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_confidence("prior_confidence", self.prior_confidence)?;
@@ -560,16 +649,35 @@ impl ArchiveStore {
     pub(crate) async fn record_causal_link(
         &self,
         run_id: &str,
-        cause_episode_id: &str,
-        effect_episode_id: &str,
-        pearl_level: &str,
-        confidence: f64,
+        payload: CausalLinkPayload,
     ) -> Result<()> {
+        let payload = payload.normalized()?;
+        let held_fixed = payload.held_fixed.join(",");
+        let estimated_effect_delta = payload
+            .estimated_effect_delta
+            .map(|value| format!(", has estimated-effect-delta {value}"))
+            .unwrap_or_default();
+        let actual_trace_id = payload
+            .actual_trace_id
+            .as_deref()
+            .map(|value| format!(r#", has actual-trace-id "{}""#, escape_tql(value)))
+            .unwrap_or_default();
+        let hypothetical_intervention = payload
+            .hypothetical_intervention
+            .as_deref()
+            .map(|value| format!(r#", has hypothetical-intervention "{}""#, escape_tql(value)))
+            .unwrap_or_default();
         let tx = self
             .driver
             .transaction(&self.db_name, TransactionType::Write)
             .await?;
-        let scope = format!("run:{run_id};pearl:{pearl_level}");
+        let pearl_level = payload.pearl_level.as_label();
+        let epistemic_warrant = payload
+            .epistemic_warrant
+            .as_ref()
+            .map(PearlLevel::as_label)
+            .unwrap_or(pearl_level);
+        let scope = format!("run:{run_id};pearl:{pearl_level};warrant:{epistemic_warrant}");
         // Match the two experience entities by episode_id, then insert the causal link.
         let tql = format!(
             r#"match
@@ -579,12 +687,23 @@ impl ArchiveStore {
                insert
                 (cause: $cause, effect: $effect) isa causally_contributed_to,
                     has confidence {confidence},
-                    has scope "{scope}";"#,
+                    has scope "{scope}",
+                    has pearl-hierarchy-level "{pearl_level}",
+                    has epistemic-warrant "{epistemic_warrant}",
+                    has warrant-gap "{warrant_gap}",
+                    has held-fixed "{held_fixed}"{estimated_effect_delta}{actual_trace_id}{hypothetical_intervention};"#,
             run_id = escape_tql(run_id),
-            cause_episode_id = escape_tql(cause_episode_id),
-            effect_episode_id = escape_tql(effect_episode_id),
-            confidence = confidence,
+            cause_episode_id = escape_tql(&payload.cause_episode_id),
+            effect_episode_id = escape_tql(&payload.effect_episode_id),
+            confidence = payload.confidence,
             scope = escape_tql(&scope),
+            pearl_level = pearl_level,
+            epistemic_warrant = epistemic_warrant,
+            warrant_gap = payload.warrant_gap,
+            held_fixed = escape_tql(&held_fixed),
+            estimated_effect_delta = estimated_effect_delta,
+            actual_trace_id = actual_trace_id,
+            hypothetical_intervention = hypothetical_intervention,
         );
         tx.query(&tql).await.context("record_causal_link query")?;
         tx.commit().await?;
@@ -673,7 +792,7 @@ fn revision_type_label(value: &RevisionType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{BeliefRevision, RevisionType};
+    use super::{BeliefRevision, CausalLinkPayload, PearlLevel, RevisionType};
 
     fn revision(revision_type: RevisionType, evidence_ids: Vec<&str>) -> BeliefRevision {
         BeliefRevision {
@@ -708,5 +827,27 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn causal_link_payload_requires_structural_fields_for_higher_pearl_levels() {
+        let payload = CausalLinkPayload {
+            cause_episode_id: "cause-1".to_string(),
+            effect_episode_id: "effect-1".to_string(),
+            pearl_level: PearlLevel::Counterfactual,
+            confidence: 0.8,
+            held_fixed: vec!["ambiguous_spec".to_string()],
+            estimated_effect_delta: Some(0.3),
+            actual_trace_id: None,
+            hypothetical_intervention: None,
+            warrant_gap: false,
+            epistemic_warrant: None,
+        }
+        .normalized()
+        .expect("normalize causal link");
+
+        assert_eq!(payload.pearl_level, PearlLevel::Interventional);
+        assert_eq!(payload.epistemic_warrant, Some(PearlLevel::Interventional));
+        assert!(payload.warrant_gap);
     }
 }

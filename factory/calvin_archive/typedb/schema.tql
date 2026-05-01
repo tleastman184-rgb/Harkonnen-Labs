@@ -47,6 +47,13 @@ attribute risk-score, value double;            # 0.0 = low risk, 1.0 = very like
 attribute failure-phase, value string;         # which phase the prediction targets
 attribute failure-kind-label, value string;    # compile_error | test_failure | wrong_answer | timeout
 attribute source-cause-ids, value string;      # comma-separated PriorCauseSignal ids that drove the prediction
+attribute pearl-hierarchy-level, value string; # Associational | Interventional | Counterfactual
+attribute epistemic-warrant, value string;     # highest Pearl level structurally supported by payload
+attribute warrant-gap, value string;           # true when requested level was downgraded
+attribute held-fixed, value string;            # comma-separated do-set variables
+attribute estimated-effect-delta, value double;
+attribute actual-trace-id, value string;
+attribute hypothetical-intervention, value string;
 
 entity soul,
   owns uuid @key,
@@ -285,6 +292,13 @@ relation destabilizes,
 relation causally_contributed_to,
   owns confidence,
   owns scope,
+  owns pearl-hierarchy-level,
+  owns epistemic-warrant,
+  owns warrant-gap,
+  owns held-fixed,
+  owns estimated-effect-delta,
+  owns actual-trace-id,
+  owns hypothetical-intervention,
   relates cause,
   relates effect;
 

@@ -69,7 +69,8 @@ pub struct AppContext {
     #[allow(dead_code)]
     pub operator_models: crate::operator_model::OperatorModelStore,
     pub started_at: std::time::Instant,
-    /// Calvin Archive HTTP client — None when disabled or harmony not running.
+    /// Calvin Archive client — None only when disabled or local init fails.
+    /// When harmony is down, writes queue locally and drain on recovery.
     pub calvin: Option<crate::calvin_client::CalvinClient>,
     /// Open Brain MCP-backed memory client — default cross-client recall path.
     pub open_brain: Option<crate::openbrain::OpenBrainClient>,
@@ -1057,7 +1058,8 @@ impl AppContext {
         let chat = crate::chat::ChatStore::with_bus(pool.clone(), packchat_bus);
         // Calvin must be initialised before the ingest loop so the loop can forward
         // CalvinIngressEvents from inbound Twilight envelopes to the Calvin archive.
-        let calvin = crate::calvin_client::try_connect(&paths.setup.calvin_archive).await;
+        let calvin =
+            crate::calvin_client::try_connect(&paths.setup.calvin_archive, pool.clone()).await;
         if let Some(socket_path) = twilight_socket_path {
             chat.spawn_twilight_ingest_loop(
                 socket_path,

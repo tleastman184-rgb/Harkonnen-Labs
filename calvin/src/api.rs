@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    archive::{ArchiveExperience, BeliefRevision},
+    archive::{ArchiveExperience, BeliefRevision, CausalLinkPayload},
     metrics,
     telemetry::TelemetryEvent,
     CalvinState,
@@ -208,8 +208,16 @@ async fn check_adaptation(
 struct RecordCausalLinkRequest {
     cause_episode_id: String,
     effect_episode_id: String,
-    pearl_level: String,
+    pearl_level: crate::archive::PearlLevel,
     confidence: f64,
+    #[serde(default)]
+    held_fixed: Vec<String>,
+    estimated_effect_delta: Option<f64>,
+    actual_trace_id: Option<String>,
+    hypothetical_intervention: Option<String>,
+    #[serde(default)]
+    warrant_gap: bool,
+    epistemic_warrant: Option<crate::archive::PearlLevel>,
 }
 
 async fn record_causal_link(
@@ -217,17 +225,26 @@ async fn record_causal_link(
     Path(run_id): Path<String>,
     Json(req): Json<RecordCausalLinkRequest>,
 ) -> impl IntoResponse {
-    match state
-        .archive
-        .record_causal_link(
-            &run_id,
-            &req.cause_episode_id,
-            &req.effect_episode_id,
-            &req.pearl_level,
-            req.confidence,
+    let payload = CausalLinkPayload {
+        cause_episode_id: req.cause_episode_id,
+        effect_episode_id: req.effect_episode_id,
+        pearl_level: req.pearl_level,
+        confidence: req.confidence,
+        held_fixed: req.held_fixed,
+        estimated_effect_delta: req.estimated_effect_delta,
+        actual_trace_id: req.actual_trace_id,
+        hypothetical_intervention: req.hypothetical_intervention,
+        warrant_gap: req.warrant_gap,
+        epistemic_warrant: req.epistemic_warrant,
+    };
+    if let Err(e) = payload.clone().normalized() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
-        .await
-    {
+            .into_response();
+    }
+    match state.archive.record_causal_link(&run_id, payload).await {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
