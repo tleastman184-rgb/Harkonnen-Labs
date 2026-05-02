@@ -865,6 +865,7 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
             let query = required_string(&arguments, "query")
                 .map_err(|_| (-32602, "memory_pull requires query".to_string()))?;
             let scope = optional_string(&arguments, "scope").unwrap_or_else(|| "general".into());
+            let trigger = optional_string(&arguments, "trigger");
             let max_tokens = arguments
                 .get("max_tokens")
                 .and_then(Value::as_u64)
@@ -924,6 +925,7 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
                         tokens_approx,
                         hits_returned,
                         &hit_previews,
+                        trigger.as_deref(),
                     )
                     .await
                 {
@@ -940,16 +942,22 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
                 run_id = run_id.as_deref().unwrap_or(""),
                 query = %query,
                 scope = %scope,
+                trigger = trigger.as_deref().unwrap_or(""),
                 hits_returned = hits_returned,
                 tokens = tokens_approx,
                 "memory_pull"
             );
 
             let body = if output_lines.is_empty() {
-                format!("No memory found for query: \"{query}\" (scope: {scope})")
+                let trigger_suffix = trigger
+                    .as_deref()
+                    .map(|value| format!(", trigger: {value}"))
+                    .unwrap_or_default();
+                format!("No memory found for query: \"{query}\" (scope: {scope}{trigger_suffix})")
             } else {
                 format!(
-                    "# Memory pull — query: \"{query}\" | scope: {scope} | {hits_returned} hit(s)\n\n{}",
+                    "# Memory pull — query: \"{query}\" | scope: {scope} | trigger: {} | {hits_returned} hit(s)\n\n{}",
+                    trigger.as_deref().unwrap_or("none"),
                     output_lines
                         .iter()
                         .enumerate()
@@ -1972,6 +1980,10 @@ fn tool_descriptors() -> Vec<Value> {
                         "type": "string",
                         "description": "Isolation scope: general | sable | mason | scout | keeper",
                         "default": "general"
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "description": "Optional rebrief trigger such as unexpected_discovery when the phase-entry briefing is stale."
                     },
                     "max_tokens": {
                         "type": "integer",
@@ -3152,6 +3164,68 @@ mod mcp_e2e {
         assert!(
             records[0].tokens_returned <= 300,
             "memory_pull should persist returned tokens within the requested budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_pull_unexpected_discovery_persists_rebrief_trigger() {
+        let (state, _dir) = build_test_state().await;
+        let run_id = "run-context-pull-trigger";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(run_id)
+        .bind("spec-context-pull-trigger")
+        .bind("product-context-pull")
+        .bind("running")
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.app.pool)
+        .await
+        .unwrap();
+        rpc(
+            &state,
+            call(
+                29,
+                "memory_store",
+                json!({ "content": "Mason discovered an undocumented schema edge in the auth adapter." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(
+            &state,
+            call(
+                30,
+                "memory_pull",
+                json!({
+                    "run_id": run_id,
+                    "query": "undocumented schema edge auth adapter",
+                    "scope": "mason",
+                    "trigger": "unexpected_discovery",
+                    "max_tokens": 300
+                }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("trigger: unexpected_discovery"),
+            "memory_pull response should name the rebrief trigger; got: {text}"
+        );
+
+        let records = state.app.list_context_pull_records(run_id).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].scope, "mason");
+        assert_eq!(records[0].trigger.as_deref(), Some("unexpected_discovery"));
+        assert_eq!(records[0].query, "undocumented schema edge auth adapter");
+        assert!(
+            records[0]
+                .hit_previews
+                .iter()
+                .any(|preview| preview.contains("undocumented schema edge")),
+            "triggered pull should persist hit previews"
         );
     }
 

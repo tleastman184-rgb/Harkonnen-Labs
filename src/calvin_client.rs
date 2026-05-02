@@ -177,6 +177,50 @@ pub struct CausalLinkPayload {
     pub epistemic_warrant: Option<PearlLevel>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationDecision {
+    Accept,
+    Modify,
+    Reject,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdaptationAudit {
+    pub safe: bool,
+    pub decision: IntegrationDecision,
+    pub invariants_checked: Vec<String>,
+    pub violated_invariants: Vec<String>,
+    pub confidence: f64,
+    pub quarantine_reason: Option<String>,
+    pub preservation_note: Option<String>,
+    pub candidate_id: String,
+}
+
+impl AdaptationAudit {
+    fn from_legacy_safe(value: bool) -> Self {
+        Self {
+            safe: value,
+            decision: if value {
+                IntegrationDecision::Accept
+            } else {
+                IntegrationDecision::Reject
+            },
+            invariants_checked: Vec::new(),
+            violated_invariants: Vec::new(),
+            confidence: if value { 0.5 } else { 0.75 },
+            quarantine_reason: if value {
+                None
+            } else {
+                Some("Legacy Calvin response marked adaptation unsafe.".to_string())
+            },
+            preservation_note: Some("Parsed from legacy boolean safety response.".to_string()),
+            candidate_id: "legacy-untracked".to_string(),
+        }
+    }
+}
+
 impl CausalLinkPayload {
     pub fn associational(cause_episode_id: &str, effect_episode_id: &str, confidence: f64) -> Self {
         Self {
@@ -530,6 +574,17 @@ impl CalvinClient {
         agent_name: &str,
         adaptation_summary: &str,
     ) -> Result<bool> {
+        Ok(self
+            .check_adaptation_audit(agent_name, adaptation_summary)
+            .await?
+            .safe)
+    }
+
+    pub async fn check_adaptation_audit(
+        &self,
+        agent_name: &str,
+        adaptation_summary: &str,
+    ) -> Result<AdaptationAudit> {
         let body = serde_json::json!({"adaptation_summary": adaptation_summary});
         let resp = self
             .read_client
@@ -539,7 +594,13 @@ impl CalvinClient {
             .await
             .context("POST /agents/{agent_name}/check")?;
         let v: serde_json::Value = resp.json().await?;
-        Ok(v["safe"].as_bool().unwrap_or(true))
+        if v.get("decision").is_some() {
+            Ok(serde_json::from_value(v).context("parsing AdaptationAudit")?)
+        } else {
+            Ok(AdaptationAudit::from_legacy_safe(
+                v["safe"].as_bool().unwrap_or(true),
+            ))
+        }
     }
 
     pub async fn get_metrics(&self, agent_name: &str) -> Result<MetricsSnapshot> {
@@ -863,8 +924,8 @@ pub async fn try_connect(config: &CalvinConfig, queue_pool: SqlitePool) -> Optio
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_calvin_write_queue_once, try_connect, BeliefRevision, CalvinClient,
-        CausalLinkPayload, PearlLevel, RevisionType, TelemetryEvent,
+        drain_calvin_write_queue_once, try_connect, AdaptationAudit, BeliefRevision, CalvinClient,
+        CausalLinkPayload, IntegrationDecision, PearlLevel, RevisionType, TelemetryEvent,
     };
     use crate::setup::CalvinConfig;
     use axum::{extract::State, http::StatusCode, routing::post, Router};
@@ -1132,6 +1193,36 @@ mod tests {
         assert_eq!(payload.pearl_level, PearlLevel::Interventional);
         assert_eq!(payload.epistemic_warrant, Some(PearlLevel::Interventional));
         assert!(payload.warrant_gap);
+    }
+
+    #[test]
+    fn adaptation_audit_legacy_bool_response_remains_parseable() {
+        let audit = AdaptationAudit::from_legacy_safe(false);
+
+        assert!(!audit.safe);
+        assert_eq!(audit.decision, IntegrationDecision::Reject);
+        assert_eq!(audit.candidate_id, "legacy-untracked");
+        assert!(audit.quarantine_reason.is_some());
+    }
+
+    #[test]
+    fn adaptation_audit_structured_response_parses() {
+        let raw = serde_json::json!({
+            "safe": false,
+            "decision": "reject",
+            "invariants_checked": ["cooperative", "truthful"],
+            "violated_invariants": ["cooperative"],
+            "confidence": 0.95,
+            "quarantine_reason": "violates cooperative",
+            "preservation_note": "Priority 1 rejection",
+            "candidate_id": "candidate-1"
+        });
+        let audit: AdaptationAudit = serde_json::from_value(raw).expect("audit");
+
+        assert!(!audit.safe);
+        assert_eq!(audit.decision, IntegrationDecision::Reject);
+        assert_eq!(audit.violated_invariants, vec!["cooperative"]);
+        assert_eq!(audit.candidate_id, "candidate-1");
     }
 
     #[tokio::test]

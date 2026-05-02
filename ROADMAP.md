@@ -379,10 +379,10 @@ OpenZiti Dial and Bind policies should be separate. Privileged writers should ca
 - Stale or superseded distilled memories are surfaced as `needs_reconsolidation`, with enough evidence context to decide whether to refresh OB1, promote to Calvin, quarantine, or discard. **DONE 2026-04-29:** covered by `orchestrator::tests::newer_packchat_evidence_marks_prior_memory_needs_reconsolidation`.
 - A memory chain health endpoint and UI panel can answer whether PackChat -> OB1 -> Calvin is clear, blocked, stale, duplicated, or waiting on OpenZiti/service configuration. **DONE 2026-04-29:** `GET /api/runs/{id}/memory/candidates` returns `memory_chain_health`, and the Memory tab renders the report.
 - Memory candidates and Calvin promotion contracts classify evidence by source authority, and the health report summarizes authority distribution. **DONE 2026-04-29:** covered by `chat::tests::source_authority_taxonomy_prefers_stronger_evidence`.
-- Candidate dedupe prevents repeated chat phrasing from producing duplicate OB1 thoughts.
+- Candidate dedupe prevents repeated chat phrasing from producing duplicate OB1 thoughts. **DONE 2026-05-01:** covered by `orchestrator::tests::duplicate_shared_recall_candidates_do_not_create_second_openbrain_thought`.
 - Sensitivity labels prevent secrets and high-risk payloads from being sent to OB1 without review. **DONE 2026-04-29:** covered by `orchestrator::tests::sensitive_shared_recall_is_held_and_not_sent_to_openbrain`.
-- Closing a run automatically triggers candidate processing; transient failures are marked `retry_pending` and retried by the same processing endpoint until zero remain after a clean run close.
-- A `causation_id`-bearing wire envelope produces a `causally_contributed_to` link in the Calvin causal graph.
+- Closing a run automatically triggers candidate processing; transient failures are marked `retry_pending` and retried by the same processing endpoint until zero remain after a clean run close. **DONE 2026-04-28:** covered by `memory_candidates::run_close_triggers_candidate_processing` and `chat::tests::pending_memory_candidate_scan_includes_retry_pending`.
+- A `causation_id`-bearing wire envelope produces a `causally_contributed_to` link in the Calvin causal graph. **DONE 2026-04-28:** covered by `memory_candidates::causation_id_written_to_calvin_causal_graph`.
 - OpenZiti policy documentation exists for all four services, including Dial/Bind identity roles. **DONE 2026-04-29:** `factory/context/openziti-memory-chain.yaml` now includes identity roles, service profiles, suggested local service configs, service-policy templates, and deployment checks.
 
 **Done when:** a live PackChat/Twilight conversation can become a distilled OB1 memory with provenance, the memory can improve a later briefing, identity-relevant material is routed to Calvin as a governed promotion proposal rather than as unstructured prose, and all six E2E integration gap tests pass.
@@ -511,12 +511,18 @@ Memory accumulation and genuine prior revision are not the same thing. A lesson 
 
 **Computable BeliefRevision contract shipped 2026-04-30:** Harkonnen's `BeliefRevision` client payload and the Calvin sidecar archive/API payload now carry `prior_confidence`, `evidence_ids`, and `revision_type` (`fast_loop`, `medium_loop`, `schema_revision`, `policy_change`) alongside `new_confidence`. Both client and sidecar validate finite confidence values in `0.0..=1.0`; all revisions require evidence IDs; medium-loop and schema-revision updates require at least three evidence IDs. The Phase 6 TypeDB schema now lets `revised_into` relations persist `prior-confidence`, `evidence-ids`, and `revision-type`, so belief updates are measurable calibration events rather than prose annotations.
 
+**Prediction success reinforcement shipped 2026-05-01:** Harkonnen now persists local run-prediction shadows and writes `prediction_success_reinforcements` for low-error run closes (`prediction_error <= 0.2`). Each contributing `source_cause_id` gets a reviewable reinforcement event with cumulative `confirmation_count`, surfaced through `GET /api/runs/{id}/prediction-reinforcements`, so successful predictions strengthen the signals that fired instead of only failure cases feeding memory. Regression test: `orchestrator::tests::low_error_prediction_records_success_reinforcement_counts` — green.
+
+**Decision-influence calibration exclusion ledger shipped 2026-05-01:** run close now samples eligible briefing hits with deterministic hash selection (default 0.05) and records `memory_influence_exclusions` with run, phase, briefing scope, memory key, preview, spec-family placeholder, expected outcome, actual outcome, exclusion probability, and selection basis. `GET /api/runs/{id}/memory-influence-exclusions` exposes the run ledger. This is the first calibration event stream needed to keep `decision_influence_score` distinct from retrieval frequency. Regression test: `orchestrator::tests::memory_influence_exclusion_event_is_recorded_from_briefing_hits` — green.
+
+**Mid-run re-briefing protocol shipped 2026-05-01:** `memory_pull` now accepts optional `trigger`, with `trigger: "unexpected_discovery"` as the first-class signal that a phase-entry briefing went stale. Triggered pulls persist the trigger in `context_pull_records`, appear in `GET /api/runs/{id}/context-utilization` summary counts, and contribute a run-health review item so recurring unexpected discoveries can later become required briefing sections for the spec family. Regression test: `mcp_server::tests::memory_pull_unexpected_discovery_persists_rebrief_trigger` — green.
+
 **Benchmark gate:**
 
 - At least one lesson promoted as `prior_revision_target` has a linked behavioral-change record showing the Praxis metric it shifted and the run where the shift first appeared.
 - Coobie's behavioral-change report is produced at run close and included in the run artifact list.
-- At least one `decision_influence_score` calibration exclusion event has been recorded and the resulting score is distinguishable from retrieval frequency alone.
-- At least one `prediction_success_reinforcement` event is recorded after a low-error run and the contributing signal's `confirmation_count` increments.
+- At least one `decision_influence_score` calibration exclusion event has been recorded and the resulting score is distinguishable from retrieval frequency alone. **DONE 2026-05-01:** covered by `orchestrator::tests::memory_influence_exclusion_event_is_recorded_from_briefing_hits`.
+- At least one `prediction_success_reinforcement` event is recorded after a low-error run and the contributing signal's `confirmation_count` increments. **DONE 2026-05-01:** covered by `orchestrator::tests::low_error_prediction_records_success_reinforcement_counts`.
 
 ---
 
@@ -658,6 +664,10 @@ TypeDB 3.x changes the implementation assumptions: the old JVM burden objection 
 - **Semantic adaptation safety classifier** — upgrade `check_adaptation_safe` in `archive.rs` from heuristic string-matching to an embedding-based classifier. Represent each Labrador kernel trait as a vector; score the proposed adaptation summary against the negation-space of each trait using cosine similarity. Flag any adaptation that scores above a configurable negation threshold as unsafe regardless of literal phrasing. This replaces the `basic_heuristic` marker added in the Phase 5-D correctness fix. E2E test: `calvin::adaptation_safety_catches_semantic_negation` (currently passing with the mock; the real TypeDB path must pass the same assertion).
 - **`check_adaptation_safe` returns `AdaptationAudit`, not bool** — the response from the adaptation safety check must be a structured `AdaptationAudit { safe: bool, decision: IntegrationDecision, invariants_checked: Vec<String>, violated_invariants: Vec<String>, confidence: f64, quarantine_reason: Option<String>, preservation_note: Option<String>, candidate_id: String }` rather than `{"safe": bool}`. The 1-bit response discards all audit evidence. The `candidate_id` references the `integration-candidate` entity written to the Calvin Archive at check time so every Meta-Governor adjudication is traceable. This is the implementation of the Meta-Governor Decision Procedure (P8-P9) at the API boundary.
 - **Pearl-level structural payload enforcement** — `record_causal_link` on `CalvinClient` currently accepts a single shape for all three Pearl levels. This is taxonomy, not causation. The P8-P12 `epistemic_warrant` field alone is insufficient if the payloads are structurally identical. Enforce structural differences at the API level: associational links require only `(cause_id, effect_id, confidence)`; interventional links additionally require `held_fixed: Vec<String>` (the do-set variables) and `estimated_effect_delta: f64` (the measured downstream change under intervention); counterfactual links additionally require `actual_trace_id: String` (the Mythos episode ID for the observed world) and `hypothetical_intervention: String` (the counterfactual world state). The harmony endpoint must reject links labeled at a higher level without the required fields, accepting them at the highest warranted level with a `warrant_gap` annotation. Without structural enforcement, `epistemic_warrant` is advisory only and CLADDER benchmark passes remain cosmetic.
+
+**AdaptationAudit API shipped 2026-05-01:** Calvin `/agents/{name}/check` now returns `AdaptationAudit` with `safe`, `decision`, checked and violated invariants, confidence, quarantine reason, preservation note, and `candidate_id`. The sidecar writes a minimal `integration-candidate` record for each check when TypeDB is available, and Harkonnen exposes `check_adaptation_audit()` while keeping `check_adaptation_safe()` as a boolean compatibility wrapper.
+
+**Deterministic semantic adaptation classifier shipped 2026-05-01:** `check_adaptation_safe` now scores each proposed adaptation against a generated negation-space for every high-confidence Labrador invariant using a deterministic hashed token-vector and cosine similarity. The existing literal checks remain, but alias phrases such as "prefer solo throughput" for violating `cooperative` and "sound certain when unsure" for violating `signals uncertainty` are now caught without exact trait-name string matches. This keeps the sidecar dependency-light while preserving the future path to a model-backed embedding classifier.
 - **GAIA Level 3 adapter** — maps GAIA's multi-step tool-use tasks to Harkonnen's factory run format; routes sub-tasks to the appropriate Labrador rather than a single generalist. Requires the TypeDB query surface to be live.
 - **AgentBench adapters** — OS, database, and web environments, each mapped to a Labrador role.
 
@@ -1593,7 +1603,7 @@ These are useful capabilities, but they must not block the current path to a ful
 
 ### Constraint-polytope exploration (Avis-Fukuda / Double Description)
 
-The standalone `src/double_description.rs` module implements a bounded `f64` Double Description core for half-space intersection. Keep this as exploratory math until Harkonnen has a concrete use for constraint-polytopes in governance, adaptation safety, or causal feasibility checks.
+The bounded `f64` Double Description sketch should stay outside the active Harkonnen crate until Harkonnen has a concrete use for constraint-polytopes in governance, adaptation safety, or causal feasibility checks.
 
 Potential future uses:
 
@@ -1601,7 +1611,7 @@ Potential future uses:
 - Give the Meta-Governor a geometric feasibility check before accepting new invariants.
 - Model bounded causal or benchmark constraints where a vertex representation is more useful than a prose rule.
 
-Do not wire this into Phase 5b, PackChat, OB1, Calvin write integrity, or the TypeDB causal path until the end-to-end system is productive. If no Harkonnen caller emerges, move the module to a standalone crate or external scratch space.
+Do not wire this into Phase 5b, PackChat, OB1, Calvin write integrity, or the TypeDB causal path until the end-to-end system is productive. If a Harkonnen caller emerges, bring it back as a standalone crate or intentionally scoped module with fresh tests.
 
 ### Scanned document ingestion (`pdfium-render` + vision/OCR)
 

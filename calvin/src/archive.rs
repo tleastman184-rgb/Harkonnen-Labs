@@ -86,6 +86,27 @@ pub(crate) struct CausalLinkPayload {
     pub epistemic_warrant: Option<PearlLevel>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IntegrationDecision {
+    Accept,
+    Modify,
+    Reject,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AdaptationAudit {
+    pub safe: bool,
+    pub decision: IntegrationDecision,
+    pub invariants_checked: Vec<String>,
+    pub violated_invariants: Vec<String>,
+    pub confidence: f64,
+    pub quarantine_reason: Option<String>,
+    pub preservation_note: Option<String>,
+    pub candidate_id: String,
+}
+
 impl CausalLinkPayload {
     pub(crate) fn normalized(mut self) -> Result<Self> {
         validate_confidence("causal_link.confidence", self.confidence)?;
@@ -464,7 +485,8 @@ impl ArchiveStore {
         &self,
         adaptation_summary: &str,
         agent_name: &str,
-    ) -> Result<bool> {
+    ) -> Result<AdaptationAudit> {
+        let candidate_id = Uuid::new_v4().to_string();
         let tx = self
             .driver
             .transaction(&self.db_name, TransactionType::Read)
@@ -491,29 +513,82 @@ impl ArchiveStore {
                 }
             }
         }
-        let lower = adaptation_summary.to_lowercase();
-        for trait_name in &high_confidence_traits {
-            let tl = trait_name.to_lowercase();
-            // Literal negation prefixes
-            if lower.contains(&format!("not {tl}"))
-                || lower.contains(&format!("remove {tl}"))
-                || lower.contains(&format!("eliminate {tl}"))
-                // Semantic negation patterns (basic_heuristic; Phase 6 upgrades to embedding classifier)
-                || lower.contains(&format!("avoid {tl}"))
-                || lower.contains(&format!("without {tl}"))
-                || lower.contains(&format!("less {tl}"))
-                || lower.contains(&format!("deprioritise {tl}"))
-                || lower.contains(&format!("deprioritize {tl}"))
-                || lower.contains(&format!("reduce {tl}"))
-                || lower.contains(&format!("replace {tl}"))
-                || lower.contains(&format!("instead of {tl}"))
-                || lower.contains(&format!("abandon {tl}"))
-                || lower.contains(&format!("drop {tl}"))
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let violated_invariants =
+            violated_adaptation_invariants(adaptation_summary, &high_confidence_traits);
+        let safe = violated_invariants.is_empty();
+        let decision = if safe {
+            IntegrationDecision::Accept
+        } else {
+            IntegrationDecision::Reject
+        };
+        let confidence = if !violated_invariants.is_empty() {
+            0.95
+        } else if high_confidence_traits.is_empty() {
+            0.50
+        } else {
+            0.75
+        };
+        let quarantine_reason = if safe {
+            None
+        } else {
+            Some(format!(
+                "Adaptation violates invariant(s): {}",
+                violated_invariants.join(", ")
+            ))
+        };
+        let preservation_note = if safe {
+            Some("No high-confidence Labrador kernel invariant was contradicted by the adaptation summary under the deterministic semantic negation classifier.".to_string())
+        } else {
+            Some("Rejected by Priority 1 identity-safety gate before integration.".to_string())
+        };
+        let audit = AdaptationAudit {
+            safe,
+            decision,
+            invariants_checked: high_confidence_traits,
+            violated_invariants,
+            confidence,
+            quarantine_reason,
+            preservation_note,
+            candidate_id,
+        };
+        let _ = self
+            .record_adaptation_candidate(adaptation_summary, &audit)
+            .await;
+        Ok(audit)
+    }
+
+    async fn record_adaptation_candidate(
+        &self,
+        adaptation_summary: &str,
+        audit: &AdaptationAudit,
+    ) -> Result<()> {
+        let tx = self
+            .driver
+            .transaction(&self.db_name, TransactionType::Write)
+            .await?;
+        let status = integration_decision_label(&audit.decision);
+        let quarantine_reason = audit.quarantine_reason.as_deref().unwrap_or("");
+        let preservation_note = audit.preservation_note.as_deref().unwrap_or("");
+        let tql = format!(
+            r#"insert $c isa integration-candidate,
+                has uuid "{candidate_id}",
+                has narrative_summary "{summary}",
+                has status "{status}",
+                has confidence {confidence},
+                has quarantine-reason "{quarantine_reason}",
+                has preservation_note "{preservation_note}";"#,
+            candidate_id = escape_tql(&audit.candidate_id),
+            summary = escape_tql(adaptation_summary),
+            status = status,
+            confidence = audit.confidence,
+            quarantine_reason = escape_tql(quarantine_reason),
+            preservation_note = escape_tql(preservation_note),
+        );
+        tx.query(&tql)
+            .await
+            .context("record_adaptation_candidate query")?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn record_prediction(
@@ -790,9 +865,179 @@ fn revision_type_label(value: &RevisionType) -> &'static str {
     }
 }
 
+fn integration_decision_label(value: &IntegrationDecision) -> &'static str {
+    match value {
+        IntegrationDecision::Accept => "accept",
+        IntegrationDecision::Modify => "modify",
+        IntegrationDecision::Reject => "reject",
+        IntegrationDecision::Quarantine => "quarantine",
+    }
+}
+
+const ADAPTATION_EMBEDDING_DIMS: usize = 96;
+const ADAPTATION_NEGATION_THRESHOLD: f64 = 0.57;
+
+fn violated_adaptation_invariants(adaptation_summary: &str, invariants: &[String]) -> Vec<String> {
+    let lower = adaptation_summary.to_lowercase();
+    invariants
+        .iter()
+        .filter(|trait_name| {
+            let tl = trait_name.to_lowercase();
+            literal_negation_match(&lower, &tl)
+                || semantic_negation_score(&lower, trait_name) >= ADAPTATION_NEGATION_THRESHOLD
+        })
+        .cloned()
+        .collect()
+}
+
+fn literal_negation_match(summary_lower: &str, trait_lower: &str) -> bool {
+    [
+        "not ",
+        "remove ",
+        "eliminate ",
+        "avoid ",
+        "without ",
+        "less ",
+        "deprioritise ",
+        "deprioritize ",
+        "reduce ",
+        "replace ",
+        "instead of ",
+        "abandon ",
+        "drop ",
+    ]
+    .iter()
+    .any(|prefix| summary_lower.contains(&format!("{prefix}{trait_lower}")))
+}
+
+fn semantic_negation_score(summary_lower: &str, trait_name: &str) -> f64 {
+    let summary_vec = adaptation_text_vector(summary_lower);
+    invariant_negation_phrases(trait_name)
+        .iter()
+        .map(|phrase| cosine_similarity(&summary_vec, &adaptation_text_vector(phrase)))
+        .fold(0.0, f64::max)
+}
+
+fn invariant_negation_phrases(trait_name: &str) -> Vec<String> {
+    let normalized = trait_name.to_lowercase();
+    let mut phrases = vec![
+        format!("avoid {normalized}"),
+        format!("less {normalized}"),
+        format!("reduce {normalized}"),
+        format!("drop {normalized}"),
+        format!("without {normalized}"),
+        format!("stop being {normalized}"),
+    ];
+    for alias in invariant_negation_aliases(&normalized) {
+        phrases.push(alias.to_string());
+    }
+    phrases
+}
+
+fn invariant_negation_aliases(trait_name: &str) -> &'static [&'static str] {
+    match trait_name {
+        "cooperative" => &[
+            "act alone",
+            "prefer solo throughput",
+            "avoid collaboration",
+            "ignore pack coordination",
+            "stop coordinating with the pack",
+        ],
+        "helpful" => &[
+            "be less useful",
+            "withhold assistance",
+            "ignore operator requests",
+            "stop helping",
+        ],
+        "non-adversarial" => &[
+            "be adversarial",
+            "argue against the operator",
+            "be hostile",
+            "increase adversarial behavior",
+        ],
+        "truth-seeking" | "truthful" => &[
+            "prefer convenient answers",
+            "hide uncertainty",
+            "ignore contrary evidence",
+            "mislead the operator",
+            "reduce truthfulness",
+        ],
+        "signals uncertainty" => &[
+            "hide uncertainty",
+            "sound certain when unsure",
+            "stop asking clarifying questions",
+            "avoid saying uncertain",
+        ],
+        "pack-aware" => &[
+            "ignore pack context",
+            "stop coordinating with the pack",
+            "act as a solo agent",
+            "drop pack awareness",
+        ],
+        _ => &[],
+    }
+}
+
+fn adaptation_text_vector(text: &str) -> [f64; ADAPTATION_EMBEDDING_DIMS] {
+    let mut vector = [0.0; ADAPTATION_EMBEDDING_DIMS];
+    for token in semantic_tokens(text) {
+        let idx = stable_hash(token) % ADAPTATION_EMBEDDING_DIMS;
+        vector[idx] += 1.0;
+    }
+    vector
+}
+
+fn semantic_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .filter_map(|raw| {
+            let token = raw.trim().to_ascii_lowercase();
+            if token.len() < 3 || ADAPTATION_STOP_WORDS.contains(&token.as_str()) {
+                None
+            } else {
+                Some(token)
+            }
+        })
+        .collect()
+}
+
+const ADAPTATION_STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "when", "that", "this", "from", "into", "than", "then", "will",
+    "should", "would", "could", "being", "been", "are", "was", "were",
+];
+
+fn stable_hash(token: String) -> usize {
+    token
+        .bytes()
+        .fold(14_695_981_039_346_656_037usize, |hash, byte| {
+            hash.wrapping_mul(1_099_511_628_211usize) ^ usize::from(byte)
+        })
+}
+
+fn cosine_similarity(
+    left: &[f64; ADAPTATION_EMBEDDING_DIMS],
+    right: &[f64; ADAPTATION_EMBEDDING_DIMS],
+) -> f64 {
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for idx in 0..ADAPTATION_EMBEDDING_DIMS {
+        dot += left[idx] * right[idx];
+        left_norm += left[idx] * left[idx];
+        right_norm += right[idx] * right[idx];
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BeliefRevision, CausalLinkPayload, PearlLevel, RevisionType};
+    use super::{
+        semantic_negation_score, violated_adaptation_invariants, BeliefRevision, CausalLinkPayload,
+        PearlLevel, RevisionType, ADAPTATION_NEGATION_THRESHOLD,
+    };
 
     fn revision(revision_type: RevisionType, evidence_ids: Vec<&str>) -> BeliefRevision {
         BeliefRevision {
@@ -849,5 +1094,39 @@ mod tests {
         assert_eq!(payload.pearl_level, PearlLevel::Interventional);
         assert_eq!(payload.epistemic_warrant, Some(PearlLevel::Interventional));
         assert!(payload.warrant_gap);
+    }
+
+    #[test]
+    fn adaptation_audit_violation_detection_reports_specific_invariants() {
+        let invariants = vec![
+            "cooperative".to_string(),
+            "truthful".to_string(),
+            "pack-aware".to_string(),
+        ];
+        let violated = violated_adaptation_invariants(
+            "Be less cooperative and avoid truthful reporting.",
+            &invariants,
+        );
+
+        assert_eq!(violated, vec!["cooperative", "truthful"]);
+    }
+
+    #[test]
+    fn semantic_adaptation_classifier_catches_alias_negation() {
+        let invariants = vec![
+            "cooperative".to_string(),
+            "truth-seeking".to_string(),
+            "signals uncertainty".to_string(),
+        ];
+        let violated = violated_adaptation_invariants(
+            "Prefer solo throughput and sound certain when unsure.",
+            &invariants,
+        );
+
+        assert_eq!(violated, vec!["cooperative", "signals uncertainty"]);
+        assert!(
+            semantic_negation_score("prefer solo throughput", "cooperative")
+                >= ADAPTATION_NEGATION_THRESHOLD
+        );
     }
 }

@@ -817,6 +817,14 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
             get(get_behavioral_change_report),
         )
         .route(
+            "/api/runs/:id/prediction-reinforcements",
+            get(get_prediction_success_reinforcements),
+        )
+        .route(
+            "/api/runs/:id/memory-influence-exclusions",
+            get(get_memory_influence_exclusions),
+        )
+        .route(
             "/api/runs/:id/context-utilization",
             get(get_context_utilization),
         )
@@ -1830,6 +1838,50 @@ async fn get_plan_completion_audit(
     }
 }
 
+async fn get_prediction_success_reinforcements(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_prediction_success_reinforcements(Some(&id)).await {
+            Ok(reinforcements) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "total": reinforcements.len(),
+                    "reinforcements": reinforcements,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_memory_influence_exclusions(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_memory_influence_exclusions(Some(&id)).await {
+            Ok(exclusions) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "total": exclusions.len(),
+                    "exclusions": exclusions,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
 async fn get_behavioral_change_report(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -1881,6 +1933,14 @@ async fn get_context_utilization(
                 .iter()
                 .map(|record| record.tokens_returned)
                 .sum();
+            let triggered_pulls = pull_records
+                .iter()
+                .filter(|record| record.trigger.is_some())
+                .count();
+            let unexpected_discovery_pulls = pull_records
+                .iter()
+                .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
+                .count();
             let utilized_briefing_hits = phase_attributions
                 .iter()
                 .filter(|record| {
@@ -1912,6 +1972,8 @@ async fn get_context_utilization(
                         "briefing_tokens_used": briefing_tokens_used,
                         "mid_task_pull_count": pull_records.len(),
                         "mid_task_pull_tokens": pull_tokens_returned,
+                        "triggered_pull_count": triggered_pulls,
+                        "unexpected_discovery_pull_count": unexpected_discovery_pulls,
                         "utilized_briefing_hits": utilized_briefing_hits,
                         "utilization_rate": utilization_rate,
                         "utilization_status": utilization_status,
@@ -3895,6 +3957,10 @@ async fn build_run_health(app: &AppContext, id: &str) -> anyhow::Result<Option<s
                 .any(|hit| context_hit_referenced_by_pull(hit, &pull_records))
         })
         .count();
+    let unexpected_discovery_pulls = pull_records
+        .iter()
+        .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
+        .count();
     let utilization_rate = if phase_attributions.is_empty() {
         0.0
     } else {
@@ -3929,6 +3995,12 @@ async fn build_run_health(app: &AppContext, id: &str) -> anyhow::Result<Option<s
     }
     if context_status == "low" {
         review_items.push("context utilization is low".to_string());
+    }
+    if unexpected_discovery_pulls > 0 {
+        review_items.push(format!(
+            "{unexpected_discovery_pulls} unexpected-discovery rebrief pull{} recorded",
+            plural_suffix(unexpected_discovery_pulls)
+        ));
     }
 
     let status = if !blockers.is_empty() {
@@ -3972,6 +4044,7 @@ async fn build_run_health(app: &AppContext, id: &str) -> anyhow::Result<Option<s
                 "rate": utilization_rate,
                 "phase_attribution_count": phase_attributions.len(),
                 "mid_task_pull_count": pull_records.len(),
+                "unexpected_discovery_pull_count": unexpected_discovery_pulls,
             },
         },
     })))

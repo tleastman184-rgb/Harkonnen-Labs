@@ -225,6 +225,14 @@ entity quarantine-entry,
   owns status,
   plays quarantine-holds:held;
 
+entity integration-candidate,
+  owns uuid @key,
+  owns narrative_summary,
+  owns status,
+  owns confidence,
+  owns quarantine-reason,
+  owns preservation_note;
+
 # Evidence and inference
 entity evidence-item,
   owns uuid @key,

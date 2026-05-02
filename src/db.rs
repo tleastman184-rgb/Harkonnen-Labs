@@ -63,6 +63,103 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS run_predictions (
+            prediction_id      TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL UNIQUE,
+            spec_id            TEXT NOT NULL,
+            predicted_outcome  TEXT NOT NULL,
+            risk_score         REAL NOT NULL,
+            confidence         REAL NOT NULL,
+            failure_phase      TEXT,
+            failure_kind       TEXT,
+            source_cause_ids   TEXT NOT NULL DEFAULT '',
+            narrative_summary  TEXT NOT NULL,
+            created_at         TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_run_predictions_spec_created
+        ON run_predictions (spec_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS prediction_success_reinforcements (
+            reinforcement_id   TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL,
+            prediction_id      TEXT NOT NULL,
+            source_cause_id    TEXT NOT NULL,
+            prediction_error   REAL NOT NULL,
+            actual_outcome     TEXT NOT NULL,
+            confirmation_count INTEGER NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending_workbench_review',
+            created_at         TEXT NOT NULL,
+            UNIQUE(run_id, source_cause_id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_prediction_success_reinforcements_cause
+        ON prediction_success_reinforcements (source_cause_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_influence_exclusions (
+            exclusion_id          TEXT PRIMARY KEY,
+            run_id                TEXT NOT NULL,
+            phase                 TEXT NOT NULL,
+            briefing_scope        TEXT,
+            memory_key            TEXT NOT NULL,
+            memory_preview        TEXT NOT NULL,
+            spec_family           TEXT NOT NULL DEFAULT 'unknown',
+            expected_outcome      TEXT NOT NULL,
+            actual_outcome        TEXT NOT NULL,
+            exclusion_probability REAL NOT NULL,
+            selection_basis       TEXT NOT NULL,
+            created_at            TEXT NOT NULL,
+            UNIQUE(run_id, phase, memory_key)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_influence_exclusions_run
+        ON memory_influence_exclusions (run_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_influence_exclusions_key
+        ON memory_influence_exclusions (memory_key, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS run_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -215,12 +312,21 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             tokens_returned INTEGER NOT NULL,
             hits_returned INTEGER NOT NULL,
             hit_previews TEXT NOT NULL DEFAULT '[]',
+            trigger TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (run_id) REFERENCES runs(run_id)
         )
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "context_pull_records",
+        "trigger",
+        "ALTER TABLE context_pull_records ADD COLUMN trigger TEXT",
+    )
     .await?;
 
     sqlx::query(

@@ -7,7 +7,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
     archive::{ArchiveExperience, BeliefRevision, CausalLinkPayload},
@@ -180,11 +180,6 @@ struct CheckAdaptationRequest {
     adaptation_summary: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CheckAdaptationResponse {
-    safe: bool,
-}
-
 async fn check_adaptation(
     State(state): State<Arc<CalvinState>>,
     Path(name): Path<String>,
@@ -195,7 +190,7 @@ async fn check_adaptation(
         .check_adaptation_safe(&req.adaptation_summary, &name)
         .await
     {
-        Ok(safe) => Json(CheckAdaptationResponse { safe }).into_response(),
+        Ok(audit) => Json(audit).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

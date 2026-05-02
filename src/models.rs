@@ -519,6 +519,8 @@ pub struct ContextPullRecord {
     pub hits_returned: u32,
     #[serde(default)]
     pub hit_previews: Vec<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

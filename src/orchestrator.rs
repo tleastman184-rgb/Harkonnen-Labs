@@ -183,6 +183,47 @@ pub struct MemoryCandidateProcessSummary {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalRunPrediction {
+    prediction_id: String,
+    run_id: String,
+    spec_id: String,
+    predicted_outcome: String,
+    source_cause_ids: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionSuccessReinforcement {
+    pub reinforcement_id: String,
+    pub run_id: String,
+    pub prediction_id: String,
+    pub source_cause_id: String,
+    pub prediction_error: f64,
+    pub actual_outcome: String,
+    pub confirmation_count: i64,
+    pub status: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfluenceExclusion {
+    pub exclusion_id: String,
+    pub run_id: String,
+    pub phase: String,
+    pub briefing_scope: Option<String>,
+    pub memory_key: String,
+    pub memory_preview: String,
+    pub spec_family: String,
+    pub expected_outcome: String,
+    pub actual_outcome: String,
+    pub exclusion_probability: f64,
+    pub selection_basis: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+const PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD: f64 = 0.2;
+const MEMORY_INFLUENCE_EXCLUSION_PROBABILITY: f64 = 0.05;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandTrialReport {
     run_id: String,
@@ -12163,10 +12204,13 @@ Return JSON only.",
         spec_id: &str,
         briefing: &CoobieBriefing,
     ) {
+        let pred = synthesize_run_prediction(run_id, spec_id, briefing);
+        if let Err(error) = self.store_local_run_prediction(&pred).await {
+            tracing::warn!(run_id = %run_id, error = %error, "local run prediction persistence failed");
+        }
         let Some(calvin) = self.calvin.as_ref() else {
             return;
         };
-        let pred = synthesize_run_prediction(run_id, spec_id, briefing);
         if let Err(error) = calvin.record_prediction(&pred).await {
             tracing::warn!(run_id = %run_id, error = %error, "Calvin record_prediction failed");
         } else {
@@ -12186,35 +12230,56 @@ Return JSON only.",
         actual_outcome: &str,
         failure_phase: Option<&str>,
     ) {
-        let Some(calvin) = self.calvin.as_ref() else {
-            return;
-        };
-        // Look up the existing prediction for this run.
-        let prediction_id = match calvin.get_prediction(run_id).await {
-            Ok(Some(pred)) => pred
-                .get("prediction_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            Ok(None) => {
-                tracing::debug!(run_id = %run_id, "no prediction found for run; skipping result");
-                return;
-            }
+        let local_prediction = match self.get_local_run_prediction(run_id).await {
+            Ok(prediction) => prediction,
             Err(error) => {
-                tracing::warn!(run_id = %run_id, error = %error, "Calvin get_prediction failed");
-                return;
+                tracing::warn!(run_id = %run_id, error = %error, "local run prediction lookup failed");
+                None
             }
         };
+
+        // Look up the existing prediction for this run.
+        let remote_prediction = if let Some(calvin) = self.calvin.as_ref() {
+            match calvin.get_prediction(run_id).await {
+                Ok(prediction) => prediction,
+                Err(error) => {
+                    tracing::warn!(run_id = %run_id, error = %error, "Calvin get_prediction failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let prediction_id = remote_prediction
+            .as_ref()
+            .and_then(|pred| {
+                pred.get("prediction_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                local_prediction
+                    .as_ref()
+                    .map(|pred| pred.prediction_id.clone())
+            });
         let Some(prediction_id) = prediction_id else {
+            tracing::debug!(run_id = %run_id, "no prediction found for run; skipping result");
             return;
         };
-        let predicted_outcome = match calvin.get_prediction(run_id).await {
-            Ok(Some(pred)) => pred
-                .get("predicted_outcome")
-                .and_then(|v| v.as_str())
-                .unwrap_or("uncertain")
-                .to_string(),
-            _ => "uncertain".to_string(),
-        };
+        let predicted_outcome = remote_prediction
+            .as_ref()
+            .and_then(|pred| {
+                pred.get("predicted_outcome")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                local_prediction
+                    .as_ref()
+                    .map(|pred| pred.predicted_outcome.clone())
+            })
+            .unwrap_or_else(|| "uncertain".to_string());
         let error_score = compute_prediction_error(&predicted_outcome, actual_outcome);
         let result_id = uuid::Uuid::new_v4().to_string();
         let narrative = format!(
@@ -12230,16 +12295,339 @@ Return JSON only.",
             prediction_error: error_score,
             narrative_summary: narrative,
         };
-        if let Err(error) = calvin.record_prediction_result(&outcome).await {
-            tracing::warn!(run_id = %run_id, error = %error, "Calvin record_prediction_result failed");
-        } else {
-            tracing::debug!(
-                run_id = %run_id,
-                actual = %actual_outcome,
-                error = error_score,
-                "prediction result recorded"
-            );
+        if let Some(calvin) = self.calvin.as_ref() {
+            if let Err(error) = calvin.record_prediction_result(&outcome).await {
+                tracing::warn!(run_id = %run_id, error = %error, "Calvin record_prediction_result failed");
+            } else {
+                tracing::debug!(
+                    run_id = %run_id,
+                    actual = %actual_outcome,
+                    error = error_score,
+                    "prediction result recorded"
+                );
+            }
         }
+
+        if error_score <= PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD {
+            if let Some(prediction) = local_prediction.as_ref() {
+                if let Err(error) = self
+                    .record_prediction_success_reinforcements(
+                        prediction,
+                        actual_outcome,
+                        error_score,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %error,
+                        "prediction success reinforcement failed"
+                    );
+                }
+            }
+        }
+
+        if let Some(prediction) = local_prediction.as_ref() {
+            if let Err(error) = self
+                .record_memory_influence_exclusions(
+                    run_id,
+                    prediction,
+                    actual_outcome,
+                    MEMORY_INFLUENCE_EXCLUSION_PROBABILITY,
+                )
+                .await
+            {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "memory influence exclusion calibration failed"
+                );
+            }
+        }
+    }
+
+    async fn store_local_run_prediction(
+        &self,
+        prediction: &crate::calvin_client::RunPrediction,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO run_predictions (
+                prediction_id, run_id, spec_id, predicted_outcome, risk_score, confidence,
+                failure_phase, failure_kind, source_cause_ids, narrative_summary, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(run_id) DO UPDATE SET
+                prediction_id = excluded.prediction_id,
+                spec_id = excluded.spec_id,
+                predicted_outcome = excluded.predicted_outcome,
+                risk_score = excluded.risk_score,
+                confidence = excluded.confidence,
+                failure_phase = excluded.failure_phase,
+                failure_kind = excluded.failure_kind,
+                source_cause_ids = excluded.source_cause_ids,
+                narrative_summary = excluded.narrative_summary,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(&prediction.prediction_id)
+        .bind(&prediction.run_id)
+        .bind(&prediction.spec_id)
+        .bind(&prediction.predicted_outcome)
+        .bind(prediction.risk_score)
+        .bind(prediction.confidence)
+        .bind(&prediction.failure_phase)
+        .bind(&prediction.failure_kind)
+        .bind(&prediction.source_cause_ids)
+        .bind(&prediction.narrative_summary)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_local_run_prediction(&self, run_id: &str) -> Result<Option<LocalRunPrediction>> {
+        let row = sqlx::query(
+            r#"
+            SELECT prediction_id, run_id, spec_id, predicted_outcome, source_cause_ids
+            FROM run_predictions
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| LocalRunPrediction {
+            prediction_id: row.get("prediction_id"),
+            run_id: row.get("run_id"),
+            spec_id: row.get("spec_id"),
+            predicted_outcome: row.get("predicted_outcome"),
+            source_cause_ids: row.get("source_cause_ids"),
+        }))
+    }
+
+    async fn record_prediction_success_reinforcements(
+        &self,
+        prediction: &LocalRunPrediction,
+        actual_outcome: &str,
+        prediction_error: f64,
+    ) -> Result<usize> {
+        let cause_ids = prediction
+            .source_cause_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|cause| !cause.is_empty())
+            .collect::<BTreeSet<_>>();
+        if cause_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut inserted = 0;
+        for cause_id in cause_ids {
+            let prior_count: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*) FROM prediction_success_reinforcements
+                WHERE source_cause_id = ?1
+                "#,
+            )
+            .bind(cause_id)
+            .fetch_one(&self.pool)
+            .await?;
+            let confirmation_count = prior_count + 1;
+            let result = sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO prediction_success_reinforcements (
+                    reinforcement_id, run_id, prediction_id, source_cause_id,
+                    prediction_error, actual_outcome, confirmation_count, status, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending_workbench_review', ?8)
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&prediction.run_id)
+            .bind(&prediction.prediction_id)
+            .bind(cause_id)
+            .bind(prediction_error)
+            .bind(actual_outcome)
+            .bind(confirmation_count)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() > 0 {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub async fn list_prediction_success_reinforcements(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<PredictionSuccessReinforcement>> {
+        let rows = if let Some(run_id) = run_id {
+            sqlx::query(
+                r#"
+                SELECT reinforcement_id, run_id, prediction_id, source_cause_id,
+                       prediction_error, actual_outcome, confirmation_count, status, created_at
+                FROM prediction_success_reinforcements
+                WHERE run_id = ?1
+                ORDER BY created_at ASC, source_cause_id ASC
+                "#,
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT reinforcement_id, run_id, prediction_id, source_cause_id,
+                       prediction_error, actual_outcome, confirmation_count, status, created_at
+                FROM prediction_success_reinforcements
+                ORDER BY created_at ASC, source_cause_id ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let created_at = row.get::<String, _>("created_at");
+                Ok(PredictionSuccessReinforcement {
+                    reinforcement_id: row.get("reinforcement_id"),
+                    run_id: row.get("run_id"),
+                    prediction_id: row.get("prediction_id"),
+                    source_cause_id: row.get("source_cause_id"),
+                    prediction_error: row.get("prediction_error"),
+                    actual_outcome: row.get("actual_outcome"),
+                    confirmation_count: row.get("confirmation_count"),
+                    status: row.get("status"),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .context("parse prediction success reinforcement created_at")?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    async fn record_memory_influence_exclusions(
+        &self,
+        run_id: &str,
+        prediction: &LocalRunPrediction,
+        actual_outcome: &str,
+        exclusion_probability: f64,
+    ) -> Result<usize> {
+        let probability = exclusion_probability.clamp(0.0, 1.0);
+        if probability <= 0.0 {
+            return Ok(0);
+        }
+        let attributions = self.list_phase_attributions_for_run(run_id).await?;
+        let mut inserted = 0;
+        let now = Utc::now().to_rfc3339();
+        for attribution in attributions {
+            for hit in attribution.memory_hits.iter().filter(|hit| {
+                let trimmed = hit.trim();
+                !trimmed.is_empty() && !trimmed.contains("No reusable memory")
+            }) {
+                let memory_key = memory_influence_key(hit);
+                if memory_key.is_empty() {
+                    continue;
+                }
+                if !select_memory_influence_exclusion(
+                    run_id,
+                    &attribution.phase,
+                    &memory_key,
+                    probability,
+                ) {
+                    continue;
+                }
+                let result = sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO memory_influence_exclusions (
+                        exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                        spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                        selection_basis, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                            'deterministic_hash_calibration', ?11)
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(run_id)
+                .bind(&attribution.phase)
+                .bind(attribution.briefing_scope.map(|scope| scope.to_string()))
+                .bind(&memory_key)
+                .bind(memory_influence_preview(hit, 240))
+                .bind(&prediction.spec_id)
+                .bind(&prediction.predicted_outcome)
+                .bind(actual_outcome)
+                .bind(probability)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+                if result.rows_affected() > 0 {
+                    inserted += 1;
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub async fn list_memory_influence_exclusions(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<MemoryInfluenceExclusion>> {
+        let rows = if let Some(run_id) = run_id {
+            sqlx::query(
+                r#"
+                SELECT exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                       spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                       selection_basis, created_at
+                FROM memory_influence_exclusions
+                WHERE run_id = ?1
+                ORDER BY created_at ASC, phase ASC, memory_key ASC
+                "#,
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                       spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                       selection_basis, created_at
+                FROM memory_influence_exclusions
+                ORDER BY created_at ASC, run_id ASC, phase ASC, memory_key ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let created_at = row.get::<String, _>("created_at");
+                Ok(MemoryInfluenceExclusion {
+                    exclusion_id: row.get("exclusion_id"),
+                    run_id: row.get("run_id"),
+                    phase: row.get("phase"),
+                    briefing_scope: row.get("briefing_scope"),
+                    memory_key: row.get("memory_key"),
+                    memory_preview: row.get("memory_preview"),
+                    spec_family: row.get("spec_family"),
+                    expected_outcome: row.get("expected_outcome"),
+                    actual_outcome: row.get("actual_outcome"),
+                    exclusion_probability: row.get("exclusion_probability"),
+                    selection_basis: row.get("selection_basis"),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .context("parse memory influence exclusion created_at")?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
     }
 
     async fn try_process_memory_candidates_on_close(&self, run_id: &str) {
@@ -16480,7 +16868,12 @@ Return JSON only.",
         tokens_returned: u32,
         hits_returned: u32,
         hit_previews: &[String],
+        trigger: Option<&str>,
     ) -> Result<ContextPullRecord> {
+        let trigger = trigger
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let record = ContextPullRecord {
             pull_id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
@@ -16490,14 +16883,15 @@ Return JSON only.",
             tokens_returned,
             hits_returned,
             hit_previews: hit_previews.to_vec(),
+            trigger,
             created_at: Utc::now(),
         };
         sqlx::query(
             r#"
             INSERT INTO context_pull_records (
                 pull_id, run_id, query, scope, max_tokens, tokens_returned,
-                hits_returned, hit_previews, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                hits_returned, hit_previews, trigger, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )
         .bind(&record.pull_id)
@@ -16508,6 +16902,7 @@ Return JSON only.",
         .bind(i64::from(record.tokens_returned))
         .bind(i64::from(record.hits_returned))
         .bind(serde_json::to_string(&record.hit_previews)?)
+        .bind(&record.trigger)
         .bind(record.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -16518,7 +16913,7 @@ Return JSON only.",
         let rows = sqlx::query(
             r#"
             SELECT pull_id, run_id, query, scope, max_tokens, tokens_returned,
-                   hits_returned, hit_previews, created_at
+                   hits_returned, hit_previews, trigger, created_at
             FROM context_pull_records
             WHERE run_id = ?1
             ORDER BY created_at ASC, pull_id ASC
@@ -16540,6 +16935,7 @@ Return JSON only.",
                 hits_returned: row.get::<i64, _>("hits_returned") as u32,
                 hit_previews: serde_json::from_str(row.get::<String, _>("hit_previews").as_str())
                     .with_context(|| "parsing context pull hit_previews")?,
+                trigger: row.get::<Option<String>, _>("trigger"),
                 created_at: chrono::DateTime::parse_from_rfc3339(
                     row.get::<String, _>("created_at").as_str(),
                 )?
@@ -28806,6 +29202,45 @@ fn normalize_text_key(content: &str) -> String {
         .join(" ")
 }
 
+fn memory_influence_key(content: &str) -> String {
+    let normalized = normalize_text_key(content);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn select_memory_influence_exclusion(
+    run_id: &str,
+    phase: &str,
+    memory_key: &str,
+    probability: f64,
+) -> bool {
+    let probability = probability.clamp(0.0, 1.0);
+    if probability <= 0.0 || memory_key.is_empty() {
+        return false;
+    }
+    if probability >= 1.0 {
+        return true;
+    }
+    let mut hasher = DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    phase.hash(&mut hasher);
+    memory_key.hash(&mut hasher);
+    let bucket = hasher.finish() % 10_000;
+    bucket < (probability * 10_000.0).round() as u64
+}
+
+fn memory_influence_preview(content: &str, max_chars: usize) -> String {
+    let mut preview = content.chars().take(max_chars).collect::<String>();
+    if content.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
 #[derive(Debug, Default)]
 struct MemoryReconsolidationTriggers {
     candidate_ids: BTreeSet<String>,
@@ -30355,6 +30790,245 @@ mod tests {
             "captured OB1 memory should be retrievable through Coobie briefing collection; hits={:?}",
             hits.hits
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_shared_recall_candidates_do_not_create_second_openbrain_thought() {
+        let (openbrain_url, thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let first_candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let second_candidate_id = format!("candidate-{}", Uuid::new_v4());
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &first_candidate_id,
+            "shared_recall",
+            "normal",
+            "Remember this: keep OB1 as the default shared recall path.",
+        )
+        .await;
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &second_candidate_id,
+            "shared_recall",
+            "normal",
+            "remember this keep ob1 as the default shared recall path",
+        )
+        .await;
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process memory candidates");
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.captured_openbrain, 1);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(
+            thoughts.lock().expect("thoughts lock").len(),
+            1,
+            "duplicate PackChat phrasing should not create a second OB1 thought"
+        );
+
+        let stored = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list candidates");
+        let statuses = stored
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.candidate_id.as_str(),
+                    candidate.status.as_str(),
+                    candidate.dedupe_key.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            statuses
+                .iter()
+                .any(|(id, status, _)| *id == first_candidate_id && *status == "captured_openbrain"),
+            "first candidate should be captured; statuses={statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|(id, status, _)| {
+                *id == second_candidate_id && *status == "duplicate_openbrain"
+            }),
+            "second candidate should be marked duplicate; statuses={statuses:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|candidate| candidate.dedupe_key.as_deref()
+                    == Some("remember this keep ob1 as the default shared recall path")),
+            "both candidates should persist the same normalized dedupe key; statuses={statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_error_prediction_records_success_reinforcement_counts() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            spec_id: "spec-prediction-reinforcement".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "TEST_BLIND_SPOT,SPEC_AMBIGUITY".to_string(),
+            narrative_summary: "Low-risk prediction from two prior causal signals.".to_string(),
+        };
+        app.store_local_run_prediction(&prediction)
+            .await
+            .expect("store prediction");
+
+        app.try_record_calvin_prediction_result(&run_id, "completed", None)
+            .await;
+
+        let reinforcements = app
+            .list_prediction_success_reinforcements(Some(&run_id))
+            .await
+            .expect("list reinforcements");
+        assert_eq!(reinforcements.len(), 2);
+        assert!(reinforcements.iter().all(|event| {
+            event.prediction_error == 0.0
+                && event.actual_outcome == "completed"
+                && event.confirmation_count == 1
+                && event.status == "pending_workbench_review"
+        }));
+
+        let second_run_id = format!("run-{}", Uuid::new_v4());
+        let second_prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: second_run_id.clone(),
+            spec_id: "spec-prediction-reinforcement".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "TEST_BLIND_SPOT".to_string(),
+            narrative_summary: "Second low-risk prediction from the same signal.".to_string(),
+        };
+        app.store_local_run_prediction(&second_prediction)
+            .await
+            .expect("store second prediction");
+
+        app.try_record_calvin_prediction_result(&second_run_id, "completed", None)
+            .await;
+
+        let all_reinforcements = app
+            .list_prediction_success_reinforcements(None)
+            .await
+            .expect("list all reinforcements");
+        let test_blind_spot = all_reinforcements
+            .iter()
+            .find(|event| {
+                event.run_id == second_run_id && event.source_cause_id == "TEST_BLIND_SPOT"
+            })
+            .expect("second reinforcement");
+        assert_eq!(test_blind_spot.confirmation_count, 2);
+    }
+
+    #[tokio::test]
+    async fn memory_influence_exclusion_event_is_recorded_from_briefing_hits() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            spec_id: "auth-service-family".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "SPEC_AMBIGUITY".to_string(),
+            narrative_summary: "Low-risk prediction with one prior signal.".to_string(),
+        };
+        app.store_local_run_prediction(&prediction)
+            .await
+            .expect("store prediction");
+        let episode_id = format!("episode-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO episodes (episode_id, run_id, phase, goal, outcome, confidence, started_at)
+            VALUES (?1, ?2, 'mason', 'exercise memory influence calibration', 'success', 0.8, ?3)
+            "#,
+        )
+        .bind(&episode_id)
+        .bind(&run_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .expect("insert episode");
+        app.upsert_phase_attribution(&PhaseAttributionRecord {
+            attribution_id: format!("phase-attribution-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            episode_id,
+            phase: "mason".to_string(),
+            agent_name: "mason".to_string(),
+            outcome: "success".to_string(),
+            confidence: Some(0.8),
+            prompt_bundle_fingerprint: None,
+            prompt_bundle_provider: None,
+            prompt_bundle_artifact: None,
+            pinned_skill_ids: Vec::new(),
+            memory_hits: vec![
+                "[open-brain] Prior auth-service edits need explicit scope checks.".to_string(),
+            ],
+            core_memory_ids: Vec::new(),
+            project_memory_ids: Vec::new(),
+            relevant_lesson_ids: Vec::new(),
+            required_checks: Vec::new(),
+            guardrails: Vec::new(),
+            query_terms: vec!["auth".to_string(), "scope".to_string()],
+            briefing_scope: Some(BriefingScope::MasonPreflight),
+            briefing_token_budget: 800,
+            briefing_tokens_used: 120,
+            briefing_hits_provided: 1,
+            stakeholder_alignment: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("insert phase attribution");
+
+        let local_prediction = app
+            .get_local_run_prediction(&run_id)
+            .await
+            .expect("local prediction lookup")
+            .expect("local prediction");
+        let inserted = app
+            .record_memory_influence_exclusions(&run_id, &local_prediction, "completed", 1.0)
+            .await
+            .expect("record exclusions");
+        assert_eq!(inserted, 1);
+
+        let exclusions = app
+            .list_memory_influence_exclusions(Some(&run_id))
+            .await
+            .expect("list exclusions");
+        assert_eq!(exclusions.len(), 1);
+        let exclusion = &exclusions[0];
+        assert_eq!(exclusion.phase, "mason");
+        assert_eq!(exclusion.briefing_scope.as_deref(), Some("mason_preflight"));
+        assert_eq!(exclusion.spec_family, "auth-service-family");
+        assert_eq!(exclusion.expected_outcome, "pass");
+        assert_eq!(exclusion.actual_outcome, "completed");
+        assert_eq!(exclusion.exclusion_probability, 1.0);
+        assert_eq!(exclusion.selection_basis, "deterministic_hash_calibration");
+        assert!(
+            exclusion.memory_preview.contains("explicit scope checks"),
+            "preview should preserve the excluded briefing hit"
+        );
+        assert!(!exclusion.memory_key.is_empty());
     }
 
     #[tokio::test]
