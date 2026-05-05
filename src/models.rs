@@ -631,6 +631,8 @@ pub struct PriorCauseSignal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoobieBriefing {
     pub spec_id: String,
+    #[serde(default)]
+    pub spec_family: Option<String>,
     pub product: String,
     pub query_terms: Vec<String>,
     pub domain_signals: Vec<String>,
@@ -910,6 +912,8 @@ pub struct AgentExecution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentPackage {
     pub spec_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_family: Option<String>,
     pub summary: String,
     pub ambiguity_notes: Vec<String>,
     pub recommended_steps: Vec<String>,

@@ -92,6 +92,30 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS spec_family_profiles (
+            family_id        TEXT PRIMARY KEY,
+            label            TEXT NOT NULL,
+            fingerprint_json TEXT NOT NULL DEFAULT '[]',
+            spec_ids_json    TEXT NOT NULL DEFAULT '[]',
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_spec_family_profiles_updated
+        ON spec_family_profiles (updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS prediction_success_reinforcements (
             reinforcement_id   TEXT PRIMARY KEY,
             run_id             TEXT NOT NULL,

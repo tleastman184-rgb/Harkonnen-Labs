@@ -221,6 +221,16 @@ pub struct MemoryInfluenceExclusion {
     pub created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecFamilyProfile {
+    pub family_id: String,
+    pub label: String,
+    pub fingerprint: Vec<String>,
+    pub spec_ids: Vec<String>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
 const PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD: f64 = 0.2;
 const MEMORY_INFLUENCE_EXCLUSION_PROBABILITY: f64 = 0.05;
 
@@ -1985,6 +1995,9 @@ impl AppContext {
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let log_path = self.run_log_path(&run_id);
+        let spec_family = self
+            .upsert_spec_family_profile(&spec_obj, &target_source)
+            .await?;
 
         self.insert_run(&run_id, &spec_obj.id, &target_source.label, "queued", now)
             .await?;
@@ -1996,8 +2009,11 @@ impl AppContext {
                 "orchestrator",
                 "queued",
                 &format!(
-                    "Created run for spec {} against target {} ({})",
-                    spec_obj.id, target_source.label, target_source.source_path
+                    "Created run for spec {} in family {} against target {} ({})",
+                    spec_obj.id,
+                    spec_family.family_id,
+                    target_source.label,
+                    target_source.source_path
                 ),
                 &log_path,
             )
@@ -6863,6 +6879,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
 
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
+            spec_family: Some(derive_spec_family_profile(spec_obj, target_source).family_id),
             product: target_source.label.clone(),
             query_terms: enriched_query_terms,
             domain_signals: domain_signals.to_vec(),
@@ -7216,10 +7233,10 @@ Render Coobie's preflight markdown for the pack. Incorporate repo-local guidance
                     "{}
 
 Task contract:
-You are Scout, a spec-intake specialist for a software factory. Read a YAML spec, prior memory context, and repo-local guidance, then produce a concise implementation intent package as JSON with these fields: spec_id (string), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.",
+You are Scout, a spec-intake specialist for a software factory. Read a YAML spec, prior memory context, and repo-local guidance, then produce a concise implementation intent package as JSON with these fields: spec_id (string), spec_family (string or null), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.",
                     support.system_instruction
                 ))
-                .unwrap_or_else(|| "You are Scout, a spec-intake specialist for a software factory. Read a YAML spec and prior memory context, then produce a concise implementation intent package as JSON with these fields: spec_id (string), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.".to_string());
+                .unwrap_or_else(|| "You are Scout, a spec-intake specialist for a software factory. Read a YAML spec and prior memory context, then produce a concise implementation intent package as JSON with these fields: spec_id (string), spec_family (string or null), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.".to_string());
             let repo_context_block = prompt_support
                 .as_ref()
                 .map(|support| support.repo_context_block.as_str())
@@ -7284,7 +7301,10 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                         )
                         .await;
                     }
-                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(body.trim()) {
+                    if let Ok(mut parsed) = serde_json::from_str::<IntentPackage>(body.trim()) {
+                        if parsed.spec_family.is_none() {
+                            parsed.spec_family = briefing.spec_family.clone();
+                        }
                         return Ok(parsed);
                     }
                     let stripped = body
@@ -7293,7 +7313,10 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                         .trim_start_matches("```")
                         .trim_end_matches("```")
                         .trim();
-                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(stripped) {
+                    if let Ok(mut parsed) = serde_json::from_str::<IntentPackage>(stripped) {
+                        if parsed.spec_family.is_none() {
+                            parsed.spec_family = briefing.spec_family.clone();
+                        }
                         return Ok(parsed);
                     }
                     tracing::warn!("Scout LLM response was not valid IntentPackage JSON — falling back to stub");
@@ -7322,6 +7345,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
 
         Ok(IntentPackage {
             spec_id: spec_obj.id.clone(),
+            spec_family: briefing.spec_family.clone(),
             summary: format!("Implement {}", spec_obj.title),
             ambiguity_notes,
             recommended_steps: vec![
@@ -12116,6 +12140,133 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn upsert_spec_family_profile(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+    ) -> Result<SpecFamilyProfile> {
+        let derived = derive_spec_family_profile(spec_obj, target_source);
+        let existing = self
+            .load_spec_family_profile(&derived.family_id)
+            .await?
+            .unwrap_or_else(|| derived.clone());
+        let mut spec_ids = existing.spec_ids.clone();
+        push_unique(&mut spec_ids, &spec_obj.id);
+        let mut fingerprint = existing.fingerprint.clone();
+        for token in &derived.fingerprint {
+            push_unique(&mut fingerprint, token);
+        }
+        fingerprint.truncate(24);
+        let now = Utc::now();
+        let created_at = if existing.spec_ids.is_empty() {
+            now
+        } else {
+            existing.created_at
+        };
+        let profile = SpecFamilyProfile {
+            family_id: derived.family_id,
+            label: derived.label,
+            fingerprint,
+            spec_ids,
+            created_at,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO spec_family_profiles (
+                family_id, label, fingerprint_json, spec_ids_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(family_id) DO UPDATE SET
+                label = excluded.label,
+                fingerprint_json = excluded.fingerprint_json,
+                spec_ids_json = excluded.spec_ids_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&profile.family_id)
+        .bind(&profile.label)
+        .bind(serde_json::to_string(&profile.fingerprint)?)
+        .bind(serde_json::to_string(&profile.spec_ids)?)
+        .bind(profile.created_at.to_rfc3339())
+        .bind(profile.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        let content = format!(
+            "Spec family {} ({}) includes spec {} for product {}. Fingerprint: {}.",
+            profile.family_id,
+            profile.label,
+            spec_obj.id,
+            target_source.label,
+            profile.fingerprint.join(", ")
+        );
+        let metadata = crate::memory::SemanticMemoryMetadata {
+            org: Some("harkonnen-labs".to_string()),
+            role: Some("spec_family".to_string()),
+            product: Some(target_source.label.clone()),
+            spec_id: Some(spec_obj.id.clone()),
+            memory_type: Some("spec_family_profile".to_string()),
+            tags: vec![
+                "spec_family".to_string(),
+                profile.family_id.clone(),
+                target_source.label.clone(),
+            ],
+            sensitivity_label: Some("normal".to_string()),
+            created_at: Some(profile.updated_at),
+            ..Default::default()
+        };
+        if let Err(error) = self.semantic_memory_store(&content, metadata).await {
+            tracing::debug!(
+                spec_id = %spec_obj.id,
+                family_id = %profile.family_id,
+                error = %error,
+                "semantic spec-family profile store failed"
+            );
+        }
+
+        Ok(profile)
+    }
+
+    pub async fn load_spec_family_profile(
+        &self,
+        family_id: &str,
+    ) -> Result<Option<SpecFamilyProfile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT family_id, label, fingerprint_json, spec_ids_json, created_at, updated_at
+            FROM spec_family_profiles
+            WHERE family_id = ?1
+            "#,
+        )
+        .bind(family_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_spec_family_profile).transpose()
+    }
+
+    async fn spec_family_for_spec_id(&self, spec_id: &str) -> Result<String> {
+        let rows = sqlx::query(
+            r#"
+            SELECT family_id, spec_ids_json
+            FROM spec_family_profiles
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let raw: String = row.get("spec_ids_json");
+            let spec_ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+            if spec_ids.iter().any(|id| id == spec_id) {
+                return Ok(row.get("family_id"));
+            }
+        }
+        Ok(derive_spec_family_id_from_text(spec_id))
+    }
+
     async fn try_open_calvin_run(&self, run_id: &str, spec_id: &str) {
         let Some(calvin) = self.calvin.as_ref() else {
             return;
@@ -12523,6 +12674,7 @@ Return JSON only.",
         if probability <= 0.0 {
             return Ok(0);
         }
+        let spec_family = self.spec_family_for_spec_id(&prediction.spec_id).await?;
         let attributions = self.list_phase_attributions_for_run(run_id).await?;
         let mut inserted = 0;
         let now = Utc::now().to_rfc3339();
@@ -12560,7 +12712,7 @@ Return JSON only.",
                 .bind(attribution.briefing_scope.map(|scope| scope.to_string()))
                 .bind(&memory_key)
                 .bind(memory_influence_preview(hit, 240))
-                .bind(&prediction.spec_id)
+                .bind(&spec_family)
                 .bind(&prediction.predicted_outcome)
                 .bind(actual_outcome)
                 .bind(probability)
@@ -19806,13 +19958,17 @@ fn build_implementation_plan(
 }
 
 fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadata) -> Vec<String> {
+    let spec_family = derive_spec_family_profile(spec_obj, target_source);
     let mut terms = vec![
         spec_obj.id.clone(),
+        spec_family.family_id.clone(),
+        spec_family.label.clone(),
         spec_obj.title.clone(),
         spec_obj.purpose.clone(),
         target_source.label.clone(),
         target_source.source_kind.clone(),
     ];
+    terms.extend(spec_family.fingerprint.clone());
 
     for value in spec_obj
         .scope
@@ -19863,6 +20019,184 @@ fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadat
         }
     }
     unique
+}
+
+fn parse_spec_family_profile(row: sqlx::sqlite::SqliteRow) -> Result<SpecFamilyProfile> {
+    let created_at = row.get::<String, _>("created_at");
+    let updated_at = row.get::<String, _>("updated_at");
+    let fingerprint_raw = row.get::<String, _>("fingerprint_json");
+    let spec_ids_raw = row.get::<String, _>("spec_ids_json");
+    let fingerprint = serde_json::from_str::<Vec<String>>(&fingerprint_raw).unwrap_or_default();
+    let spec_ids = serde_json::from_str::<Vec<String>>(&spec_ids_raw).unwrap_or_default();
+    Ok(SpecFamilyProfile {
+        family_id: row.get("family_id"),
+        label: row.get("label"),
+        fingerprint,
+        spec_ids,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+            .context("parse spec family created_at")?
+            .with_timezone(&Utc),
+        updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .context("parse spec family updated_at")?
+            .with_timezone(&Utc),
+    })
+}
+
+fn derive_spec_family_profile(
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+) -> SpecFamilyProfile {
+    let mut tokens = spec_family_tokens(spec_obj, target_source);
+    if tokens.is_empty() {
+        tokens.push("general".to_string());
+    }
+    let label = choose_spec_family_label(&tokens);
+    let family_id = normalize_spec_family_id(&label);
+    let now = Utc::now();
+    SpecFamilyProfile {
+        family_id,
+        label,
+        fingerprint: tokens.into_iter().take(24).collect(),
+        spec_ids: vec![spec_obj.id.clone()],
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn derive_spec_family_id_from_text(value: &str) -> String {
+    let words = normalize_spec_family_words(value);
+    if words.is_empty() {
+        "general".to_string()
+    } else {
+        words.into_iter().take(3).collect::<Vec<_>>().join("_")
+    }
+}
+
+fn choose_spec_family_label(tokens: &[String]) -> String {
+    let domain_pairs = [
+        ("auth", "auth_service"),
+        ("oauth", "auth_service"),
+        ("jwt", "auth_service"),
+        ("login", "auth_service"),
+        ("permission", "auth_service"),
+        ("billing", "billing"),
+        ("invoice", "billing"),
+        ("payment", "billing"),
+        ("checkout", "billing"),
+        ("search", "search"),
+        ("retrieval", "retrieval"),
+        ("memory", "memory"),
+        ("packchat", "packchat"),
+        ("calvin", "calvin_archive"),
+        ("archive", "calvin_archive"),
+        ("api", "api_contract"),
+        ("endpoint", "api_contract"),
+        ("schema", "schema_migration"),
+        ("migration", "schema_migration"),
+        ("cli", "cli_tooling"),
+        ("test", "test_harness"),
+        ("validation", "test_harness"),
+    ];
+    for (needle, family) in domain_pairs {
+        if tokens.iter().any(|token| token == needle) {
+            return family.to_string();
+        }
+    }
+    tokens.iter().take(3).cloned().collect::<Vec<_>>().join("_")
+}
+
+fn spec_family_tokens(spec_obj: &Spec, target_source: &TargetSourceMetadata) -> Vec<String> {
+    let corpus = format!(
+        "{} {} {} {} {} {} {} {} {} {} {} {}",
+        spec_obj.id,
+        spec_obj.title,
+        spec_obj.purpose,
+        target_source.label,
+        target_source.source_kind,
+        spec_obj.scope.join(" "),
+        spec_obj.constraints.join(" "),
+        spec_obj.inputs.join(" "),
+        spec_obj.outputs.join(" "),
+        spec_obj.acceptance_criteria.join(" "),
+        spec_obj.dependencies.join(" "),
+        spec_obj.security_expectations.join(" ")
+    );
+    normalize_spec_family_words(&corpus)
+}
+
+fn normalize_spec_family_words(value: &str) -> Vec<String> {
+    let stop = [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "spec",
+        "service",
+        "system",
+        "feature",
+        "update",
+        "implement",
+        "build",
+        "create",
+        "support",
+        "ensure",
+        "harkonnen",
+        "labs",
+        "factory",
+        "project",
+        "run",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            push_spec_family_word(&mut words, &stop, &current);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        push_spec_family_word(&mut words, &stop, &current);
+    }
+    words
+}
+
+fn push_spec_family_word(words: &mut Vec<String>, stop: &HashSet<&str>, raw: &str) {
+    if raw.len() < 3 || stop.contains(raw) {
+        return;
+    }
+    if !words.iter().any(|word| word == raw) {
+        words.push(raw.to_string());
+    }
+}
+
+fn normalize_spec_family_id(label: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+    for ch in label.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_sep = false;
+        } else if !last_was_sep && !normalized.is_empty() {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "general".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn infer_domain_signals(
@@ -28583,6 +28917,7 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         spec_id: spec
             .map(|value| value.id.clone())
             .unwrap_or_else(|| "unknown-spec".to_string()),
+        spec_family: spec.map(|value| derive_spec_family_id_from_text(&value.id)),
         product: run_id.to_string(),
         query_terms: Vec::new(),
         domain_signals: Vec::new(),
@@ -30117,6 +30452,7 @@ fn structured_benchmark_intent(spec_obj: &Spec) -> Option<IntentPackage> {
 
     Some(IntentPackage {
         spec_id: spec_obj.id.clone(),
+        spec_family: Some(derive_spec_family_id_from_text(&target_label)),
         summary: format!(
             "Execute the structured DevBench task for {} using the repo_config-grounded harness.",
             target_label
@@ -30589,6 +30925,39 @@ mod tests {
         .expect("insert memory candidate");
     }
 
+    fn sample_target_source() -> TargetSourceMetadata {
+        TargetSourceMetadata {
+            label: "labrador-subsystem".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "/tmp/labrador-subsystem".to_string(),
+            git: None,
+        }
+    }
+
+    fn sample_auth_spec(id: &str, title: &str) -> Spec {
+        Spec {
+            id: id.to_string(),
+            title: title.to_string(),
+            purpose: "Improve OAuth login and JWT permission boundaries for the auth module."
+                .to_string(),
+            scope: vec!["Update authentication API endpoints".to_string()],
+            constraints: vec!["Preserve existing session semantics".to_string()],
+            inputs: vec!["OAuth callback payload".to_string()],
+            outputs: vec!["Validated login response".to_string()],
+            acceptance_criteria: vec!["JWT scope checks reject unauthorized users".to_string()],
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: vec!["oauth".to_string(), "jwt".to_string()],
+            performance_expectations: Vec::new(),
+            security_expectations: vec!["Do not weaken permission checks".to_string()],
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        }
+    }
+
     fn sample_run(run_id: &str) -> RunRecord {
         RunRecord {
             run_id: run_id.to_string(),
@@ -30622,6 +30991,7 @@ mod tests {
     fn sample_briefing() -> CoobieBriefing {
         CoobieBriefing {
             spec_id: "spec-1".to_string(),
+            spec_family: Some("spec_1".to_string()),
             product: "product".to_string(),
             query_terms: Vec::new(),
             domain_signals: Vec::new(),
@@ -30937,6 +31307,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spec_family_profile_groups_related_auth_specs_and_biases_query_terms() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let target = sample_target_source();
+        let first = sample_auth_spec("auth-login-refresh", "Refresh OAuth login flow");
+        let second = sample_auth_spec("auth-scope-hardening", "Harden JWT scope checks");
+
+        let first_profile = app
+            .upsert_spec_family_profile(&first, &target)
+            .await
+            .expect("first family profile");
+        let second_profile = app
+            .upsert_spec_family_profile(&second, &target)
+            .await
+            .expect("second family profile");
+
+        assert_eq!(first_profile.family_id, "auth_service");
+        assert_eq!(second_profile.family_id, "auth_service");
+        assert!(second_profile.spec_ids.contains(&first.id));
+        assert!(second_profile.spec_ids.contains(&second.id));
+
+        let loaded = app
+            .load_spec_family_profile("auth_service")
+            .await
+            .expect("load family")
+            .expect("auth family profile");
+        assert!(loaded.fingerprint.iter().any(|token| token == "oauth"));
+        assert!(loaded.fingerprint.iter().any(|token| token == "jwt"));
+
+        let terms = build_coobie_query_terms(&second, &target);
+        assert!(
+            terms.iter().any(|term| term == "auth_service"),
+            "query terms should carry the family id so retrieval can bias toward related specs"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_influence_exclusion_event_is_recorded_from_briefing_hits() {
         let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
         let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
@@ -30956,6 +31363,12 @@ mod tests {
         app.store_local_run_prediction(&prediction)
             .await
             .expect("store prediction");
+        app.upsert_spec_family_profile(
+            &sample_auth_spec("auth-service-family", "Auth service family"),
+            &sample_target_source(),
+        )
+        .await
+        .expect("upsert spec family");
         let episode_id = format!("episode-{}", Uuid::new_v4());
         sqlx::query(
             r#"
@@ -31019,7 +31432,7 @@ mod tests {
         let exclusion = &exclusions[0];
         assert_eq!(exclusion.phase, "mason");
         assert_eq!(exclusion.briefing_scope.as_deref(), Some("mason_preflight"));
-        assert_eq!(exclusion.spec_family, "auth-service-family");
+        assert_eq!(exclusion.spec_family, "auth_service");
         assert_eq!(exclusion.expected_outcome, "pass");
         assert_eq!(exclusion.actual_outcome, "completed");
         assert_eq!(exclusion.exclusion_probability, 1.0);

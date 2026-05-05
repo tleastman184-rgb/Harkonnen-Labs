@@ -138,6 +138,8 @@ const PACKCHAT_ASSISTANT_CONTEXT_CHARS: usize = 2_400;
 const PACKCHAT_MIN_ASSISTANT_CONTEXT_CHARS: usize = 600;
 const HARKONNEN_PACKCHAT_TOPIC_ROOT: &str = "harkonnen";
 const HARKONNEN_PACKCHAT_TWILIGHT_OPERATION: &str = "harkonnen.packchat.event";
+const TWILIGHT_IDENTITY_CONTINUITY_OPERATION: &str = "identity_continuity_event";
+const TWILIGHT_IDENTITY_CONTINUITY_SCHEMA: &str = "twilight.identity_continuity_event.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1306,6 +1308,112 @@ impl ChatStore {
         Ok(())
     }
 
+    async fn capture_twilight_identity_continuity_candidate(
+        &self,
+        source_event_id: &str,
+        source_uuid: Option<&str>,
+        payload: &Value,
+    ) -> Result<()> {
+        if payload
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            != TWILIGHT_IDENTITY_CONTINUITY_SCHEMA
+        {
+            return Ok(());
+        }
+
+        let agent_name = payload
+            .get("agent_name")
+            .and_then(Value::as_str)
+            .unwrap_or("twilight-agent");
+        let role = payload
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("agent");
+        let prior_model = payload
+            .get("prior_model_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let new_model = payload
+            .get("new_model_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let content = format!(
+            "Twilight identity continuity check pending for {agent_name}: model changed from {prior_model} to {new_model}."
+        );
+        let raw_payload = merge_identity_continuity_content(payload, &content);
+        let evidence_refs = serde_json::json!([
+            {
+                "ref_type": "twilight_identity_continuity_event",
+                "id": source_event_id,
+            },
+            {
+                "ref_type": "agent_observation",
+                "id": source_uuid.unwrap_or(agent_name),
+            }
+        ]);
+        let causality_json = serde_json::json!({
+            "correlation_id": payload
+                .get("agent_uuid")
+                .and_then(Value::as_str)
+                .or(source_uuid)
+                .unwrap_or(agent_name),
+            "causation_id": payload
+                .get("snapshot_ref")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty()),
+        });
+        let calvin_contract = serde_json::json!({
+            "schema": "harkonnen.calvin.identity_continuity_candidate.v1",
+            "source_schema": TWILIGHT_IDENTITY_CONTINUITY_SCHEMA,
+            "agent_name": agent_name,
+            "prior_model_id": prior_model,
+            "new_model_id": new_model,
+            "continuity_check_pending": payload
+                .get("continuity_check_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            "review_state": {
+                "status": "pending",
+                "review_required": true,
+                "reason": "Twilight reported a runtime identity/model transition; Calvin should receive only a governed promotion proposal."
+            }
+        });
+
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO memory_candidates
+                (candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
+                 agent_runtime_id, agent, role, operation, raw_payload, distilled_content,
+                 dedupe_key,
+                 importance_score, retention_class, learning_intent, sensitivity_label, evidence_refs,
+                 causality_json, status, openbrain_ref, calvin_contract_json, created_at,
+                 processed_at)
+            VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, ?5, ?6, ?7, NULL, ?8,
+                    0.86, 'calvin_candidate', 'prior_revision_target', 'normal', ?9,
+                    ?10, 'pending', NULL, ?11, ?12, NULL)
+            "#,
+        )
+        .bind(format!("memcand-twilight-identity-{source_event_id}"))
+        .bind(source_event_id)
+        .bind(source_uuid)
+        .bind(agent_name)
+        .bind(role)
+        .bind(TWILIGHT_IDENTITY_CONTINUITY_OPERATION)
+        .bind(serde_json::to_string(&raw_payload)?)
+        .bind(memory_candidate_dedupe_key(&content))
+        .bind(serde_json::to_string(&evidence_refs)?)
+        .bind(serde_json::to_string(&causality_json)?)
+        .bind(serde_json::to_string(&calvin_contract)?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     // ── Checkpoints ───────────────────────────────────────────────────────────
 
     /// Load open checkpoints for a run, materialised as structured records.
@@ -2271,6 +2379,25 @@ fn memory_candidate_evidence_refs(event: &PackChatBusEvent) -> Value {
     Value::Array(refs)
 }
 
+fn merge_identity_continuity_content(payload: &Value, content: &str) -> Value {
+    let mut raw_payload = payload.clone();
+    if let Value::Object(ref mut object) = raw_payload {
+        object.insert("content".to_string(), Value::String(content.to_string()));
+        object.insert(
+            "content_preview".to_string(),
+            Value::String(content.to_string()),
+        );
+    } else {
+        raw_payload = serde_json::json!({
+            "schema": TWILIGHT_IDENTITY_CONTINUITY_SCHEMA,
+            "content": content,
+            "content_preview": content,
+            "payload": payload,
+        });
+    }
+    raw_payload
+}
+
 fn calvin_chamber_for_packchat_event(event: &PackChatBusEvent) -> &'static str {
     // Event kind takes priority — specific event kinds map directly to chambers.
     match event.kind {
@@ -2471,13 +2598,57 @@ async fn run_twilight_ingest_once(
 
     while let Some(line) = lines.next_line().await? {
         let message: Value = serde_json::from_str(line.trim()).context("parsing Twilight event")?;
-        if message["event"].as_str() != Some("task_request")
-            || message["operation"].as_str() != Some(HARKONNEN_PACKCHAT_TWILIGHT_OPERATION)
-        {
+        if message["event"].as_str() != Some("task_request") {
             continue;
         }
+        let operation = message["operation"].as_str().unwrap_or_default();
         let task_id = message["task_id"].as_str().unwrap_or_default().to_string();
         let input_json = message["input_json"].as_str().unwrap_or("{}");
+        if operation == TWILIGHT_IDENTITY_CONTINUITY_OPERATION {
+            let payload: Value =
+                serde_json::from_str(input_json).context("parsing Twilight identity event")?;
+            let source_event_id = message["message_uuid"]
+                .as_str()
+                .or_else(|| message["task_id"].as_str())
+                .unwrap_or_default();
+            let outcome = match store
+                .capture_twilight_identity_continuity_candidate(
+                    source_event_id,
+                    message["source_uuid"].as_str(),
+                    &payload,
+                )
+                .await
+            {
+                Ok(()) => serde_json::json!({
+                    "ingested": true,
+                    "event_id": source_event_id,
+                    "operation": operation
+                }),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Twilight identity continuity ingest failed");
+                    serde_json::json!({"ingested": false, "error": error.to_string()})
+                }
+            };
+
+            if !task_id.is_empty() {
+                write_async_ipc_json(
+                    &mut write_half,
+                    serde_json::json!({
+                        "cmd": "reply_task",
+                        "task_id": task_id,
+                        "output_json": outcome.to_string(),
+                        "success": outcome["ingested"].as_bool().unwrap_or(false),
+                    }),
+                )
+                .await?;
+                let _ = read_async_ipc_json(&mut lines).await?;
+            }
+            continue;
+        }
+
+        if operation != HARKONNEN_PACKCHAT_TWILIGHT_OPERATION {
+            continue;
+        }
         let envelope: PackChatWireEnvelope =
             serde_json::from_str(input_json).context("parsing PackChat wire envelope")?;
 
@@ -3064,6 +3235,68 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.retention_class == "shared_recall"));
+    }
+
+    #[tokio::test]
+    async fn twilight_identity_continuity_event_creates_calvin_candidate() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        create_memory_candidates_table(&pool).await;
+        let store = ChatStore::new(pool.clone());
+        let payload = serde_json::json!({
+            "schema": "twilight.identity_continuity_event.v1",
+            "agent_uuid": "tw-agent-1",
+            "agent_name": "coobie",
+            "role": "pack_chat",
+            "prior_model_id": "anthropic:claude-sonnet-4",
+            "new_model_id": "anthropic:claude-sonnet-4.5",
+            "prior": {
+                "llm_provider": "anthropic",
+                "model_name": "claude-sonnet-4"
+            },
+            "new": {
+                "llm_provider": "anthropic",
+                "model_name": "claude-sonnet-4.5"
+            },
+            "continuity_check_pending": true,
+            "snapshot_ref": "twilight://snapshots/coobie/42"
+        });
+
+        store
+            .capture_twilight_identity_continuity_candidate(
+                "tw-msg-identity-1",
+                Some("tw-node-1"),
+                &payload,
+            )
+            .await
+            .expect("capture continuity candidate");
+
+        let candidates = store
+            .list_pending_memory_candidates(None, 10)
+            .await
+            .expect("pending candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.operation, TWILIGHT_IDENTITY_CONTINUITY_OPERATION);
+        assert_eq!(candidate.retention_class, "calvin_candidate");
+        assert_eq!(candidate.learning_intent, "prior_revision_target");
+        assert_eq!(candidate.agent.as_deref(), Some("coobie"));
+        assert_eq!(
+            candidate.raw_payload["schema"].as_str(),
+            Some("twilight.identity_continuity_event.v1")
+        );
+        assert!(candidate
+            .raw_payload
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("model changed"));
+        assert_eq!(
+            candidate
+                .calvin_contract_json
+                .as_ref()
+                .and_then(|contract| { contract.get("schema").and_then(Value::as_str) }),
+            Some("harkonnen.calvin.identity_continuity_candidate.v1")
+        );
     }
 
     #[tokio::test]
