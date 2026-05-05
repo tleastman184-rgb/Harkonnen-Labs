@@ -596,6 +596,63 @@ Each variant is a typed `reqwest` call to the provider's REST API. `SubAgentBack
 
 **First slice shipped 2026-04-29:** `src/llm.rs` now exposes `ProviderBackend::{Anthropic, OpenAi, Gemini}`, `build_provider_backend()`, `complete()`, and `complete_request()`. `SubAgentDispatcher` routes isolated `ClaudeCodeAgent`, `CodexPlanAgent`, and `GeminiAgent` calls through typed provider backends with model overrides instead of subprocess spawns or ad hoc provider construction. Regression tests cover OpenAI backend mapping and model-override credential preservation.
 
+### Named Briefing Blocks
+
+Coobie briefings are currently assembled as freeform markdown and passed as a single string to each phase prompt. The internal structure is invisible: you cannot tell programmatically which part of a briefing contains causal patterns vs. operator profile vs. open checks, you cannot diff two briefings from consecutive runs of the same spec, and you cannot update one category of context without regenerating the whole briefing. This matters increasingly as the memory system grows — a large briefing with no internal structure is as opaque as a large prompt.
+
+Reformulate Coobie briefings as a `Vec<BriefingBlock>` where each block carries a name, content string, source tag, and token count. The assembled LLM prompt remains a flat string at the boundary, but the intermediate representation is structured.
+
+Proposed standard blocks:
+
+| Block | Content | Source |
+| --- | --- | --- |
+| `causal_patterns` | Palace den scents + active DeepSignal activations | Causal memory + Palace patrol |
+| `operator_profile` | Commissioning brief posture + risk tolerances | Operator model |
+| `active_run` | Current spec + phase + blackboard summary | Working memory |
+| `open_checks` | Required checks + guardrails per scope | Scope filter output |
+| `recalled_lessons` | OB1 hits + file-backed memory hits (ranked, deduplicated) | SemanticMemory + file store |
+
+What this enables beyond the current flat string:
+
+- **Introspection** — `GET /api/runs/{id}/briefing` returns the block structure. The Pack Board can render each block independently and show which blocks are populated vs empty.
+- **Diffability** — compare briefings for the same spec across runs. Which blocks changed? Which recalled lessons are new since the last run?
+- **Independent updateability** — approving a new lesson in the Consolidation Workbench updates the `recalled_lessons` block without touching `causal_patterns` or `operator_profile`.
+- **Per-block utilization tracking** — `decision_influence_score` is attributable per block rather than per hit. A block with consistently zero influence across 10 runs is a scope configuration signal, not just a retrieval signal.
+
+This is a Coobie schema improvement derived from comparing Letta's labeled in-context memory block model against Harkonnen's current freeform briefing path. It is not a Letta integration.
+
+---
+
+### Agent State as First-Class Database Entity
+
+The dog runtime registry (shipped v1-A) tracks live agent instances per role with `thread_id`, ownership, and status. This is coordination state. It does not record what each agent currently knows, what LLM it is using, or what happened last time it ran.
+
+Add an `agent_state` table to `state.db` with one canonical row per Labrador role:
+
+```sql
+CREATE TABLE agent_state (
+    agent_name             TEXT PRIMARY KEY,
+    agent_role             TEXT NOT NULL,
+    llm_provider           TEXT NOT NULL,
+    llm_model              TEXT NOT NULL,
+    memory_block_ids       TEXT NOT NULL DEFAULT '{}',   -- JSON: block_name → OB1 ref / memory file id
+    last_stop_reason       TEXT,                         -- last known stop reason for this agent
+    last_active_run        TEXT,                         -- run_id of most recent run this agent participated in
+    behavior_contract_hash TEXT,                         -- SHA256 of current factory/agents/contracts/ file
+    updated_at             TEXT NOT NULL
+);
+```
+
+`memory_block_ids` maps each standard briefing block name to the OB1 thought ref or file memory ID that was most recently assigned to it. When Coobie assembles a briefing for Mason, she queries `agent_state` for Mason's existing block refs before running a full semantic search — giving each agent a fast path to its prior context without a cold retrieval every time.
+
+`last_stop_reason` is low-cost diagnostic data that pays off quickly. Debugging why Bramble behaved differently in run X vs run Y starts with knowing that Bramble stopped with `timeout` in run X and `all_tests_passed` in run Y. Recording it costs nothing.
+
+`behavior_contract_hash` fingerprints each agent's current `factory/agents/contracts/` file. If the file changes between runs, the hash change is visible as a database event — making behavioral contract revision auditable without requiring a git diff.
+
+This pattern is derived from Letta's `AgentState` model (which records LLM config, tool bindings, memory blocks, and `last_stop_reason` per agent). The implementation is Harkonnen-native; there is no Letta dependency.
+
+---
+
 **Benchmark gate:**
 
 - Re-run `FRAMES` after OB1 lands as the default semantic recall path to confirm multi-hop recall improves over the SQLite/local-vector baseline
@@ -924,6 +981,23 @@ their complexity overhead only when agents genuinely span machines. Before this
 phase opens, the single-machine setup should be complete and stable.
 
 **Twilight Bark alignment note:** [`Twilight Bark`](https://github.com/durinwinter/twilight-bark) is a plausible concrete implementation target for this future databus because it already ships a Zenoh-powered bus, a traffic controller/registry, MCP-native access, and JSONL event logging. Harkonnen should therefore keep PackChat bus-facing contracts transport-agnostic and shaped around: stable thread/message/checkpoint envelopes, role/runtime identity, topic/keyexpr routing, and append-only eventlog semantics. The current local PackChat path now emits those envelopes to a local JSONL bus log so the eventual Phase 9 switchover can target Twilight Bark rather than a bespoke second transport.
+
+### PackChat Message Ordering — sequence_id Prerequisite
+
+PackChat messages are currently ordered by `created_at` timestamp. In single-machine mode this is acceptable. In Phase 9 distributed mode it breaks: clock drift between home-linux and work-windows can be several seconds, two machines can generate messages within the same millisecond, and Buffa + Zenoh delivery latency can cause out-of-order arrival.
+
+Before Phase 9 ships, add a monotonic `sequence_id` column to `chat_messages`:
+
+```sql
+ALTER TABLE chat_messages ADD COLUMN sequence_id INTEGER;
+-- Per-thread incrementing integer assigned at insert time on the originating machine.
+```
+
+`sequence_id` is a per-thread incrementing integer from SQLite on the originating machine, making intra-machine ordering deterministic. Cross-machine ordering uses a `(machine_id, sequence_id)` composite — same guarantee, globally scoped.
+
+All read paths that sort messages (`list_chat_messages`, conversation reconstruction, Coobie's distillation worker, Twilight ingest loop) must switch from `created_at` to `sequence_id` as the primary sort key. Timestamps remain for display and time-window queries; `sequence_id` is the canonical ordering primitive.
+
+This pattern is derived from Letta's recall memory implementation. It is low-cost to add in Phase 9 setup and high-cost to retrofit after distributed ordering bugs appear in production.
 
 ### Proto schema (`factory/proto/`)
 

@@ -281,6 +281,32 @@ POST /api/coordination/check-lease     # guardrail gate — must be called befor
 
 Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record. Active leases and Keeper policy events are mirrored into SQLite, and run-scoped PackChat coordination threads provide the shared conversation surface for live dog runtimes.
 
+### Agent State Table
+
+The dog runtime registry tracks live instances per role with `thread_id`, ownership, and status. This is coordination state. It does not record what each agent currently knows, what LLM it is running, or why it last stopped.
+
+Add `agent_state` to `state.db` — one canonical row per Labrador role, updated at the end of each run that involves that agent:
+
+```sql
+CREATE TABLE agent_state (
+    agent_name             TEXT PRIMARY KEY,
+    agent_role             TEXT NOT NULL,
+    llm_provider           TEXT NOT NULL,
+    llm_model              TEXT NOT NULL,
+    memory_block_ids       TEXT NOT NULL DEFAULT '{}',   -- JSON: block_name → OB1 ref / memory file id
+    last_stop_reason       TEXT,
+    last_active_run        TEXT,
+    behavior_contract_hash TEXT,                         -- SHA256 of factory/agents/contracts/<name>.md
+    updated_at             TEXT NOT NULL
+);
+```
+
+`memory_block_ids` maps each standard briefing block name to the OB1 thought ref or file memory ID most recently assigned to it. Coobie queries `agent_state` for each agent's existing block refs before running a full semantic search, giving each agent a fast path to its prior context across sessions.
+
+`behavior_contract_hash` fingerprints each agent's current `factory/agents/contracts/` file. A hash change between runs surfaces behavioral contract revision as a database event — auditable without requiring a file diff.
+
+This pattern is derived from comparing Letta's `AgentState` model against Harkonnen's current agent representation. It is a Harkonnen-native schema addition; there is no Letta dependency.
+
 ---
 
 ## Part 4 — Memory System
@@ -298,6 +324,24 @@ Coobie manages six distinct layers — not one undifferentiated note pile:
 | Team Blackboard | Four named slices (Mission, Action, Evidence, Memory) for pack coordination | SQLite + per-run board.json | Live |
 | Dog Runtime Registry | Canonical dog role plus live runtime instances (`mason#codex`, `mason#claude`, etc.) linked to PackChat threads | SQLite + blackboard sync | Live |
 | Consolidation | Operator-reviewed promotion, pruning, and abstraction of high-value episodes | SQLite consolidation_candidates | Live |
+
+### Named Briefing Block Structure
+
+Coobie briefings are assembled from the memory layers above and delivered as a flat string to each phase prompt. The intermediate representation is structured as `Vec<BriefingBlock>` — each block carries a name, content, source tag, and token count. The assembled prompt remains a flat string at the LLM boundary; the block structure is preserved for introspection and diffing.
+
+Standard blocks used across all scopes:
+
+| Block | Content | Source layer |
+| --- | --- | --- |
+| `causal_patterns` | Palace den scents + active DeepSignal activations | Causal memory + Palace patrol |
+| `operator_profile` | Commissioning brief posture + risk tolerances | Operator model |
+| `active_run` | Current spec + phase + blackboard summary | Working memory |
+| `open_checks` | Required checks + guardrails for this scope | Scope filter |
+| `recalled_lessons` | OB1 hits + file-backed memory hits, ranked and deduplicated | SemanticMemory + file store |
+
+Scope-specific blocks are added or suppressed by the `BriefingScope` filter: Sable receives no `recalled_lessons` entries tagged `implementation_notes` or `mason_plan`; Scout receives no `causal_patterns` entries tagged `hidden_scenario`.
+
+The block structure enables: per-block utilization tracking in `ContextUtilization` (which block contributed to which decision), independent block updating when a new lesson is approved without regenerating the whole briefing, and `GET /api/runs/{id}/briefing` returning the block structure for Pack Board rendering. This pattern is derived from comparing Letta's labeled in-context memory block model against Harkonnen's current freeform briefing path.
 
 ### Coobie Palace
 
@@ -352,6 +396,8 @@ Twilight Bark / PackChat
 **Twilight Bark / PackChat** is the live transport layer. PackChat messages, checkpoint replies, task events, agent observations, and cross-runtime coordination updates move as versioned envelopes. The transport may be local SQLite/JSONL during development or Twilight Bark over Zenoh/OpenZiti in distributed mode, but the contract is the same: append-only event identity, thread identity, runtime identity, causality metadata, and evidence references.
 
 **Dependency direction:** Twilight Bark is a dependency of Harkonnen Labs, not the other way around. Harkonnen may publish Harkonnen-owned PackChat operations such as `harkonnen.packchat.event` through Twilight Bark's generic task/event bus, but Twilight Bark must remain Harkonnen-agnostic: no Calvin archive concepts, no Labrador dog-role assumptions, and no imports of Harkonnen code. Harkonnen owns PackChat schemas, Calvin ingress contracts, and archive promotion policy on its side of the bridge.
+
+**Message ordering — sequence_id:** PackChat messages carry a `sequence_id` — a per-thread monotonic integer assigned at insert time on the originating machine. `sequence_id` is the canonical sort key for all read paths (conversation reconstruction, Coobie distillation, Twilight ingest). `created_at` timestamps are preserved for display and time-window queries but must not be used as a sort key in distributed mode, where clock drift between machines makes timestamp ordering unreliable. Cross-machine ordering uses a `(machine_id, sequence_id)` composite. This pattern is derived from Letta's recall memory implementation and is a Phase 9 prerequisite; the column is cheap to add before distribution and expensive to retrofit after ordering bugs appear.
 
 **Memory candidates** are the raw ingress boundary. Harkonnen should persist candidate rows before summarization so nothing depends on a successful LLM call. Candidate metadata includes `candidate_id`, `source_event_id`, `thread_id`, `run_id`, `agent_runtime_id`, `operation`, `created_at`, `importance_score`, `retention_class`, `sensitivity_label`, `evidence_refs`, and `causality`.
 
