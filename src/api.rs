@@ -26,8 +26,8 @@ use crate::{
     llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, AgentRuntimeState, BlackboardState, ConsolidationCandidate, CoobieBriefing,
-        DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingBlock, ConsolidationCandidate,
+        CoobieBriefing, DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle,
         EvidenceAnnotationHistoryEvent, EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary,
         InterventionPlan, LessonRecord, MetricAttack, OperatorModelContext, OperatorModelProfile,
         OperatorModelScope, OperatorModelSession, OptimizationProgram, PhaseAttributionRecord,
@@ -54,6 +54,23 @@ struct RunStateResponse {
     coobie_report_response: Option<String>,
     evidence_match_report: Option<EvidenceMatchReport>,
     coobie_translations: Vec<PidginTranslation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BriefingQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunBriefingResponse {
+    run_id: String,
+    scope: String,
+    artifact: String,
+    block_count: usize,
+    total_block_tokens: u32,
+    blocks: Vec<BriefingBlock>,
+    briefing: CoobieBriefing,
 }
 
 #[derive(Debug, Serialize)]
@@ -867,6 +884,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         )
         .route("/api/soul/:id", get(get_soul_kernel))
         .route("/api/soul/:id/guide", get(get_soul_guide))
+        .route("/api/runs/:id/briefing", get(get_run_briefing))
         .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
@@ -2120,6 +2138,76 @@ async fn get_coobie_briefing(
         }
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_briefing(
+    Path(id): Path<String>,
+    Query(query): Query<BriefingQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let Some((scope, artifact)) = briefing_scope_artifact(query.scope.as_deref()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "scope must be one of coobie_preflight, scout_preflight, mason_preflight, sable_preflight",
+                )
+                    .into_response();
+            };
+            let briefing_path = app.paths.workspaces.join(&id).join("run").join(&artifact);
+            match read_optional_json::<CoobieBriefing>(&briefing_path).await {
+                Ok(Some(briefing)) => {
+                    let blocks = briefing.briefing_blocks.clone();
+                    let total_block_tokens =
+                        blocks.iter().map(|block| block.token_count).sum::<u32>();
+                    let response = RunBriefingResponse {
+                        run_id: id,
+                        scope,
+                        artifact,
+                        block_count: blocks.len(),
+                        total_block_tokens,
+                        blocks,
+                        briefing,
+                    };
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                Ok(None) => (StatusCode::NOT_FOUND, "Briefing not yet generated").into_response(),
+                Err(error) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+fn briefing_scope_artifact(scope: Option<&str>) -> Option<(String, String)> {
+    let normalized = scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("coobie_preflight")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match normalized.as_str() {
+        "coobie" | "coobie_preflight" => Some((
+            "coobie_preflight".to_string(),
+            "coobie_briefing.json".to_string(),
+        )),
+        "scout" | "scout_preflight" => Some((
+            "scout_preflight".to_string(),
+            "scout_briefing.json".to_string(),
+        )),
+        "mason" | "mason_preflight" => Some((
+            "mason_preflight".to_string(),
+            "mason_briefing.json".to_string(),
+        )),
+        "sable" | "sable_preflight" => Some((
+            "sable_preflight".to_string(),
+            "sable_briefing.json".to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -6292,4 +6380,28 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::briefing_scope_artifact;
+
+    #[test]
+    fn briefing_scope_artifact_maps_named_scopes_to_artifacts() {
+        assert_eq!(
+            briefing_scope_artifact(None),
+            Some((
+                "coobie_preflight".to_string(),
+                "coobie_briefing.json".to_string()
+            ))
+        );
+        assert_eq!(
+            briefing_scope_artifact(Some("mason-preflight")),
+            Some((
+                "mason_preflight".to_string(),
+                "mason_briefing.json".to_string()
+            ))
+        );
+        assert_eq!(briefing_scope_artifact(Some("unknown")), None);
+    }
 }

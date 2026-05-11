@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-pub use crate::memory::{BriefingScope, ContextSection, ContextTarget};
+pub use crate::memory::{BriefingBlock, BriefingScope, ContextSection, ContextTarget};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectComponent {
@@ -633,6 +633,8 @@ pub struct CoobieBriefing {
     pub spec_id: String,
     #[serde(default)]
     pub spec_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_family_retrieval: Option<SpecFamilyRetrievalProof>,
     pub product: String,
     pub query_terms: Vec<String>,
     pub domain_signals: Vec<String>,
@@ -687,6 +689,8 @@ pub struct CoobieBriefing {
     #[serde(default)]
     pub briefing_hits_provided: usize,
     #[serde(default)]
+    pub briefing_blocks: Vec<BriefingBlock>,
+    #[serde(default)]
     pub required_sections_applied: Vec<ContextSection>,
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
@@ -702,6 +706,17 @@ pub struct CoobieBriefing {
     pub open_questions: Vec<String>,
     pub coobie_response: String,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpecFamilyRetrievalProof {
+    pub schema: String,
+    pub spec_family: String,
+    pub flat_top_hit: Option<String>,
+    pub family_biased_top_hit: Option<String>,
+    pub family_hit_count: usize,
+    pub unrelated_hit_count: usize,
+    pub improved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1080,7 +1095,7 @@ pub struct CounterfactualOutcome {
 pub struct ConsolidationCandidate {
     pub candidate_id: String,
     pub run_id: String,
-    /// `"lesson"` | `"causal_link"` | `"pattern"` | `"schema_revision"`
+    /// `"lesson"` | `"causal_link"` | `"pattern"` | `"schema_revision"` | `"cross_agent_pattern"`
     pub kind: String,
     /// `"pending"` | `"kept"` | `"discarded"`
     pub status: String,

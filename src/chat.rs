@@ -3299,6 +3299,150 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn twilight_ingest_smoke_preserves_identity_continuity_contract() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempdir().expect("tempdir");
+        let socket_path = dir.path().join("twilight-identity-ingest.sock");
+        let replies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = UnixListener::bind(&socket_path).expect("bind twilight mock");
+        let replies_for_task = Arc::clone(&replies);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept twilight ingest");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+
+            let register: Value = serde_json::from_str(
+                &lines
+                    .next_line()
+                    .await
+                    .expect("read register")
+                    .expect("register line"),
+            )
+            .expect("register json");
+            assert_eq!(register["cmd"].as_str(), Some("register"));
+            write_half
+                .write_all(br#"{"ok":true,"agent_uuid":"mock-twilight-agent"}"#)
+                .await
+                .expect("write register response");
+            write_half.write_all(b"\n").await.expect("register newline");
+
+            let subscribe: Value = serde_json::from_str(
+                &lines
+                    .next_line()
+                    .await
+                    .expect("read subscribe")
+                    .expect("subscribe line"),
+            )
+            .expect("subscribe json");
+            assert_eq!(subscribe["cmd"].as_str(), Some("subscribe_tasks"));
+            write_half
+                .write_all(br#"{"ok":true}"#)
+                .await
+                .expect("write subscribe response");
+            write_half
+                .write_all(b"\n")
+                .await
+                .expect("subscribe newline");
+
+            let payload = serde_json::json!({
+                "schema": "twilight.identity_continuity_event.v1",
+                "agent_uuid": "twilight-agent-node",
+                "agent_name": "coobie",
+                "role": "pack_chat",
+                "prior_model_id": "anthropic:claude-sonnet-4",
+                "new_model_id": "anthropic:claude-sonnet-4.5",
+                "continuity_check_pending": true,
+                "snapshot_ref": "twilight://snapshots/coobie/identity-smoke"
+            });
+            let event = serde_json::json!({
+                "event": "task_request",
+                "task_id": "identity-task-1",
+                "operation": TWILIGHT_IDENTITY_CONTINUITY_OPERATION,
+                "input_json": payload.to_string(),
+                "source_uuid": "twilight-agent-node",
+                "message_uuid": "twilight-message-identity-1"
+            });
+            write_half
+                .write_all(format!("{event}\n").as_bytes())
+                .await
+                .expect("write identity event");
+
+            let reply: Value = serde_json::from_str(
+                &lines
+                    .next_line()
+                    .await
+                    .expect("read task reply")
+                    .expect("task reply line"),
+            )
+            .expect("reply json");
+            replies_for_task
+                .lock()
+                .expect("reply log lock")
+                .push(reply.clone());
+            assert_eq!(reply["cmd"].as_str(), Some("reply_task"));
+            assert_eq!(reply["task_id"].as_str(), Some("identity-task-1"));
+            assert_eq!(reply["success"].as_bool(), Some(true));
+            write_half
+                .write_all(br#"{"ok":true}"#)
+                .await
+                .expect("write reply ack");
+            write_half.write_all(b"\n").await.expect("ack newline");
+        });
+
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        create_memory_candidates_table(&pool).await;
+        let store = ChatStore::new(pool.clone());
+        let mut presence = HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_twilight_ingest_once(
+                &store,
+                &socket_path,
+                "harkonnen-packchat",
+                "packchat-bridge",
+                &mut presence,
+                None,
+            ),
+        )
+        .await
+        .expect("ingest smoke timeout")
+        .expect("ingest smoke");
+        server.await.expect("twilight mock task");
+
+        let candidates = store
+            .list_pending_memory_candidates(None, 10)
+            .await
+            .expect("pending candidates");
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.operation, TWILIGHT_IDENTITY_CONTINUITY_OPERATION);
+        assert_eq!(candidate.retention_class, "calvin_candidate");
+        assert_eq!(candidate.learning_intent, "prior_revision_target");
+        assert_eq!(
+            candidate.source_event_id,
+            "twilight-message-identity-1".to_string()
+        );
+        assert_eq!(candidate.agent.as_deref(), Some("coobie"));
+        assert_eq!(
+            candidate.raw_payload["schema"].as_str(),
+            Some(TWILIGHT_IDENTITY_CONTINUITY_SCHEMA)
+        );
+        assert_eq!(
+            candidate
+                .calvin_contract_json
+                .as_ref()
+                .and_then(|contract| contract.get("schema").and_then(Value::as_str)),
+            Some("harkonnen.calvin.identity_continuity_candidate.v1")
+        );
+        assert_eq!(replies.lock().expect("reply log lock").len(), 1);
+    }
+
     #[tokio::test]
     async fn five_message_packchat_thread_produces_memory_candidates() {
         let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");

@@ -15,7 +15,7 @@ pub mod context_budget;
 pub mod semantic;
 pub mod semantic_openbrain;
 
-pub use briefing::{BriefingScope, ContextSection, ContextTarget};
+pub use briefing::{BriefingBlock, BriefingScope, ContextSection, ContextTarget};
 pub use context_budget::{estimate_briefing_tokens, text_within_token_budget};
 pub use semantic::{
     NoopSemanticMemory, SemanticMemory, SemanticMemoryMetadata, SemanticMemoryWrite,

@@ -20,17 +20,18 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, AgentRuntimeState, BlackboardState, BriefingScope, CausalEventEdge,
-        CausalEventNode, CheckpointAnswerRecord, CodeReviewLearningRecord, CommissioningBrief,
-        ConsolidationCandidate, ContextPullRecord, ContextSection, ContextTarget, CoobieBriefing,
-        CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord, EpisodeStateDiff,
-        EvidenceAnnotation, EvidenceAnnotationBundle, EvidenceAnnotationHistoryEvent,
-        EvidenceMatchAssessment, EvidenceMatchReport, EvidenceSource, EvidenceTimeRange,
-        EvidenceWindowMatch, FailureKind, HiddenScenarioCheckResult, HiddenScenarioEvaluation,
-        HiddenScenarioSummary, IntentPackage, LessonRecord, LiveEvent, OperatorModelContext,
-        PearlHierarchyLevel, PhaseAttributionRecord, PriorCauseSignal, ProjectInterviewContext,
-        ProjectResumeRisk, RunCausalGraph, RunCheckpointRecord, RunEvent, RunRecord,
-        RunTimingReport, ScenarioResult, SoulIdentityContext, Spec, StakeholderAlignmentSummary,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingBlock, BriefingScope,
+        CausalEventEdge, CausalEventNode, CheckpointAnswerRecord, CodeReviewLearningRecord,
+        CommissioningBrief, ConsolidationCandidate, ContextPullRecord, ContextSection,
+        ContextTarget, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord,
+        EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
+        EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, FailureKind,
+        HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
+        LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
+        PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
+        RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
+        SoulIdentityContext, Spec, SpecFamilyRetrievalProof, StakeholderAlignmentSummary,
         TwinEnvironment, TwinFailureMode, TwinService, TwinServiceSpec, ValidationSummary,
         WorkerHarnessConfig,
     },
@@ -233,6 +234,7 @@ pub struct SpecFamilyProfile {
 
 const PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD: f64 = 0.2;
 const MEMORY_INFLUENCE_EXCLUSION_PROBABILITY: f64 = 0.05;
+const CROSS_AGENT_PATTERN_MIN_BASIS_RUNS: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandTrialReport {
@@ -515,6 +517,7 @@ struct MemoryContextBundle {
     project_memory_root: Option<String>,
     core_memory_ids: Vec<String>,
     project_memory_ids: Vec<String>,
+    spec_family_retrieval: Option<SpecFamilyRetrievalProof>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2173,6 +2176,8 @@ impl AppContext {
                         )
                         .await;
                 }
+                self.try_generate_consolidation_candidates_on_close(run_id)
+                    .await;
                 self.finalize_blackboard(final_status, &output.run_dir)
                     .await?;
                 self.write_run_timing_artifact(run_id, &output.run_dir)
@@ -2312,6 +2317,8 @@ impl AppContext {
                 if run_dir.exists() {
                     self.write_run_timing_artifact(run_id, &run_dir).await?;
                 }
+                self.try_generate_consolidation_candidates_on_close(run_id)
+                    .await;
                 let _ = self.package_artifacts(run_id).await;
             }
         }
@@ -2389,8 +2396,9 @@ impl AppContext {
                 log_path,
             )
             .await?;
+        let spec_family = derive_spec_family_profile(spec_obj, target_source);
         let memory_context = self
-            .retrieve_coobie_memory_context(target_source, &query_terms)
+            .retrieve_coobie_memory_context(target_source, &query_terms, Some(&spec_family))
             .await?;
         let briefing = self
             .dispatch_coobie_briefing(
@@ -4626,6 +4634,7 @@ Top memory hits:
         &self,
         target_source: &TargetSourceMetadata,
         query_terms: &[String],
+        spec_family: Option<&SpecFamilyProfile>,
     ) -> Result<MemoryContextBundle> {
         let project_store = self.project_memory_store(target_source).await?;
         let mut project_memory = self
@@ -4694,6 +4703,14 @@ Top memory hits:
 
         project_memory.hits.truncate(6);
         core_memory.hits.truncate(6);
+        let spec_family_retrieval = spec_family.map(|family| {
+            apply_spec_family_memory_bias(
+                &mut memory_hits,
+                &family.family_id,
+                &family.fingerprint,
+                12,
+            )
+        });
         memory_hits.truncate(12);
 
         if memory_hits.is_empty() {
@@ -4710,6 +4727,7 @@ Top memory hits:
             project_memory_root: Some(project_store.root.display().to_string()),
             core_memory_ids: core_memory.ids,
             project_memory_ids: project_memory.ids,
+            spec_family_retrieval,
         })
     }
 
@@ -6885,6 +6903,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
             memory_hits: memory_selection.memory_hits,
+            spec_family_retrieval: memory_context.spec_family_retrieval.clone(),
             core_memory_hits: memory_selection.core_memory_hits,
             project_memory_hits: memory_selection.project_memory_hits,
             resume_packet_summary: resume_packet.summary.clone(),
@@ -6911,6 +6930,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             target_token_budget: context_target.token_budget,
             briefing_tokens_used: memory_selection.tokens_used,
             briefing_hits_provided: memory_selection.hits_provided,
+            briefing_blocks: Vec::new(),
             required_sections_applied,
             application_risks,
             environment_risks,
@@ -6924,6 +6944,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             coobie_response: String::new(),
             generated_at: Utc::now(),
         };
+        briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
         briefing.coobie_response = self
             .coobie_llm_briefing_response(run_id, spec_obj, target_source, &briefing)
             .await
@@ -12797,6 +12818,21 @@ Return JSON only.",
         }
     }
 
+    async fn try_generate_consolidation_candidates_on_close(&self, run_id: &str) {
+        match self.generate_consolidation_candidates(run_id).await {
+            Ok(candidates) => tracing::debug!(
+                run_id = %run_id,
+                candidate_count = candidates.len(),
+                "generated consolidation candidates on run close"
+            ),
+            Err(error) => tracing::warn!(
+                run_id = %run_id,
+                error = %error,
+                "consolidation candidate generation failed on run close"
+            ),
+        }
+    }
+
     async fn try_write_calvin_event(
         &self,
         run_id: &str,
@@ -17661,9 +17697,147 @@ Return JSON only.",
             candidates.push(candidate);
         }
 
+        if let Some(candidate) = self
+            .build_cross_agent_pattern_candidate(run_id, &spec_obj)
+            .await?
+        {
+            if !self.candidate_exists(&candidate.candidate_id).await? {
+                self.insert_consolidation_candidate(&candidate).await?;
+                candidates.push(candidate);
+            }
+        }
+
         let _ = target_source;
         let _ = spec_obj;
         Ok(candidates)
+    }
+
+    async fn build_cross_agent_pattern_candidate(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+    ) -> Result<Option<ConsolidationCandidate>> {
+        let family_id = self.spec_family_for_spec_id(&spec_obj.id).await?;
+        let basis = self
+            .cross_agent_pattern_basis(run_id, &family_id, CROSS_AGENT_PATTERN_MIN_BASIS_RUNS * 4)
+            .await?;
+        if basis.len() < CROSS_AGENT_PATTERN_MIN_BASIS_RUNS
+            || !basis
+                .iter()
+                .any(|item| item.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id))
+        {
+            return Ok(None);
+        }
+
+        let candidate_id = normalize_consolidation_candidate_id(&format!(
+            "cross-agent-pattern-{family_id}-scout-ambiguity-mason-failure"
+        ));
+        if self.candidate_exists(&candidate_id).await? {
+            return Ok(None);
+        }
+        let confidence = (0.55 + (basis.len() as f64 * 0.08)).min(0.9);
+        let proposal = serde_json::json!({
+            "schema": "harkonnen.cross_agent_pattern.v1",
+            "spec_family": family_id,
+            "pattern": "Scout ambiguity signals co-occur with Mason/Bramble implementation failure in the same spec family.",
+            "source_role": "scout",
+            "affected_role": "mason",
+            "recommended_action": "Inject a cross-agent briefing note into Scout and Mason scopes: when Scout sees this ambiguity shape, require explicit acceptance-criteria and scope confirmation before Mason begins implementation.",
+            "review_state": {
+                "status": "pending",
+                "review_required": true,
+                "reason": "Cross-agent pattern spans role boundaries and must be reviewed before promotion."
+            },
+            "basis_run_count": basis.len(),
+            "basis": basis.clone(),
+        });
+        let basis_run_count = basis.len();
+        Ok(Some(ConsolidationCandidate {
+            candidate_id,
+            run_id: run_id.to_string(),
+            kind: "cross_agent_pattern".to_string(),
+            status: "pending".to_string(),
+            content_json: proposal,
+            edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: basis,
+            confidence,
+            label: format!(
+                "[cross-agent] Scout ambiguity -> Mason failure ({family_id}, {} runs)",
+                basis_run_count
+            ),
+            created_at: Utc::now(),
+            reviewed_at: None,
+        }))
+    }
+
+    async fn cross_agent_pattern_basis(
+        &self,
+        current_run_id: &str,
+        family_id: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let profile = self.load_spec_family_profile(family_id).await?;
+        let family_spec_ids = profile
+            .as_ref()
+            .map(|profile| profile.spec_ids.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        if family_spec_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT run_id, spec_id, status, created_at
+            FROM runs
+            ORDER BY created_at DESC, run_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut basis = Vec::new();
+        for row in rows {
+            let spec_id: String = row.get("spec_id");
+            if !family_spec_ids.contains(&spec_id) {
+                continue;
+            }
+            let run_id: String = row.get("run_id");
+            let attributions = self.list_phase_attributions_for_run(&run_id).await?;
+            let Some(scout) = attributions
+                .iter()
+                .find(|attr| attribution_has_scout_ambiguity(attr))
+            else {
+                continue;
+            };
+            let Some(mason) = attributions
+                .iter()
+                .find(|attr| attribution_has_mason_failure(attr))
+            else {
+                continue;
+            };
+            basis.push(serde_json::json!({
+                "run_id": run_id,
+                "spec_id": spec_id,
+                "run_status": row.get::<String, _>("status"),
+                "scout_attribution_id": scout.attribution_id,
+                "scout_episode_id": scout.episode_id,
+                "scout_outcome": scout.outcome,
+                "scout_signals": cross_agent_signal_preview(scout),
+                "mason_attribution_id": mason.attribution_id,
+                "mason_episode_id": mason.episode_id,
+                "mason_phase": mason.phase,
+                "mason_outcome": mason.outcome,
+            }));
+            if basis.len() >= limit
+                && basis.iter().any(|item| {
+                    item.get("run_id").and_then(serde_json::Value::as_str) == Some(current_run_id)
+                })
+            {
+                break;
+            }
+        }
+        Ok(basis)
     }
 
     /// Return all candidates for a run, ordered by confidence descending.
@@ -20197,6 +20371,123 @@ fn normalize_spec_family_id(label: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn apply_spec_family_memory_bias(
+    hits: &mut Vec<String>,
+    family_id: &str,
+    fingerprint: &[String],
+    limit: usize,
+) -> SpecFamilyRetrievalProof {
+    let flat_top_hit = hits.first().cloned();
+    let mut indexed = hits
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, hit)| {
+            let score = spec_family_memory_score(&hit, family_id, fingerprint);
+            (index, score, hit)
+        })
+        .collect::<Vec<_>>();
+    indexed.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let family_hit_count = indexed.iter().filter(|(_, score, _)| *score > 0).count();
+    let unrelated_hit_count = indexed.len().saturating_sub(family_hit_count);
+    let reranked = indexed
+        .into_iter()
+        .map(|(_, _, hit)| hit)
+        .collect::<Vec<_>>();
+    let family_biased_top_hit = reranked.first().cloned();
+    *hits = reranked.into_iter().take(limit).collect();
+    SpecFamilyRetrievalProof {
+        schema: "harkonnen.spec_family_retrieval_proof.v1".to_string(),
+        spec_family: family_id.to_string(),
+        flat_top_hit: flat_top_hit.clone(),
+        family_biased_top_hit: family_biased_top_hit.clone(),
+        family_hit_count,
+        unrelated_hit_count,
+        improved: flat_top_hit != family_biased_top_hit && family_hit_count > 0,
+    }
+}
+
+fn spec_family_memory_score(hit: &str, family_id: &str, fingerprint: &[String]) -> i32 {
+    let normalized = hit.to_ascii_lowercase();
+    let mut score = 0;
+    let family_terms = normalize_spec_family_words(family_id);
+    for term in family_terms {
+        if normalized.contains(&term) {
+            score += 8;
+        }
+    }
+    if normalized.contains(&family_id.replace('_', " ")) || normalized.contains(family_id) {
+        score += 12;
+    }
+    for term in fingerprint.iter().take(12) {
+        let term = term.trim().to_ascii_lowercase();
+        if term.len() >= 3 && normalized.contains(&term) {
+            score += 2;
+        }
+    }
+    score
+}
+
+fn attribution_has_scout_ambiguity(attr: &PhaseAttributionRecord) -> bool {
+    let role_phase = format!("{} {}", attr.agent_name, attr.phase).to_ascii_lowercase();
+    if !role_phase.contains("scout") && !role_phase.contains("intake") {
+        return false;
+    }
+    if attr.outcome != "success" {
+        return true;
+    }
+    let signal_text = cross_agent_signal_text(attr);
+    [
+        "ambigu",
+        "scope_creep",
+        "scope creep",
+        "spec_ambiguity",
+        "clarif",
+    ]
+    .iter()
+    .any(|needle| signal_text.contains(needle))
+}
+
+fn attribution_has_mason_failure(attr: &PhaseAttributionRecord) -> bool {
+    let role_phase = format!("{} {}", attr.agent_name, attr.phase).to_ascii_lowercase();
+    let is_mason_lane = role_phase.contains("mason")
+        || role_phase.contains("implementation")
+        || role_phase.contains("build")
+        || role_phase.contains("validation");
+    is_mason_lane && attr.outcome != "success"
+}
+
+fn cross_agent_signal_text(attr: &PhaseAttributionRecord) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        attr.outcome,
+        attr.phase,
+        attr.agent_name,
+        attr.query_terms.join(" "),
+        attr.required_checks.join(" "),
+        attr.guardrails.join(" "),
+        attr.memory_hits.join(" ")
+    )
+    .to_ascii_lowercase()
+}
+
+fn cross_agent_signal_preview(attr: &PhaseAttributionRecord) -> Vec<String> {
+    attr.query_terms
+        .iter()
+        .chain(attr.required_checks.iter())
+        .chain(attr.guardrails.iter())
+        .chain(attr.memory_hits.iter())
+        .filter(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("ambigu")
+                || normalized.contains("scope")
+                || normalized.contains("clarif")
+        })
+        .take(5)
+        .cloned()
+        .collect()
 }
 
 fn infer_domain_signals(
@@ -26946,8 +27237,197 @@ fn build_scoped_briefing(base: &CoobieBriefing, scope: BriefingScope) -> CoobieB
         _ => {}
     }
 
+    scoped.briefing_blocks = build_named_briefing_blocks(&scoped);
     scoped.coobie_response = crate::coobie::render_coobie_briefing_response(&scoped);
     scoped
+}
+
+fn build_named_briefing_blocks(briefing: &CoobieBriefing) -> Vec<BriefingBlock> {
+    let prior_causes = briefing
+        .prior_causes
+        .iter()
+        .map(|cause| {
+            format!(
+                "{} (occurrences={}, scenario_pass_rate={:.2})",
+                cause.description, cause.occurrences, cause.scenario_pass_rate
+            )
+        })
+        .collect::<Vec<_>>();
+    let causal_patterns = join_briefing_lines(
+        &[
+            ("Prior causes", prior_causes),
+            ("Pattern focus", briefing.pattern_matching_focus.clone()),
+            ("Causal-chain focus", briefing.causal_chain_focus.clone()),
+        ],
+        "No causal pattern signals selected for this briefing.",
+    );
+
+    let mut operator_profile_lines = Vec::new();
+    if let Some(context) = &briefing.operator_model_context {
+        operator_profile_lines.push(format!("Operator model: {}", context.summary));
+        operator_profile_lines.extend(
+            context
+                .risk_tolerances
+                .iter()
+                .take(4)
+                .map(|value| format!("Risk tolerance: {value}")),
+        );
+        operator_profile_lines.extend(
+            context
+                .preferred_tools
+                .iter()
+                .take(4)
+                .map(|value| format!("Preferred tool: {value}")),
+        );
+    }
+    if let Some(context) = &briefing.project_interview_context {
+        operator_profile_lines.push(format!("Project purpose: {}", context.repo_purpose));
+        operator_profile_lines.push(format!("Operator intent: {}", context.operator_intent));
+    }
+    if let Some(context) = &briefing.soul_identity_context {
+        operator_profile_lines.push(format!("Identity thesis: {}", context.identity_thesis));
+        operator_profile_lines.extend(
+            context
+                .preserved_invariants
+                .iter()
+                .take(4)
+                .map(|value| format!("Preserved invariant: {value}")),
+        );
+    }
+    let operator_profile = join_plain_briefing_lines(
+        operator_profile_lines,
+        "No operator, project interview, or identity context applied.",
+    );
+
+    let project_components = briefing
+        .project_components
+        .iter()
+        .map(|component| format!("{}: {}", component.name, component.path))
+        .collect::<Vec<_>>();
+    let active_run = join_briefing_lines(
+        &[
+            ("Query terms", briefing.query_terms.clone()),
+            ("Domain signals", briefing.domain_signals.clone()),
+            ("Project components", project_components),
+            ("Resume summary", briefing.resume_packet_summary.clone()),
+        ],
+        "No active-run context selected for this briefing.",
+    );
+
+    let open_checks = join_briefing_lines(
+        &[
+            ("Application risks", briefing.application_risks.clone()),
+            ("Environment risks", briefing.environment_risks.clone()),
+            (
+                "Regulatory considerations",
+                briefing.regulatory_considerations.clone(),
+            ),
+            ("Guardrails", briefing.recommended_guardrails.clone()),
+            ("Required checks", briefing.required_checks.clone()),
+            ("Open questions", briefing.open_questions.clone()),
+        ],
+        "No open checks selected for this briefing.",
+    );
+
+    let lessons = briefing
+        .relevant_lessons
+        .iter()
+        .map(|lesson| {
+            lesson
+                .intervention
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|intervention| format!("{} -> {}", lesson.pattern, intervention))
+                .unwrap_or_else(|| lesson.pattern.clone())
+        })
+        .collect::<Vec<_>>();
+    let resume_risks = briefing
+        .resume_packet_risks
+        .iter()
+        .map(|risk| format!("{} ({})", risk.summary, risk.memory_id))
+        .collect::<Vec<_>>();
+    let recalled_lessons = join_briefing_lines(
+        &[
+            ("Memory hits", briefing.memory_hits.clone()),
+            ("Core memory hits", briefing.core_memory_hits.clone()),
+            ("Project memory hits", briefing.project_memory_hits.clone()),
+            ("Relevant lessons", lessons),
+            ("Resume risks", resume_risks),
+            (
+                "Stale-memory mitigation",
+                briefing.stale_memory_mitigation_plan.clone(),
+            ),
+        ],
+        "No recalled lessons selected for this briefing.",
+    );
+
+    vec![
+        briefing_block(
+            "causal_patterns",
+            "causal memory + palace patrol",
+            causal_patterns,
+        ),
+        briefing_block(
+            "operator_profile",
+            "operator model + project interview + soul identity",
+            operator_profile,
+        ),
+        briefing_block("active_run", "working memory", active_run),
+        briefing_block("open_checks", "scope filter output", open_checks),
+        briefing_block(
+            "recalled_lessons",
+            "semantic memory + file store + resume packet",
+            recalled_lessons,
+        ),
+    ]
+}
+
+fn briefing_block(name: &str, source: &str, content: String) -> BriefingBlock {
+    BriefingBlock {
+        name: name.to_string(),
+        source: source.to_string(),
+        token_count: estimate_briefing_tokens(&content),
+        content,
+    }
+}
+
+fn join_plain_briefing_lines(lines: Vec<String>, fallback: &str) -> String {
+    let values = lines
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        fallback.to_string()
+    } else {
+        values
+            .into_iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn join_briefing_lines(groups: &[(&str, Vec<String>)], fallback: &str) -> String {
+    let mut out = Vec::new();
+    for (label, values) in groups {
+        let values = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            continue;
+        }
+        out.push(format!("{label}:"));
+        out.extend(values.into_iter().map(|value| format!("- {value}")));
+    }
+
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out.join("\n")
+    }
 }
 
 fn render_sable_context_summary(briefing: &CoobieBriefing) -> String {
@@ -28913,11 +29393,12 @@ fn preview_text(value: &str, limit: usize) -> Option<String> {
 }
 
 fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBriefing {
-    CoobieBriefing {
+    let mut briefing = CoobieBriefing {
         spec_id: spec
             .map(|value| value.id.clone())
             .unwrap_or_else(|| "unknown-spec".to_string()),
         spec_family: spec.map(|value| derive_spec_family_id_from_text(&value.id)),
+        spec_family_retrieval: None,
         product: run_id.to_string(),
         query_terms: Vec::new(),
         domain_signals: Vec::new(),
@@ -28949,6 +29430,7 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         target_token_budget: 0,
         briefing_tokens_used: 0,
         briefing_hits_provided: 0,
+        briefing_blocks: Vec::new(),
         required_sections_applied: Vec::new(),
         application_risks: Vec::new(),
         environment_risks: Vec::new(),
@@ -28961,7 +29443,9 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         open_questions: Vec::new(),
         coobie_response: "Invocation gateway fallback briefing".to_string(),
         generated_at: Utc::now(),
-    }
+    };
+    briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
+    briefing
 }
 
 fn pearl_hierarchy_for_causal_link(link_type: &str) -> PearlHierarchyLevel {
@@ -30958,6 +31442,74 @@ mod tests {
         }
     }
 
+    async fn insert_test_phase_attribution(
+        app: &AppContext,
+        run_id: &str,
+        phase: &str,
+        agent_name: &str,
+        outcome: &str,
+        query_terms: Vec<String>,
+        required_checks: Vec<String>,
+    ) {
+        let episode_id = format!("episode-{run_id}-{phase}-{agent_name}");
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO episodes (episode_id, run_id, phase, goal, outcome, confidence, started_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, 0.7, ?6)
+            "#,
+        )
+        .bind(&episode_id)
+        .bind(run_id)
+        .bind(phase)
+        .bind(format!("{agent_name} {phase}"))
+        .bind(outcome)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .expect("insert episode");
+        app.upsert_phase_attribution(&PhaseAttributionRecord {
+            attribution_id: format!("phase-attribution-{episode_id}"),
+            run_id: run_id.to_string(),
+            episode_id,
+            phase: phase.to_string(),
+            agent_name: agent_name.to_string(),
+            outcome: outcome.to_string(),
+            confidence: Some(0.7),
+            prompt_bundle_fingerprint: None,
+            prompt_bundle_provider: None,
+            prompt_bundle_artifact: None,
+            pinned_skill_ids: Vec::new(),
+            memory_hits: Vec::new(),
+            core_memory_ids: Vec::new(),
+            project_memory_ids: Vec::new(),
+            relevant_lesson_ids: Vec::new(),
+            required_checks,
+            guardrails: Vec::new(),
+            query_terms,
+            briefing_scope: briefing_scope_for_agent(agent_name),
+            briefing_token_budget: 800,
+            briefing_tokens_used: 120,
+            briefing_hits_provided: 1,
+            stakeholder_alignment: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("insert phase attribution");
+    }
+
+    async fn write_run_spec_for_test(app: &AppContext, run_id: &str, spec: &Spec) {
+        let run_dir = app.run_dir(run_id);
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .expect("create run dir");
+        tokio::fs::write(
+            run_dir.join("spec.yaml"),
+            serde_yaml::to_string(spec).expect("serialize spec"),
+        )
+        .await
+        .expect("write run spec");
+    }
+
     fn sample_run(run_id: &str) -> RunRecord {
         RunRecord {
             run_id: run_id.to_string(),
@@ -30992,6 +31544,7 @@ mod tests {
         CoobieBriefing {
             spec_id: "spec-1".to_string(),
             spec_family: Some("spec_1".to_string()),
+            spec_family_retrieval: None,
             product: "product".to_string(),
             query_terms: Vec::new(),
             domain_signals: Vec::new(),
@@ -31023,6 +31576,7 @@ mod tests {
             target_token_budget: 900,
             briefing_tokens_used: 0,
             briefing_hits_provided: 0,
+            briefing_blocks: Vec::new(),
             required_sections_applied: Vec::new(),
             application_risks: Vec::new(),
             environment_risks: Vec::new(),
@@ -31093,6 +31647,49 @@ mod tests {
             .memory_hits
             .iter()
             .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+    }
+
+    #[test]
+    fn named_briefing_blocks_group_memory_checks_and_scope_filters() {
+        let mut briefing = sample_briefing();
+        briefing.memory_hits = vec![
+            "Spec history: prior auth flow ambiguity".to_string(),
+            "Implementation note: Mason edited login handler".to_string(),
+        ];
+        briefing.recommended_guardrails =
+            vec!["Confirm acceptance criteria before edits".to_string()];
+        briefing.required_checks = vec!["Run the auth regression suite".to_string()];
+        briefing.open_questions = vec!["Which login surface is in scope?".to_string()];
+        briefing.pattern_matching_focus =
+            vec!["Auth ambiguity repeats across similar specs".to_string()];
+        briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
+
+        assert_eq!(briefing.briefing_blocks.len(), 5);
+        let recalled = briefing
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "recalled_lessons")
+            .expect("recalled lessons block");
+        assert!(recalled.content.contains("Spec history"));
+        assert!(recalled.token_count > 0);
+
+        let checks = briefing
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "open_checks")
+            .expect("open checks block");
+        assert!(checks.content.contains("Run the auth regression suite"));
+
+        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let scout_recalled = scout
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "recalled_lessons")
+            .expect("scout recalled block");
+        assert!(!scout_recalled
+            .content
+            .to_ascii_lowercase()
+            .contains("implementation note"));
     }
 
     #[test]
@@ -31341,6 +31938,109 @@ mod tests {
             terms.iter().any(|term| term == "auth_service"),
             "query terms should carry the family id so retrieval can bias toward related specs"
         );
+    }
+
+    #[test]
+    fn spec_family_biased_retrieval_promotes_same_family_hit_over_flat_top_hit() {
+        let mut hits = vec![
+            "[project memory] Generic API cleanup note: update endpoint docs.".to_string(),
+            "[project memory] Auth service lesson: OAuth callback and JWT scope checks need explicit acceptance criteria before Mason edits.".to_string(),
+            "[project memory] Billing service note: invoice retry policy changed.".to_string(),
+        ];
+        let proof = apply_spec_family_memory_bias(
+            &mut hits,
+            "auth_service",
+            &["oauth".to_string(), "jwt".to_string(), "scope".to_string()],
+            12,
+        );
+
+        assert_eq!(proof.schema, "harkonnen.spec_family_retrieval_proof.v1");
+        assert_eq!(proof.spec_family, "auth_service");
+        assert!(proof.improved);
+        assert_eq!(proof.family_hit_count, 1);
+        assert!(proof.unrelated_hit_count >= 1);
+        assert!(hits
+            .first()
+            .expect("top hit")
+            .contains("Auth service lesson"));
+        assert_ne!(proof.flat_top_hit, proof.family_biased_top_hit);
+    }
+
+    #[tokio::test]
+    async fn cross_agent_pattern_candidate_emits_for_repeated_family_cooccurrence() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let target = sample_target_source();
+        let prior_spec = sample_auth_spec("auth-login-refresh", "Refresh OAuth login flow");
+        let current_spec = sample_auth_spec("auth-scope-hardening", "Harden JWT scope checks");
+        app.upsert_spec_family_profile(&prior_spec, &target)
+            .await
+            .expect("prior family");
+        app.upsert_spec_family_profile(&current_spec, &target)
+            .await
+            .expect("current family");
+
+        let prior_run = format!("run-{}", Uuid::new_v4());
+        let current_run = format!("run-{}", Uuid::new_v4());
+        let now = Utc::now();
+        app.insert_run(&prior_run, &prior_spec.id, &target.label, "failed", now)
+            .await
+            .expect("insert prior run");
+        app.insert_run(&current_run, &current_spec.id, &target.label, "failed", now)
+            .await
+            .expect("insert current run");
+        write_run_spec_for_test(&app, &current_run, &current_spec).await;
+
+        for run_id in [&prior_run, &current_run] {
+            insert_test_phase_attribution(
+                &app,
+                run_id,
+                "intake",
+                "scout",
+                "success",
+                vec!["scope creep".to_string(), "spec ambiguity".to_string()],
+                vec!["Clarify auth acceptance criteria before implementation".to_string()],
+            )
+            .await;
+            insert_test_phase_attribution(
+                &app,
+                run_id,
+                "implementation",
+                "mason",
+                "failure",
+                vec!["auth".to_string()],
+                Vec::new(),
+            )
+            .await;
+        }
+
+        let candidates = app
+            .generate_consolidation_candidates(&current_run)
+            .await
+            .expect("generate candidates");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.kind == "cross_agent_pattern")
+            .expect("cross-agent candidate");
+        assert_eq!(candidate.review_class, "elevated");
+        assert_eq!(candidate.pattern_basis.len(), 2);
+        assert_eq!(
+            candidate.content_json["schema"].as_str(),
+            Some("harkonnen.cross_agent_pattern.v1")
+        );
+        assert_eq!(
+            candidate.content_json["spec_family"].as_str(),
+            Some("auth_service")
+        );
+        assert!(candidate.label.contains("Scout ambiguity -> Mason failure"));
+
+        let listed = app
+            .list_consolidation_candidates(&current_run)
+            .await
+            .expect("list candidates");
+        assert!(listed
+            .iter()
+            .any(|candidate| candidate.kind == "cross_agent_pattern"));
     }
 
     #[tokio::test]

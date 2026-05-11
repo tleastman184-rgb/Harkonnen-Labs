@@ -54,6 +54,8 @@ export default function RunDetailDrawer({ runId, onClose }) {
   const [error, setError] = useState('');
   const [explorationLog, setExplorationLog] = useState(null);
   const [corpusResults, setCorpusResults] = useState(null);
+  const [briefing, setBriefing] = useState(null);
+  const [briefingError, setBriefingError] = useState('');
   const [artifactError, setArtifactError] = useState('');
   const drawerRef = useRef(null);
 
@@ -109,6 +111,24 @@ export default function RunDetailDrawer({ runId, onClose }) {
     return () => { cancelled = true; };
   }, [runId, tab]);
 
+  useEffect(() => {
+    if (!runId || tab !== 'briefing') return;
+    let cancelled = false;
+    setBriefingError('');
+
+    const load = async () => {
+      try {
+        const data = await fetchJson(`${API_BASE}/runs/${runId}/briefing`);
+        if (!cancelled) setBriefing(data);
+      } catch (err) {
+        if (!cancelled) setBriefingError(err.message);
+      }
+    };
+
+    load();
+    return () => { cancelled = true; };
+  }, [runId, tab]);
+
   // Close on outside click
   useEffect(() => {
     const handler = (e) => {
@@ -138,7 +158,7 @@ export default function RunDetailDrawer({ runId, onClose }) {
 
   const hasExploreLog = blackboard?.artifact_refs?.includes('exploration_log.md');
   const hasCorpusResults = blackboard?.artifact_refs?.includes('corpus_results.json');
-  const TABS = ['overview', 'timeline', 'decisions', 'agents', 'causal', 'lessons', 'memory', 'review', 'workbench', 'explore', 'corpus'];
+  const TABS = ['overview', 'briefing', 'timeline', 'decisions', 'agents', 'causal', 'lessons', 'memory', 'review', 'workbench', 'explore', 'corpus'];
 
   return (
     <div className="drawer-overlay">
@@ -275,6 +295,52 @@ export default function RunDetailDrawer({ runId, onClose }) {
                     <div className="tl-time">{new Date(decision.created_at).toLocaleString()}</div>
                   </div>
                 ))
+              )}
+            </div>
+          )}
+
+          {tab === 'briefing' && (
+            <div className="briefing-panel">
+              {briefingError ? (
+                <div className="drawer-error">Could not load briefing: {briefingError}</div>
+              ) : !briefing ? (
+                <div className="drawer-empty">Loading briefing blocks...</div>
+              ) : (
+                <>
+                  <div className="briefing-summary">
+                    <div className="briefing-summary-item">
+                      <span className="briefing-label">Scope</span>
+                      <span>{titleCase(briefing.scope)}</span>
+                    </div>
+                    <div className="briefing-summary-item">
+                      <span className="briefing-label">Blocks</span>
+                      <span>{briefing.block_count ?? 0}</span>
+                    </div>
+                    <div className="briefing-summary-item">
+                      <span className="briefing-label">Tokens</span>
+                      <span>{briefing.total_block_tokens ?? 0}</span>
+                    </div>
+                    <div className="briefing-summary-item">
+                      <span className="briefing-label">Artifact</span>
+                      <span className="briefing-artifact">{briefing.artifact}</span>
+                    </div>
+                  </div>
+                  <div className="briefing-blocks">
+                    {(briefing.blocks || []).length === 0 ? (
+                      <div className="drawer-empty">No named briefing blocks were recorded for this run.</div>
+                    ) : (
+                      briefing.blocks.map((block) => (
+                        <section key={block.name} className="briefing-block">
+                          <div className="briefing-block-header">
+                            <span className="briefing-block-name">{titleCase(block.name)}</span>
+                            <span className="briefing-block-meta">{block.source} · {block.token_count} tokens</span>
+                          </div>
+                          <pre>{block.content}</pre>
+                        </section>
+                      ))
+                    )}
+                  </div>
+                </>
               )}
             </div>
           )}
@@ -581,6 +647,70 @@ export default function RunDetailDrawer({ runId, onClose }) {
         }
         .artifact-list { margin-top: 0.35rem; }
         .timeline-scroll { display: flex; flex-direction: column; gap: 0; }
+        .briefing-panel { display: flex; flex-direction: column; gap: 0.75rem; }
+        .briefing-summary {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 0.65rem;
+        }
+        .briefing-summary-item {
+          border: 1px solid rgba(255,255,255,0.06);
+          background: rgba(255,255,255,0.03);
+          border-radius: 8px;
+          padding: 0.7rem 0.8rem;
+          min-width: 0;
+        }
+        .briefing-label {
+          display: block;
+          color: var(--accent-gold);
+          font-size: 0.62rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.1em;
+          margin-bottom: 0.25rem;
+        }
+        .briefing-artifact {
+          display: block;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-family: var(--font-mono);
+          font-size: 0.72rem;
+        }
+        .briefing-blocks { display: flex; flex-direction: column; gap: 0.65rem; }
+        .briefing-block {
+          border: 1px solid rgba(255,255,255,0.07);
+          background: rgba(0,0,0,0.18);
+          border-radius: 8px;
+          padding: 0.8rem;
+        }
+        .briefing-block-header {
+          display: flex;
+          justify-content: space-between;
+          gap: 0.75rem;
+          align-items: baseline;
+          margin-bottom: 0.45rem;
+        }
+        .briefing-block-name {
+          font-size: 0.82rem;
+          font-weight: 800;
+          color: var(--text-primary);
+        }
+        .briefing-block-meta {
+          flex-shrink: 0;
+          font-size: 0.68rem;
+          color: var(--text-secondary);
+          font-family: var(--font-mono);
+        }
+        .briefing-block pre {
+          margin: 0;
+          white-space: pre-wrap;
+          overflow-x: auto;
+          color: var(--text-secondary);
+          font-family: var(--font-mono);
+          font-size: 0.74rem;
+          line-height: 1.45;
+        }
         .tl-item {
           border-left: 2px solid rgba(194, 163, 114, 0.4);
           padding: 0.4rem 0 0.4rem 0.9rem;
@@ -689,6 +819,11 @@ export default function RunDetailDrawer({ runId, onClose }) {
         .cmd-badge { font-size: 0.66rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; border-radius: 999px; padding: 0.18rem 0.55rem; border: 1px solid; }
         .cmd-badge.passed { color: #8fae7c; border-color: rgba(143,174,124,0.4); }
         .cmd-badge.failed { color: #c7684c; border-color: rgba(199,104,76,0.4); }
+        @media (max-width: 760px) {
+          .briefing-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .briefing-block-header { flex-direction: column; gap: 0.2rem; }
+          .briefing-block-meta { flex-shrink: 1; }
+        }
       `}</style>
     </div>
   );
