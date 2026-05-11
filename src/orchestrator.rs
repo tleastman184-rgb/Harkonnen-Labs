@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -20,23 +20,36 @@ use crate::{
     llm::{self, LlmRequest, Message},
     memory::{MemoryEntry, MemoryIngestOptions, MemoryIngestResult, MemoryProvenance, MemoryStore},
     models::{
-        AgentExecution, AgentRuntimeState, BlackboardState, BriefingScope, CausalEventEdge,
-        CausalEventNode, CheckpointAnswerRecord, CommissioningBrief, ConsolidationCandidate,
-        ContextSection, ContextTarget, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState,
-        EpisodeRecord, EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingBlock, BriefingScope,
+        CausalEventEdge, CausalEventNode, CheckpointAnswerRecord, CodeReviewLearningRecord,
+        CommissioningBrief, ConsolidationCandidate, ContextPullRecord, ContextSection,
+        ContextTarget, CoobieBriefing, CoobieEvidenceCitation, EpisodeCausalState, EpisodeRecord,
+        EpisodeStateDiff, EvidenceAnnotation, EvidenceAnnotationBundle,
         EvidenceAnnotationHistoryEvent, EvidenceMatchAssessment, EvidenceMatchReport,
         EvidenceSource, EvidenceTimeRange, EvidenceWindowMatch, FailureKind,
         HiddenScenarioCheckResult, HiddenScenarioEvaluation, HiddenScenarioSummary, IntentPackage,
         LessonRecord, LiveEvent, OperatorModelContext, PearlHierarchyLevel, PhaseAttributionRecord,
         PriorCauseSignal, ProjectInterviewContext, ProjectResumeRisk, RunCausalGraph,
         RunCheckpointRecord, RunEvent, RunRecord, RunTimingReport, ScenarioResult,
-        SoulIdentityContext, Spec, StakeholderAlignmentSummary, TwinEnvironment, TwinFailureMode,
-        TwinService, TwinServiceSpec, ValidationSummary, WorkerHarnessConfig,
+        SoulIdentityContext, Spec, SpecFamilyRetrievalProof, StakeholderAlignmentSummary,
+        TwinEnvironment, TwinFailureMode, TwinService, TwinServiceSpec, ValidationSummary,
+        WorkerHarnessConfig,
     },
     pidgin, policy, scenarios,
     setup::command_available,
     spec, workspace,
 };
+
+fn default_twilight_daemon_socket() -> PathBuf {
+    if let Ok(socket) = std::env::var("TWILIGHT_DAEMON_SOCKET") {
+        return PathBuf::from(socket);
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir).join("twilight-daemon.sock");
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    PathBuf::from(format!("/tmp/twilight-{user}-daemon.sock"))
+}
 
 #[derive(Debug, Clone)]
 pub struct AppContext {
@@ -57,8 +70,15 @@ pub struct AppContext {
     #[allow(dead_code)]
     pub operator_models: crate::operator_model::OperatorModelStore,
     pub started_at: std::time::Instant,
-    /// Calvin Archive HTTP client — None when disabled or harmony not running.
+    /// Calvin Archive client — None only when disabled or local init fails.
+    /// When harmony is down, writes queue locally and drain on recovery.
     pub calvin: Option<crate::calvin_client::CalvinClient>,
+    /// Open Brain MCP-backed memory client — default cross-client recall path.
+    pub open_brain: Option<crate::openbrain::OpenBrainClient>,
+    /// Default long-term semantic memory. OB1-backed when configured.
+    pub semantic_memory: Arc<dyn crate::memory::SemanticMemory>,
+    /// Sub-agent dispatcher — routes high-context tasks to isolated backends.
+    pub dispatcher: crate::subagent::SubAgentDispatcher,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +170,72 @@ struct CommandTrialRecord {
     stderr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryCandidateProcessSummary {
+    pub run_id: Option<String>,
+    pub scanned: usize,
+    pub captured_openbrain: usize,
+    pub calvin_promotions: usize,
+    pub reconsolidations: usize,
+    pub held_for_review: usize,
+    pub ignored: usize,
+    pub duplicates: usize,
+    pub retry_pending: usize,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalRunPrediction {
+    prediction_id: String,
+    run_id: String,
+    spec_id: String,
+    predicted_outcome: String,
+    source_cause_ids: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionSuccessReinforcement {
+    pub reinforcement_id: String,
+    pub run_id: String,
+    pub prediction_id: String,
+    pub source_cause_id: String,
+    pub prediction_error: f64,
+    pub actual_outcome: String,
+    pub confirmation_count: i64,
+    pub status: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfluenceExclusion {
+    pub exclusion_id: String,
+    pub run_id: String,
+    pub phase: String,
+    pub briefing_scope: Option<String>,
+    pub memory_key: String,
+    pub memory_preview: String,
+    pub spec_family: String,
+    pub expected_outcome: String,
+    pub actual_outcome: String,
+    pub exclusion_probability: f64,
+    pub selection_basis: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecFamilyProfile {
+    pub family_id: String,
+    pub label: String,
+    pub fingerprint: Vec<String>,
+    pub spec_ids: Vec<String>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+const PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD: f64 = 0.2;
+const MEMORY_INFLUENCE_EXCLUSION_PROBABILITY: f64 = 0.05;
+const CROSS_AGENT_PATTERN_MIN_BASIS_RUNS: usize = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandTrialReport {
     run_id: String,
@@ -170,6 +256,8 @@ struct ValidationRepairAttemptRecord {
     proposal_summary: String,
     #[serde(default)]
     proposal_rationale: Vec<String>,
+    #[serde(default)]
+    edited_files: Vec<String>,
     edits_applied: usize,
     before_summary: String,
     after_summary: String,
@@ -195,6 +283,69 @@ struct ValidationRepairArtifact {
     generated_at: String,
     #[serde(default)]
     attempts: Vec<ValidationRepairAttemptRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanCompletionAuditItem {
+    item_id: String,
+    source: String,
+    requirement: String,
+    status: String,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanCompletionAuditArtifact {
+    run_id: String,
+    spec_id: String,
+    product: String,
+    final_status: String,
+    generated_at: String,
+    summary: String,
+    unresolved_count: usize,
+    #[serde(default)]
+    items: Vec<PlanCompletionAuditItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralPriorRevisionCandidate {
+    candidate_id: String,
+    source_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+    retention_class: String,
+    source_authority: String,
+    content_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BehavioralChangeMetrics {
+    checkpoint_count: usize,
+    clarification_count: usize,
+    validation_repair_attempts: usize,
+    retry_count: usize,
+    plan_audit_unresolved_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hidden_scenarios_passed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralChangeReportArtifact {
+    schema: String,
+    run_id: String,
+    spec_id: String,
+    product: String,
+    final_status: String,
+    generated_at: String,
+    status: String,
+    summary: String,
+    metrics: BehavioralChangeMetrics,
+    #[serde(default)]
+    prior_revision_candidates: Vec<BehavioralPriorRevisionCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +517,7 @@ struct MemoryContextBundle {
     project_memory_root: Option<String>,
     core_memory_ids: Vec<String>,
     project_memory_ids: Vec<String>,
+    spec_family_retrieval: Option<SpecFamilyRetrievalProof>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -931,15 +1083,63 @@ impl AppContext {
             None
         };
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
-        let chat = crate::chat::ChatStore::with_bus(
-            pool.clone(),
-            Arc::new(crate::chat::LocalJsonlPackChatBus::new(
-                paths.logs.join("packchat-bus.jsonl"),
-                paths.setup.setup.name.clone(),
-            )),
-        );
+        let local_packchat_bus = Arc::new(crate::chat::LocalJsonlPackChatBus::new(
+            paths.logs.join("packchat-bus.jsonl"),
+            paths.setup.setup.name.clone(),
+        ));
+        let twilight_socket_path = paths.setup.twilight_bark.enabled.then(|| {
+            paths
+                .setup
+                .twilight_bark
+                .daemon_socket
+                .clone()
+                .unwrap_or_else(default_twilight_daemon_socket)
+        });
+        let packchat_bus: Arc<dyn crate::chat::PackChatBus> =
+            if let Some(socket_path) = twilight_socket_path.clone() {
+                Arc::new(crate::chat::CompositePackChatBus::new(vec![
+                    local_packchat_bus,
+                    Arc::new(crate::chat::TwilightPackChatBus::new(
+                        socket_path,
+                        paths.setup.twilight_bark.agent_name.clone(),
+                        paths.setup.twilight_bark.agent_role.clone(),
+                        paths.setup.setup.name.clone(),
+                    )),
+                ]))
+            } else {
+                local_packchat_bus
+            };
+        let chat = crate::chat::ChatStore::with_bus(pool.clone(), packchat_bus);
+        // Calvin must be initialised before the ingest loop so the loop can forward
+        // CalvinIngressEvents from inbound Twilight envelopes to the Calvin archive.
+        let calvin =
+            crate::calvin_client::try_connect(&paths.setup.calvin_archive, pool.clone()).await;
+        if let Some(socket_path) = twilight_socket_path {
+            chat.spawn_twilight_ingest_loop(
+                socket_path,
+                format!("{}-ingest", paths.setup.twilight_bark.agent_name),
+                paths.setup.twilight_bark.agent_role.clone(),
+                calvin.clone(),
+            );
+        }
         let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
-        let calvin = crate::calvin_client::try_connect(&paths.setup.calvin_archive).await;
+        let open_brain = match crate::openbrain::OpenBrainClient::new(&paths.setup.open_brain) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %error, "Open Brain client unavailable");
+                None
+            }
+        };
+        let semantic_memory: Arc<dyn crate::memory::SemanticMemory> =
+            if let Some(client) = open_brain.as_ref() {
+                Arc::new(crate::memory::OpenBrainSemanticMemory::new(client.clone()))
+            } else {
+                Arc::new(crate::memory::NoopSemanticMemory)
+            };
+        let dispatcher = crate::subagent::SubAgentDispatcher::new(
+            paths.setup.sub_agents.clone(),
+            paths.setup.clone(),
+        );
         Ok(Self {
             paths,
             pool,
@@ -952,6 +1152,9 @@ impl AppContext {
             operator_models,
             started_at: std::time::Instant::now(),
             calvin,
+            open_brain,
+            semantic_memory,
+            dispatcher,
         })
     }
 
@@ -1795,6 +1998,9 @@ impl AppContext {
         let run_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let log_path = self.run_log_path(&run_id);
+        let spec_family = self
+            .upsert_spec_family_profile(&spec_obj, &target_source)
+            .await?;
 
         self.insert_run(&run_id, &spec_obj.id, &target_source.label, "queued", now)
             .await?;
@@ -1806,8 +2012,11 @@ impl AppContext {
                 "orchestrator",
                 "queued",
                 &format!(
-                    "Created run for spec {} against target {} ({})",
-                    spec_obj.id, target_source.label, target_source.source_path
+                    "Created run for spec {} in family {} against target {} ({})",
+                    spec_obj.id,
+                    spec_family.family_id,
+                    target_source.label,
+                    target_source.source_path
                 ),
                 &log_path,
             )
@@ -1927,7 +2136,48 @@ impl AppContext {
                         &prepared.log_path,
                     )
                     .await?;
+                let audit = build_plan_completion_audit(
+                    run_id,
+                    &prepared.spec_obj,
+                    &prepared.target_source,
+                    final_status,
+                    Some(&output.validation),
+                    Some(&output.hidden_scenarios),
+                    &output.run_dir,
+                );
+                self.write_plan_completion_audit(&output.run_dir, &audit)
+                    .await?;
                 self.try_close_calvin_run(run_id, final_status).await;
+                self.try_record_calvin_prediction_result(run_id, final_status, None)
+                    .await;
+                self.try_process_memory_candidates_on_close(run_id).await;
+                if let Err(report_error) = self
+                    .write_behavioral_change_report_for_run(
+                        run_id,
+                        &prepared.spec_obj,
+                        &prepared.target_source,
+                        final_status,
+                        Some(&output.validation),
+                        Some(&output.hidden_scenarios),
+                        &audit,
+                        &output.run_dir,
+                    )
+                    .await
+                {
+                    let _ = self
+                        .record_event(
+                            run_id,
+                            None,
+                            "memory",
+                            "coobie",
+                            "warning",
+                            &format!("Behavioral-change report skipped: {report_error}"),
+                            &prepared.log_path,
+                        )
+                        .await;
+                }
+                self.try_generate_consolidation_candidates_on_close(run_id)
+                    .await;
                 self.finalize_blackboard(final_status, &output.run_dir)
                     .await?;
                 self.write_run_timing_artifact(run_id, &output.run_dir)
@@ -1949,7 +2199,57 @@ impl AppContext {
                     )
                     .await?;
                 self.try_close_calvin_run(run_id, "failed").await;
+                self.try_record_calvin_prediction_result(run_id, "failed", None)
+                    .await;
+                self.try_process_memory_candidates_on_close(run_id).await;
                 let run_dir = self.run_dir(run_id);
+                let audit = build_plan_completion_audit(
+                    run_id,
+                    &prepared.spec_obj,
+                    &prepared.target_source,
+                    "failed",
+                    None,
+                    None,
+                    &run_dir,
+                );
+                if let Err(audit_error) = self.write_plan_completion_audit(&run_dir, &audit).await {
+                    let _ = self
+                        .record_event(
+                            run_id,
+                            None,
+                            "complete",
+                            "orchestrator",
+                            "warning",
+                            &format!("Plan completion audit skipped: {audit_error}"),
+                            &prepared.log_path,
+                        )
+                        .await;
+                }
+                if let Err(report_error) = self
+                    .write_behavioral_change_report_for_run(
+                        run_id,
+                        &prepared.spec_obj,
+                        &prepared.target_source,
+                        "failed",
+                        None,
+                        None,
+                        &audit,
+                        &run_dir,
+                    )
+                    .await
+                {
+                    let _ = self
+                        .record_event(
+                            run_id,
+                            None,
+                            "memory",
+                            "coobie",
+                            "warning",
+                            &format!("Behavioral-change report skipped: {report_error}"),
+                            &prepared.log_path,
+                        )
+                        .await;
+                }
                 self.mark_blackboard_failed(&message, &run_dir).await?;
                 let lessons = match self.consolidate_run(run_id, &prepared.spec_obj).await {
                     Ok(lessons) => lessons,
@@ -2017,6 +2317,8 @@ impl AppContext {
                 if run_dir.exists() {
                     self.write_run_timing_artifact(run_id, &run_dir).await?;
                 }
+                self.try_generate_consolidation_candidates_on_close(run_id)
+                    .await;
                 let _ = self.package_artifacts(run_id).await;
             }
         }
@@ -2094,19 +2396,24 @@ impl AppContext {
                 log_path,
             )
             .await?;
+        let spec_family = derive_spec_family_profile(spec_obj, target_source);
         let memory_context = self
-            .retrieve_coobie_memory_context(target_source, &query_terms)
+            .retrieve_coobie_memory_context(target_source, &query_terms, Some(&spec_family))
             .await?;
         let briefing = self
-            .build_coobie_briefing(
+            .dispatch_coobie_briefing(
                 run_id,
                 spec_obj,
                 target_source,
                 &query_terms,
                 &domain_signals,
                 &memory_context,
+                None, // profile_dispatch: loaded from profiles in Phase 5b
             )
             .await?;
+        // Emit pre-run prediction — the explicit error signal that closes the learning loop.
+        self.try_record_calvin_prediction(run_id, &spec_obj.id, &briefing)
+            .await;
         let scout_briefing = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
         let mason_briefing = build_scoped_briefing(&briefing, BriefingScope::MasonPreflight);
         let sable_briefing = build_scoped_briefing(&briefing, BriefingScope::SablePreflight);
@@ -3824,6 +4131,10 @@ next_actions={}",
                     "No predefined hidden scenarios for spec '{}' — invoking Sable to generate",
                     spec_obj.id
                 );
+                let sable_isolation = self
+                    .dispatcher
+                    .isolates("sable_evaluation", None)
+                    .then(crate::subagent::sable_isolation_system);
                 match scenarios::sable_generate_and_evaluate(
                     &spec_obj,
                     &self.paths.setup,
@@ -3835,6 +4146,7 @@ next_actions={}",
                     &agent_executions,
                     Some(&render_sable_context_summary(&sable_briefing)),
                     &run_dir,
+                    sable_isolation.as_deref(),
                 )
                 .await
                 {
@@ -4322,6 +4634,7 @@ Top memory hits:
         &self,
         target_source: &TargetSourceMetadata,
         query_terms: &[String],
+        spec_family: Option<&SpecFamilyProfile>,
     ) -> Result<MemoryContextBundle> {
         let project_store = self.project_memory_store(target_source).await?;
         let mut project_memory = self
@@ -4390,6 +4703,14 @@ Top memory hits:
 
         project_memory.hits.truncate(6);
         core_memory.hits.truncate(6);
+        let spec_family_retrieval = spec_family.map(|family| {
+            apply_spec_family_memory_bias(
+                &mut memory_hits,
+                &family.family_id,
+                &family.fingerprint,
+                12,
+            )
+        });
         memory_hits.truncate(12);
 
         if memory_hits.is_empty() {
@@ -4406,6 +4727,7 @@ Top memory hits:
             project_memory_root: Some(project_store.root.display().to_string()),
             core_memory_ids: core_memory.ids,
             project_memory_ids: project_memory.ids,
+            spec_family_retrieval,
         })
     }
 
@@ -4447,17 +4769,29 @@ Top memory hits:
             kw
         };
 
+        let mut raw_hits = raw_hits;
+        if !semantic_query.is_empty() {
+            match self.semantic_memory_search(&semantic_query, 20).await {
+                Ok(mut open_brain_hits) => raw_hits.append(&mut open_brain_hits),
+                Err(error) => {
+                    tracing::warn!(error = %error, "semantic memory search failed");
+                }
+            }
+        }
+
         for hit in raw_hits {
             if hit.contains("No memories found") || hit.contains("Memory not initialized") {
                 continue;
             }
+            let dedupe_key = normalize_briefing_hit_key(&hit);
+            if dedupe_key.is_empty() || !seen.insert(dedupe_key) {
+                continue;
+            }
+            let labeled_hit = format!("[{source_label}] {hit}");
             if let Some(id) = extract_memory_entry_id(&hit) {
                 ids.push(id);
             }
-            let labeled_hit = format!("[{source_label}] {hit}");
-            if seen.insert(labeled_hit.clone()) {
-                hits.push(labeled_hit);
-            }
+            hits.push(labeled_hit);
         }
 
         Ok(CollectedMemoryHits { hits, ids })
@@ -6563,11 +6897,13 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
 
         let mut briefing = CoobieBriefing {
             spec_id: spec_obj.id.clone(),
+            spec_family: Some(derive_spec_family_profile(spec_obj, target_source).family_id),
             product: target_source.label.clone(),
             query_terms: enriched_query_terms,
             domain_signals: domain_signals.to_vec(),
             prior_report_count,
             memory_hits: memory_selection.memory_hits,
+            spec_family_retrieval: memory_context.spec_family_retrieval.clone(),
             core_memory_hits: memory_selection.core_memory_hits,
             project_memory_hits: memory_selection.project_memory_hits,
             resume_packet_summary: resume_packet.summary.clone(),
@@ -6594,6 +6930,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             target_token_budget: context_target.token_budget,
             briefing_tokens_used: memory_selection.tokens_used,
             briefing_hits_provided: memory_selection.hits_provided,
+            briefing_blocks: Vec::new(),
             required_sections_applied,
             application_risks,
             environment_risks,
@@ -6607,6 +6944,7 @@ Do not keep everything in Harkonnen core memory. Promote only durable cross-proj
             coobie_response: String::new(),
             generated_at: Utc::now(),
         };
+        briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
         briefing.coobie_response = self
             .coobie_llm_briefing_response(run_id, spec_obj, target_source, &briefing)
             .await
@@ -6916,10 +7254,10 @@ Render Coobie's preflight markdown for the pack. Incorporate repo-local guidance
                     "{}
 
 Task contract:
-You are Scout, a spec-intake specialist for a software factory. Read a YAML spec, prior memory context, and repo-local guidance, then produce a concise implementation intent package as JSON with these fields: spec_id (string), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.",
+You are Scout, a spec-intake specialist for a software factory. Read a YAML spec, prior memory context, and repo-local guidance, then produce a concise implementation intent package as JSON with these fields: spec_id (string), spec_family (string or null), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.",
                     support.system_instruction
                 ))
-                .unwrap_or_else(|| "You are Scout, a spec-intake specialist for a software factory. Read a YAML spec and prior memory context, then produce a concise implementation intent package as JSON with these fields: spec_id (string), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.".to_string());
+                .unwrap_or_else(|| "You are Scout, a spec-intake specialist for a software factory. Read a YAML spec and prior memory context, then produce a concise implementation intent package as JSON with these fields: spec_id (string), spec_family (string or null), summary (one sentence), ambiguity_notes (array of strings), recommended_steps (ordered array of strings). Respond with valid JSON only and no markdown.".to_string());
             let repo_context_block = prompt_support
                 .as_ref()
                 .map(|support| support.repo_context_block.as_str())
@@ -6984,7 +7322,10 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                         )
                         .await;
                     }
-                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(body.trim()) {
+                    if let Ok(mut parsed) = serde_json::from_str::<IntentPackage>(body.trim()) {
+                        if parsed.spec_family.is_none() {
+                            parsed.spec_family = briefing.spec_family.clone();
+                        }
                         return Ok(parsed);
                     }
                     let stripped = body
@@ -6993,7 +7334,10 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
                         .trim_start_matches("```")
                         .trim_end_matches("```")
                         .trim();
-                    if let Ok(parsed) = serde_json::from_str::<IntentPackage>(stripped) {
+                    if let Ok(mut parsed) = serde_json::from_str::<IntentPackage>(stripped) {
+                        if parsed.spec_family.is_none() {
+                            parsed.spec_family = briefing.spec_family.clone();
+                        }
                         return Ok(parsed);
                     }
                     tracing::warn!("Scout LLM response was not valid IntentPackage JSON — falling back to stub");
@@ -7022,6 +7366,7 @@ Produce the intent package JSON and incorporate Coobie guardrails, required chec
 
         Ok(IntentPackage {
             spec_id: spec_obj.id.clone(),
+            spec_family: briefing.spec_family.clone(),
             summary: format!("Implement {}", spec_obj.title),
             ambiguity_notes,
             recommended_steps: vec![
@@ -9709,7 +10054,283 @@ Produce the tool plan analysis and explicitly call out tools or MCP gaps that bl
             render_validation_repair_markdown(report),
         )
         .await?;
+        let records = code_review_learning_records_from_validation_repair(report);
+        self.insert_code_review_learning_records(&records).await?;
         Ok(())
+    }
+
+    async fn write_plan_completion_audit(
+        &self,
+        run_dir: &Path,
+        audit: &PlanCompletionAuditArtifact,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir)
+            .await
+            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
+        self.write_json_file(&run_dir.join("plan_completion_audit.json"), audit)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("plan_completion_audit.md"),
+            render_plan_completion_audit_markdown(audit),
+        )
+        .await?;
+        let mut board = self.blackboard.write().await;
+        push_unique(&mut board.artifact_refs, "plan_completion_audit.json");
+        push_unique(&mut board.artifact_refs, "plan_completion_audit.md");
+        Ok(())
+    }
+
+    pub async fn load_plan_completion_audit(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let path = self.run_dir(run_id).join("plan_completion_audit.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
+    async fn write_behavioral_change_report_for_run(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        final_status: &str,
+        validation: Option<&ValidationSummary>,
+        hidden_scenarios: Option<&HiddenScenarioSummary>,
+        audit: &PlanCompletionAuditArtifact,
+        run_dir: &Path,
+    ) -> Result<()> {
+        let candidates = self.chat.list_memory_candidates_for_run(run_id).await?;
+        let prior_revision_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.learning_intent == "prior_revision_target")
+            .map(behavioral_prior_revision_candidate)
+            .collect::<Vec<_>>();
+        let (checkpoint_count, clarification_count) = self.run_checkpoint_counts(run_id).await?;
+        let validation_repair_attempts = load_validation_repair_attempt_count(run_dir).await?;
+        let metrics = BehavioralChangeMetrics {
+            checkpoint_count,
+            clarification_count,
+            validation_repair_attempts,
+            retry_count: validation_repair_attempts,
+            plan_audit_unresolved_count: audit.unresolved_count,
+            validation_passed: validation.map(|summary| summary.passed),
+            hidden_scenarios_passed: hidden_scenarios.map(|summary| summary.passed),
+        };
+        let report = build_behavioral_change_report(
+            run_id,
+            spec_obj,
+            target_source,
+            final_status,
+            metrics,
+            prior_revision_candidates,
+        );
+        self.write_behavioral_change_report(run_dir, &report).await
+    }
+
+    async fn run_checkpoint_counts(&self, run_id: &str) -> Result<(usize, usize)> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS checkpoint_count,
+                SUM(CASE
+                    WHEN lower(checkpoint_type) LIKE '%clarif%'
+                      OR lower(prompt) LIKE '%clarif%'
+                      OR lower(prompt) LIKE '%ambigu%'
+                    THEN 1 ELSE 0 END
+                ) AS clarification_count
+            FROM run_checkpoints
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let checkpoint_count: i64 = row.get("checkpoint_count");
+        let clarification_count: Option<i64> = row.get("clarification_count");
+        Ok((
+            checkpoint_count.max(0) as usize,
+            clarification_count.unwrap_or(0).max(0) as usize,
+        ))
+    }
+
+    async fn write_behavioral_change_report(
+        &self,
+        run_dir: &Path,
+        report: &BehavioralChangeReportArtifact,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(run_dir)
+            .await
+            .with_context(|| format!("creating run dir {}", run_dir.display()))?;
+        self.write_json_file(&run_dir.join("behavioral_change_report.json"), report)
+            .await?;
+        tokio::fs::write(
+            run_dir.join("behavioral_change_report.md"),
+            render_behavioral_change_report_markdown(report),
+        )
+        .await?;
+        self.insert_behavioral_change_report(report).await?;
+        let mut board = self.blackboard.write().await;
+        push_unique(&mut board.artifact_refs, "behavioral_change_report.json");
+        push_unique(&mut board.artifact_refs, "behavioral_change_report.md");
+        Ok(())
+    }
+
+    async fn insert_behavioral_change_report(
+        &self,
+        report: &BehavioralChangeReportArtifact,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO behavioral_change_reports (
+                report_id, run_id, spec_id, status, summary, metrics_json,
+                prior_revision_candidates_json, artifact_json, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(run_id) DO UPDATE SET
+                spec_id = excluded.spec_id,
+                status = excluded.status,
+                summary = excluded.summary,
+                metrics_json = excluded.metrics_json,
+                prior_revision_candidates_json = excluded.prior_revision_candidates_json,
+                artifact_json = excluded.artifact_json,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(format!("behavioral-change-{}", report.run_id))
+        .bind(&report.run_id)
+        .bind(&report.spec_id)
+        .bind(&report.status)
+        .bind(&report.summary)
+        .bind(serde_json::to_string(&report.metrics)?)
+        .bind(serde_json::to_string(&report.prior_revision_candidates)?)
+        .bind(serde_json::to_string(report)?)
+        .bind(&report.generated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_behavioral_change_report(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact_json
+            FROM behavioral_change_reports
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            let raw: String = row.get("artifact_json");
+            return serde_json::from_str(&raw)
+                .map(Some)
+                .with_context(|| format!("parsing behavioral_change_reports for {run_id}"));
+        }
+
+        let path = self.run_dir(run_id).join("behavioral_change_report.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub async fn insert_code_review_learning_records(
+        &self,
+        records: &[CodeReviewLearningRecord],
+    ) -> Result<()> {
+        for record in records {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO code_review_learning_records (
+                    record_id,
+                    run_id,
+                    source_agent,
+                    reviewer_agent,
+                    finding_fingerprint,
+                    files_json,
+                    severity,
+                    resolution,
+                    lesson,
+                    evidence_refs_json,
+                    stale_if_file_changed_json,
+                    status,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )
+            .bind(&record.record_id)
+            .bind(&record.run_id)
+            .bind(&record.source_agent)
+            .bind(&record.reviewer_agent)
+            .bind(&record.finding_fingerprint)
+            .bind(serde_json::to_string(&record.files)?)
+            .bind(&record.severity)
+            .bind(&record.resolution)
+            .bind(&record.lesson)
+            .bind(serde_json::to_string(&record.evidence_refs)?)
+            .bind(serde_json::to_string(&record.stale_if_file_changed)?)
+            .bind(&record.status)
+            .bind(&record.created_at)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_code_review_learning_records(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<CodeReviewLearningRecord>> {
+        let rows = if let Some(run_id) = run_id {
+            sqlx::query(
+                r#"
+                SELECT record_id, run_id, source_agent, reviewer_agent, finding_fingerprint,
+                       files_json, severity, resolution, lesson, evidence_refs_json,
+                       stale_if_file_changed_json, status, created_at
+                FROM code_review_learning_records
+                WHERE run_id = ?1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT record_id, run_id, source_agent, reviewer_agent, finding_fingerprint,
+                       files_json, severity, resolution, lesson, evidence_refs_json,
+                       stale_if_file_changed_json, status, created_at
+                FROM code_review_learning_records
+                ORDER BY created_at DESC
+                LIMIT 200
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(parse_code_review_learning_record)
+            .collect()
     }
 
     fn agent_prompt_support(
@@ -11540,6 +12161,133 @@ Return JSON only.",
         Ok(())
     }
 
+    async fn upsert_spec_family_profile(
+        &self,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+    ) -> Result<SpecFamilyProfile> {
+        let derived = derive_spec_family_profile(spec_obj, target_source);
+        let existing = self
+            .load_spec_family_profile(&derived.family_id)
+            .await?
+            .unwrap_or_else(|| derived.clone());
+        let mut spec_ids = existing.spec_ids.clone();
+        push_unique(&mut spec_ids, &spec_obj.id);
+        let mut fingerprint = existing.fingerprint.clone();
+        for token in &derived.fingerprint {
+            push_unique(&mut fingerprint, token);
+        }
+        fingerprint.truncate(24);
+        let now = Utc::now();
+        let created_at = if existing.spec_ids.is_empty() {
+            now
+        } else {
+            existing.created_at
+        };
+        let profile = SpecFamilyProfile {
+            family_id: derived.family_id,
+            label: derived.label,
+            fingerprint,
+            spec_ids,
+            created_at,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO spec_family_profiles (
+                family_id, label, fingerprint_json, spec_ids_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(family_id) DO UPDATE SET
+                label = excluded.label,
+                fingerprint_json = excluded.fingerprint_json,
+                spec_ids_json = excluded.spec_ids_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&profile.family_id)
+        .bind(&profile.label)
+        .bind(serde_json::to_string(&profile.fingerprint)?)
+        .bind(serde_json::to_string(&profile.spec_ids)?)
+        .bind(profile.created_at.to_rfc3339())
+        .bind(profile.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        let content = format!(
+            "Spec family {} ({}) includes spec {} for product {}. Fingerprint: {}.",
+            profile.family_id,
+            profile.label,
+            spec_obj.id,
+            target_source.label,
+            profile.fingerprint.join(", ")
+        );
+        let metadata = crate::memory::SemanticMemoryMetadata {
+            org: Some("harkonnen-labs".to_string()),
+            role: Some("spec_family".to_string()),
+            product: Some(target_source.label.clone()),
+            spec_id: Some(spec_obj.id.clone()),
+            memory_type: Some("spec_family_profile".to_string()),
+            tags: vec![
+                "spec_family".to_string(),
+                profile.family_id.clone(),
+                target_source.label.clone(),
+            ],
+            sensitivity_label: Some("normal".to_string()),
+            created_at: Some(profile.updated_at),
+            ..Default::default()
+        };
+        if let Err(error) = self.semantic_memory_store(&content, metadata).await {
+            tracing::debug!(
+                spec_id = %spec_obj.id,
+                family_id = %profile.family_id,
+                error = %error,
+                "semantic spec-family profile store failed"
+            );
+        }
+
+        Ok(profile)
+    }
+
+    pub async fn load_spec_family_profile(
+        &self,
+        family_id: &str,
+    ) -> Result<Option<SpecFamilyProfile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT family_id, label, fingerprint_json, spec_ids_json, created_at, updated_at
+            FROM spec_family_profiles
+            WHERE family_id = ?1
+            "#,
+        )
+        .bind(family_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(parse_spec_family_profile).transpose()
+    }
+
+    async fn spec_family_for_spec_id(&self, spec_id: &str) -> Result<String> {
+        let rows = sqlx::query(
+            r#"
+            SELECT family_id, spec_ids_json
+            FROM spec_family_profiles
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let raw: String = row.get("spec_ids_json");
+            let spec_ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+            if spec_ids.iter().any(|id| id == spec_id) {
+                return Ok(row.get("family_id"));
+            }
+        }
+        Ok(derive_spec_family_id_from_text(spec_id))
+    }
+
     async fn try_open_calvin_run(&self, run_id: &str, spec_id: &str) {
         let Some(calvin) = self.calvin.as_ref() else {
             return;
@@ -11556,12 +12304,532 @@ Return JSON only.",
         }
     }
 
+    /// Dispatch the Coobie briefing construction task.
+    ///
+    /// When the configured backend is `DirectLlm`, calls `build_coobie_briefing`
+    /// inline — behavioral no-op vs. the pre-5-C3 path. When `ClaudeCodeAgent`,
+    /// runs an isolated LLM call using the coobie_briefing_prompt so the
+    /// retrieval trace never inflates the orchestrator's main context window.
+    async fn dispatch_coobie_briefing(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+        target_source: &TargetSourceMetadata,
+        query_terms: &[String],
+        domain_signals: &[String],
+        memory_context: &MemoryContextBundle,
+        profile_dispatch: Option<
+            &std::collections::HashMap<String, crate::setup::SubAgentTaskConfig>,
+        >,
+    ) -> Result<CoobieBriefing> {
+        if self
+            .dispatcher
+            .isolates("coobie_briefing", profile_dispatch)
+        {
+            let keywords: Vec<&str> = query_terms.iter().map(String::as_str).collect();
+            let prompt = crate::subagent::coobie_briefing_prompt(run_id, "preflight", &keywords);
+            let system = Some(crate::subagent::sable_isolation_system());
+            let result = self
+                .dispatcher
+                .dispatch("coobie_briefing", prompt, system, profile_dispatch)
+                .await;
+            tracing::debug!(
+                run_id = %run_id,
+                backend = %result.backend_used,
+                duration_ms = result.duration_ms,
+                tokens = ?result.tokens_used,
+                "coobie_briefing dispatched via sub-agent"
+            );
+            if !result.output.is_empty() {
+                // Parse the isolated output into a CoobieBriefing if possible;
+                // fall back to inline if the parse fails (DirectLlm fallback).
+                if let Ok(b) = serde_json::from_str::<CoobieBriefing>(&result.output) {
+                    return Ok(b);
+                }
+            }
+        }
+        // DirectLlm path (or isolated path fell back): call existing inline implementation.
+        self.build_coobie_briefing(
+            run_id,
+            spec_obj,
+            target_source,
+            query_terms,
+            domain_signals,
+            memory_context,
+        )
+        .await
+    }
+
     async fn try_close_calvin_run(&self, run_id: &str, outcome: &str) {
         let Some(calvin) = self.calvin.as_ref() else {
             return;
         };
         if let Err(error) = calvin.close_run(run_id, outcome).await {
             tracing::warn!(run_id = %run_id, error = %error, "Calvin close_run failed");
+        }
+    }
+
+    /// Emit a pre-run prediction to Calvin, synthesized from the Coobie briefing.
+    async fn try_record_calvin_prediction(
+        &self,
+        run_id: &str,
+        spec_id: &str,
+        briefing: &CoobieBriefing,
+    ) {
+        let pred = synthesize_run_prediction(run_id, spec_id, briefing);
+        if let Err(error) = self.store_local_run_prediction(&pred).await {
+            tracing::warn!(run_id = %run_id, error = %error, "local run prediction persistence failed");
+        }
+        let Some(calvin) = self.calvin.as_ref() else {
+            return;
+        };
+        if let Err(error) = calvin.record_prediction(&pred).await {
+            tracing::warn!(run_id = %run_id, error = %error, "Calvin record_prediction failed");
+        } else {
+            tracing::debug!(
+                run_id = %run_id,
+                predicted_outcome = %pred.predicted_outcome,
+                risk_score = pred.risk_score,
+                "prediction recorded"
+            );
+        }
+    }
+
+    /// Compute and emit the prediction result after a run closes.
+    async fn try_record_calvin_prediction_result(
+        &self,
+        run_id: &str,
+        actual_outcome: &str,
+        failure_phase: Option<&str>,
+    ) {
+        let local_prediction = match self.get_local_run_prediction(run_id).await {
+            Ok(prediction) => prediction,
+            Err(error) => {
+                tracing::warn!(run_id = %run_id, error = %error, "local run prediction lookup failed");
+                None
+            }
+        };
+
+        // Look up the existing prediction for this run.
+        let remote_prediction = if let Some(calvin) = self.calvin.as_ref() {
+            match calvin.get_prediction(run_id).await {
+                Ok(prediction) => prediction,
+                Err(error) => {
+                    tracing::warn!(run_id = %run_id, error = %error, "Calvin get_prediction failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let prediction_id = remote_prediction
+            .as_ref()
+            .and_then(|pred| {
+                pred.get("prediction_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                local_prediction
+                    .as_ref()
+                    .map(|pred| pred.prediction_id.clone())
+            });
+        let Some(prediction_id) = prediction_id else {
+            tracing::debug!(run_id = %run_id, "no prediction found for run; skipping result");
+            return;
+        };
+        let predicted_outcome = remote_prediction
+            .as_ref()
+            .and_then(|pred| {
+                pred.get("predicted_outcome")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                local_prediction
+                    .as_ref()
+                    .map(|pred| pred.predicted_outcome.clone())
+            })
+            .unwrap_or_else(|| "uncertain".to_string());
+        let error_score = compute_prediction_error(&predicted_outcome, actual_outcome);
+        let result_id = uuid::Uuid::new_v4().to_string();
+        let narrative = format!(
+            "Run {run_id} {actual_outcome}. Prediction was '{predicted_outcome}'. Error: {error_score:.2}."
+        );
+        let outcome = crate::calvin_client::PredictionOutcome {
+            prediction_id,
+            result_id,
+            run_id: run_id.to_string(),
+            actual_outcome: actual_outcome.to_string(),
+            actual_failure_phase: failure_phase.map(str::to_string),
+            actual_failure_kind: None,
+            prediction_error: error_score,
+            narrative_summary: narrative,
+        };
+        if let Some(calvin) = self.calvin.as_ref() {
+            if let Err(error) = calvin.record_prediction_result(&outcome).await {
+                tracing::warn!(run_id = %run_id, error = %error, "Calvin record_prediction_result failed");
+            } else {
+                tracing::debug!(
+                    run_id = %run_id,
+                    actual = %actual_outcome,
+                    error = error_score,
+                    "prediction result recorded"
+                );
+            }
+        }
+
+        if error_score <= PREDICTION_SUCCESS_REINFORCEMENT_THRESHOLD {
+            if let Some(prediction) = local_prediction.as_ref() {
+                if let Err(error) = self
+                    .record_prediction_success_reinforcements(
+                        prediction,
+                        actual_outcome,
+                        error_score,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %error,
+                        "prediction success reinforcement failed"
+                    );
+                }
+            }
+        }
+
+        if let Some(prediction) = local_prediction.as_ref() {
+            if let Err(error) = self
+                .record_memory_influence_exclusions(
+                    run_id,
+                    prediction,
+                    actual_outcome,
+                    MEMORY_INFLUENCE_EXCLUSION_PROBABILITY,
+                )
+                .await
+            {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "memory influence exclusion calibration failed"
+                );
+            }
+        }
+    }
+
+    async fn store_local_run_prediction(
+        &self,
+        prediction: &crate::calvin_client::RunPrediction,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO run_predictions (
+                prediction_id, run_id, spec_id, predicted_outcome, risk_score, confidence,
+                failure_phase, failure_kind, source_cause_ids, narrative_summary, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(run_id) DO UPDATE SET
+                prediction_id = excluded.prediction_id,
+                spec_id = excluded.spec_id,
+                predicted_outcome = excluded.predicted_outcome,
+                risk_score = excluded.risk_score,
+                confidence = excluded.confidence,
+                failure_phase = excluded.failure_phase,
+                failure_kind = excluded.failure_kind,
+                source_cause_ids = excluded.source_cause_ids,
+                narrative_summary = excluded.narrative_summary,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(&prediction.prediction_id)
+        .bind(&prediction.run_id)
+        .bind(&prediction.spec_id)
+        .bind(&prediction.predicted_outcome)
+        .bind(prediction.risk_score)
+        .bind(prediction.confidence)
+        .bind(&prediction.failure_phase)
+        .bind(&prediction.failure_kind)
+        .bind(&prediction.source_cause_ids)
+        .bind(&prediction.narrative_summary)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_local_run_prediction(&self, run_id: &str) -> Result<Option<LocalRunPrediction>> {
+        let row = sqlx::query(
+            r#"
+            SELECT prediction_id, run_id, spec_id, predicted_outcome, source_cause_ids
+            FROM run_predictions
+            WHERE run_id = ?1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| LocalRunPrediction {
+            prediction_id: row.get("prediction_id"),
+            run_id: row.get("run_id"),
+            spec_id: row.get("spec_id"),
+            predicted_outcome: row.get("predicted_outcome"),
+            source_cause_ids: row.get("source_cause_ids"),
+        }))
+    }
+
+    async fn record_prediction_success_reinforcements(
+        &self,
+        prediction: &LocalRunPrediction,
+        actual_outcome: &str,
+        prediction_error: f64,
+    ) -> Result<usize> {
+        let cause_ids = prediction
+            .source_cause_ids
+            .split(',')
+            .map(str::trim)
+            .filter(|cause| !cause.is_empty())
+            .collect::<BTreeSet<_>>();
+        if cause_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut inserted = 0;
+        for cause_id in cause_ids {
+            let prior_count: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*) FROM prediction_success_reinforcements
+                WHERE source_cause_id = ?1
+                "#,
+            )
+            .bind(cause_id)
+            .fetch_one(&self.pool)
+            .await?;
+            let confirmation_count = prior_count + 1;
+            let result = sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO prediction_success_reinforcements (
+                    reinforcement_id, run_id, prediction_id, source_cause_id,
+                    prediction_error, actual_outcome, confirmation_count, status, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending_workbench_review', ?8)
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&prediction.run_id)
+            .bind(&prediction.prediction_id)
+            .bind(cause_id)
+            .bind(prediction_error)
+            .bind(actual_outcome)
+            .bind(confirmation_count)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() > 0 {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub async fn list_prediction_success_reinforcements(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<PredictionSuccessReinforcement>> {
+        let rows = if let Some(run_id) = run_id {
+            sqlx::query(
+                r#"
+                SELECT reinforcement_id, run_id, prediction_id, source_cause_id,
+                       prediction_error, actual_outcome, confirmation_count, status, created_at
+                FROM prediction_success_reinforcements
+                WHERE run_id = ?1
+                ORDER BY created_at ASC, source_cause_id ASC
+                "#,
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT reinforcement_id, run_id, prediction_id, source_cause_id,
+                       prediction_error, actual_outcome, confirmation_count, status, created_at
+                FROM prediction_success_reinforcements
+                ORDER BY created_at ASC, source_cause_id ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let created_at = row.get::<String, _>("created_at");
+                Ok(PredictionSuccessReinforcement {
+                    reinforcement_id: row.get("reinforcement_id"),
+                    run_id: row.get("run_id"),
+                    prediction_id: row.get("prediction_id"),
+                    source_cause_id: row.get("source_cause_id"),
+                    prediction_error: row.get("prediction_error"),
+                    actual_outcome: row.get("actual_outcome"),
+                    confirmation_count: row.get("confirmation_count"),
+                    status: row.get("status"),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .context("parse prediction success reinforcement created_at")?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    async fn record_memory_influence_exclusions(
+        &self,
+        run_id: &str,
+        prediction: &LocalRunPrediction,
+        actual_outcome: &str,
+        exclusion_probability: f64,
+    ) -> Result<usize> {
+        let probability = exclusion_probability.clamp(0.0, 1.0);
+        if probability <= 0.0 {
+            return Ok(0);
+        }
+        let spec_family = self.spec_family_for_spec_id(&prediction.spec_id).await?;
+        let attributions = self.list_phase_attributions_for_run(run_id).await?;
+        let mut inserted = 0;
+        let now = Utc::now().to_rfc3339();
+        for attribution in attributions {
+            for hit in attribution.memory_hits.iter().filter(|hit| {
+                let trimmed = hit.trim();
+                !trimmed.is_empty() && !trimmed.contains("No reusable memory")
+            }) {
+                let memory_key = memory_influence_key(hit);
+                if memory_key.is_empty() {
+                    continue;
+                }
+                if !select_memory_influence_exclusion(
+                    run_id,
+                    &attribution.phase,
+                    &memory_key,
+                    probability,
+                ) {
+                    continue;
+                }
+                let result = sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO memory_influence_exclusions (
+                        exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                        spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                        selection_basis, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                            'deterministic_hash_calibration', ?11)
+                    "#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(run_id)
+                .bind(&attribution.phase)
+                .bind(attribution.briefing_scope.map(|scope| scope.to_string()))
+                .bind(&memory_key)
+                .bind(memory_influence_preview(hit, 240))
+                .bind(&spec_family)
+                .bind(&prediction.predicted_outcome)
+                .bind(actual_outcome)
+                .bind(probability)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+                if result.rows_affected() > 0 {
+                    inserted += 1;
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    pub async fn list_memory_influence_exclusions(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<MemoryInfluenceExclusion>> {
+        let rows = if let Some(run_id) = run_id {
+            sqlx::query(
+                r#"
+                SELECT exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                       spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                       selection_basis, created_at
+                FROM memory_influence_exclusions
+                WHERE run_id = ?1
+                ORDER BY created_at ASC, phase ASC, memory_key ASC
+                "#,
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT exclusion_id, run_id, phase, briefing_scope, memory_key, memory_preview,
+                       spec_family, expected_outcome, actual_outcome, exclusion_probability,
+                       selection_basis, created_at
+                FROM memory_influence_exclusions
+                ORDER BY created_at ASC, run_id ASC, phase ASC, memory_key ASC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let created_at = row.get::<String, _>("created_at");
+                Ok(MemoryInfluenceExclusion {
+                    exclusion_id: row.get("exclusion_id"),
+                    run_id: row.get("run_id"),
+                    phase: row.get("phase"),
+                    briefing_scope: row.get("briefing_scope"),
+                    memory_key: row.get("memory_key"),
+                    memory_preview: row.get("memory_preview"),
+                    spec_family: row.get("spec_family"),
+                    expected_outcome: row.get("expected_outcome"),
+                    actual_outcome: row.get("actual_outcome"),
+                    exclusion_probability: row.get("exclusion_probability"),
+                    selection_basis: row.get("selection_basis"),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .context("parse memory influence exclusion created_at")?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    async fn try_process_memory_candidates_on_close(&self, run_id: &str) {
+        match self.process_memory_candidates(Some(run_id), 100).await {
+            Ok(summary) => tracing::debug!(
+                run_id = %run_id,
+                scanned = summary.scanned,
+                "memory candidates processed on run close"
+            ),
+            Err(error) => tracing::warn!(
+                run_id = %run_id,
+                error = %error,
+                "memory candidate processing failed on run close; candidates remain pending for retry"
+            ),
+        }
+    }
+
+    async fn try_generate_consolidation_candidates_on_close(&self, run_id: &str) {
+        match self.generate_consolidation_candidates(run_id).await {
+            Ok(candidates) => tracing::debug!(
+                run_id = %run_id,
+                candidate_count = candidates.len(),
+                "generated consolidation candidates on run close"
+            ),
+            Err(error) => tracing::warn!(
+                run_id = %run_id,
+                error = %error,
+                "consolidation candidate generation failed on run close"
+            ),
         }
     }
 
@@ -15779,6 +17047,115 @@ Return JSON only.",
         Ok(records)
     }
 
+    pub async fn record_context_pull(
+        &self,
+        run_id: &str,
+        query: &str,
+        scope: &str,
+        max_tokens: u32,
+        tokens_returned: u32,
+        hits_returned: u32,
+        hit_previews: &[String],
+        trigger: Option<&str>,
+    ) -> Result<ContextPullRecord> {
+        let trigger = trigger
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let record = ContextPullRecord {
+            pull_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            query: query.to_string(),
+            scope: scope.to_string(),
+            max_tokens,
+            tokens_returned,
+            hits_returned,
+            hit_previews: hit_previews.to_vec(),
+            trigger,
+            created_at: Utc::now(),
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO context_pull_records (
+                pull_id, run_id, query, scope, max_tokens, tokens_returned,
+                hits_returned, hit_previews, trigger, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(&record.pull_id)
+        .bind(&record.run_id)
+        .bind(&record.query)
+        .bind(&record.scope)
+        .bind(i64::from(record.max_tokens))
+        .bind(i64::from(record.tokens_returned))
+        .bind(i64::from(record.hits_returned))
+        .bind(serde_json::to_string(&record.hit_previews)?)
+        .bind(&record.trigger)
+        .bind(record.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    pub async fn list_context_pull_records(&self, run_id: &str) -> Result<Vec<ContextPullRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT pull_id, run_id, query, scope, max_tokens, tokens_returned,
+                   hits_returned, hit_previews, trigger, created_at
+            FROM context_pull_records
+            WHERE run_id = ?1
+            ORDER BY created_at ASC, pull_id ASC
+            "#,
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(ContextPullRecord {
+                pull_id: row.get::<String, _>("pull_id"),
+                run_id: row.get::<String, _>("run_id"),
+                query: row.get::<String, _>("query"),
+                scope: row.get::<String, _>("scope"),
+                max_tokens: row.get::<i64, _>("max_tokens") as u32,
+                tokens_returned: row.get::<i64, _>("tokens_returned") as u32,
+                hits_returned: row.get::<i64, _>("hits_returned") as u32,
+                hit_previews: serde_json::from_str(row.get::<String, _>("hit_previews").as_str())
+                    .with_context(|| "parsing context pull hit_previews")?,
+                trigger: row.get::<Option<String>, _>("trigger"),
+                created_at: chrono::DateTime::parse_from_rfc3339(
+                    row.get::<String, _>("created_at").as_str(),
+                )?
+                .with_timezone(&Utc),
+            });
+        }
+        Ok(records)
+    }
+
+    pub async fn semantic_memory_search(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+        Ok(self
+            .semantic_memory
+            .search(query, limit)
+            .await?
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect())
+    }
+
+    pub async fn semantic_memory_store(
+        &self,
+        content: &str,
+        metadata: crate::memory::SemanticMemoryMetadata,
+    ) -> Result<()> {
+        self.semantic_memory
+            .store(crate::memory::SemanticMemoryWrite {
+                content: content.to_string(),
+                metadata,
+            })
+            .await
+    }
+
     pub async fn consolidate_run_for_operator(&self, run_id: &str) -> Result<Vec<LessonRecord>> {
         let run_dir = self.run_dir(run_id);
         let spec_path = run_dir.join("spec.yaml");
@@ -15792,6 +17169,292 @@ Return JSON only.",
         self.attach_lessons_to_blackboard(&run_dir, &lessons)
             .await?;
         Ok(lessons)
+    }
+
+    // ── Phase 5-D — PackChat memory distillation chain ──────────────────────
+
+    pub async fn list_memory_candidates_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::chat::MemoryCandidate>> {
+        self.chat.list_memory_candidates_for_run(run_id).await
+    }
+
+    pub async fn process_memory_candidates(
+        &self,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<MemoryCandidateProcessSummary> {
+        let limit = limit.clamp(1, 200);
+        let candidates = self
+            .chat
+            .list_pending_memory_candidates(run_id, limit)
+            .await?;
+        let mut summary = MemoryCandidateProcessSummary {
+            run_id: run_id.map(str::to_string),
+            scanned: candidates.len(),
+            ..Default::default()
+        };
+
+        for candidate in candidates {
+            let dedupe_key = candidate
+                .dedupe_key
+                .clone()
+                .filter(|key| !key.trim().is_empty())
+                .unwrap_or_else(|| memory_candidate_dedupe_key(&candidate));
+            summary.reconsolidations += self
+                .apply_memory_reconsolidation_triggers(&candidate)
+                .await?;
+            if candidate.sensitivity_label != "normal" {
+                self.chat
+                    .update_memory_candidate_processing(
+                        &candidate.candidate_id,
+                        "held_for_review",
+                        None,
+                        None,
+                        Some(&dedupe_key),
+                        None,
+                    )
+                    .await?;
+                summary.held_for_review += 1;
+                continue;
+            }
+
+            let distilled = distill_memory_candidate(&candidate);
+            match candidate.retention_class.as_str() {
+                "shared_recall" => {
+                    if self
+                        .openbrain_duplicate_exists(&candidate.candidate_id, &dedupe_key)
+                        .await?
+                    {
+                        self.chat
+                            .update_memory_candidate_processing(
+                                &candidate.candidate_id,
+                                "duplicate_openbrain",
+                                Some(&distilled),
+                                None,
+                                Some(&dedupe_key),
+                                None,
+                            )
+                            .await?;
+                        summary.duplicates += 1;
+                        continue;
+                    }
+
+                    if self.open_brain.is_some() {
+                        let metadata = crate::memory::SemanticMemoryMetadata {
+                            org: Some("harkonnen-labs".to_string()),
+                            role: Some("shared_recall".to_string()),
+                            product: candidate.spec_id.clone(),
+                            spec_id: candidate.spec_id.clone(),
+                            run_id: candidate.run_id.clone(),
+                            thread_id: candidate.thread_id.clone(),
+                            source_event_id: Some(candidate.source_event_id.clone()),
+                            agent: candidate
+                                .agent
+                                .clone()
+                                .or_else(|| Some("coobie".to_string())),
+                            memory_type: Some("packchat_distillation".to_string()),
+                            tags: vec![
+                                "packchat".to_string(),
+                                "shared_recall".to_string(),
+                                candidate.retention_class.clone(),
+                            ],
+                            sensitivity_label: Some(candidate.sensitivity_label.clone()),
+                            created_at: Some(candidate.created_at),
+                            ..Default::default()
+                        };
+                        match self.semantic_memory_store(&distilled, metadata).await {
+                            Ok(()) => {
+                                self.chat
+                                    .update_memory_candidate_processing(
+                                        &candidate.candidate_id,
+                                        "captured_openbrain",
+                                        Some(&distilled),
+                                        Some(&format!("openbrain:{}", candidate.candidate_id)),
+                                        Some(&dedupe_key),
+                                        None,
+                                    )
+                                    .await?;
+                                summary.captured_openbrain += 1;
+                            }
+                            Err(error) => {
+                                self.chat
+                                    .update_memory_candidate_processing(
+                                        &candidate.candidate_id,
+                                        "retry_pending",
+                                        Some(&distilled),
+                                        None,
+                                        Some(&dedupe_key),
+                                        None,
+                                    )
+                                    .await?;
+                                summary.retry_pending += 1;
+                                summary.errors.push(format!(
+                                    "{}: OB1 capture failed: {}",
+                                    candidate.candidate_id, error
+                                ));
+                            }
+                        }
+                    } else {
+                        self.chat
+                            .update_memory_candidate_processing(
+                                &candidate.candidate_id,
+                                "waiting_openbrain",
+                                Some(&distilled),
+                                None,
+                                Some(&dedupe_key),
+                                None,
+                            )
+                            .await?;
+                        summary.held_for_review += 1;
+                    }
+                }
+                "calvin_candidate" => {
+                    let contract = build_calvin_promotion_contract(&candidate, &distilled);
+                    match self
+                        .enqueue_calvin_promotion_candidate(&candidate, contract.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            self.chat
+                                .update_memory_candidate_processing(
+                                    &candidate.candidate_id,
+                                    "promotion_pending",
+                                    Some(&distilled),
+                                    None,
+                                    Some(&dedupe_key),
+                                    Some(&contract),
+                                )
+                                .await?;
+                            summary.calvin_promotions += 1;
+                        }
+                        Err(error) => {
+                            self.chat
+                                .update_memory_candidate_processing(
+                                    &candidate.candidate_id,
+                                    "retry_pending",
+                                    Some(&distilled),
+                                    None,
+                                    Some(&dedupe_key),
+                                    Some(&contract),
+                                )
+                                .await?;
+                            summary.retry_pending += 1;
+                            summary.errors.push(format!(
+                                "{}: Calvin promotion enqueue failed: {}",
+                                candidate.candidate_id, error
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    self.chat
+                        .update_memory_candidate_processing(
+                            &candidate.candidate_id,
+                            "ignored_ephemeral",
+                            Some(&distilled),
+                            None,
+                            Some(&dedupe_key),
+                            None,
+                        )
+                        .await?;
+                    summary.ignored += 1;
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    async fn openbrain_duplicate_exists(
+        &self,
+        candidate_id: &str,
+        dedupe_key: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1 FROM memory_candidates
+            WHERE candidate_id != ?1
+              AND status = 'captured_openbrain'
+              AND dedupe_key = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(dedupe_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn apply_memory_reconsolidation_triggers(
+        &self,
+        candidate: &crate::chat::MemoryCandidate,
+    ) -> Result<usize> {
+        let triggers = extract_memory_reconsolidation_triggers(candidate);
+        let mut updated = 0;
+        for candidate_id in triggers.candidate_ids {
+            if self
+                .chat
+                .mark_memory_candidate_needs_reconsolidation(
+                    &candidate_id,
+                    candidate,
+                    &triggers.reason,
+                )
+                .await?
+            {
+                updated += 1;
+            }
+        }
+        for source_event_id in triggers.source_event_ids {
+            updated += self
+                .chat
+                .mark_memory_source_needs_reconsolidation(
+                    &source_event_id,
+                    candidate,
+                    &triggers.reason,
+                )
+                .await?;
+        }
+        Ok(updated)
+    }
+
+    async fn enqueue_calvin_promotion_candidate(
+        &self,
+        candidate: &crate::chat::MemoryCandidate,
+        contract: serde_json::Value,
+    ) -> Result<()> {
+        let Some(run_id) = candidate.run_id.as_deref() else {
+            return Ok(());
+        };
+        let candidate_id = format!("calvin-promotion-{}", candidate.candidate_id);
+        if self.candidate_exists(&candidate_id).await? {
+            return Ok(());
+        }
+        let label = format!(
+            "[calvin] {} {}",
+            candidate.agent.as_deref().unwrap_or("packchat"),
+            candidate
+                .message_id
+                .as_deref()
+                .unwrap_or(candidate.candidate_id.as_str())
+        );
+        let consolidation = ConsolidationCandidate {
+            candidate_id,
+            run_id: run_id.to_string(),
+            kind: "calvin_promotion".to_string(),
+            status: "pending".to_string(),
+            content_json: contract,
+            edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: Vec::new(),
+            confidence: candidate.importance_score,
+            label,
+            created_at: Utc::now(),
+            reviewed_at: None,
+        };
+        self.insert_consolidation_candidate(&consolidation).await
     }
 
     // ── Phase 5 — Consolidation Workbench ─────────────────────────────────────
@@ -15879,6 +17542,8 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(&lesson).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: 0.8,
                 label,
                 created_at: Utc::now(),
@@ -15931,6 +17596,8 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(&lesson).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: attr.confidence.unwrap_or(0.5),
                 label,
                 created_at: Utc::now(),
@@ -15963,6 +17630,8 @@ Return JSON only.",
                 status: "pending".to_string(),
                 content_json: serde_json::to_value(hypothesis).unwrap_or_default(),
                 edited_json: None,
+                review_class: "standard".to_string(),
+                pattern_basis: Vec::new(),
                 confidence: hypothesis.confidence as f64,
                 label,
                 created_at: Utc::now(),
@@ -15972,9 +17641,203 @@ Return JSON only.",
             candidates.push(candidate);
         }
 
+        // ── Elevated schema-revision proposals ──
+        //
+        // These are deliberately stricter than single-run lessons. A schema
+        // revision changes how a class of situations is categorized, so it
+        // requires cross-episode evidence before the Workbench can even keep it.
+        let memory_candidates = self.chat.list_memory_candidates_for_run(run_id).await?;
+        for memory_candidate in memory_candidates
+            .iter()
+            .filter(|candidate| candidate.learning_intent == "prior_revision_target")
+        {
+            let basis = self
+                .schema_revision_pattern_basis(memory_candidate, 12)
+                .await?;
+            if !schema_revision_pattern_basis_is_valid(&basis) {
+                continue;
+            }
+            let candidate_id = format!(
+                "schema-revision-{}",
+                memory_candidate
+                    .dedupe_key
+                    .as_deref()
+                    .unwrap_or(&memory_candidate.candidate_id)
+            );
+            let candidate_id = normalize_consolidation_candidate_id(&candidate_id);
+            if self.candidate_exists(&candidate_id).await? {
+                continue;
+            }
+            let proposal = build_schema_revision_proposal(memory_candidate, &basis);
+            let label = format!(
+                "[schema revision] {}",
+                truncate_text(
+                    proposal
+                        .get("compiled_claim")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("prior-revision pattern"),
+                    96
+                )
+            );
+            let candidate = ConsolidationCandidate {
+                candidate_id,
+                run_id: run_id.to_string(),
+                kind: "schema_revision".to_string(),
+                status: "pending".to_string(),
+                content_json: proposal,
+                edited_json: None,
+                review_class: "elevated".to_string(),
+                pattern_basis: basis,
+                confidence: 0.72,
+                label,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            };
+            self.insert_consolidation_candidate(&candidate).await?;
+            candidates.push(candidate);
+        }
+
+        if let Some(candidate) = self
+            .build_cross_agent_pattern_candidate(run_id, &spec_obj)
+            .await?
+        {
+            if !self.candidate_exists(&candidate.candidate_id).await? {
+                self.insert_consolidation_candidate(&candidate).await?;
+                candidates.push(candidate);
+            }
+        }
+
         let _ = target_source;
         let _ = spec_obj;
         Ok(candidates)
+    }
+
+    async fn build_cross_agent_pattern_candidate(
+        &self,
+        run_id: &str,
+        spec_obj: &Spec,
+    ) -> Result<Option<ConsolidationCandidate>> {
+        let family_id = self.spec_family_for_spec_id(&spec_obj.id).await?;
+        let basis = self
+            .cross_agent_pattern_basis(run_id, &family_id, CROSS_AGENT_PATTERN_MIN_BASIS_RUNS * 4)
+            .await?;
+        if basis.len() < CROSS_AGENT_PATTERN_MIN_BASIS_RUNS
+            || !basis
+                .iter()
+                .any(|item| item.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id))
+        {
+            return Ok(None);
+        }
+
+        let candidate_id = normalize_consolidation_candidate_id(&format!(
+            "cross-agent-pattern-{family_id}-scout-ambiguity-mason-failure"
+        ));
+        if self.candidate_exists(&candidate_id).await? {
+            return Ok(None);
+        }
+        let confidence = (0.55 + (basis.len() as f64 * 0.08)).min(0.9);
+        let proposal = serde_json::json!({
+            "schema": "harkonnen.cross_agent_pattern.v1",
+            "spec_family": family_id,
+            "pattern": "Scout ambiguity signals co-occur with Mason/Bramble implementation failure in the same spec family.",
+            "source_role": "scout",
+            "affected_role": "mason",
+            "recommended_action": "Inject a cross-agent briefing note into Scout and Mason scopes: when Scout sees this ambiguity shape, require explicit acceptance-criteria and scope confirmation before Mason begins implementation.",
+            "review_state": {
+                "status": "pending",
+                "review_required": true,
+                "reason": "Cross-agent pattern spans role boundaries and must be reviewed before promotion."
+            },
+            "basis_run_count": basis.len(),
+            "basis": basis.clone(),
+        });
+        let basis_run_count = basis.len();
+        Ok(Some(ConsolidationCandidate {
+            candidate_id,
+            run_id: run_id.to_string(),
+            kind: "cross_agent_pattern".to_string(),
+            status: "pending".to_string(),
+            content_json: proposal,
+            edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: basis,
+            confidence,
+            label: format!(
+                "[cross-agent] Scout ambiguity -> Mason failure ({family_id}, {} runs)",
+                basis_run_count
+            ),
+            created_at: Utc::now(),
+            reviewed_at: None,
+        }))
+    }
+
+    async fn cross_agent_pattern_basis(
+        &self,
+        current_run_id: &str,
+        family_id: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let profile = self.load_spec_family_profile(family_id).await?;
+        let family_spec_ids = profile
+            .as_ref()
+            .map(|profile| profile.spec_ids.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        if family_spec_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT run_id, spec_id, status, created_at
+            FROM runs
+            ORDER BY created_at DESC, run_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut basis = Vec::new();
+        for row in rows {
+            let spec_id: String = row.get("spec_id");
+            if !family_spec_ids.contains(&spec_id) {
+                continue;
+            }
+            let run_id: String = row.get("run_id");
+            let attributions = self.list_phase_attributions_for_run(&run_id).await?;
+            let Some(scout) = attributions
+                .iter()
+                .find(|attr| attribution_has_scout_ambiguity(attr))
+            else {
+                continue;
+            };
+            let Some(mason) = attributions
+                .iter()
+                .find(|attr| attribution_has_mason_failure(attr))
+            else {
+                continue;
+            };
+            basis.push(serde_json::json!({
+                "run_id": run_id,
+                "spec_id": spec_id,
+                "run_status": row.get::<String, _>("status"),
+                "scout_attribution_id": scout.attribution_id,
+                "scout_episode_id": scout.episode_id,
+                "scout_outcome": scout.outcome,
+                "scout_signals": cross_agent_signal_preview(scout),
+                "mason_attribution_id": mason.attribution_id,
+                "mason_episode_id": mason.episode_id,
+                "mason_phase": mason.phase,
+                "mason_outcome": mason.outcome,
+            }));
+            if basis.len() >= limit
+                && basis.iter().any(|item| {
+                    item.get("run_id").and_then(serde_json::Value::as_str) == Some(current_run_id)
+                })
+            {
+                break;
+            }
+        }
+        Ok(basis)
     }
 
     /// Return all candidates for a run, ordered by confidence descending.
@@ -15985,7 +17848,7 @@ Return JSON only.",
         let rows = sqlx::query(
             r#"
             SELECT candidate_id, run_id, kind, status, content_json, edited_json,
-                   confidence, label, created_at, reviewed_at
+                   review_class, pattern_basis_json, confidence, label, created_at, reviewed_at
             FROM consolidation_candidates
             WHERE run_id = ?1
             ORDER BY confidence DESC, created_at ASC
@@ -16009,6 +17872,11 @@ Return JSON only.",
                 edited_json: row
                     .get::<Option<String>, _>("edited_json")
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                review_class: row.get::<String, _>("review_class"),
+                pattern_basis: row
+                    .get::<Option<String>, _>("pattern_basis_json")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
                 confidence: row.get::<f64, _>("confidence"),
                 label: row.get::<String, _>("label"),
                 created_at: chrono::DateTime::parse_from_rfc3339(
@@ -16025,6 +17893,56 @@ Return JSON only.",
         Ok(out)
     }
 
+    async fn load_consolidation_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Option<ConsolidationCandidate>> {
+        let row = sqlx::query(
+            r#"
+            SELECT candidate_id, run_id, kind, status, content_json, edited_json,
+                   review_class, pattern_basis_json, confidence, label, created_at, reviewed_at
+            FROM consolidation_candidates
+            WHERE candidate_id = ?1
+            "#,
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ConsolidationCandidate {
+            candidate_id: row.get::<String, _>("candidate_id"),
+            run_id: row.get::<String, _>("run_id"),
+            kind: row.get::<String, _>("kind"),
+            status: row.get::<String, _>("status"),
+            content_json: row
+                .get::<Option<String>, _>("content_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            edited_json: row
+                .get::<Option<String>, _>("edited_json")
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            review_class: row.get::<String, _>("review_class"),
+            pattern_basis: row
+                .get::<Option<String>, _>("pattern_basis_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            confidence: row.get::<f64, _>("confidence"),
+            label: row.get::<String, _>("label"),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                row.get::<String, _>("created_at").as_str(),
+            )?
+            .with_timezone(&Utc),
+            reviewed_at: row
+                .get::<Option<String>, _>("reviewed_at")
+                .map(|s| chrono::DateTime::parse_from_rfc3339(&s))
+                .transpose()?
+                .map(|dt| dt.with_timezone(&Utc)),
+        }))
+    }
+
     /// Set a candidate's status to `"kept"` or `"discarded"`.
     pub async fn review_consolidation_candidate(
         &self,
@@ -16033,6 +17951,13 @@ Return JSON only.",
     ) -> Result<()> {
         if status != "kept" && status != "discarded" {
             bail!("invalid consolidation status: {status}; must be 'kept' or 'discarded'");
+        }
+        if status == "kept" {
+            let candidate = self
+                .load_consolidation_candidate(candidate_id)
+                .await?
+                .with_context(|| format!("consolidation candidate not found: {candidate_id}"))?;
+            validate_consolidation_candidate_for_keep(&candidate)?;
         }
         sqlx::query(
             "UPDATE consolidation_candidates SET status = ?2, reviewed_at = ?3 WHERE candidate_id = ?1",
@@ -16051,6 +17976,12 @@ Return JSON only.",
         candidate_id: &str,
         edited_json: serde_json::Value,
     ) -> Result<()> {
+        let mut candidate = self
+            .load_consolidation_candidate(candidate_id)
+            .await?
+            .with_context(|| format!("consolidation candidate not found: {candidate_id}"))?;
+        candidate.edited_json = Some(edited_json.clone());
+        validate_consolidation_candidate_for_keep(&candidate)?;
         let json_str = serde_json::to_string(&edited_json)?;
         sqlx::query(
             r#"UPDATE consolidation_candidates
@@ -16090,8 +18021,9 @@ Return JSON only.",
                 continue;
             }
             if candidate.kind != "lesson" {
-                // causal_link / pattern candidates are stored in their own
-                // tables (causal_hypotheses) — not lesson memory.
+                // causal_link / pattern / schema_revision candidates are not
+                // promoted into lesson memory. Schema revisions require a later
+                // governed Ethos/Calvin integration path.
                 continue;
             }
 
@@ -16168,6 +18100,86 @@ Return JSON only.",
         Ok(row.is_some())
     }
 
+    async fn schema_revision_pattern_basis(
+        &self,
+        seed: &crate::chat::MemoryCandidate,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let dedupe_key = seed
+            .dedupe_key
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| memory_candidate_dedupe_key(seed));
+        if dedupe_key.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT candidate_id, source_event_id, run_id, spec_id, message_id,
+                   agent, role, raw_payload, distilled_content,
+                   evidence_refs, created_at
+            FROM memory_candidates
+            WHERE learning_intent = 'prior_revision_target'
+              AND dedupe_key = ?1
+              AND status NOT IN ('discarded', 'ignored_ephemeral')
+            ORDER BY created_at ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(&dedupe_key)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut seen_runs = BTreeSet::new();
+        let mut basis = Vec::new();
+        for row in rows {
+            let run_id = row.get::<Option<String>, _>("run_id");
+            let Some(run_id_value) = run_id.as_deref().filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            if !seen_runs.insert(run_id_value.to_string()) {
+                continue;
+            }
+            let raw_payload = row
+                .get::<Option<String>, _>("raw_payload")
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .unwrap_or_default();
+            let content = row
+                .get::<Option<String>, _>("distilled_content")
+                .or_else(|| {
+                    raw_payload
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    raw_payload
+                        .get("content_preview")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            basis.push(serde_json::json!({
+                "run_id": run_id_value,
+                "spec_id": row.get::<Option<String>, _>("spec_id"),
+                "candidate_id": row.get::<String, _>("candidate_id"),
+                "source_event_id": row.get::<String, _>("source_event_id"),
+                "message_id": row.get::<Option<String>, _>("message_id"),
+                "agent": row.get::<Option<String>, _>("agent"),
+                "role": row.get::<String, _>("role"),
+                "evidence_refs": row
+                    .get::<Option<String>, _>("evidence_refs")
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                "content_preview": truncate_text(&content, 240),
+                "created_at": row.get::<String, _>("created_at"),
+            }));
+        }
+        Ok(basis)
+    }
+
     async fn insert_consolidation_candidate(
         &self,
         candidate: &ConsolidationCandidate,
@@ -16175,8 +18187,8 @@ Return JSON only.",
         sqlx::query(
             r#"INSERT OR IGNORE INTO consolidation_candidates
                (candidate_id, run_id, kind, status, content_json, edited_json,
-                confidence, label, created_at, reviewed_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                review_class, pattern_basis_json, confidence, label, created_at, reviewed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
         )
         .bind(&candidate.candidate_id)
         .bind(&candidate.run_id)
@@ -16190,6 +18202,8 @@ Return JSON only.",
                 .map(|v| serde_json::to_string(v))
                 .transpose()?,
         )
+        .bind(&candidate.review_class)
+        .bind(serde_json::to_string(&candidate.pattern_basis)?)
         .bind(candidate.confidence)
         .bind(&candidate.label)
         .bind(candidate.created_at.to_rfc3339())
@@ -18118,13 +20132,17 @@ fn build_implementation_plan(
 }
 
 fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadata) -> Vec<String> {
+    let spec_family = derive_spec_family_profile(spec_obj, target_source);
     let mut terms = vec![
         spec_obj.id.clone(),
+        spec_family.family_id.clone(),
+        spec_family.label.clone(),
         spec_obj.title.clone(),
         spec_obj.purpose.clone(),
         target_source.label.clone(),
         target_source.source_kind.clone(),
     ];
+    terms.extend(spec_family.fingerprint.clone());
 
     for value in spec_obj
         .scope
@@ -18175,6 +20193,301 @@ fn build_coobie_query_terms(spec_obj: &Spec, target_source: &TargetSourceMetadat
         }
     }
     unique
+}
+
+fn parse_spec_family_profile(row: sqlx::sqlite::SqliteRow) -> Result<SpecFamilyProfile> {
+    let created_at = row.get::<String, _>("created_at");
+    let updated_at = row.get::<String, _>("updated_at");
+    let fingerprint_raw = row.get::<String, _>("fingerprint_json");
+    let spec_ids_raw = row.get::<String, _>("spec_ids_json");
+    let fingerprint = serde_json::from_str::<Vec<String>>(&fingerprint_raw).unwrap_or_default();
+    let spec_ids = serde_json::from_str::<Vec<String>>(&spec_ids_raw).unwrap_or_default();
+    Ok(SpecFamilyProfile {
+        family_id: row.get("family_id"),
+        label: row.get("label"),
+        fingerprint,
+        spec_ids,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+            .context("parse spec family created_at")?
+            .with_timezone(&Utc),
+        updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .context("parse spec family updated_at")?
+            .with_timezone(&Utc),
+    })
+}
+
+fn derive_spec_family_profile(
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+) -> SpecFamilyProfile {
+    let mut tokens = spec_family_tokens(spec_obj, target_source);
+    if tokens.is_empty() {
+        tokens.push("general".to_string());
+    }
+    let label = choose_spec_family_label(&tokens);
+    let family_id = normalize_spec_family_id(&label);
+    let now = Utc::now();
+    SpecFamilyProfile {
+        family_id,
+        label,
+        fingerprint: tokens.into_iter().take(24).collect(),
+        spec_ids: vec![spec_obj.id.clone()],
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn derive_spec_family_id_from_text(value: &str) -> String {
+    let words = normalize_spec_family_words(value);
+    if words.is_empty() {
+        "general".to_string()
+    } else {
+        words.into_iter().take(3).collect::<Vec<_>>().join("_")
+    }
+}
+
+fn choose_spec_family_label(tokens: &[String]) -> String {
+    let domain_pairs = [
+        ("auth", "auth_service"),
+        ("oauth", "auth_service"),
+        ("jwt", "auth_service"),
+        ("login", "auth_service"),
+        ("permission", "auth_service"),
+        ("billing", "billing"),
+        ("invoice", "billing"),
+        ("payment", "billing"),
+        ("checkout", "billing"),
+        ("search", "search"),
+        ("retrieval", "retrieval"),
+        ("memory", "memory"),
+        ("packchat", "packchat"),
+        ("calvin", "calvin_archive"),
+        ("archive", "calvin_archive"),
+        ("api", "api_contract"),
+        ("endpoint", "api_contract"),
+        ("schema", "schema_migration"),
+        ("migration", "schema_migration"),
+        ("cli", "cli_tooling"),
+        ("test", "test_harness"),
+        ("validation", "test_harness"),
+    ];
+    for (needle, family) in domain_pairs {
+        if tokens.iter().any(|token| token == needle) {
+            return family.to_string();
+        }
+    }
+    tokens.iter().take(3).cloned().collect::<Vec<_>>().join("_")
+}
+
+fn spec_family_tokens(spec_obj: &Spec, target_source: &TargetSourceMetadata) -> Vec<String> {
+    let corpus = format!(
+        "{} {} {} {} {} {} {} {} {} {} {} {}",
+        spec_obj.id,
+        spec_obj.title,
+        spec_obj.purpose,
+        target_source.label,
+        target_source.source_kind,
+        spec_obj.scope.join(" "),
+        spec_obj.constraints.join(" "),
+        spec_obj.inputs.join(" "),
+        spec_obj.outputs.join(" "),
+        spec_obj.acceptance_criteria.join(" "),
+        spec_obj.dependencies.join(" "),
+        spec_obj.security_expectations.join(" ")
+    );
+    normalize_spec_family_words(&corpus)
+}
+
+fn normalize_spec_family_words(value: &str) -> Vec<String> {
+    let stop = [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "spec",
+        "service",
+        "system",
+        "feature",
+        "update",
+        "implement",
+        "build",
+        "create",
+        "support",
+        "ensure",
+        "harkonnen",
+        "labs",
+        "factory",
+        "project",
+        "run",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            push_spec_family_word(&mut words, &stop, &current);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        push_spec_family_word(&mut words, &stop, &current);
+    }
+    words
+}
+
+fn push_spec_family_word(words: &mut Vec<String>, stop: &HashSet<&str>, raw: &str) {
+    if raw.len() < 3 || stop.contains(raw) {
+        return;
+    }
+    if !words.iter().any(|word| word == raw) {
+        words.push(raw.to_string());
+    }
+}
+
+fn normalize_spec_family_id(label: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+    for ch in label.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_sep = false;
+        } else if !last_was_sep && !normalized.is_empty() {
+            normalized.push('_');
+            last_was_sep = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "general".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn apply_spec_family_memory_bias(
+    hits: &mut Vec<String>,
+    family_id: &str,
+    fingerprint: &[String],
+    limit: usize,
+) -> SpecFamilyRetrievalProof {
+    let flat_top_hit = hits.first().cloned();
+    let mut indexed = hits
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, hit)| {
+            let score = spec_family_memory_score(&hit, family_id, fingerprint);
+            (index, score, hit)
+        })
+        .collect::<Vec<_>>();
+    indexed.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let family_hit_count = indexed.iter().filter(|(_, score, _)| *score > 0).count();
+    let unrelated_hit_count = indexed.len().saturating_sub(family_hit_count);
+    let reranked = indexed
+        .into_iter()
+        .map(|(_, _, hit)| hit)
+        .collect::<Vec<_>>();
+    let family_biased_top_hit = reranked.first().cloned();
+    *hits = reranked.into_iter().take(limit).collect();
+    SpecFamilyRetrievalProof {
+        schema: "harkonnen.spec_family_retrieval_proof.v1".to_string(),
+        spec_family: family_id.to_string(),
+        flat_top_hit: flat_top_hit.clone(),
+        family_biased_top_hit: family_biased_top_hit.clone(),
+        family_hit_count,
+        unrelated_hit_count,
+        improved: flat_top_hit != family_biased_top_hit && family_hit_count > 0,
+    }
+}
+
+fn spec_family_memory_score(hit: &str, family_id: &str, fingerprint: &[String]) -> i32 {
+    let normalized = hit.to_ascii_lowercase();
+    let mut score = 0;
+    let family_terms = normalize_spec_family_words(family_id);
+    for term in family_terms {
+        if normalized.contains(&term) {
+            score += 8;
+        }
+    }
+    if normalized.contains(&family_id.replace('_', " ")) || normalized.contains(family_id) {
+        score += 12;
+    }
+    for term in fingerprint.iter().take(12) {
+        let term = term.trim().to_ascii_lowercase();
+        if term.len() >= 3 && normalized.contains(&term) {
+            score += 2;
+        }
+    }
+    score
+}
+
+fn attribution_has_scout_ambiguity(attr: &PhaseAttributionRecord) -> bool {
+    let role_phase = format!("{} {}", attr.agent_name, attr.phase).to_ascii_lowercase();
+    if !role_phase.contains("scout") && !role_phase.contains("intake") {
+        return false;
+    }
+    if attr.outcome != "success" {
+        return true;
+    }
+    let signal_text = cross_agent_signal_text(attr);
+    [
+        "ambigu",
+        "scope_creep",
+        "scope creep",
+        "spec_ambiguity",
+        "clarif",
+    ]
+    .iter()
+    .any(|needle| signal_text.contains(needle))
+}
+
+fn attribution_has_mason_failure(attr: &PhaseAttributionRecord) -> bool {
+    let role_phase = format!("{} {}", attr.agent_name, attr.phase).to_ascii_lowercase();
+    let is_mason_lane = role_phase.contains("mason")
+        || role_phase.contains("implementation")
+        || role_phase.contains("build")
+        || role_phase.contains("validation");
+    is_mason_lane && attr.outcome != "success"
+}
+
+fn cross_agent_signal_text(attr: &PhaseAttributionRecord) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        attr.outcome,
+        attr.phase,
+        attr.agent_name,
+        attr.query_terms.join(" "),
+        attr.required_checks.join(" "),
+        attr.guardrails.join(" "),
+        attr.memory_hits.join(" ")
+    )
+    .to_ascii_lowercase()
+}
+
+fn cross_agent_signal_preview(attr: &PhaseAttributionRecord) -> Vec<String> {
+    attr.query_terms
+        .iter()
+        .chain(attr.required_checks.iter())
+        .chain(attr.guardrails.iter())
+        .chain(attr.memory_hits.iter())
+        .filter(|value| {
+            let normalized = value.to_ascii_lowercase();
+            normalized.contains("ambigu")
+                || normalized.contains("scope")
+                || normalized.contains("clarif")
+        })
+        .take(5)
+        .cloned()
+        .collect()
 }
 
 fn infer_domain_signals(
@@ -22976,6 +25289,23 @@ fn extract_memory_entry_id(hit: &str) -> Option<String> {
     }
 }
 
+fn normalize_briefing_hit_key(hit: &str) -> String {
+    let mut text = hit.trim();
+
+    while let Some(rest) = text.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            break;
+        };
+        text = rest[end + 1..].trim_start();
+    }
+
+    if let Some((before_source, _)) = text.split_once(" [source:") {
+        text = before_source.trim_end();
+    }
+
+    normalize_text_key(text)
+}
+
 fn format_yaml_list(items: &[String]) -> String {
     if items.is_empty() {
         "[]".to_string()
@@ -23527,11 +25857,16 @@ fn render_validation_repair_markdown(report: &ValidationRepairArtifact) -> Strin
             .iter()
             .map(|attempt| {
                 format!(
-                    "## Iteration {}\n\n- Outcome: {}\n- Passed after: {}\n- Edits applied: {}\n- Failure kind before: {}\n- Failure kind after: {}\n- Proposal summary: {}\n- Guidance: {}\n\n### Before\n{}\n\n### After\n{}\n\n### Before failing checks\n{}\n\n### After failing checks\n{}\n\n### Proposal rationale\n{}",
+                    "## Iteration {}\n\n- Outcome: {}\n- Passed after: {}\n- Edits applied: {}\n- Edited files: {}\n- Failure kind before: {}\n- Failure kind after: {}\n- Proposal summary: {}\n- Guidance: {}\n\n### Before\n{}\n\n### After\n{}\n\n### Before failing checks\n{}\n\n### After failing checks\n{}\n\n### Proposal rationale\n{}",
                     attempt.iteration,
                     attempt.outcome,
                     if attempt.passed_after { "true" } else { "false" },
                     attempt.edits_applied,
+                    if attempt.edited_files.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        attempt.edited_files.join(", ")
+                    },
                     attempt.failure_kind_before.as_deref().unwrap_or("unknown"),
                     attempt.failure_kind_after.as_deref().unwrap_or("unknown"),
                     attempt.proposal_summary,
@@ -23568,6 +25903,575 @@ fn render_validation_repair_markdown(report: &ValidationRepairArtifact) -> Strin
         report.generated_at,
         attempts,
     )
+}
+
+fn build_plan_completion_audit(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    final_status: &str,
+    validation: Option<&ValidationSummary>,
+    hidden_scenarios: Option<&HiddenScenarioSummary>,
+    run_dir: &Path,
+) -> PlanCompletionAuditArtifact {
+    let mut items = Vec::new();
+    items.push(plan_audit_core_item(
+        "core.visible_validation",
+        "evidence",
+        "Visible validation evidence must exist before run close.",
+        validation.is_some_and(|summary| summary.passed),
+        validation.is_some(),
+        run_dir,
+        &["validation.json"],
+    ));
+    items.push(plan_audit_core_item(
+        "core.hidden_scenarios",
+        "evidence",
+        "Hidden scenario evidence must exist before run close.",
+        hidden_scenarios.is_some_and(|summary| summary.passed),
+        hidden_scenarios.is_some(),
+        run_dir,
+        &["hidden_scenarios.json"],
+    ));
+
+    for (index, criterion) in spec_obj.acceptance_criteria.iter().enumerate() {
+        items.push(plan_audit_requirement_item(
+            &format!("spec.acceptance.{}", index + 1),
+            "spec.acceptance_criteria",
+            criterion,
+            final_status,
+            validation,
+            hidden_scenarios,
+            run_dir,
+        ));
+    }
+    for (index, output) in spec_obj.outputs.iter().enumerate() {
+        items.push(plan_audit_requirement_item(
+            &format!("spec.output.{}", index + 1),
+            "spec.outputs",
+            output,
+            final_status,
+            validation,
+            hidden_scenarios,
+            run_dir,
+        ));
+    }
+    if let Some(blueprint) = spec_obj.scenario_blueprint.as_ref() {
+        for (index, artifact) in blueprint.required_artifacts.iter().enumerate() {
+            let exists = run_dir.join(artifact).exists();
+            items.push(PlanCompletionAuditItem {
+                item_id: format!("scenario.required_artifact.{}", index + 1),
+                source: "spec.scenario_blueprint.required_artifacts".to_string(),
+                requirement: artifact.clone(),
+                status: if exists { "fulfilled" } else { "missing" }.to_string(),
+                evidence_refs: if exists {
+                    vec![artifact.clone()]
+                } else {
+                    Vec::new()
+                },
+                note: if exists {
+                    "Required scenario artifact exists.".to_string()
+                } else {
+                    "Required scenario artifact was not found in the run directory.".to_string()
+                },
+            });
+        }
+    }
+
+    let unresolved_count = items
+        .iter()
+        .filter(|item| item.status != "fulfilled")
+        .count();
+    let summary = if unresolved_count == 0 {
+        "All audited plan/spec items have supporting evidence.".to_string()
+    } else {
+        format!(
+            "{unresolved_count} audited item(s) need review before treating the run as complete."
+        )
+    };
+
+    PlanCompletionAuditArtifact {
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        final_status: final_status.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        summary,
+        unresolved_count,
+        items,
+    }
+}
+
+fn plan_audit_core_item(
+    item_id: &str,
+    source: &str,
+    requirement: &str,
+    passed: bool,
+    evidence_present: bool,
+    run_dir: &Path,
+    artifact_candidates: &[&str],
+) -> PlanCompletionAuditItem {
+    let evidence_refs = artifact_candidates
+        .iter()
+        .filter(|artifact| run_dir.join(artifact).exists())
+        .map(|artifact| (*artifact).to_string())
+        .collect::<Vec<_>>();
+    let status = if passed {
+        "fulfilled"
+    } else if evidence_present {
+        "partial"
+    } else {
+        "missing"
+    };
+    let note = match status {
+        "fulfilled" => "Evidence exists and the check passed.",
+        "partial" => "Evidence exists but the check did not fully pass.",
+        _ => "No evidence artifact was available for this check.",
+    };
+    PlanCompletionAuditItem {
+        item_id: item_id.to_string(),
+        source: source.to_string(),
+        requirement: requirement.to_string(),
+        status: status.to_string(),
+        evidence_refs,
+        note: note.to_string(),
+    }
+}
+
+fn plan_audit_requirement_item(
+    item_id: &str,
+    source: &str,
+    requirement: &str,
+    final_status: &str,
+    validation: Option<&ValidationSummary>,
+    hidden_scenarios: Option<&HiddenScenarioSummary>,
+    run_dir: &Path,
+) -> PlanCompletionAuditItem {
+    let lower = requirement.to_ascii_lowercase();
+    let wants_validation = lower.contains("test")
+        || lower.contains("build")
+        || lower.contains("compile")
+        || lower.contains("validat");
+    let wants_hidden = lower.contains("scenario")
+        || lower.contains("hidden")
+        || lower.contains("behavior")
+        || lower.contains("behaviour");
+    let validation_ok = validation.is_some_and(|summary| summary.passed);
+    let hidden_ok = hidden_scenarios.is_some_and(|summary| summary.passed);
+    let status = if wants_validation {
+        if validation_ok {
+            "fulfilled"
+        } else if validation.is_some() {
+            "partial"
+        } else {
+            "missing"
+        }
+    } else if wants_hidden {
+        if hidden_ok {
+            "fulfilled"
+        } else if hidden_scenarios.is_some() {
+            "partial"
+        } else {
+            "missing"
+        }
+    } else if final_status == "completed" {
+        "fulfilled"
+    } else if validation.is_some() || hidden_scenarios.is_some() {
+        "partial"
+    } else {
+        "missing"
+    };
+    let mut evidence_refs = Vec::new();
+    for artifact in [
+        "validation.json",
+        "hidden_scenarios.json",
+        "mason_edit_application.json",
+        "causal_report.json",
+        "blackboard.json",
+    ] {
+        if run_dir.join(artifact).exists() {
+            evidence_refs.push(artifact.to_string());
+        }
+    }
+    let note = match status {
+        "fulfilled" => "Requirement has supporting completion evidence.",
+        "partial" => "Requirement has some evidence, but the run did not fully satisfy it.",
+        _ => "Requirement has no supporting evidence in this run.",
+    };
+    PlanCompletionAuditItem {
+        item_id: item_id.to_string(),
+        source: source.to_string(),
+        requirement: requirement.to_string(),
+        status: status.to_string(),
+        evidence_refs,
+        note: note.to_string(),
+    }
+}
+
+fn render_plan_completion_audit_markdown(audit: &PlanCompletionAuditArtifact) -> String {
+    let items = if audit.items.is_empty() {
+        "- No audit items were generated.".to_string()
+    } else {
+        audit
+            .items
+            .iter()
+            .map(|item| {
+                format!(
+                    "- [{}] {} — {} ({})\n  Evidence: {}\n  Note: {}",
+                    item.status,
+                    item.item_id,
+                    item.requirement,
+                    item.source,
+                    render_inline_list(&item.evidence_refs, "none"),
+                    item.note
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Plan Completion Audit\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Final status: {}\n- Generated at: {}\n- Unresolved items: {}\n\n{}\n\n## Items\n{}",
+        audit.run_id,
+        audit.spec_id,
+        audit.product,
+        audit.final_status,
+        audit.generated_at,
+        audit.unresolved_count,
+        audit.summary,
+        items,
+    )
+}
+
+fn behavioral_prior_revision_candidate(
+    candidate: &crate::chat::MemoryCandidate,
+) -> BehavioralPriorRevisionCandidate {
+    BehavioralPriorRevisionCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        source_event_id: candidate.source_event_id.clone(),
+        message_id: candidate.message_id.clone(),
+        retention_class: candidate.retention_class.clone(),
+        source_authority: candidate.source_authority.clone(),
+        content_preview: memory_candidate_preview(candidate, 220),
+    }
+}
+
+fn build_behavioral_change_report(
+    run_id: &str,
+    spec_obj: &Spec,
+    target_source: &TargetSourceMetadata,
+    final_status: &str,
+    metrics: BehavioralChangeMetrics,
+    prior_revision_candidates: Vec<BehavioralPriorRevisionCandidate>,
+) -> BehavioralChangeReportArtifact {
+    let status = if prior_revision_candidates.is_empty() {
+        "no_prior_revision"
+    } else if final_status == "completed"
+        && metrics.plan_audit_unresolved_count == 0
+        && metrics.validation_passed.unwrap_or(true)
+        && metrics.hidden_scenarios_passed.unwrap_or(true)
+    {
+        "possible_shift"
+    } else {
+        "stored_not_learned_pending"
+    };
+    let summary = match status {
+        "no_prior_revision" => {
+            "No prior-revision memory candidates were present for this run.".to_string()
+        }
+        "possible_shift" => format!(
+            "{} prior-revision candidate(s) were present and the run closed cleanly; later calibrated scoring can test whether behavior actually shifted.",
+            prior_revision_candidates.len()
+        ),
+        _ => format!(
+            "{} prior-revision candidate(s) were present, but unresolved evidence remains before Harkonnen should claim learning.",
+            prior_revision_candidates.len()
+        ),
+    };
+
+    BehavioralChangeReportArtifact {
+        schema: "harkonnen.behavioral_change_report.v1".to_string(),
+        run_id: run_id.to_string(),
+        spec_id: spec_obj.id.clone(),
+        product: target_source.label.clone(),
+        final_status: final_status.to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        status: status.to_string(),
+        summary,
+        metrics,
+        prior_revision_candidates,
+    }
+}
+
+fn render_behavioral_change_report_markdown(report: &BehavioralChangeReportArtifact) -> String {
+    let prior_revision_candidates = if report.prior_revision_candidates.is_empty() {
+        "- None.".to_string()
+    } else {
+        report
+            .prior_revision_candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "- {} ({}, {})\n  Source: {}\n  Preview: {}",
+                    candidate.candidate_id,
+                    candidate.retention_class,
+                    candidate.source_authority,
+                    candidate.source_event_id,
+                    candidate.content_preview
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "# Behavioral Change Report\n\n- Run: {}\n- Spec: {}\n- Product: {}\n- Final status: {}\n- Generated at: {}\n- Status: {}\n\n{}\n\n## Metrics\n\n- Checkpoints: {}\n- Clarifications: {}\n- Validation repair attempts: {}\n- Retry count: {}\n- Plan audit unresolved: {}\n- Validation passed: {}\n- Hidden scenarios passed: {}\n\n## Prior Revision Candidates\n{}",
+        report.run_id,
+        report.spec_id,
+        report.product,
+        report.final_status,
+        report.generated_at,
+        report.status,
+        report.summary,
+        report.metrics.checkpoint_count,
+        report.metrics.clarification_count,
+        report.metrics.validation_repair_attempts,
+        report.metrics.retry_count,
+        report.metrics.plan_audit_unresolved_count,
+        render_optional_bool(report.metrics.validation_passed),
+        render_optional_bool(report.metrics.hidden_scenarios_passed),
+        prior_revision_candidates,
+    )
+}
+
+fn render_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn memory_candidate_preview(candidate: &crate::chat::MemoryCandidate, max_chars: usize) -> String {
+    let content = candidate
+        .distilled_content
+        .clone()
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| candidate.operation.clone());
+    truncate_text(&content, max_chars)
+}
+
+fn build_schema_revision_proposal(
+    candidate: &crate::chat::MemoryCandidate,
+    pattern_basis: &[serde_json::Value],
+) -> serde_json::Value {
+    let claim = memory_candidate_preview(candidate, 360);
+    serde_json::json!({
+        "schema": "harkonnen.schema_revision_proposal.v1",
+        "candidate_type": "schema_revision",
+        "compiled_claim": claim,
+        "source_candidate_id": candidate.candidate_id,
+        "source_event_id": candidate.source_event_id,
+        "source_authority": candidate.source_authority,
+        "retention_class": candidate.retention_class,
+        "learning_intent": candidate.learning_intent,
+        "pattern_basis": pattern_basis,
+        "minimum_basis_required": 3,
+        "distinct_run_basis_required": true,
+        "single_run_disallowed": true,
+        "operator_endorsement_required": true,
+        "review_class": "elevated",
+        "integration_recommendation": "Submit to the governed Consolidation Workbench as a schema-level proposal; do not promote from a single run.",
+    })
+}
+
+fn validate_consolidation_candidate_for_keep(candidate: &ConsolidationCandidate) -> Result<()> {
+    if candidate.kind != "schema_revision" {
+        return Ok(());
+    }
+    let content = candidate
+        .edited_json
+        .as_ref()
+        .unwrap_or(&candidate.content_json);
+    let basis = content
+        .get("pattern_basis")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| candidate.pattern_basis.clone());
+    if !schema_revision_pattern_basis_is_valid(&basis) {
+        bail!(
+            "schema_revision candidates require pattern_basis from at least 3 distinct runs before they can be kept"
+        );
+    }
+    if content
+        .get("operator_endorsement_required")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        bail!("schema_revision candidates must require operator_endorsement_required=true");
+    }
+    Ok(())
+}
+
+fn schema_revision_pattern_basis_is_valid(pattern_basis: &[serde_json::Value]) -> bool {
+    let distinct_runs = pattern_basis
+        .iter()
+        .filter_map(|entry| entry.get("run_id").and_then(serde_json::Value::as_str))
+        .filter(|run_id| !run_id.trim().is_empty())
+        .collect::<BTreeSet<_>>();
+    pattern_basis.len() >= 3 && distinct_runs.len() >= 3
+}
+
+fn normalize_consolidation_candidate_id(value: &str) -> String {
+    let normalized = normalize_text_key(value)
+        .split_whitespace()
+        .take(18)
+        .collect::<Vec<_>>()
+        .join("-");
+    if normalized.is_empty() {
+        format!("candidate-{}", Uuid::new_v4())
+    } else {
+        normalized
+    }
+}
+
+async fn load_validation_repair_attempt_count(run_dir: &Path) -> Result<usize> {
+    let path = run_dir.join("validation_repair_attempts.json");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed
+        .get("attempts")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0))
+}
+
+fn code_review_learning_records_from_validation_repair(
+    report: &ValidationRepairArtifact,
+) -> Vec<CodeReviewLearningRecord> {
+    report
+        .attempts
+        .iter()
+        .map(|attempt| {
+            let fingerprint = code_review_learning_fingerprint(report, attempt);
+            let severity = match attempt.outcome.as_str() {
+                "regressed" => "high",
+                "stalled" => "medium",
+                "improved" => "medium",
+                _ => "low",
+            };
+            let resolution = match attempt.outcome.as_str() {
+                "resolved" | "improved" => "auto_fixed",
+                _ => "skipped",
+            };
+            let lesson = match attempt.outcome.as_str() {
+                "resolved" => format!(
+                    "Mason repair resolved Bramble validation after iteration {}: {}",
+                    attempt.iteration, attempt.proposal_summary
+                ),
+                "improved" => format!(
+                    "Mason repair improved Bramble validation but left follow-up checks: {}",
+                    render_inline_list(&attempt.after_failing_checks, "none")
+                ),
+                "regressed" => format!(
+                    "Mason repair regressed validation; avoid repeating this edit pattern: {}",
+                    attempt.proposal_summary
+                ),
+                _ => format!(
+                    "Mason repair stalled validation; choose a different implementation strategy than: {}",
+                    attempt.proposal_summary
+                ),
+            };
+            CodeReviewLearningRecord {
+                record_id: format!("review-learning-{}-{}", report.run_id, fingerprint),
+                run_id: report.run_id.clone(),
+                source_agent: "mason".to_string(),
+                reviewer_agent: "bramble".to_string(),
+                finding_fingerprint: fingerprint,
+                files: attempt.edited_files.clone(),
+                severity: severity.to_string(),
+                resolution: resolution.to_string(),
+                lesson,
+                evidence_refs: vec![
+                    "validation_repair_attempts.json".to_string(),
+                    "validation_repair_attempts.md".to_string(),
+                ],
+                stale_if_file_changed: attempt.edited_files.clone(),
+                status: "active".to_string(),
+                created_at: report.generated_at.clone(),
+            }
+        })
+        .collect()
+}
+
+fn code_review_learning_fingerprint(
+    report: &ValidationRepairArtifact,
+    attempt: &ValidationRepairAttemptRecord,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    report.spec_id.hash(&mut hasher);
+    report.product.hash(&mut hasher);
+    attempt.outcome.hash(&mut hasher);
+    attempt.failure_kind_before.hash(&mut hasher);
+    attempt.failure_kind_after.hash(&mut hasher);
+    attempt.proposal_summary.hash(&mut hasher);
+    attempt.edited_files.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn parse_code_review_learning_record(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<CodeReviewLearningRecord> {
+    Ok(CodeReviewLearningRecord {
+        record_id: row.get("record_id"),
+        run_id: row.get("run_id"),
+        source_agent: row.get("source_agent"),
+        reviewer_agent: row.get("reviewer_agent"),
+        finding_fingerprint: row.get("finding_fingerprint"),
+        files: row
+            .get::<Option<String>, _>("files_json")
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
+        severity: row.get("severity"),
+        resolution: row.get("resolution"),
+        lesson: row.get("lesson"),
+        evidence_refs: row
+            .get::<Option<String>, _>("evidence_refs_json")
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
+        stale_if_file_changed: row
+            .get::<Option<String>, _>("stale_if_file_changed_json")
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn render_inline_list(items: &[String], empty: &str) -> String {
+    if items.is_empty() {
+        empty.to_string()
+    } else {
+        items.join(", ")
+    }
 }
 
 fn command_trial_pattern_key(phase: &str, raw_command: &str, classification: &str) -> String {
@@ -24070,11 +26974,7 @@ fn briefing_scope_for_agent(agent_name: &str) -> Option<BriefingScope> {
 }
 
 fn estimate_briefing_tokens(text: &str) -> u32 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-    ((trimmed.chars().count() as u32) + 3) / 4
+    crate::memory::estimate_briefing_tokens(text)
 }
 
 fn select_budgeted_memory_hits(
@@ -24337,8 +27237,197 @@ fn build_scoped_briefing(base: &CoobieBriefing, scope: BriefingScope) -> CoobieB
         _ => {}
     }
 
+    scoped.briefing_blocks = build_named_briefing_blocks(&scoped);
     scoped.coobie_response = crate::coobie::render_coobie_briefing_response(&scoped);
     scoped
+}
+
+fn build_named_briefing_blocks(briefing: &CoobieBriefing) -> Vec<BriefingBlock> {
+    let prior_causes = briefing
+        .prior_causes
+        .iter()
+        .map(|cause| {
+            format!(
+                "{} (occurrences={}, scenario_pass_rate={:.2})",
+                cause.description, cause.occurrences, cause.scenario_pass_rate
+            )
+        })
+        .collect::<Vec<_>>();
+    let causal_patterns = join_briefing_lines(
+        &[
+            ("Prior causes", prior_causes),
+            ("Pattern focus", briefing.pattern_matching_focus.clone()),
+            ("Causal-chain focus", briefing.causal_chain_focus.clone()),
+        ],
+        "No causal pattern signals selected for this briefing.",
+    );
+
+    let mut operator_profile_lines = Vec::new();
+    if let Some(context) = &briefing.operator_model_context {
+        operator_profile_lines.push(format!("Operator model: {}", context.summary));
+        operator_profile_lines.extend(
+            context
+                .risk_tolerances
+                .iter()
+                .take(4)
+                .map(|value| format!("Risk tolerance: {value}")),
+        );
+        operator_profile_lines.extend(
+            context
+                .preferred_tools
+                .iter()
+                .take(4)
+                .map(|value| format!("Preferred tool: {value}")),
+        );
+    }
+    if let Some(context) = &briefing.project_interview_context {
+        operator_profile_lines.push(format!("Project purpose: {}", context.repo_purpose));
+        operator_profile_lines.push(format!("Operator intent: {}", context.operator_intent));
+    }
+    if let Some(context) = &briefing.soul_identity_context {
+        operator_profile_lines.push(format!("Identity thesis: {}", context.identity_thesis));
+        operator_profile_lines.extend(
+            context
+                .preserved_invariants
+                .iter()
+                .take(4)
+                .map(|value| format!("Preserved invariant: {value}")),
+        );
+    }
+    let operator_profile = join_plain_briefing_lines(
+        operator_profile_lines,
+        "No operator, project interview, or identity context applied.",
+    );
+
+    let project_components = briefing
+        .project_components
+        .iter()
+        .map(|component| format!("{}: {}", component.name, component.path))
+        .collect::<Vec<_>>();
+    let active_run = join_briefing_lines(
+        &[
+            ("Query terms", briefing.query_terms.clone()),
+            ("Domain signals", briefing.domain_signals.clone()),
+            ("Project components", project_components),
+            ("Resume summary", briefing.resume_packet_summary.clone()),
+        ],
+        "No active-run context selected for this briefing.",
+    );
+
+    let open_checks = join_briefing_lines(
+        &[
+            ("Application risks", briefing.application_risks.clone()),
+            ("Environment risks", briefing.environment_risks.clone()),
+            (
+                "Regulatory considerations",
+                briefing.regulatory_considerations.clone(),
+            ),
+            ("Guardrails", briefing.recommended_guardrails.clone()),
+            ("Required checks", briefing.required_checks.clone()),
+            ("Open questions", briefing.open_questions.clone()),
+        ],
+        "No open checks selected for this briefing.",
+    );
+
+    let lessons = briefing
+        .relevant_lessons
+        .iter()
+        .map(|lesson| {
+            lesson
+                .intervention
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|intervention| format!("{} -> {}", lesson.pattern, intervention))
+                .unwrap_or_else(|| lesson.pattern.clone())
+        })
+        .collect::<Vec<_>>();
+    let resume_risks = briefing
+        .resume_packet_risks
+        .iter()
+        .map(|risk| format!("{} ({})", risk.summary, risk.memory_id))
+        .collect::<Vec<_>>();
+    let recalled_lessons = join_briefing_lines(
+        &[
+            ("Memory hits", briefing.memory_hits.clone()),
+            ("Core memory hits", briefing.core_memory_hits.clone()),
+            ("Project memory hits", briefing.project_memory_hits.clone()),
+            ("Relevant lessons", lessons),
+            ("Resume risks", resume_risks),
+            (
+                "Stale-memory mitigation",
+                briefing.stale_memory_mitigation_plan.clone(),
+            ),
+        ],
+        "No recalled lessons selected for this briefing.",
+    );
+
+    vec![
+        briefing_block(
+            "causal_patterns",
+            "causal memory + palace patrol",
+            causal_patterns,
+        ),
+        briefing_block(
+            "operator_profile",
+            "operator model + project interview + soul identity",
+            operator_profile,
+        ),
+        briefing_block("active_run", "working memory", active_run),
+        briefing_block("open_checks", "scope filter output", open_checks),
+        briefing_block(
+            "recalled_lessons",
+            "semantic memory + file store + resume packet",
+            recalled_lessons,
+        ),
+    ]
+}
+
+fn briefing_block(name: &str, source: &str, content: String) -> BriefingBlock {
+    BriefingBlock {
+        name: name.to_string(),
+        source: source.to_string(),
+        token_count: estimate_briefing_tokens(&content),
+        content,
+    }
+}
+
+fn join_plain_briefing_lines(lines: Vec<String>, fallback: &str) -> String {
+    let values = lines
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        fallback.to_string()
+    } else {
+        values
+            .into_iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn join_briefing_lines(groups: &[(&str, Vec<String>)], fallback: &str) -> String {
+    let mut out = Vec::new();
+    for (label, values) in groups {
+        let values = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            continue;
+        }
+        out.push(format!("{label}:"));
+        out.extend(values.into_iter().map(|value| format!("- {value}")));
+    }
+
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out.join("\n")
+    }
 }
 
 fn render_sable_context_summary(briefing: &CoobieBriefing) -> String {
@@ -24701,6 +27790,13 @@ fn assess_validation_repair_attempt(
         iteration,
         proposal_summary: proposal.summary.clone(),
         proposal_rationale: proposal.rationale.clone(),
+        edited_files: proposal
+            .edits
+            .iter()
+            .map(|edit| edit.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         edits_applied,
         before_summary: summarize_validation(before),
         after_summary: summarize_validation(after),
@@ -26297,10 +29393,12 @@ fn preview_text(value: &str, limit: usize) -> Option<String> {
 }
 
 fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBriefing {
-    CoobieBriefing {
+    let mut briefing = CoobieBriefing {
         spec_id: spec
             .map(|value| value.id.clone())
             .unwrap_or_else(|| "unknown-spec".to_string()),
+        spec_family: spec.map(|value| derive_spec_family_id_from_text(&value.id)),
+        spec_family_retrieval: None,
         product: run_id.to_string(),
         query_terms: Vec::new(),
         domain_signals: Vec::new(),
@@ -26332,6 +29430,7 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         target_token_budget: 0,
         briefing_tokens_used: 0,
         briefing_hits_provided: 0,
+        briefing_blocks: Vec::new(),
         required_sections_applied: Vec::new(),
         application_risks: Vec::new(),
         environment_risks: Vec::new(),
@@ -26344,7 +29443,9 @@ fn fallback_tool_gateway_briefing(run_id: &str, spec: Option<&Spec>) -> CoobieBr
         open_questions: Vec::new(),
         coobie_response: "Invocation gateway fallback briefing".to_string(),
         generated_at: Utc::now(),
-    }
+    };
+    briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
+    briefing
 }
 
 fn pearl_hierarchy_for_causal_link(link_type: &str) -> PearlHierarchyLevel {
@@ -26844,6 +29945,329 @@ fn build_stakeholder_alignment_summary(
             &["Project posture question"],
         ),
     })
+}
+
+fn distill_memory_candidate(candidate: &crate::chat::MemoryCandidate) -> String {
+    let content = candidate
+        .raw_payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default()
+        .trim();
+    let content = if content.is_empty() {
+        candidate
+            .distilled_content
+            .as_deref()
+            .unwrap_or("PackChat event with no textual content")
+    } else {
+        content
+    };
+    let agent = candidate.agent.as_deref().unwrap_or("packchat");
+    let run = candidate.run_id.as_deref().unwrap_or("no-run");
+    let thread = candidate.thread_id.as_deref().unwrap_or("no-thread");
+    format!(
+        "{} [source: PackChat thread={}, run={}, agent={}, candidate={}]",
+        content.trim(),
+        thread,
+        run,
+        agent,
+        candidate.candidate_id
+    )
+}
+
+fn memory_candidate_dedupe_key(candidate: &crate::chat::MemoryCandidate) -> String {
+    let content = candidate
+        .raw_payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_else(|| candidate.distilled_content.as_deref().unwrap_or_default());
+    normalize_text_key(content)
+}
+
+fn normalize_text_key(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut prev_space = false;
+    for ch in content.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(mapped);
+            prev_space = false;
+        }
+    }
+    out.split_whitespace()
+        .take(80)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn memory_influence_key(content: &str) -> String {
+    let normalized = normalize_text_key(content);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn select_memory_influence_exclusion(
+    run_id: &str,
+    phase: &str,
+    memory_key: &str,
+    probability: f64,
+) -> bool {
+    let probability = probability.clamp(0.0, 1.0);
+    if probability <= 0.0 || memory_key.is_empty() {
+        return false;
+    }
+    if probability >= 1.0 {
+        return true;
+    }
+    let mut hasher = DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    phase.hash(&mut hasher);
+    memory_key.hash(&mut hasher);
+    let bucket = hasher.finish() % 10_000;
+    bucket < (probability * 10_000.0).round() as u64
+}
+
+fn memory_influence_preview(content: &str, max_chars: usize) -> String {
+    let mut preview = content.chars().take(max_chars).collect::<String>();
+    if content.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+#[derive(Debug, Default)]
+struct MemoryReconsolidationTriggers {
+    candidate_ids: BTreeSet<String>,
+    source_event_ids: BTreeSet<String>,
+    reason: String,
+}
+
+fn extract_memory_reconsolidation_triggers(
+    candidate: &crate::chat::MemoryCandidate,
+) -> MemoryReconsolidationTriggers {
+    let mut triggers = MemoryReconsolidationTriggers {
+        reason: "newer PackChat evidence superseded or revised an earlier memory candidate"
+            .to_string(),
+        ..Default::default()
+    };
+
+    collect_reconsolidation_targets_from_json(&candidate.raw_payload, &mut triggers);
+    if let Some(metadata) = candidate.raw_payload.get("metadata_json") {
+        collect_reconsolidation_targets_from_json(metadata, &mut triggers);
+    }
+    collect_reconsolidation_targets_from_json(&candidate.evidence_refs, &mut triggers);
+
+    triggers
+}
+
+fn collect_reconsolidation_targets_from_json(
+    value: &serde_json::Value,
+    triggers: &mut MemoryReconsolidationTriggers,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_reconsolidation_targets_from_json(item, triggers);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "revises_candidate_id",
+                "supersedes_candidate_id",
+                "invalidates_candidate_id",
+                "memory_revises_candidate_id",
+                "memory_supersedes_candidate_id",
+            ] {
+                if let Some(target) = map.get(key).and_then(serde_json::Value::as_str) {
+                    if !target.trim().is_empty() {
+                        triggers.candidate_ids.insert(target.trim().to_string());
+                    }
+                }
+            }
+            for key in [
+                "revises_source_event_id",
+                "supersedes_source_event_id",
+                "invalidates_source_event_id",
+                "memory_revises_source_event_id",
+                "memory_supersedes_source_event_id",
+            ] {
+                if let Some(target) = map.get(key).and_then(serde_json::Value::as_str) {
+                    if !target.trim().is_empty() {
+                        triggers.source_event_ids.insert(target.trim().to_string());
+                    }
+                }
+            }
+
+            let ref_type = map
+                .get("ref_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(
+                ref_type,
+                "revises_memory_candidate"
+                    | "supersedes_memory_candidate"
+                    | "invalidates_memory_candidate"
+            ) {
+                if let Some(target) = map.get("id").and_then(serde_json::Value::as_str) {
+                    if !target.trim().is_empty() {
+                        triggers.candidate_ids.insert(target.trim().to_string());
+                    }
+                }
+            }
+            if matches!(
+                ref_type,
+                "revises_source_event" | "supersedes_source_event" | "invalidates_source_event"
+            ) {
+                if let Some(target) = map.get("id").and_then(serde_json::Value::as_str) {
+                    if !target.trim().is_empty() {
+                        triggers.source_event_ids.insert(target.trim().to_string());
+                    }
+                }
+            }
+
+            if let Some(reason) = map
+                .get("reconsolidation_reason")
+                .or_else(|| map.get("supersession_reason"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if !reason.trim().is_empty() {
+                    triggers.reason = reason.trim().to_string();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn memory_candidate_plain_content(candidate: &crate::chat::MemoryCandidate) -> String {
+    candidate
+        .raw_payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            candidate
+                .raw_payload
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or(candidate.distilled_content.as_deref())
+        .unwrap_or("PackChat event with no textual content")
+        .trim()
+        .to_string()
+}
+
+fn calvin_evidence_timeline(
+    candidate: &crate::chat::MemoryCandidate,
+    distilled: &str,
+) -> serde_json::Value {
+    let refs = candidate
+        .evidence_refs
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let entries = refs
+        .into_iter()
+        .enumerate()
+        .map(|(index, evidence_ref)| {
+            let ref_type = evidence_ref
+                .get("ref_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            serde_json::json!({
+                "sequence": index + 1,
+                "observed_at": candidate.created_at.to_rfc3339(),
+                "source_authority": crate::chat::evidence_ref_source_authority(ref_type),
+                "evidence_ref": evidence_ref,
+                "claim_fragment": distilled,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        serde_json::json!([{
+            "sequence": 1,
+            "observed_at": candidate.created_at.to_rfc3339(),
+            "source_authority": "agent_observation",
+            "evidence_ref": {
+                "ref_type": "memory_candidate",
+                "id": candidate.candidate_id,
+            },
+            "claim_fragment": distilled,
+        }])
+    } else {
+        serde_json::Value::Array(entries)
+    }
+}
+
+fn build_calvin_promotion_contract(
+    candidate: &crate::chat::MemoryCandidate,
+    distilled: &str,
+) -> serde_json::Value {
+    let mut contract = candidate
+        .calvin_contract_json
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !contract.is_object() {
+        contract = serde_json::json!({});
+    }
+    contract["schema"] = serde_json::Value::String("harkonnen.calvin.promotion.v1".to_string());
+    contract["candidate_id"] = serde_json::Value::String(candidate.candidate_id.clone());
+    contract["source_event_id"] = serde_json::Value::String(candidate.source_event_id.clone());
+    contract["compiled_claim"] =
+        serde_json::Value::String(memory_candidate_plain_content(candidate));
+    contract["distilled_content"] = serde_json::Value::String(distilled.to_string());
+    contract["retention_class"] = serde_json::Value::String(candidate.retention_class.clone());
+    contract["sensitivity_label"] = serde_json::Value::String(candidate.sensitivity_label.clone());
+    contract["source_authority"] = serde_json::Value::String(candidate.source_authority.clone());
+    contract["evidence_timeline"] = calvin_evidence_timeline(candidate, distilled);
+    contract["staleness_triggers"] = serde_json::json!([
+        "newer_conflicting_evidence",
+        "source_event_superseded",
+        "confidence_changed",
+        "sensitivity_label_changed",
+        "operator_rejected_or_modified_claim"
+    ]);
+    contract["review_state"] = serde_json::json!({
+        "status": "pending",
+        "review_required": true,
+        "reason": "calvin promotion requires governed review before canonical archive mutation"
+    });
+    contract["integration_recommendation"] = serde_json::Value::String("quarantine".to_string());
+    contract["recommended_governance_outcome"] =
+        serde_json::Value::String("quarantine".to_string());
+    contract["preservation_note"] = serde_json::Value::String(
+        "Promotion is a governed proposal. Calvin canonical state must not be mutated until an operator or Meta-Governor accepts, modifies, rejects, or quarantines it.".to_string(),
+    );
+    contract["evidence_refs"] = candidate.evidence_refs.clone();
+    contract["causality"] = candidate.causality_json.clone();
+    contract["pathos_score"] = serde_json::json!(candidate.importance_score);
+    contract["chamber_targets"] = serde_json::json!(["mythos", "episteme", "praxis"]);
+    contract
 }
 
 fn phase_to_calvin_chamber(phase: &str) -> crate::calvin_client::Chamber {
@@ -27512,6 +30936,7 @@ fn structured_benchmark_intent(spec_obj: &Spec) -> Option<IntentPackage> {
 
     Some(IntentPackage {
         spec_id: spec_obj.id.clone(),
+        spec_family: Some(derive_spec_family_id_from_text(&target_label)),
         summary: format!(
             "Execute the structured DevBench task for {} using the repo_config-grounded harness.",
             target_label
@@ -27626,10 +31051,464 @@ fn render_run_timing_markdown(report: &RunTimingReport) -> String {
     lines.join("\n")
 }
 
+/// Synthesize a prediction from the Coobie briefing using heuristic risk factors.
+///
+/// This is marked `basic_heuristic` — Phase 7 replaces it with a model-driven
+/// classifier trained on the causal attribution corpus.
+fn synthesize_run_prediction(
+    run_id: &str,
+    spec_id: &str,
+    briefing: &CoobieBriefing,
+) -> crate::calvin_client::RunPrediction {
+    let max_occurrences = briefing
+        .prior_causes
+        .iter()
+        .map(|c| c.occurrences)
+        .max()
+        .unwrap_or(0);
+    let min_pass_rate = briefing
+        .prior_causes
+        .iter()
+        .map(|c| c.scenario_pass_rate)
+        .fold(1.0f32, f32::min);
+
+    let mut risk: f64 = 0.0;
+    // Prior cause frequency is the strongest signal.
+    if max_occurrences >= 3 {
+        risk += 0.4;
+    } else if max_occurrences >= 1 {
+        risk += 0.2;
+    }
+    // Many required checks → higher complexity → higher failure probability.
+    if briefing.required_checks.len() > 5 {
+        risk += 0.2;
+    } else if briefing.required_checks.len() > 2 {
+        risk += 0.1;
+    }
+    // Low historical scenario pass rate on relevant causes.
+    if min_pass_rate < 0.5 {
+        risk += 0.3;
+    } else if min_pass_rate < 0.8 {
+        risk += 0.15;
+    }
+    // Many open questions → spec ambiguity risk.
+    if briefing.open_questions.len() > 3 {
+        risk += 0.1;
+    }
+    risk = risk.min(1.0);
+
+    let predicted_outcome = if risk >= 0.6 {
+        "fail"
+    } else if risk >= 0.3 {
+        "uncertain"
+    } else {
+        "pass"
+    };
+
+    // Map the most frequent prior cause to a predicted failing phase.
+    let predicted_failure_phase = briefing
+        .prior_causes
+        .iter()
+        .max_by_key(|c| c.occurrences)
+        .map(|c| phase_from_cause_id(&c.cause_id).to_string());
+
+    let source_cause_ids = briefing
+        .prior_causes
+        .iter()
+        .map(|c| c.cause_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let confidence = if risk > 0.3 { 0.7 } else { 0.5 };
+
+    let narrative = format!(
+        "Coobie predicts '{}' for run {} (spec: {}). Risk score: {:.2}. \
+         Based on {} prior cause(s), {} required check(s), \
+         and minimum scenario pass rate {:.0}%.",
+        predicted_outcome,
+        run_id,
+        spec_id,
+        risk,
+        briefing.prior_causes.len(),
+        briefing.required_checks.len(),
+        min_pass_rate * 100.0,
+    );
+
+    crate::calvin_client::RunPrediction {
+        prediction_id: uuid::Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        predicted_outcome: predicted_outcome.to_string(),
+        risk_score: risk,
+        confidence,
+        failure_phase: predicted_failure_phase,
+        failure_kind: None, // heuristic; Phase 7 refines with FailureKind classifier
+        source_cause_ids,
+        narrative_summary: narrative,
+    }
+}
+
+/// Map a PriorCauseSignal cause_id to the most likely failing factory phase.
+fn phase_from_cause_id(cause_id: &str) -> &str {
+    if cause_id.contains("SPEC") || cause_id.contains("AMBIG") {
+        "scout"
+    } else if cause_id.contains("TWIN") || cause_id.contains("ENV") {
+        "twin"
+    } else if cause_id.contains("TEST") || cause_id.contains("BLIND") {
+        "validation"
+    } else if cause_id.contains("PACK") || cause_id.contains("BREAKDOWN") {
+        "orchestration"
+    } else if cause_id.contains("MEMORY") || cause_id.contains("PRIOR") {
+        "preflight"
+    } else {
+        "unknown"
+    }
+}
+
+/// Compute prediction error: 0.0 = correct prediction, 1.0 = completely wrong.
+///
+/// Asymmetric by design: missing a real failure (false confidence) is penalised
+/// more heavily than raising a false alarm.
+pub(crate) fn compute_prediction_error(predicted: &str, actual: &str) -> f64 {
+    match (predicted, actual) {
+        ("pass", "completed") => 0.0,
+        ("fail", "failed") => 0.0,
+        ("uncertain", _) => 0.2,      // never fully wrong when uncertain
+        ("pass", "failed") => 1.0,    // missed a real failure — worst outcome
+        ("fail", "completed") => 0.6, // false alarm — less harmful than false confidence
+        ("pass", "completed_with_issues") => 0.4,
+        ("fail", "completed_with_issues") => 0.1,
+        ("uncertain", "completed") => 0.1,
+        ("uncertain", "failed") => 0.2,
+        _ => 0.5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
     use chrono::{Duration, TimeZone};
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    type OpenBrainThoughts = Arc<Mutex<Vec<String>>>;
+
+    async fn spawn_openbrain_round_trip_mock() -> (String, OpenBrainThoughts) {
+        let thoughts: OpenBrainThoughts = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock openbrain");
+        let addr = listener.local_addr().expect("mock openbrain addr");
+        let app = Router::new()
+            .route("/", post(openbrain_round_trip_dispatch))
+            .with_state(Arc::clone(&thoughts));
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock openbrain");
+        });
+
+        (format!("http://{addr}"), thoughts)
+    }
+
+    async fn openbrain_round_trip_dispatch(
+        State(thoughts): State<OpenBrainThoughts>,
+        Json(req): Json<Value>,
+    ) -> impl IntoResponse {
+        let id = req.get("id").cloned().unwrap_or(json!(1));
+        let tool = req
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let args = req
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let result = match tool {
+            "capture_thought" => {
+                if let Some(content) = args.get("content").and_then(Value::as_str) {
+                    thoughts
+                        .lock()
+                        .expect("thoughts lock")
+                        .push(content.to_string());
+                }
+                json!({"content": [{"type": "text", "text": "ok"}]})
+            }
+            "search_thoughts" => {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let matches = thoughts
+                    .lock()
+                    .expect("thoughts lock")
+                    .iter()
+                    .filter(|thought| {
+                        let thought_lc = thought.to_ascii_lowercase();
+                        query
+                            .split_whitespace()
+                            .filter(|term| term.len() > 2)
+                            .all(|term| thought_lc.contains(term))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                json!({"content": [{"type": "text", "text": matches.join("\n")}]})
+            }
+            _ => json!({"content": [{"type": "text", "text": "unknown tool"}]}),
+        };
+
+        Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    }
+
+    async fn test_app_with_openbrain(openbrain_url: String) -> (tempfile::TempDir, AppContext) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let factory = root.join("factory");
+        let memory = factory.join("memory");
+        let logs = factory.join("logs");
+        let specs = factory.join("specs");
+        let scenarios = factory.join("scenarios");
+        let artifacts = factory.join("artifacts");
+        let workspaces = factory.join("workspaces");
+        let products = root.join("products");
+        for path in [
+            &factory,
+            &memory,
+            &logs,
+            &specs,
+            &scenarios,
+            &artifacts,
+            &workspaces,
+            &products,
+        ] {
+            std::fs::create_dir_all(path).expect("create test path");
+        }
+
+        let setup = crate::setup::SetupConfig {
+            setup: crate::setup::SetupMeta {
+                name: "test".to_string(),
+                template: None,
+                role: None,
+                organization: None,
+                platform: std::env::consts::OS.to_string(),
+                anythingllm: Some(false),
+                openclaw: Some(false),
+            },
+            machine: None,
+            providers: crate::setup::ProvidersConfig {
+                default: "test".to_string(),
+                claude: None,
+                gemini: None,
+                codex: None,
+                extras: std::collections::HashMap::new(),
+            },
+            routing: None,
+            mcp: None,
+            calvin_archive: crate::setup::CalvinConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            twilight_bark: crate::setup::TwilightBarkConfig::default(),
+            open_brain: crate::setup::OpenBrainConfig {
+                connection_url: Some(openbrain_url),
+                timeout_ms: 750,
+                ..Default::default()
+            },
+            sub_agents: crate::setup::SubAgentConfig::default(),
+        };
+
+        let paths = Paths {
+            root,
+            factory: factory.clone(),
+            specs,
+            scenarios,
+            artifacts,
+            logs: logs.clone(),
+            workspaces,
+            memory: memory.clone(),
+            db_file: factory.join("state.db"),
+            products,
+            setup,
+        };
+        let pool = db::init_db(&paths).await.expect("init db");
+        let memory_store = MemoryStore::new(paths.memory.clone());
+        let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
+        let (event_tx, _) = tokio::sync::broadcast::channel(16);
+        let chat = crate::chat::ChatStore::new(pool.clone());
+        let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
+        let open_brain =
+            crate::openbrain::OpenBrainClient::new(&paths.setup.open_brain).expect("openbrain");
+        let dispatcher = crate::subagent::SubAgentDispatcher::new(
+            paths.setup.sub_agents.clone(),
+            paths.setup.clone(),
+        );
+        let semantic_memory: Arc<dyn crate::memory::SemanticMemory> =
+            if let Some(client) = open_brain.as_ref() {
+                Arc::new(crate::memory::OpenBrainSemanticMemory::new(client.clone()))
+            } else {
+                Arc::new(crate::memory::NoopSemanticMemory)
+            };
+        let app = AppContext {
+            paths,
+            pool,
+            memory_store,
+            blackboard: Arc::new(RwLock::new(BlackboardState::default())),
+            coobie,
+            embedding_store: None,
+            event_tx,
+            chat,
+            operator_models,
+            started_at: std::time::Instant::now(),
+            calvin: None,
+            open_brain,
+            semantic_memory,
+            dispatcher,
+        };
+        (dir, app)
+    }
+
+    async fn insert_memory_candidate_for_test(
+        app: &AppContext,
+        run_id: &str,
+        candidate_id: &str,
+        retention_class: &str,
+        sensitivity_label: &str,
+        content: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO memory_candidates
+                (candidate_id, source_event_id, thread_id, run_id, spec_id, message_id,
+                 agent_runtime_id, agent, role, operation, raw_payload, distilled_content,
+                 dedupe_key, importance_score, retention_class, sensitivity_label,
+                 evidence_refs, causality_json, status, created_at)
+            VALUES (?1, ?2, 'thread-memory-chain', ?3, 'spec-memory-chain', ?4,
+                    'coobie#test', 'coobie', 'agent', 'packchat.message_appended',
+                    ?5, NULL, NULL, 0.82, ?6, ?7, ?8, ?9, 'pending', ?10)
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(format!("event-{candidate_id}"))
+        .bind(run_id)
+        .bind(format!("msg-{candidate_id}"))
+        .bind(json!({"content": content}).to_string())
+        .bind(retention_class)
+        .bind(sensitivity_label)
+        .bind(
+            json!([{"ref_type": "packchat_message", "id": format!("msg-{candidate_id}")}])
+                .to_string(),
+        )
+        .bind(json!({"correlation_id": run_id, "causation_id": null}).to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .expect("insert memory candidate");
+    }
+
+    fn sample_target_source() -> TargetSourceMetadata {
+        TargetSourceMetadata {
+            label: "labrador-subsystem".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "/tmp/labrador-subsystem".to_string(),
+            git: None,
+        }
+    }
+
+    fn sample_auth_spec(id: &str, title: &str) -> Spec {
+        Spec {
+            id: id.to_string(),
+            title: title.to_string(),
+            purpose: "Improve OAuth login and JWT permission boundaries for the auth module."
+                .to_string(),
+            scope: vec!["Update authentication API endpoints".to_string()],
+            constraints: vec!["Preserve existing session semantics".to_string()],
+            inputs: vec!["OAuth callback payload".to_string()],
+            outputs: vec!["Validated login response".to_string()],
+            acceptance_criteria: vec!["JWT scope checks reject unauthorized users".to_string()],
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: vec!["oauth".to_string(), "jwt".to_string()],
+            performance_expectations: Vec::new(),
+            security_expectations: vec!["Do not weaken permission checks".to_string()],
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        }
+    }
+
+    async fn insert_test_phase_attribution(
+        app: &AppContext,
+        run_id: &str,
+        phase: &str,
+        agent_name: &str,
+        outcome: &str,
+        query_terms: Vec<String>,
+        required_checks: Vec<String>,
+    ) {
+        let episode_id = format!("episode-{run_id}-{phase}-{agent_name}");
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO episodes (episode_id, run_id, phase, goal, outcome, confidence, started_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, 0.7, ?6)
+            "#,
+        )
+        .bind(&episode_id)
+        .bind(run_id)
+        .bind(phase)
+        .bind(format!("{agent_name} {phase}"))
+        .bind(outcome)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .expect("insert episode");
+        app.upsert_phase_attribution(&PhaseAttributionRecord {
+            attribution_id: format!("phase-attribution-{episode_id}"),
+            run_id: run_id.to_string(),
+            episode_id,
+            phase: phase.to_string(),
+            agent_name: agent_name.to_string(),
+            outcome: outcome.to_string(),
+            confidence: Some(0.7),
+            prompt_bundle_fingerprint: None,
+            prompt_bundle_provider: None,
+            prompt_bundle_artifact: None,
+            pinned_skill_ids: Vec::new(),
+            memory_hits: Vec::new(),
+            core_memory_ids: Vec::new(),
+            project_memory_ids: Vec::new(),
+            relevant_lesson_ids: Vec::new(),
+            required_checks,
+            guardrails: Vec::new(),
+            query_terms,
+            briefing_scope: briefing_scope_for_agent(agent_name),
+            briefing_token_budget: 800,
+            briefing_tokens_used: 120,
+            briefing_hits_provided: 1,
+            stakeholder_alignment: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("insert phase attribution");
+    }
+
+    async fn write_run_spec_for_test(app: &AppContext, run_id: &str, spec: &Spec) {
+        let run_dir = app.run_dir(run_id);
+        tokio::fs::create_dir_all(&run_dir)
+            .await
+            .expect("create run dir");
+        tokio::fs::write(
+            run_dir.join("spec.yaml"),
+            serde_yaml::to_string(spec).expect("serialize spec"),
+        )
+        .await
+        .expect("write run spec");
+    }
 
     fn sample_run(run_id: &str) -> RunRecord {
         RunRecord {
@@ -27664,6 +31543,8 @@ mod tests {
     fn sample_briefing() -> CoobieBriefing {
         CoobieBriefing {
             spec_id: "spec-1".to_string(),
+            spec_family: Some("spec_1".to_string()),
+            spec_family_retrieval: None,
             product: "product".to_string(),
             query_terms: Vec::new(),
             domain_signals: Vec::new(),
@@ -27695,6 +31576,7 @@ mod tests {
             target_token_budget: 900,
             briefing_tokens_used: 0,
             briefing_hits_provided: 0,
+            briefing_blocks: Vec::new(),
             required_sections_applied: Vec::new(),
             application_risks: Vec::new(),
             environment_risks: Vec::new(),
@@ -27765,6 +31647,712 @@ mod tests {
             .memory_hits
             .iter()
             .all(|hit| !hit.to_ascii_lowercase().contains("implementation note")));
+    }
+
+    #[test]
+    fn named_briefing_blocks_group_memory_checks_and_scope_filters() {
+        let mut briefing = sample_briefing();
+        briefing.memory_hits = vec![
+            "Spec history: prior auth flow ambiguity".to_string(),
+            "Implementation note: Mason edited login handler".to_string(),
+        ];
+        briefing.recommended_guardrails =
+            vec!["Confirm acceptance criteria before edits".to_string()];
+        briefing.required_checks = vec!["Run the auth regression suite".to_string()];
+        briefing.open_questions = vec!["Which login surface is in scope?".to_string()];
+        briefing.pattern_matching_focus =
+            vec!["Auth ambiguity repeats across similar specs".to_string()];
+        briefing.briefing_blocks = build_named_briefing_blocks(&briefing);
+
+        assert_eq!(briefing.briefing_blocks.len(), 5);
+        let recalled = briefing
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "recalled_lessons")
+            .expect("recalled lessons block");
+        assert!(recalled.content.contains("Spec history"));
+        assert!(recalled.token_count > 0);
+
+        let checks = briefing
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "open_checks")
+            .expect("open checks block");
+        assert!(checks.content.contains("Run the auth regression suite"));
+
+        let scout = build_scoped_briefing(&briefing, BriefingScope::ScoutPreflight);
+        let scout_recalled = scout
+            .briefing_blocks
+            .iter()
+            .find(|block| block.name == "recalled_lessons")
+            .expect("scout recalled block");
+        assert!(!scout_recalled
+            .content
+            .to_ascii_lowercase()
+            .contains("implementation note"));
+    }
+
+    #[test]
+    fn normalize_briefing_hit_key_dedupes_source_labels_and_provenance() {
+        assert_eq!(
+            normalize_briefing_hit_key(
+                "[project memory] [open-brain] Thin evidence should become explicit checks. [source: PackChat thread=t1, run=r1]",
+            ),
+            normalize_briefing_hit_key("[core memory] Thin evidence should become explicit checks.")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_candidate_capture_is_retrievable_from_openbrain_briefing_path() {
+        let (openbrain_url, thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let content =
+            "Thin evidence in PackChat requires explicit checks before Mason edits the auth scope.";
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &candidate_id,
+            "shared_recall",
+            "normal",
+            content,
+        )
+        .await;
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process memory candidates");
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.captured_openbrain, 1);
+        assert_eq!(thoughts.lock().expect("thoughts lock").len(), 1);
+
+        let stored = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list candidates");
+        assert_eq!(stored[0].status, "captured_openbrain");
+        let expected_openbrain_ref = format!("openbrain:{candidate_id}");
+        assert_eq!(
+            stored[0].openbrain_ref.as_deref(),
+            Some(expected_openbrain_ref.as_str())
+        );
+
+        let hits = app
+            .collect_memory_hits(
+                &app.memory_store,
+                &["thin evidence explicit checks".to_string()],
+                "project memory",
+            )
+            .await
+            .expect("collect memory hits");
+
+        assert!(
+            hits.hits.iter().any(|hit| {
+                hit.contains("[open-brain]")
+                    && hit.contains("Thin evidence")
+                    && hit.contains("PackChat thread=thread-memory-chain")
+            }),
+            "captured OB1 memory should be retrievable through Coobie briefing collection; hits={:?}",
+            hits.hits
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_shared_recall_candidates_do_not_create_second_openbrain_thought() {
+        let (openbrain_url, thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let first_candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let second_candidate_id = format!("candidate-{}", Uuid::new_v4());
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &first_candidate_id,
+            "shared_recall",
+            "normal",
+            "Remember this: keep OB1 as the default shared recall path.",
+        )
+        .await;
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &second_candidate_id,
+            "shared_recall",
+            "normal",
+            "remember this keep ob1 as the default shared recall path",
+        )
+        .await;
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process memory candidates");
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.captured_openbrain, 1);
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(
+            thoughts.lock().expect("thoughts lock").len(),
+            1,
+            "duplicate PackChat phrasing should not create a second OB1 thought"
+        );
+
+        let stored = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list candidates");
+        let statuses = stored
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.candidate_id.as_str(),
+                    candidate.status.as_str(),
+                    candidate.dedupe_key.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            statuses
+                .iter()
+                .any(|(id, status, _)| *id == first_candidate_id && *status == "captured_openbrain"),
+            "first candidate should be captured; statuses={statuses:?}"
+        );
+        assert!(
+            statuses.iter().any(|(id, status, _)| {
+                *id == second_candidate_id && *status == "duplicate_openbrain"
+            }),
+            "second candidate should be marked duplicate; statuses={statuses:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|candidate| candidate.dedupe_key.as_deref()
+                    == Some("remember this keep ob1 as the default shared recall path")),
+            "both candidates should persist the same normalized dedupe key; statuses={statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_error_prediction_records_success_reinforcement_counts() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            spec_id: "spec-prediction-reinforcement".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "TEST_BLIND_SPOT,SPEC_AMBIGUITY".to_string(),
+            narrative_summary: "Low-risk prediction from two prior causal signals.".to_string(),
+        };
+        app.store_local_run_prediction(&prediction)
+            .await
+            .expect("store prediction");
+
+        app.try_record_calvin_prediction_result(&run_id, "completed", None)
+            .await;
+
+        let reinforcements = app
+            .list_prediction_success_reinforcements(Some(&run_id))
+            .await
+            .expect("list reinforcements");
+        assert_eq!(reinforcements.len(), 2);
+        assert!(reinforcements.iter().all(|event| {
+            event.prediction_error == 0.0
+                && event.actual_outcome == "completed"
+                && event.confirmation_count == 1
+                && event.status == "pending_workbench_review"
+        }));
+
+        let second_run_id = format!("run-{}", Uuid::new_v4());
+        let second_prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: second_run_id.clone(),
+            spec_id: "spec-prediction-reinforcement".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "TEST_BLIND_SPOT".to_string(),
+            narrative_summary: "Second low-risk prediction from the same signal.".to_string(),
+        };
+        app.store_local_run_prediction(&second_prediction)
+            .await
+            .expect("store second prediction");
+
+        app.try_record_calvin_prediction_result(&second_run_id, "completed", None)
+            .await;
+
+        let all_reinforcements = app
+            .list_prediction_success_reinforcements(None)
+            .await
+            .expect("list all reinforcements");
+        let test_blind_spot = all_reinforcements
+            .iter()
+            .find(|event| {
+                event.run_id == second_run_id && event.source_cause_id == "TEST_BLIND_SPOT"
+            })
+            .expect("second reinforcement");
+        assert_eq!(test_blind_spot.confirmation_count, 2);
+    }
+
+    #[tokio::test]
+    async fn spec_family_profile_groups_related_auth_specs_and_biases_query_terms() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let target = sample_target_source();
+        let first = sample_auth_spec("auth-login-refresh", "Refresh OAuth login flow");
+        let second = sample_auth_spec("auth-scope-hardening", "Harden JWT scope checks");
+
+        let first_profile = app
+            .upsert_spec_family_profile(&first, &target)
+            .await
+            .expect("first family profile");
+        let second_profile = app
+            .upsert_spec_family_profile(&second, &target)
+            .await
+            .expect("second family profile");
+
+        assert_eq!(first_profile.family_id, "auth_service");
+        assert_eq!(second_profile.family_id, "auth_service");
+        assert!(second_profile.spec_ids.contains(&first.id));
+        assert!(second_profile.spec_ids.contains(&second.id));
+
+        let loaded = app
+            .load_spec_family_profile("auth_service")
+            .await
+            .expect("load family")
+            .expect("auth family profile");
+        assert!(loaded.fingerprint.iter().any(|token| token == "oauth"));
+        assert!(loaded.fingerprint.iter().any(|token| token == "jwt"));
+
+        let terms = build_coobie_query_terms(&second, &target);
+        assert!(
+            terms.iter().any(|term| term == "auth_service"),
+            "query terms should carry the family id so retrieval can bias toward related specs"
+        );
+    }
+
+    #[test]
+    fn spec_family_biased_retrieval_promotes_same_family_hit_over_flat_top_hit() {
+        let mut hits = vec![
+            "[project memory] Generic API cleanup note: update endpoint docs.".to_string(),
+            "[project memory] Auth service lesson: OAuth callback and JWT scope checks need explicit acceptance criteria before Mason edits.".to_string(),
+            "[project memory] Billing service note: invoice retry policy changed.".to_string(),
+        ];
+        let proof = apply_spec_family_memory_bias(
+            &mut hits,
+            "auth_service",
+            &["oauth".to_string(), "jwt".to_string(), "scope".to_string()],
+            12,
+        );
+
+        assert_eq!(proof.schema, "harkonnen.spec_family_retrieval_proof.v1");
+        assert_eq!(proof.spec_family, "auth_service");
+        assert!(proof.improved);
+        assert_eq!(proof.family_hit_count, 1);
+        assert!(proof.unrelated_hit_count >= 1);
+        assert!(hits
+            .first()
+            .expect("top hit")
+            .contains("Auth service lesson"));
+        assert_ne!(proof.flat_top_hit, proof.family_biased_top_hit);
+    }
+
+    #[tokio::test]
+    async fn cross_agent_pattern_candidate_emits_for_repeated_family_cooccurrence() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let target = sample_target_source();
+        let prior_spec = sample_auth_spec("auth-login-refresh", "Refresh OAuth login flow");
+        let current_spec = sample_auth_spec("auth-scope-hardening", "Harden JWT scope checks");
+        app.upsert_spec_family_profile(&prior_spec, &target)
+            .await
+            .expect("prior family");
+        app.upsert_spec_family_profile(&current_spec, &target)
+            .await
+            .expect("current family");
+
+        let prior_run = format!("run-{}", Uuid::new_v4());
+        let current_run = format!("run-{}", Uuid::new_v4());
+        let now = Utc::now();
+        app.insert_run(&prior_run, &prior_spec.id, &target.label, "failed", now)
+            .await
+            .expect("insert prior run");
+        app.insert_run(&current_run, &current_spec.id, &target.label, "failed", now)
+            .await
+            .expect("insert current run");
+        write_run_spec_for_test(&app, &current_run, &current_spec).await;
+
+        for run_id in [&prior_run, &current_run] {
+            insert_test_phase_attribution(
+                &app,
+                run_id,
+                "intake",
+                "scout",
+                "success",
+                vec!["scope creep".to_string(), "spec ambiguity".to_string()],
+                vec!["Clarify auth acceptance criteria before implementation".to_string()],
+            )
+            .await;
+            insert_test_phase_attribution(
+                &app,
+                run_id,
+                "implementation",
+                "mason",
+                "failure",
+                vec!["auth".to_string()],
+                Vec::new(),
+            )
+            .await;
+        }
+
+        let candidates = app
+            .generate_consolidation_candidates(&current_run)
+            .await
+            .expect("generate candidates");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.kind == "cross_agent_pattern")
+            .expect("cross-agent candidate");
+        assert_eq!(candidate.review_class, "elevated");
+        assert_eq!(candidate.pattern_basis.len(), 2);
+        assert_eq!(
+            candidate.content_json["schema"].as_str(),
+            Some("harkonnen.cross_agent_pattern.v1")
+        );
+        assert_eq!(
+            candidate.content_json["spec_family"].as_str(),
+            Some("auth_service")
+        );
+        assert!(candidate.label.contains("Scout ambiguity -> Mason failure"));
+
+        let listed = app
+            .list_consolidation_candidates(&current_run)
+            .await
+            .expect("list candidates");
+        assert!(listed
+            .iter()
+            .any(|candidate| candidate.kind == "cross_agent_pattern"));
+    }
+
+    #[tokio::test]
+    async fn memory_influence_exclusion_event_is_recorded_from_briefing_hits() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let prediction = crate::calvin_client::RunPrediction {
+            prediction_id: format!("prediction-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            spec_id: "auth-service-family".to_string(),
+            predicted_outcome: "pass".to_string(),
+            risk_score: 0.1,
+            confidence: 0.7,
+            failure_phase: None,
+            failure_kind: None,
+            source_cause_ids: "SPEC_AMBIGUITY".to_string(),
+            narrative_summary: "Low-risk prediction with one prior signal.".to_string(),
+        };
+        app.store_local_run_prediction(&prediction)
+            .await
+            .expect("store prediction");
+        app.upsert_spec_family_profile(
+            &sample_auth_spec("auth-service-family", "Auth service family"),
+            &sample_target_source(),
+        )
+        .await
+        .expect("upsert spec family");
+        let episode_id = format!("episode-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO episodes (episode_id, run_id, phase, goal, outcome, confidence, started_at)
+            VALUES (?1, ?2, 'mason', 'exercise memory influence calibration', 'success', 0.8, ?3)
+            "#,
+        )
+        .bind(&episode_id)
+        .bind(&run_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&app.pool)
+        .await
+        .expect("insert episode");
+        app.upsert_phase_attribution(&PhaseAttributionRecord {
+            attribution_id: format!("phase-attribution-{}", Uuid::new_v4()),
+            run_id: run_id.clone(),
+            episode_id,
+            phase: "mason".to_string(),
+            agent_name: "mason".to_string(),
+            outcome: "success".to_string(),
+            confidence: Some(0.8),
+            prompt_bundle_fingerprint: None,
+            prompt_bundle_provider: None,
+            prompt_bundle_artifact: None,
+            pinned_skill_ids: Vec::new(),
+            memory_hits: vec![
+                "[open-brain] Prior auth-service edits need explicit scope checks.".to_string(),
+            ],
+            core_memory_ids: Vec::new(),
+            project_memory_ids: Vec::new(),
+            relevant_lesson_ids: Vec::new(),
+            required_checks: Vec::new(),
+            guardrails: Vec::new(),
+            query_terms: vec!["auth".to_string(), "scope".to_string()],
+            briefing_scope: Some(BriefingScope::MasonPreflight),
+            briefing_token_budget: 800,
+            briefing_tokens_used: 120,
+            briefing_hits_provided: 1,
+            stakeholder_alignment: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("insert phase attribution");
+
+        let local_prediction = app
+            .get_local_run_prediction(&run_id)
+            .await
+            .expect("local prediction lookup")
+            .expect("local prediction");
+        let inserted = app
+            .record_memory_influence_exclusions(&run_id, &local_prediction, "completed", 1.0)
+            .await
+            .expect("record exclusions");
+        assert_eq!(inserted, 1);
+
+        let exclusions = app
+            .list_memory_influence_exclusions(Some(&run_id))
+            .await
+            .expect("list exclusions");
+        assert_eq!(exclusions.len(), 1);
+        let exclusion = &exclusions[0];
+        assert_eq!(exclusion.phase, "mason");
+        assert_eq!(exclusion.briefing_scope.as_deref(), Some("mason_preflight"));
+        assert_eq!(exclusion.spec_family, "auth_service");
+        assert_eq!(exclusion.expected_outcome, "pass");
+        assert_eq!(exclusion.actual_outcome, "completed");
+        assert_eq!(exclusion.exclusion_probability, 1.0);
+        assert_eq!(exclusion.selection_basis, "deterministic_hash_calibration");
+        assert!(
+            exclusion.memory_preview.contains("explicit scope checks"),
+            "preview should preserve the excluded briefing hit"
+        );
+        assert!(!exclusion.memory_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn calvin_candidate_becomes_governed_promotion_without_archive_mutation() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let content = "Coobie belief update: Calvin archive policy should require governed promotion contracts.";
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &candidate_id,
+            "calvin_candidate",
+            "normal",
+            content,
+        )
+        .await;
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process calvin candidate");
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.calvin_promotions, 1);
+        assert!(app.calvin.is_none(), "test app has no direct Calvin writer");
+
+        let candidates = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list memory candidates");
+        let memory_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+            .expect("memory candidate");
+        assert_eq!(memory_candidate.status, "promotion_pending");
+
+        let contract = memory_candidate
+            .calvin_contract_json
+            .as_ref()
+            .expect("calvin promotion contract");
+        assert_eq!(contract["schema"], "harkonnen.calvin.promotion.v1");
+        assert_eq!(contract["compiled_claim"], content);
+        assert_eq!(contract["source_authority"], "packchat_statement");
+        assert_eq!(contract["integration_recommendation"], "quarantine");
+        assert_eq!(contract["review_state"]["status"], "pending");
+        assert_eq!(contract["review_state"]["review_required"], true);
+        assert!(contract["staleness_triggers"]
+            .as_array()
+            .expect("staleness triggers")
+            .iter()
+            .any(|trigger| trigger == "newer_conflicting_evidence"));
+        let evidence_timeline = contract["evidence_timeline"]
+            .as_array()
+            .expect("evidence timeline");
+        assert_eq!(evidence_timeline.len(), 1);
+        assert_eq!(
+            evidence_timeline[0]["evidence_ref"]["ref_type"],
+            "packchat_message"
+        );
+        assert_eq!(
+            evidence_timeline[0]["source_authority"],
+            "packchat_statement"
+        );
+        assert_eq!(contract["recommended_governance_outcome"], "quarantine");
+        assert!(contract["preservation_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must not be mutated"));
+
+        let promotion_rows = app
+            .list_consolidation_candidates(&run_id)
+            .await
+            .expect("list consolidation candidates");
+        let promotion = promotion_rows
+            .iter()
+            .find(|candidate| candidate.candidate_id == format!("calvin-promotion-{candidate_id}"))
+            .expect("promotion candidate");
+        assert_eq!(promotion.kind, "calvin_promotion");
+        assert_eq!(promotion.status, "pending");
+        assert_eq!(
+            promotion.content_json["schema"],
+            "harkonnen.calvin.promotion.v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_packchat_evidence_marks_prior_memory_needs_reconsolidation() {
+        let (openbrain_url, _thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let old_candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let new_candidate_id = format!("candidate-{}", Uuid::new_v4());
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &old_candidate_id,
+            "shared_recall",
+            "normal",
+            "Deployment target is AWS.",
+        )
+        .await;
+        app.chat
+            .update_memory_candidate_processing(
+                &old_candidate_id,
+                "captured_openbrain",
+                Some("Deployment target is AWS."),
+                Some(&format!("openbrain:{old_candidate_id}")),
+                Some("deployment target"),
+                None,
+            )
+            .await
+            .expect("mark old candidate captured");
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &new_candidate_id,
+            "shared_recall",
+            "normal",
+            "Correction: deployment target is on-prem, not AWS.",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE memory_candidates
+            SET evidence_refs = ?2
+            WHERE candidate_id = ?1
+            "#,
+        )
+        .bind(&new_candidate_id)
+        .bind(
+            json!([
+                {
+                    "ref_type": "supersedes_memory_candidate",
+                    "id": old_candidate_id
+                }
+            ])
+            .to_string(),
+        )
+        .execute(&app.pool)
+        .await
+        .expect("attach reconsolidation evidence ref");
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process reconsolidation trigger");
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.reconsolidations, 1);
+
+        let candidates = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list memory candidates");
+        let old_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == old_candidate_id)
+            .expect("old candidate");
+        assert_eq!(old_candidate.status, "needs_reconsolidation");
+        let reconsolidation = &old_candidate
+            .calvin_contract_json
+            .as_ref()
+            .expect("reconsolidation contract")["reconsolidation"];
+        assert_eq!(
+            reconsolidation["schema"],
+            "harkonnen.memory.reconsolidation.v1"
+        );
+        assert_eq!(reconsolidation["status"], "needs_reconsolidation");
+        assert_eq!(reconsolidation["trigger_candidate_id"], new_candidate_id);
+    }
+
+    #[tokio::test]
+    async fn sensitive_shared_recall_is_held_and_not_sent_to_openbrain() {
+        let (openbrain_url, thoughts) = spawn_openbrain_round_trip_mock().await;
+        let (_dir, app) = test_app_with_openbrain(openbrain_url).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let candidate_id = format!("candidate-{}", Uuid::new_v4());
+        let content =
+            "remember this: the staging API key is secret and must stay out of shared recall.";
+
+        insert_memory_candidate_for_test(
+            &app,
+            &run_id,
+            &candidate_id,
+            "shared_recall",
+            "sensitive_review",
+            content,
+        )
+        .await;
+
+        let summary = app
+            .process_memory_candidates(Some(&run_id), 10)
+            .await
+            .expect("process sensitive candidate");
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.held_for_review, 1);
+        assert_eq!(summary.captured_openbrain, 0);
+        assert!(
+            thoughts.lock().expect("thoughts lock").is_empty(),
+            "sensitive candidate must not be sent to OB1 before review"
+        );
+
+        let candidates = app
+            .list_memory_candidates_for_run(&run_id)
+            .await
+            .expect("list memory candidates");
+        assert_eq!(candidates[0].status, "held_for_review");
+        assert!(candidates[0].openbrain_ref.is_none());
     }
 
     #[test]
@@ -28122,11 +32710,17 @@ mod tests {
         let proposal = MasonEditProposal {
             summary: "Fix edge-case handling".to_string(),
             rationale: vec!["The first case now passes.".to_string()],
-            edits: Vec::new(),
+            edits: vec![MasonEdit {
+                path: "src/lib.rs".to_string(),
+                action: "replace".to_string(),
+                summary: "Fix edge-case handling".to_string(),
+                content: "patched".to_string(),
+            }],
         };
 
         let attempt = assess_validation_repair_attempt(1, &proposal, 1, &before, &after);
         assert_eq!(attempt.outcome, "improved");
+        assert_eq!(attempt.edited_files, vec!["src/lib.rs"]);
         assert!(attempt
             .guidance_for_next_attempt
             .contains("target only the remaining failures"));
@@ -28143,6 +32737,7 @@ mod tests {
                 iteration: 1,
                 proposal_summary: "Fix sum logic".to_string(),
                 proposal_rationale: vec!["The loop skipped the final value.".to_string()],
+                edited_files: vec!["src/math.rs".to_string()],
                 edits_applied: 1,
                 before_summary: "before".to_string(),
                 after_summary: "after".to_string(),
@@ -28160,7 +32755,287 @@ mod tests {
         let markdown = render_validation_repair_markdown(&artifact);
         assert!(markdown.contains("# Validation Repair Attempts"));
         assert!(markdown.contains("Outcome: stalled"));
+        assert!(markdown.contains("Edited files: src/math.rs"));
         assert!(markdown.contains("Previous attempt did not change the failing signal."));
+    }
+
+    #[test]
+    fn validation_repair_attempts_become_code_review_learning_records() {
+        let artifact = ValidationRepairArtifact {
+            run_id: "run-1".to_string(),
+            spec_id: "spec-1".to_string(),
+            product: "product".to_string(),
+            generated_at: "2026-04-29T00:00:00Z".to_string(),
+            attempts: vec![ValidationRepairAttemptRecord {
+                iteration: 1,
+                proposal_summary: "Fix wrong total".to_string(),
+                proposal_rationale: vec!["Bramble showed expected 8 got 7.".to_string()],
+                edited_files: vec!["src/math.rs".to_string()],
+                edits_applied: 1,
+                before_summary: "failure_kind=WrongAnswer".to_string(),
+                after_summary: "all tests passed".to_string(),
+                failure_kind_before: Some("WrongAnswer".to_string()),
+                failure_kind_after: None,
+                before_failing_checks: vec!["test_command_1 (expected 8 got 7)".to_string()],
+                after_failing_checks: Vec::new(),
+                outcome: "resolved".to_string(),
+                guidance_for_next_attempt:
+                    "Previous attempt resolved visible validation; no further retry is needed."
+                        .to_string(),
+                passed_after: true,
+            }],
+        };
+
+        let records = code_review_learning_records_from_validation_repair(&artifact);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_agent, "mason");
+        assert_eq!(records[0].reviewer_agent, "bramble");
+        assert_eq!(records[0].resolution, "auto_fixed");
+        assert_eq!(records[0].files, vec!["src/math.rs"]);
+        assert_eq!(records[0].stale_if_file_changed, vec!["src/math.rs"]);
+        assert!(records[0].lesson.contains("resolved Bramble validation"));
+    }
+
+    #[test]
+    fn plan_completion_audit_flags_missing_evidence_before_close() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = Spec {
+            id: "spec-audit".to_string(),
+            title: "Audit spec".to_string(),
+            purpose: "Prove audit behavior".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            inputs: Vec::new(),
+            outputs: vec!["Ship a visible report".to_string()],
+            acceptance_criteria: vec![
+                "Visible validation must pass.".to_string(),
+                "Hidden scenario behavior must pass.".to_string(),
+            ],
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: Vec::new(),
+            performance_expectations: Vec::new(),
+            security_expectations: Vec::new(),
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        };
+        let target = TargetSourceMetadata {
+            label: "product".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "product".to_string(),
+            git: None,
+        };
+
+        let audit = build_plan_completion_audit(
+            "run-audit",
+            &spec,
+            &target,
+            "failed",
+            None,
+            None,
+            dir.path(),
+        );
+
+        assert!(audit.unresolved_count >= 2);
+        assert!(audit
+            .items
+            .iter()
+            .any(|item| item.item_id == "core.visible_validation" && item.status == "missing"));
+        assert!(render_plan_completion_audit_markdown(&audit).contains("Plan Completion Audit"));
+    }
+
+    #[test]
+    fn plan_completion_audit_marks_validation_and_hidden_evidence_fulfilled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("validation.json"), "{}").expect("validation artifact");
+        std::fs::write(dir.path().join("hidden_scenarios.json"), "{}").expect("hidden artifact");
+        let spec = Spec {
+            id: "spec-audit".to_string(),
+            title: "Audit spec".to_string(),
+            purpose: "Prove audit behavior".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            acceptance_criteria: vec!["Visible validation must pass.".to_string()],
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: Vec::new(),
+            performance_expectations: Vec::new(),
+            security_expectations: Vec::new(),
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        };
+        let target = TargetSourceMetadata {
+            label: "product".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "product".to_string(),
+            git: None,
+        };
+        let validation = ValidationSummary {
+            passed: true,
+            scored_checks: 1,
+            passed_scored_checks: 1,
+            real_test_commands: 1,
+            passed_real_test_commands: 1,
+            results: Vec::new(),
+            wrong_answer_evidence: BTreeMap::new(),
+            failure_kind: None,
+        };
+        let hidden = HiddenScenarioSummary {
+            passed: true,
+            results: Vec::new(),
+        };
+
+        let audit = build_plan_completion_audit(
+            "run-audit",
+            &spec,
+            &target,
+            "completed",
+            Some(&validation),
+            Some(&hidden),
+            dir.path(),
+        );
+
+        assert_eq!(audit.unresolved_count, 0);
+        assert!(audit
+            .items
+            .iter()
+            .any(|item| item.item_id == "core.visible_validation"
+                && item.evidence_refs.contains(&"validation.json".to_string())));
+    }
+
+    #[test]
+    fn behavioral_change_report_marks_possible_shift_only_for_clean_prior_revision_runs() {
+        let spec = Spec {
+            id: "spec-learning".to_string(),
+            title: "Learning spec".to_string(),
+            purpose: "Prove behavioral-change report status".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            forbidden_behaviors: Vec::new(),
+            rollback_requirements: Vec::new(),
+            dependencies: Vec::new(),
+            performance_expectations: Vec::new(),
+            security_expectations: Vec::new(),
+            twin_services: Vec::new(),
+            project_components: Vec::new(),
+            scenario_blueprint: None,
+            worker_harness: None,
+            test_commands: Vec::new(),
+        };
+        let target = TargetSourceMetadata {
+            label: "product".to_string(),
+            source_kind: "local".to_string(),
+            source_path: "product".to_string(),
+            git: None,
+        };
+        let candidate = BehavioralPriorRevisionCandidate {
+            candidate_id: "candidate-1".to_string(),
+            source_event_id: "event-1".to_string(),
+            message_id: Some("msg-1".to_string()),
+            retention_class: "shared_recall".to_string(),
+            source_authority: "operator".to_string(),
+            content_preview: "always use latest stable versions".to_string(),
+        };
+        let clean = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics {
+                plan_audit_unresolved_count: 0,
+                validation_passed: Some(true),
+                hidden_scenarios_passed: Some(true),
+                ..BehavioralChangeMetrics::default()
+            },
+            vec![candidate.clone()],
+        );
+        assert_eq!(clean.status, "possible_shift");
+        assert!(
+            render_behavioral_change_report_markdown(&clean).contains("Behavioral Change Report")
+        );
+
+        let unresolved = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics {
+                plan_audit_unresolved_count: 1,
+                validation_passed: Some(true),
+                hidden_scenarios_passed: Some(true),
+                ..BehavioralChangeMetrics::default()
+            },
+            vec![candidate],
+        );
+        assert_eq!(unresolved.status, "stored_not_learned_pending");
+
+        let no_prior_revision = build_behavioral_change_report(
+            "run-learning",
+            &spec,
+            &target,
+            "completed",
+            BehavioralChangeMetrics::default(),
+            Vec::new(),
+        );
+        assert_eq!(no_prior_revision.status, "no_prior_revision");
+    }
+
+    #[test]
+    fn schema_revision_requires_three_distinct_run_basis_items() {
+        let weak_basis = vec![
+            serde_json::json!({"run_id": "run-1", "candidate_id": "a"}),
+            serde_json::json!({"run_id": "run-1", "candidate_id": "b"}),
+            serde_json::json!({"run_id": "run-2", "candidate_id": "c"}),
+        ];
+        assert!(!schema_revision_pattern_basis_is_valid(&weak_basis));
+
+        let strong_basis = vec![
+            serde_json::json!({"run_id": "run-1", "candidate_id": "a"}),
+            serde_json::json!({"run_id": "run-2", "candidate_id": "b"}),
+            serde_json::json!({"run_id": "run-3", "candidate_id": "c"}),
+        ];
+        assert!(schema_revision_pattern_basis_is_valid(&strong_basis));
+
+        let candidate = ConsolidationCandidate {
+            candidate_id: "schema-revision-test".to_string(),
+            run_id: "run-3".to_string(),
+            kind: "schema_revision".to_string(),
+            status: "pending".to_string(),
+            content_json: serde_json::json!({
+                "schema": "harkonnen.schema_revision_proposal.v1",
+                "operator_endorsement_required": true,
+                "pattern_basis": strong_basis,
+            }),
+            edited_json: None,
+            review_class: "elevated".to_string(),
+            pattern_basis: Vec::new(),
+            confidence: 0.72,
+            label: "[schema revision] test".to_string(),
+            created_at: Utc::now(),
+            reviewed_at: None,
+        };
+        assert!(validate_consolidation_candidate_for_keep(&candidate).is_ok());
+
+        let invalid = ConsolidationCandidate {
+            content_json: serde_json::json!({
+                "schema": "harkonnen.schema_revision_proposal.v1",
+                "operator_endorsement_required": true,
+                "pattern_basis": weak_basis,
+            }),
+            ..candidate
+        };
+        assert!(validate_consolidation_candidate_for_keep(&invalid).is_err());
     }
 
     #[test]
@@ -28375,6 +33250,9 @@ mod tests {
                 self_server: None,
             }),
             calvin_archive: Default::default(),
+            twilight_bark: Default::default(),
+            open_brain: Default::default(),
+            sub_agents: Default::default(),
         };
         let staged = std::env::temp_dir().join(format!("harkonnen-tool-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&staged).expect("create staged dir");

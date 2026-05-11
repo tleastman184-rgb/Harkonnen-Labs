@@ -26,8 +26,8 @@ use crate::{
     llm::{self, LlmRequest},
     memory::{MemoryRetrievalHit, MemoryStore},
     models::{
-        AgentExecution, AgentRuntimeState, BlackboardState, ConsolidationCandidate, CoobieBriefing,
-        DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle,
+        AgentExecution, AgentRuntimeState, BlackboardState, BriefingBlock, ConsolidationCandidate,
+        CoobieBriefing, DecisionRecord, EvidenceAnnotation, EvidenceAnnotationBundle,
         EvidenceAnnotationHistoryEvent, EvidenceMatchReport, EvidenceSource, HiddenScenarioSummary,
         InterventionPlan, LessonRecord, MetricAttack, OperatorModelContext, OperatorModelProfile,
         OperatorModelScope, OperatorModelSession, OptimizationProgram, PhaseAttributionRecord,
@@ -54,6 +54,23 @@ struct RunStateResponse {
     coobie_report_response: Option<String>,
     evidence_match_report: Option<EvidenceMatchReport>,
     coobie_translations: Vec<PidginTranslation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BriefingQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunBriefingResponse {
+    run_id: String,
+    scope: String,
+    artifact: String,
+    block_count: usize,
+    total_block_tokens: u32,
+    blocks: Vec<BriefingBlock>,
+    briefing: CoobieBriefing,
 }
 
 #[derive(Debug, Serialize)]
@@ -770,6 +787,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         )
         .route("/api/runs/:id/lessons", get(get_run_lessons))
         .route("/api/runs/:id/state", get(get_run_state))
+        .route("/api/runs/:id/health", get(get_run_health))
         .route("/api/runs/:id/consolidate", post(post_run_consolidate))
         .route(
             "/api/runs/:id/consolidation/candidates",
@@ -786,6 +804,46 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         .route(
             "/api/runs/:id/consolidation/candidates/:cid/edit",
             post(post_candidate_edit),
+        )
+        .route(
+            "/api/runs/:id/memory/candidates",
+            get(get_memory_candidates).post(post_process_memory_candidates),
+        )
+        .route(
+            "/api/runs/:id/memory/candidates/retry",
+            post(post_process_memory_candidates),
+        )
+        .route(
+            "/api/runs/:id/memory/candidates/:cid/approve",
+            post(post_approve_memory_candidate),
+        )
+        .route(
+            "/api/runs/:id/memory/candidates/:cid/discard",
+            post(post_discard_memory_candidate),
+        )
+        .route(
+            "/api/runs/:id/code-review-learning",
+            get(get_code_review_learning_records),
+        )
+        .route(
+            "/api/runs/:id/plan-completion-audit",
+            get(get_plan_completion_audit),
+        )
+        .route(
+            "/api/runs/:id/behavioral-change",
+            get(get_behavioral_change_report),
+        )
+        .route(
+            "/api/runs/:id/prediction-reinforcements",
+            get(get_prediction_success_reinforcements),
+        )
+        .route(
+            "/api/runs/:id/memory-influence-exclusions",
+            get(get_memory_influence_exclusions),
+        )
+        .route(
+            "/api/runs/:id/context-utilization",
+            get(get_context_utilization),
         )
         .route("/api/chat", post(post_chat))
         .route("/api/coobie/query", post(post_coobie_query))
@@ -826,6 +884,7 @@ pub async fn start_api_server(app: AppContext, port: u16) -> anyhow::Result<()> 
         )
         .route("/api/soul/:id", get(get_soul_kernel))
         .route("/api/soul/:id/guide", get(get_soul_guide))
+        .route("/api/runs/:id/briefing", get(get_run_briefing))
         .route("/api/runs/:id/coobie-briefing", get(get_coobie_briefing))
         .route("/api/runs/:id/coobie-response", get(get_coobie_response))
         .route("/api/runs/:id/coobie-signals", get(get_coobie_signals))
@@ -1132,6 +1191,17 @@ async fn get_run_state(Path(id): Path<String>, State(app): State<AppContext>) ->
     }
 }
 
+async fn get_run_health(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match build_run_health(&app, &id).await {
+        Ok(Some(health)) => (StatusCode::OK, Json(health)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn get_run_mission_board(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -1352,25 +1422,32 @@ async fn post_run_consolidate(
         // If candidates exist and some are kept, only promote those.
         // Otherwise fall back to the legacy auto-promote path so old clients
         // that call /consolidate directly still work.
-        Ok(Some(_)) => match app.promote_kept_candidates(&id).await {
-            Ok(new_lessons) => match build_memory_board(&app, &id).await {
-                Ok(Some(memory_board)) => (
-                    StatusCode::OK,
-                    Json(ConsolidateRunResponse {
-                        run_id: id,
-                        total_new_lessons: new_lessons.len(),
-                        new_lessons,
-                        memory_board,
-                    }),
-                )
-                    .into_response(),
-                Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Ok(Some(_)) => {
+            if let Err(error) = app.process_memory_candidates(Some(&id), 100).await {
+                tracing::warn!(run_id = %id, error = %error, "memory candidate processing skipped before consolidation");
+            }
+            match app.promote_kept_candidates(&id).await {
+                Ok(new_lessons) => match build_memory_board(&app, &id).await {
+                    Ok(Some(memory_board)) => (
+                        StatusCode::OK,
+                        Json(ConsolidateRunResponse {
+                            run_id: id,
+                            total_new_lessons: new_lessons.len(),
+                            new_lessons,
+                            memory_board,
+                        }),
+                    )
+                        .into_response(),
+                    Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+                    Err(error) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                    }
+                },
                 Err(error) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
                 }
-            },
-            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
-        },
+            }
+        }
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -1391,6 +1468,12 @@ struct CandidatesResponse {
 #[derive(Debug, Deserialize)]
 struct EditCandidateRequest {
     content: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessMemoryCandidatesRequest {
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// `GET /api/runs/:id/consolidation/candidates` — list all candidates.
@@ -1528,6 +1611,509 @@ async fn post_candidate_edit(
     }
 }
 
+async fn get_memory_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_memory_candidates_for_run(&id).await {
+            Ok(candidates) => {
+                let total = candidates.len();
+                let mut status_counts = HashMap::<String, usize>::new();
+                let mut source_authority_counts = HashMap::<String, usize>::new();
+                for candidate in &candidates {
+                    *status_counts.entry(candidate.status.clone()).or_default() += 1;
+                    *source_authority_counts
+                        .entry(candidate.source_authority.clone())
+                        .or_default() += 1;
+                }
+                let pending = status_counts.get("pending").copied().unwrap_or(0);
+                let retry_pending = status_counts.get("retry_pending").copied().unwrap_or(0);
+                let waiting_openbrain =
+                    status_counts.get("waiting_openbrain").copied().unwrap_or(0);
+                let held_for_review = status_counts.get("held_for_review").copied().unwrap_or(0);
+                let needs_reconsolidation = status_counts
+                    .get("needs_reconsolidation")
+                    .copied()
+                    .unwrap_or(0);
+                let captured_openbrain = status_counts
+                    .get("captured_openbrain")
+                    .copied()
+                    .unwrap_or(0);
+                let promotion_pending =
+                    status_counts.get("promotion_pending").copied().unwrap_or(0);
+                let duplicate_openbrain = status_counts
+                    .get("duplicate_openbrain")
+                    .copied()
+                    .unwrap_or(0);
+                let missing_evidence_refs = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .evidence_refs
+                            .as_array()
+                            .is_none_or(|refs| refs.is_empty())
+                    })
+                    .count();
+                let actionable = retry_pending
+                    + waiting_openbrain
+                    + held_for_review
+                    + needs_reconsolidation
+                    + promotion_pending;
+                let retryable = pending + retry_pending + waiting_openbrain;
+                let mut memory_chain_blockers = Vec::new();
+                if held_for_review > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{held_for_review} candidate{} held for operator review",
+                        plural_suffix(held_for_review)
+                    ));
+                }
+                if retry_pending > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{retry_pending} candidate{} waiting for retry",
+                        plural_suffix(retry_pending)
+                    ));
+                }
+                if waiting_openbrain > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{waiting_openbrain} candidate{} waiting for OB1 configuration",
+                        plural_suffix(waiting_openbrain)
+                    ));
+                }
+                if needs_reconsolidation > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{needs_reconsolidation} memory candidate{} need reconsolidation",
+                        plural_suffix(needs_reconsolidation)
+                    ));
+                }
+                if promotion_pending > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{promotion_pending} Calvin promotion{} pending review",
+                        plural_suffix(promotion_pending)
+                    ));
+                }
+                if missing_evidence_refs > 0 {
+                    memory_chain_blockers.push(format!(
+                        "{missing_evidence_refs} candidate{} missing evidence refs",
+                        plural_suffix(missing_evidence_refs)
+                    ));
+                }
+                let memory_chain_status = if held_for_review > 0 {
+                    "needs_review"
+                } else if retry_pending > 0 {
+                    "retry_pending"
+                } else if waiting_openbrain > 0 {
+                    "waiting_openbrain"
+                } else if needs_reconsolidation > 0 {
+                    "needs_reconsolidation"
+                } else if pending > 0 {
+                    "processing"
+                } else if promotion_pending > 0 {
+                    "calvin_review"
+                } else {
+                    "clear"
+                };
+                let backlog_total = pending
+                    + retry_pending
+                    + waiting_openbrain
+                    + held_for_review
+                    + needs_reconsolidation
+                    + promotion_pending;
+                let memory_chain_health_status = if retry_pending > 0
+                    || waiting_openbrain > 0
+                    || held_for_review > 0
+                    || needs_reconsolidation > 0
+                    || missing_evidence_refs > 0
+                {
+                    "blocked"
+                } else if backlog_total > 0 || duplicate_openbrain > 0 {
+                    "degraded"
+                } else {
+                    "clear"
+                };
+                let memory_chain_health = serde_json::json!({
+                    "schema": "harkonnen.memory_chain_health.v1",
+                    "status": memory_chain_health_status,
+                    "backlog": {
+                        "total": backlog_total,
+                        "pending": pending,
+                        "retry_pending": retry_pending,
+                        "waiting_openbrain": waiting_openbrain,
+                        "held_for_review": held_for_review,
+                        "needs_reconsolidation": needs_reconsolidation,
+                        "promotion_pending": promotion_pending,
+                        "retryable": retryable,
+                        "actionable": actionable,
+                    },
+                    "quality": {
+                        "stale_claims": needs_reconsolidation,
+                        "duplicate_openbrain": duplicate_openbrain,
+                        "missing_evidence_refs": missing_evidence_refs,
+                        "source_authority_counts": source_authority_counts.clone(),
+                    },
+                    "review_load": {
+                        "operator_review": held_for_review,
+                        "calvin_review": promotion_pending,
+                        "reconsolidation_review": needs_reconsolidation,
+                    },
+                    "service_readiness": {
+                        "twilight_bark_packchat": {
+                            "configured": app.paths.setup.twilight_bark.enabled,
+                            "transport": if app.paths.setup.twilight_bark.enabled { "twilight_bark" } else { "local_sqlite" },
+                            "openziti_service": "twilight-bark.packchat",
+                        },
+                        "openbrain_mcp": {
+                            "enabled": app.paths.setup.open_brain.enabled,
+                            "configured": app.open_brain.is_some(),
+                            "openziti_service": "openbrain.mcp",
+                        },
+                        "calvin_archive": {
+                            "enabled": app.paths.setup.calvin_archive.enabled,
+                            "configured": app.calvin.is_some(),
+                            "openziti_service": "calvin.archive",
+                        },
+                        "harkonnen_api": {
+                            "enabled": true,
+                            "configured": true,
+                            "openziti_service": "harkonnen.api",
+                        },
+                    },
+                    "blockers": memory_chain_blockers.clone(),
+                });
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "run_id": id,
+                        "total": total,
+                        "memory_chain_status": memory_chain_status,
+                        "memory_chain_blockers": memory_chain_blockers,
+                        "status_counts": status_counts,
+                        "source_authority_counts": source_authority_counts,
+                        "pending": pending,
+                        "retry_pending": retry_pending,
+                        "waiting_openbrain": waiting_openbrain,
+                        "held_for_review": held_for_review,
+                        "needs_reconsolidation": needs_reconsolidation,
+                        "captured_openbrain": captured_openbrain,
+                        "promotion_pending": promotion_pending,
+                        "actionable": actionable,
+                        "retryable": retryable,
+                        "duplicate_openbrain": duplicate_openbrain,
+                        "missing_evidence_refs": missing_evidence_refs,
+                        "memory_chain_health": memory_chain_health,
+                        "candidates": candidates,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_code_review_learning_records(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_code_review_learning_records(Some(&id)).await {
+            Ok(records) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "total": records.len(),
+                    "records": records,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_plan_completion_audit(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.load_plan_completion_audit(&id).await {
+            Ok(audit) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "audit": audit,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_prediction_success_reinforcements(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_prediction_success_reinforcements(Some(&id)).await {
+            Ok(reinforcements) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "total": reinforcements.len(),
+                    "reinforcements": reinforcements,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_memory_influence_exclusions(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.list_memory_influence_exclusions(Some(&id)).await {
+            Ok(exclusions) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "total": exclusions.len(),
+                    "exclusions": exclusions,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_behavioral_change_report(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.load_behavioral_change_report(&id).await {
+            Ok(report) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "report": report,
+                })),
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn get_context_utilization(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let phase_attributions = match app.list_phase_attributions_for_run(&id).await {
+                Ok(records) => records,
+                Err(err) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+            };
+            let pull_records = match app.list_context_pull_records(&id).await {
+                Ok(records) => records,
+                Err(err) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+            };
+            let briefing_hits_provided: usize = phase_attributions
+                .iter()
+                .map(|record| record.briefing_hits_provided)
+                .sum();
+            let briefing_tokens_used: u32 = phase_attributions
+                .iter()
+                .map(|record| record.briefing_tokens_used)
+                .sum();
+            let pull_tokens_returned: u32 = pull_records
+                .iter()
+                .map(|record| record.tokens_returned)
+                .sum();
+            let triggered_pulls = pull_records
+                .iter()
+                .filter(|record| record.trigger.is_some())
+                .count();
+            let unexpected_discovery_pulls = pull_records
+                .iter()
+                .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
+                .count();
+            let utilized_briefing_hits = phase_attributions
+                .iter()
+                .filter(|record| {
+                    record
+                        .memory_hits
+                        .iter()
+                        .any(|hit| context_hit_referenced_by_pull(hit, &pull_records))
+                })
+                .count();
+            let utilization_rate = if phase_attributions.is_empty() {
+                0.0
+            } else {
+                utilized_briefing_hits as f64 / phase_attributions.len() as f64
+            };
+            let utilization_status = if phase_attributions.is_empty() {
+                "no_briefing"
+            } else if utilization_rate < 0.2 {
+                "low"
+            } else {
+                "healthy"
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "summary": {
+                        "phase_attribution_count": phase_attributions.len(),
+                        "briefing_hits_provided": briefing_hits_provided,
+                        "briefing_tokens_used": briefing_tokens_used,
+                        "mid_task_pull_count": pull_records.len(),
+                        "mid_task_pull_tokens": pull_tokens_returned,
+                        "triggered_pull_count": triggered_pulls,
+                        "unexpected_discovery_pull_count": unexpected_discovery_pulls,
+                        "utilized_briefing_hits": utilized_briefing_hits,
+                        "utilization_rate": utilization_rate,
+                        "utilization_status": utilization_status,
+                    },
+                    "phase_attributions": phase_attributions,
+                    "pull_records": pull_records,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+fn context_hit_referenced_by_pull(hit: &str, pulls: &[crate::models::ContextPullRecord]) -> bool {
+    let terms = hit
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 5)
+        .take(12)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return false;
+    }
+    pulls.iter().any(|pull| {
+        let haystack = format!(
+            "{} {}",
+            pull.query.to_ascii_lowercase(),
+            pull.hit_previews
+                .iter()
+                .map(|preview| preview.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        terms.iter().any(|term| haystack.contains(term))
+    })
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+async fn post_process_memory_candidates(
+    Path(id): Path<String>,
+    State(app): State<AppContext>,
+    Json(body): Json<ProcessMemoryCandidatesRequest>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app
+            .process_memory_candidates(Some(&id), body.limit.unwrap_or(50))
+            .await
+        {
+            Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn post_approve_memory_candidate(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app
+            .chat
+            .approve_memory_candidate_for_processing(&id, &cid)
+            .await
+        {
+            Ok(true) => match app.process_memory_candidates(Some(&id), 25).await {
+                Ok(summary) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "approved",
+                        "candidate_id": cid,
+                        "processing": summary,
+                    })),
+                )
+                    .into_response(),
+                Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+            },
+            Ok(false) => (
+                StatusCode::CONFLICT,
+                "Candidate is not reviewable, retryable, or waiting for OB1",
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn post_discard_memory_candidate(
+    Path((id, cid)): Path<(String, String)>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => match app.chat.discard_memory_candidate(&id, &cid).await {
+            Ok(true) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "discarded", "candidate_id": cid})),
+            )
+                .into_response(),
+            Ok(false) => (
+                StatusCode::CONFLICT,
+                "Candidate is already captured/promoted or was not found",
+            )
+                .into_response(),
+            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
 async fn get_coobie_briefing(
     Path(id): Path<String>,
     State(app): State<AppContext>,
@@ -1552,6 +2138,76 @@ async fn get_coobie_briefing(
         }
         Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_run_briefing(
+    Path(id): Path<String>,
+    Query(query): Query<BriefingQuery>,
+    State(app): State<AppContext>,
+) -> impl IntoResponse {
+    match app.get_run(&id).await {
+        Ok(Some(_)) => {
+            let Some((scope, artifact)) = briefing_scope_artifact(query.scope.as_deref()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "scope must be one of coobie_preflight, scout_preflight, mason_preflight, sable_preflight",
+                )
+                    .into_response();
+            };
+            let briefing_path = app.paths.workspaces.join(&id).join("run").join(&artifact);
+            match read_optional_json::<CoobieBriefing>(&briefing_path).await {
+                Ok(Some(briefing)) => {
+                    let blocks = briefing.briefing_blocks.clone();
+                    let total_block_tokens =
+                        blocks.iter().map(|block| block.token_count).sum::<u32>();
+                    let response = RunBriefingResponse {
+                        run_id: id,
+                        scope,
+                        artifact,
+                        block_count: blocks.len(),
+                        total_block_tokens,
+                        blocks,
+                        briefing,
+                    };
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                Ok(None) => (StatusCode::NOT_FOUND, "Briefing not yet generated").into_response(),
+                Err(error) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "Run not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+fn briefing_scope_artifact(scope: Option<&str>) -> Option<(String, String)> {
+    let normalized = scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("coobie_preflight")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match normalized.as_str() {
+        "coobie" | "coobie_preflight" => Some((
+            "coobie_preflight".to_string(),
+            "coobie_briefing.json".to_string(),
+        )),
+        "scout" | "scout_preflight" => Some((
+            "scout_preflight".to_string(),
+            "scout_briefing.json".to_string(),
+        )),
+        "mason" | "mason_preflight" => Some((
+            "mason_preflight".to_string(),
+            "mason_briefing.json".to_string(),
+        )),
+        "sable" | "sable_preflight" => Some((
+            "sable_preflight".to_string(),
+            "sable_briefing.json".to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -3331,6 +3987,157 @@ async fn build_run_state(app: &AppContext, id: &str) -> anyhow::Result<Option<Ru
     }))
 }
 
+async fn build_run_health(app: &AppContext, id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(run) = app.get_run(id).await? else {
+        return Ok(None);
+    };
+
+    let run_dir = app.paths.workspaces.join(id).join("run");
+    let blackboard =
+        read_optional_json::<BlackboardState>(&run_dir.join("blackboard.json")).await?;
+    let validation =
+        read_optional_json::<ValidationSummary>(&run_dir.join("validation.json")).await?;
+    let hidden_scenarios =
+        read_optional_json::<HiddenScenarioSummary>(&run_dir.join("hidden_scenarios.json")).await?;
+    let audit = app.load_plan_completion_audit(id).await?;
+    let phase_attributions = app.list_phase_attributions_for_run(id).await?;
+    let pull_records = app.list_context_pull_records(id).await?;
+    let candidates = app.list_memory_candidates_for_run(id).await?;
+
+    let open_blockers = blackboard
+        .as_ref()
+        .map(|board| board.open_blockers.clone())
+        .unwrap_or_default();
+    let mut memory_status_counts = HashMap::<String, usize>::new();
+    for candidate in &candidates {
+        *memory_status_counts
+            .entry(candidate.status.clone())
+            .or_default() += 1;
+    }
+    let memory_blocked = [
+        "retry_pending",
+        "waiting_openbrain",
+        "held_for_review",
+        "needs_reconsolidation",
+    ]
+    .iter()
+    .any(|status| memory_status_counts.get(*status).copied().unwrap_or(0) > 0);
+    let memory_review = memory_status_counts
+        .get("promotion_pending")
+        .copied()
+        .unwrap_or(0)
+        > 0;
+    let validation_failed = validation.as_ref().is_some_and(|summary| !summary.passed);
+    let hidden_failed = hidden_scenarios
+        .as_ref()
+        .is_some_and(|summary| !summary.passed);
+    let audit_unresolved = audit
+        .as_ref()
+        .and_then(|value| value.get("unresolved_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let utilized_briefing_hits = phase_attributions
+        .iter()
+        .filter(|record| {
+            record
+                .memory_hits
+                .iter()
+                .any(|hit| context_hit_referenced_by_pull(hit, &pull_records))
+        })
+        .count();
+    let unexpected_discovery_pulls = pull_records
+        .iter()
+        .filter(|record| record.trigger.as_deref() == Some("unexpected_discovery"))
+        .count();
+    let utilization_rate = if phase_attributions.is_empty() {
+        0.0
+    } else {
+        utilized_briefing_hits as f64 / phase_attributions.len() as f64
+    };
+    let context_status = if phase_attributions.is_empty() {
+        "no_briefing"
+    } else if utilization_rate < 0.2 {
+        "low"
+    } else {
+        "healthy"
+    };
+
+    let mut blockers = Vec::new();
+    blockers.extend(open_blockers.iter().cloned());
+    if validation_failed {
+        blockers.push("visible_validation_failed".to_string());
+    }
+    if hidden_failed {
+        blockers.push("hidden_scenarios_failed".to_string());
+    }
+    if memory_blocked {
+        blockers.push("memory_chain_blocked".to_string());
+    }
+
+    let mut review_items = Vec::new();
+    if audit_unresolved > 0 {
+        review_items.push(format!("{audit_unresolved} plan audit item(s) unresolved"));
+    }
+    if memory_review {
+        review_items.push("Calvin promotion review pending".to_string());
+    }
+    if context_status == "low" {
+        review_items.push("context utilization is low".to_string());
+    }
+    if unexpected_discovery_pulls > 0 {
+        review_items.push(format!(
+            "{unexpected_discovery_pulls} unexpected-discovery rebrief pull{} recorded",
+            plural_suffix(unexpected_discovery_pulls)
+        ));
+    }
+
+    let status = if !blockers.is_empty() {
+        "blocked"
+    } else if !review_items.is_empty() {
+        "needs_review"
+    } else if run.status == "completed" {
+        "ready"
+    } else {
+        "running"
+    };
+
+    Ok(Some(serde_json::json!({
+        "schema": "harkonnen.run_health.v1",
+        "run_id": id,
+        "status": status,
+        "run_status": run.status,
+        "current_phase": blackboard.as_ref().map(|board| board.current_phase.clone()),
+        "blockers": blockers,
+        "review_items": review_items,
+        "checks": {
+            "validation": {
+                "present": validation.is_some(),
+                "passed": validation.as_ref().map(|summary| summary.passed),
+            },
+            "hidden_scenarios": {
+                "present": hidden_scenarios.is_some(),
+                "passed": hidden_scenarios.as_ref().map(|summary| summary.passed),
+            },
+            "plan_audit": {
+                "present": audit.is_some(),
+                "unresolved_count": audit_unresolved,
+            },
+            "memory_chain": {
+                "status": if memory_blocked { "blocked" } else if memory_review { "needs_review" } else { "clear" },
+                "total_candidates": candidates.len(),
+                "status_counts": memory_status_counts,
+            },
+            "context_utilization": {
+                "status": context_status,
+                "rate": utilization_rate,
+                "phase_attribution_count": phase_attributions.len(),
+                "mid_task_pull_count": pull_records.len(),
+                "unexpected_discovery_pull_count": unexpected_discovery_pulls,
+            },
+        },
+    })))
+}
+
 async fn read_optional_json<T: DeserializeOwned>(path: &FsPath) -> anyhow::Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
@@ -5018,7 +5825,14 @@ async fn post_chat_message(
     };
 
     match dispatch_message(&app.chat, &app.paths, &thread, &req).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => {
+            if let Some(run_id) = thread.run_id.as_deref() {
+                if let Err(error) = app.process_memory_candidates(Some(run_id), 10).await {
+                    tracing::warn!(run_id = %run_id, error = %error, "memory candidate processing skipped after PackChat post");
+                }
+            }
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -5566,4 +6380,28 @@ async fn get_server_status(State(app): State<AppContext>) -> impl IntoResponse {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::briefing_scope_artifact;
+
+    #[test]
+    fn briefing_scope_artifact_maps_named_scopes_to_artifacts() {
+        assert_eq!(
+            briefing_scope_artifact(None),
+            Some((
+                "coobie_preflight".to_string(),
+                "coobie_briefing.json".to_string()
+            ))
+        );
+        assert_eq!(
+            briefing_scope_artifact(Some("mason-preflight")),
+            Some((
+                "mason_preflight".to_string(),
+                "mason_briefing.json".to_string()
+            ))
+        );
+        assert_eq!(briefing_scope_artifact(Some("unknown")), None);
+    }
 }

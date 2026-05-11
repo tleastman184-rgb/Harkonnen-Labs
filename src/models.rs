@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+pub use crate::memory::{BriefingBlock, BriefingScope, ContextSection, ContextTarget};
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectComponent {
     pub name: String,
@@ -506,6 +508,22 @@ pub struct PhaseAttributionRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPullRecord {
+    pub pull_id: String,
+    pub run_id: String,
+    pub query: String,
+    pub scope: String,
+    pub max_tokens: u32,
+    pub tokens_returned: u32,
+    pub hits_returned: u32,
+    #[serde(default)]
+    pub hit_previews: Vec<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StakeholderAlignmentSummary {
     #[serde(default)]
@@ -610,65 +628,13 @@ pub struct PriorCauseSignal {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BriefingScope {
-    CoobiePreflight,
-    ScoutPreflight,
-    MasonPreflight,
-    PiperPreflight,
-    SablePreflight,
-    CoobieConsolidation,
-    OperatorQuery,
-}
-
-impl std::fmt::Display for BriefingScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            BriefingScope::CoobiePreflight => "coobie_preflight",
-            BriefingScope::ScoutPreflight => "scout_preflight",
-            BriefingScope::MasonPreflight => "mason_preflight",
-            BriefingScope::PiperPreflight => "piper_preflight",
-            BriefingScope::SablePreflight => "sable_preflight",
-            BriefingScope::CoobieConsolidation => "coobie_consolidation",
-            BriefingScope::OperatorQuery => "operator_query",
-        };
-        write!(f, "{label}")
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextSection {
-    ProjectInterview,
-    OperatorModel,
-    SoulIdentity,
-}
-
-impl std::fmt::Display for ContextSection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            ContextSection::ProjectInterview => "project_interview",
-            ContextSection::OperatorModel => "operator_model",
-            ContextSection::SoulIdentity => "soul_identity",
-        };
-        write!(f, "{label}")
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextTarget {
-    pub scope: BriefingScope,
-    pub task_description: String,
-    pub token_budget: u32,
-    pub min_hits: u32,
-    #[serde(default)]
-    pub required_sections: Vec<ContextSection>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoobieBriefing {
     pub spec_id: String,
+    #[serde(default)]
+    pub spec_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_family_retrieval: Option<SpecFamilyRetrievalProof>,
     pub product: String,
     pub query_terms: Vec<String>,
     pub domain_signals: Vec<String>,
@@ -723,6 +689,8 @@ pub struct CoobieBriefing {
     #[serde(default)]
     pub briefing_hits_provided: usize,
     #[serde(default)]
+    pub briefing_blocks: Vec<BriefingBlock>,
+    #[serde(default)]
     pub required_sections_applied: Vec<ContextSection>,
     pub application_risks: Vec<String>,
     pub environment_risks: Vec<String>,
@@ -738,6 +706,17 @@ pub struct CoobieBriefing {
     pub open_questions: Vec<String>,
     pub coobie_response: String,
     pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SpecFamilyRetrievalProof {
+    pub schema: String,
+    pub spec_family: String,
+    pub flat_top_hit: Option<String>,
+    pub family_biased_top_hit: Option<String>,
+    pub family_hit_count: usize,
+    pub unrelated_hit_count: usize,
+    pub improved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -948,6 +927,8 @@ pub struct AgentExecution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentPackage {
     pub spec_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_family: Option<String>,
     pub summary: String,
     pub ambiguity_notes: Vec<String>,
     pub recommended_steps: Vec<String>,
@@ -1114,7 +1095,7 @@ pub struct CounterfactualOutcome {
 pub struct ConsolidationCandidate {
     pub candidate_id: String,
     pub run_id: String,
-    /// `"lesson"` | `"causal_link"` | `"pattern"`
+    /// `"lesson"` | `"causal_link"` | `"pattern"` | `"schema_revision"` | `"cross_agent_pattern"`
     pub kind: String,
     /// `"pending"` | `"kept"` | `"discarded"`
     pub status: String,
@@ -1123,12 +1104,22 @@ pub struct ConsolidationCandidate {
     /// If the operator edited the content, this holds the edited version.
     #[serde(default)]
     pub edited_json: Option<serde_json::Value>,
+    /// `"standard"` | `"elevated"`; schema revisions require elevated review.
+    #[serde(default = "default_consolidation_review_class")]
+    pub review_class: String,
+    /// Cross-episode evidence basis for elevated pattern/schema proposals.
+    #[serde(default)]
+    pub pattern_basis: Vec<serde_json::Value>,
     pub confidence: f64,
     /// Human-readable one-liner shown in the Workbench card.
     pub label: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub reviewed_at: Option<DateTime<Utc>>,
+}
+
+fn default_consolidation_review_class() -> String {
+    "standard".to_string()
 }
 
 /// A causal pattern that has fired on consecutive runs of the same spec.
@@ -1311,6 +1302,26 @@ pub struct MemoryUpdateRecord {
     pub review_note: Option<String>,
     #[serde(default)]
     pub reviewed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeReviewLearningRecord {
+    pub record_id: String,
+    pub run_id: String,
+    pub source_agent: String,
+    pub reviewer_agent: String,
+    pub finding_fingerprint: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    pub severity: String,
+    pub resolution: String,
+    pub lesson: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub stale_if_file_changed: Vec<String>,
+    pub status: String,
     pub created_at: String,
 }
 

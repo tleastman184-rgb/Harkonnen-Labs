@@ -594,9 +594,11 @@ pub async fn handle_memory(command: MemoryCommands, app: AppContext) -> Result<(
                 }
                 None => {
                     println!(
-                        "Semantic embedding unavailable — memory init complete without embeddings."
+                        "Local semantic embedding unavailable — memory init complete without local vectors."
                     );
-                    println!("Embeddings will be generated automatically on the next `cargo run`.");
+                    println!(
+                        "Open Brain is the default shared recall path when OPEN_BRAIN_MCP_URL is configured."
+                    );
                 }
             }
         }
@@ -782,7 +784,7 @@ fn validate_evidence_bundle(bundle: &EvidenceAnnotationBundle) -> Result<()> {
 
 pub async fn handle_setup(command: SetupCommands, paths: &Paths) -> Result<()> {
     match command {
-        SetupCommands::Check => handle_setup_check(paths),
+        SetupCommands::Check => handle_setup_check(paths).await,
         SetupCommands::Init(args) => handle_setup_init(paths, args),
         SetupCommands::ClaudePack(args) => handle_setup_claude_pack(paths, args),
     }
@@ -826,7 +828,7 @@ pub async fn handle_soul(command: SoulCommands, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn handle_setup_check(paths: &Paths) -> Result<()> {
+async fn handle_setup_check(paths: &Paths) -> Result<()> {
     let s = &paths.setup;
     println!("Setup:       {}", s.setup.name);
     if let Some(template) = &s.setup.template {
@@ -924,6 +926,16 @@ fn handle_setup_check(paths: &Paths) -> Result<()> {
         println!();
         println!("MCP Servers: none configured");
     }
+    let pool = crate::db::init_db(paths).await?;
+    let queue_stats = crate::calvin_client::load_write_queue_stats(&pool).await?;
+    println!();
+    println!(
+        "Calvin write queue: pending={} retry_pending={} pending_confirmation={} confirmed={}",
+        queue_stats.pending,
+        queue_stats.retry_pending,
+        queue_stats.pending_confirmation_count(),
+        queue_stats.confirmed
+    );
     Ok(())
 }
 
@@ -1538,47 +1550,10 @@ fn interview_mcp_servers(config: &mut SetupConfig, discovery: &SystemDiscovery) 
 }
 
 fn common_mcp_templates(platform: &str) -> Vec<McpInterviewTemplate> {
+    // filesystem, memory, and sqlite are now served natively by the Harkonnen
+    // self-server (cargo run -- mcp serve --transport stdio). Only external
+    // services remain as npx templates.
     let mut templates = vec![
-        McpInterviewTemplate {
-            name: "filesystem",
-            prompt: "filesystem MCP for product/workspace/artifact access",
-            command: "npx",
-            args: &[
-                "-y",
-                "@modelcontextprotocol/server-filesystem",
-                "./products",
-                "./factory/workspaces",
-                "./factory/artifacts",
-            ],
-            env: &[],
-            aliases: &["filesystem_read", "workspace_write", "artifact_writer"],
-            default_enabled: true,
-            customizable: false,
-        },
-        McpInterviewTemplate {
-            name: "memory",
-            prompt: "memory MCP for retrieval and scratch knowledge",
-            command: "npx",
-            args: &["-y", "@modelcontextprotocol/server-memory"],
-            env: &[],
-            aliases: &["memory_store", "metadata_query"],
-            default_enabled: true,
-            customizable: false,
-        },
-        McpInterviewTemplate {
-            name: "sqlite",
-            prompt: "sqlite MCP for run-state inspection",
-            command: "npx",
-            args: &[
-                "-y",
-                "@modelcontextprotocol/server-sqlite",
-                "./factory/state.db",
-            ],
-            env: &[],
-            aliases: &["db_read"],
-            default_enabled: true,
-            customizable: false,
-        },
         McpInterviewTemplate {
             name: "github",
             prompt: "GitHub MCP for repository, issue, and doc access",
@@ -2372,6 +2347,7 @@ pub async fn handle_archive(
 ) -> Result<()> {
     match command {
         ArchiveCommands::Status => {
+            let queue_stats = crate::calvin_client::load_write_queue_stats(&app.pool).await?;
             if !app.paths.setup.calvin_archive.enabled {
                 println!(
                     "Calvin Archive: disabled (set calvin_archive.enabled = true in setup.toml)"
@@ -2379,12 +2355,13 @@ pub async fn handle_archive(
             } else {
                 match &app.calvin {
                     None => {
-                        println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                        println!("Calvin Archive: enabled but local client unavailable");
                     }
                     Some(client) => {
                         if client.health_check().await {
                             match client.status().await {
                                 Ok(status) => {
+                                    println!("Calvin Archive: harmony reachable");
                                     println!("{}", serde_json::to_string_pretty(&status)?)
                                 }
                                 Err(e) => {
@@ -2392,11 +2369,17 @@ pub async fn handle_archive(
                                 }
                             }
                         } else {
-                            println!("Calvin Archive: enabled but harmony not responding — run `harkonnen archive start`");
+                            println!(
+                                "Calvin Archive: harmony unavailable; writes are queueing locally"
+                            );
+                            println!(
+                                "Hint: run `harkonnen archive start` to bring the sidecar back up"
+                            );
                         }
                     }
                 }
             }
+            print_calvin_write_queue_status(&queue_stats);
         }
         ArchiveCommands::Start => {
             println!("Starting Calvin Archive stack...");
@@ -2437,6 +2420,25 @@ pub async fn handle_archive(
         },
     }
     Ok(())
+}
+
+fn print_calvin_write_queue_status(stats: &crate::calvin_client::CalvinWriteQueueStats) {
+    println!(
+        "Calvin write queue: pending={} retry_pending={} pending_confirmation={} confirmed={}",
+        stats.pending,
+        stats.retry_pending,
+        stats.pending_confirmation_count(),
+        stats.confirmed
+    );
+    if let Some(value) = stats.oldest_pending_at.as_deref() {
+        println!("Oldest pending Calvin write: {value}");
+    }
+    if let Some(value) = stats.next_attempt_at.as_deref() {
+        println!("Next Calvin retry: {value}");
+    }
+    if let Some(value) = stats.last_error.as_deref() {
+        println!("Last Calvin write error: {value}");
+    }
 }
 
 fn build_docker_compose_command<const N: usize>(args: [&str; N]) -> Result<std::process::Command> {

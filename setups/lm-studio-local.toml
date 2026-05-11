@@ -1,8 +1,6 @@
 # LM Studio local setup
 # Uses the currently loaded LM Studio OpenAI-compatible endpoint on 127.0.0.1:1234.
-# LM Studio typically ignores the bearer token, but Harkonnen expects a non-empty env var.
 # Example:
-#   export LM_STUDIO_API_KEY=lm-studio
 #   export HARKONNEN_SETUP=lm-studio-local
 #   cargo run -- setup check
 
@@ -16,18 +14,18 @@ openclaw    = false
 default = "codex"
 
 [providers.codex]
-type         = "openai"
+type         = "lmstudio"
 model        = "crow-9b-opus-4.6-distill-heretic_qwen3.5"
-api_key_env  = "LM_STUDIO_API_KEY"
+api_key_env  = ""
 enabled      = true
 usage_rights = "local"
 surface      = "lm-studio"
 base_url     = "http://127.0.0.1:1234"
 
 [providers.embedding]
-type         = "openai"
+type         = "lmstudio"
 model        = "text-embedding-nomic-embed-text-v1.5"
-api_key_env  = "LM_STUDIO_API_KEY"
+api_key_env  = ""
 enabled      = true
 usage_rights = "local"
 surface      = "lm-studio"

@@ -7,10 +7,10 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{
-    archive::{ArchiveExperience, BeliefRevision},
+    archive::{ArchiveExperience, BeliefRevision, CausalLinkPayload},
     metrics,
     telemetry::TelemetryEvent,
     CalvinState,
@@ -24,9 +24,19 @@ pub(crate) fn router(state: Arc<CalvinState>) -> Router {
         .route("/runs/:run_id/experiences", post(record_experience))
         .route("/runs/:run_id/beliefs", post(revise_belief))
         .route("/runs/:run_id/close", patch(close_run))
+        .route("/runs/:run_id/causal-links", post(record_causal_link))
+        .route(
+            "/runs/:run_id/predictions",
+            post(post_prediction).get(get_prediction),
+        )
+        .route(
+            "/runs/:run_id/prediction-result",
+            post(post_prediction_result),
+        )
         .route("/agents/:name/traits", get(get_traits))
         .route("/agents/:name/beliefs", get(get_beliefs))
         .route("/agents/:name/check", post(check_adaptation))
+        .route("/agents/:name/status", patch(patch_agent_status))
         .route("/agents/:name/metrics", get(get_metrics))
         .route("/telemetry", post(write_event))
         .route("/telemetry/batch", post(write_events_batch))
@@ -100,8 +110,15 @@ async fn revise_belief(
     Path(_run_id): Path<String>,
     Json(rev): Json<BeliefRevision>,
 ) -> impl IntoResponse {
+    if let Err(e) = rev.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     match state.archive.revise_belief(&rev).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => StatusCode::CREATED.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -163,11 +180,6 @@ struct CheckAdaptationRequest {
     adaptation_summary: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CheckAdaptationResponse {
-    safe: bool,
-}
-
 async fn check_adaptation(
     State(state): State<Arc<CalvinState>>,
     Path(name): Path<String>,
@@ -178,7 +190,176 @@ async fn check_adaptation(
         .check_adaptation_safe(&req.adaptation_summary, &name)
         .await
     {
-        Ok(safe) => Json(CheckAdaptationResponse { safe }).into_response(),
+        Ok(audit) => Json(audit).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordCausalLinkRequest {
+    cause_episode_id: String,
+    effect_episode_id: String,
+    pearl_level: crate::archive::PearlLevel,
+    confidence: f64,
+    #[serde(default)]
+    held_fixed: Vec<String>,
+    estimated_effect_delta: Option<f64>,
+    actual_trace_id: Option<String>,
+    hypothetical_intervention: Option<String>,
+    #[serde(default)]
+    warrant_gap: bool,
+    epistemic_warrant: Option<crate::archive::PearlLevel>,
+}
+
+async fn record_causal_link(
+    State(state): State<Arc<CalvinState>>,
+    Path(run_id): Path<String>,
+    Json(req): Json<RecordCausalLinkRequest>,
+) -> impl IntoResponse {
+    let payload = CausalLinkPayload {
+        cause_episode_id: req.cause_episode_id,
+        effect_episode_id: req.effect_episode_id,
+        pearl_level: req.pearl_level,
+        confidence: req.confidence,
+        held_fixed: req.held_fixed,
+        estimated_effect_delta: req.estimated_effect_delta,
+        actual_trace_id: req.actual_trace_id,
+        hypothetical_intervention: req.hypothetical_intervention,
+        warrant_gap: req.warrant_gap,
+        epistemic_warrant: req.epistemic_warrant,
+    };
+    if let Err(e) = payload.clone().normalized() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    match state.archive.record_causal_link(&run_id, payload).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchAgentStatusRequest {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostPredictionRequest {
+    prediction_id: String,
+    predicted_outcome: String,
+    risk_score: f64,
+    confidence: f64,
+    #[serde(default)]
+    failure_phase: Option<String>,
+    #[serde(default)]
+    failure_kind: Option<String>,
+    #[serde(default)]
+    source_cause_ids: String,
+    narrative_summary: String,
+}
+
+async fn post_prediction(
+    State(state): State<Arc<CalvinState>>,
+    Path(run_id): Path<String>,
+    Json(req): Json<PostPredictionRequest>,
+) -> impl IntoResponse {
+    match state
+        .archive
+        .record_prediction(
+            &run_id,
+            &req.prediction_id,
+            &req.predicted_outcome,
+            req.risk_score,
+            req.confidence,
+            req.failure_phase.as_deref(),
+            req.failure_kind.as_deref(),
+            &req.source_cause_ids,
+            &req.narrative_summary,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_prediction(
+    State(state): State<Arc<CalvinState>>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    match state.archive.get_prediction(&run_id).await {
+        Ok(Some(pred)) => Json(pred).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PostPredictionResultRequest {
+    prediction_id: String,
+    result_id: String,
+    actual_outcome: String,
+    #[serde(default)]
+    actual_failure_phase: Option<String>,
+    #[serde(default)]
+    actual_failure_kind: Option<String>,
+    prediction_error: f64,
+    narrative_summary: String,
+}
+
+async fn post_prediction_result(
+    State(state): State<Arc<CalvinState>>,
+    Path(_run_id): Path<String>,
+    Json(req): Json<PostPredictionResultRequest>,
+) -> impl IntoResponse {
+    match state
+        .archive
+        .record_prediction_result(
+            &req.prediction_id,
+            &req.result_id,
+            &req.actual_outcome,
+            req.actual_failure_phase.as_deref(),
+            req.actual_failure_kind.as_deref(),
+            req.prediction_error,
+            &req.narrative_summary,
+        )
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn patch_agent_status(
+    State(state): State<Arc<CalvinState>>,
+    Path(name): Path<String>,
+    Json(req): Json<PatchAgentStatusRequest>,
+) -> impl IntoResponse {
+    match state.archive.update_agent_status(&name, &req.status).await {
+        Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

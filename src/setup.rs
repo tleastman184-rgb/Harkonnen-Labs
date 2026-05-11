@@ -13,6 +13,12 @@ pub struct SetupConfig {
     pub mcp: Option<McpConfig>,
     #[serde(default)]
     pub calvin_archive: CalvinConfig,
+    #[serde(default)]
+    pub twilight_bark: TwilightBarkConfig,
+    #[serde(default)]
+    pub open_brain: OpenBrainConfig,
+    #[serde(default)]
+    pub sub_agents: SubAgentConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -95,16 +101,167 @@ pub struct RoutingConfig {
     pub agents: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CalvinConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_calvin_url")]
     pub harmony_url: String,
+    #[serde(default = "default_calvin_health_timeout_ms")]
+    pub health_timeout_ms: u64,
+    #[serde(default = "default_calvin_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    #[serde(default = "default_calvin_read_timeout_ms")]
+    pub read_timeout_ms: u64,
 }
 
 fn default_calvin_url() -> String {
     "http://localhost:7171".to_string()
+}
+
+fn default_calvin_health_timeout_ms() -> u64 {
+    500
+}
+
+fn default_calvin_write_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_calvin_read_timeout_ms() -> u64 {
+    2_000
+}
+
+impl Default for CalvinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            harmony_url: default_calvin_url(),
+            health_timeout_ms: default_calvin_health_timeout_ms(),
+            write_timeout_ms: default_calvin_write_timeout_ms(),
+            read_timeout_ms: default_calvin_read_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TwilightBarkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub daemon_socket: Option<PathBuf>,
+    #[serde(default = "default_twilight_agent_name")]
+    pub agent_name: String,
+    #[serde(default = "default_twilight_agent_role")]
+    pub agent_role: String,
+}
+
+fn default_twilight_agent_name() -> String {
+    "harkonnen-packchat".to_string()
+}
+
+fn default_twilight_agent_role() -> String {
+    "packchat-bridge".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenBrainConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub connection_url: Option<String>,
+    #[serde(default = "default_open_brain_connection_url_env")]
+    pub connection_url_env: String,
+    #[serde(default = "default_open_brain_access_key_env")]
+    pub access_key_env: String,
+    #[serde(default = "default_open_brain_search_limit")]
+    pub search_limit: usize,
+    #[serde(default = "default_open_brain_search_threshold")]
+    pub search_threshold: f64,
+    #[serde(default = "default_open_brain_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for OpenBrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            connection_url: None,
+            connection_url_env: default_open_brain_connection_url_env(),
+            access_key_env: default_open_brain_access_key_env(),
+            search_limit: default_open_brain_search_limit(),
+            search_threshold: default_open_brain_search_threshold(),
+            timeout_ms: default_open_brain_timeout_ms(),
+        }
+    }
+}
+
+fn default_open_brain_connection_url_env() -> String {
+    "OPEN_BRAIN_MCP_URL".to_string()
+}
+
+fn default_open_brain_access_key_env() -> String {
+    "OPEN_BRAIN_ACCESS_KEY".to_string()
+}
+
+fn default_open_brain_search_limit() -> usize {
+    8
+}
+
+fn default_open_brain_search_threshold() -> f64 {
+    0.5
+}
+
+fn default_open_brain_timeout_ms() -> u64 {
+    2_500
+}
+
+/// Top-level [sub_agents] section in harkonnen.toml.
+/// Named sub-tables (e.g. [sub_agents.coobie_briefing]) are parsed into `tasks`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SubAgentConfig {
+    /// Default backend when no per-task config exists.
+    /// Values: "direct_llm" | "claude_code_agent" | "codex_plan_agent" | "gemini_agent"
+    #[serde(default = "default_sub_agent_mode")]
+    pub default_mode: String,
+    /// Per-task overrides — e.g. coobie_briefing, sable_evaluation, mason_diagnosis.
+    #[serde(flatten)]
+    pub tasks: HashMap<String, SubAgentTaskConfig>,
+}
+
+fn default_sub_agent_mode() -> String {
+    "direct_llm".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubAgentTaskConfig {
+    /// Logical task identifier matching the MASTER_SPEC task names.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// Backend to use for this task.
+    #[serde(default = "default_sub_agent_mode")]
+    pub backend: String,
+    /// Model override for ClaudeCodeAgent / GeminiAgent backends.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Run this task in an isolated context window (system-prompt enforced).
+    #[serde(default = "default_true")]
+    pub isolation: bool,
+    /// Whether the sub-agent may write to memory/SQLite/Calvin.
+    #[serde(default)]
+    pub memory_write: bool,
+    /// Context paths passed to CodexPlanAgent (relative to repo root).
+    #[serde(default)]
+    pub context_paths: Vec<String>,
+    /// Maximum conversation turns for ClaudeCodeAgent backends.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
+    /// Additional tools to block in the isolation system prompt (beyond defaults).
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+}
+
+fn default_max_turns() -> u32 {
+    6
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -210,6 +367,9 @@ impl SetupConfig {
             routing: None,
             mcp: None,
             calvin_archive: CalvinConfig::default(),
+            twilight_bark: TwilightBarkConfig::default(),
+            open_brain: OpenBrainConfig::default(),
+            sub_agents: SubAgentConfig::default(),
         }
     }
 
@@ -529,4 +689,20 @@ fn detected_username() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("USERNAME").ok())
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CalvinConfig;
+
+    #[test]
+    fn calvin_config_defaults_keep_health_reads_and_writes_separate() {
+        let config = CalvinConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.harmony_url, "http://localhost:7171");
+        assert_eq!(config.health_timeout_ms, 500);
+        assert_eq!(config.read_timeout_ms, 2_000);
+        assert_eq!(config.write_timeout_ms, 5_000);
+    }
 }

@@ -11,7 +11,7 @@ For source docs still referenced individually: [09-Identity-Continuity.md](the-s
 
 ### What This System Is
 
-A local-first, spec-driven, causally-aware AI software factory. Humans define intent and judge outcomes. A pack of nine specialist agents executes with discipline. Coobie remembers what worked. The Calvin Archive preserves who the agents are as they learn.
+A local-first, spec-driven, causally-aware AI software factory. Humans define intent and judge outcomes. A pack of nine specialist agents executes with discipline. Twilight Bark carries pack conversations across runtimes. Open Brain (OB1) provides shared semantic recall. Coobie decides what should be remembered. The Calvin Archive preserves who the agents are as they learn.
 
 The factory separates three things that most AI systems collapse together:
 
@@ -60,12 +60,16 @@ Multi-Agent Execution (Scout → Mason → Piper → Bramble → Sable → Ash �
 Validation (visible tests + hidden scenarios)
    ↓
 Artifact Production
+  ↓
+PackChat / Twilight Bark Conversation Capture
    ↓
-Episodic Capture + Causal Analysis (Coobie)
+Memory Distillation + Causal Analysis (Coobie)
+   ↓
+Open Brain Shared Recall
    ↓
 Operator-Reviewed Consolidation
    ↓
-Structured Memory + Soul Graph Update
+Calvin Archive Promotion + Soul Graph Update
    ↓
 Better Next Run
 ```
@@ -94,6 +98,7 @@ src/                    Rust CLI (cargo run -- <command>)
   llm.rs                LLM request/response types and provider routing
   memory.rs             File-backed memory store, init, reindex, retrieve
   models.rs             Shared data types (Spec, RunRecord, EpisodeRecord, etc.)
+  openbrain.rs          Open Brain (OB1) MCP client for shared semantic recall
   operator_model.rs     Operator model interview, layers, and artifact generation
   orchestrator.rs       AppContext, run lifecycle, all Labrador phase methods
   pidgin.rs             Inter-agent message format and handoff protocol
@@ -104,7 +109,7 @@ src/                    Rust CLI (cargo run -- <command>)
   spec.rs               YAML spec loader and validation
   stamp.rs              Repo stamp interview and .harkonnen/repo.toml generation
   subagent.rs           Sub-agent dispatch and provider handoff
-  tesseract.rs          Workspace isolation and file-write permission model
+  tesseract.rs          Causal Tesseract scene-graph builder
   workspace.rs          Per-run workspace creation
   mcp_registry.rs       MCP server registry — loading and routing
   mcp_server.rs         Harkonnen self-hosted MCP server (ENT-1)
@@ -187,6 +192,8 @@ cargo run -- setup check
 | Orchestrator | Coordinate runs, phase handoffs, retries, state transitions | Live |
 | Agent Role System | Nine specialist agents with bounded tools and permissions | Live |
 | Memory System (Coobie) | Six-layer memory: working, episodic, semantic, causal, blackboard, consolidation | Live (partially) |
+| Open Brain (OB1) | Default shared semantic recall across AI clients via MCP | Default when `OPEN_BRAIN_MCP_URL` is configured |
+| Twilight Bark PackChat Binding | Distributed PackChat envelope transport for conversations, checkpoints, and agent events | Initial bridge live; distillation chain planned |
 | Calvin Archive | Typed autobiographical and identity continuity archive for persisted agents | Planned (Phase 8) |
 | Hidden Scenario System | Protected behavioral evaluation isolated from implementation agents | Live |
 | Digital Twin Environment | Simulated external systems for safe integration evaluation | Partial |
@@ -274,6 +281,32 @@ POST /api/coordination/check-lease     # guardrail gate — must be called befor
 
 Keeper owns coordination policy. Claims carry `resource_kind`, `ttl_secs`, `guardrails`, and `expires_at`. Mason must call `check-lease` before any file write — a denied lease blocks the write and writes a decision record. Active leases and Keeper policy events are mirrored into SQLite, and run-scoped PackChat coordination threads provide the shared conversation surface for live dog runtimes.
 
+### Agent State Table
+
+The dog runtime registry tracks live instances per role with `thread_id`, ownership, and status. This is coordination state. It does not record what each agent currently knows, what LLM it is running, or why it last stopped.
+
+Add `agent_state` to `state.db` — one canonical row per Labrador role, updated at the end of each run that involves that agent:
+
+```sql
+CREATE TABLE agent_state (
+    agent_name             TEXT PRIMARY KEY,
+    agent_role             TEXT NOT NULL,
+    llm_provider           TEXT NOT NULL,
+    llm_model              TEXT NOT NULL,
+    memory_block_ids       TEXT NOT NULL DEFAULT '{}',   -- JSON: block_name → OB1 ref / memory file id
+    last_stop_reason       TEXT,
+    last_active_run        TEXT,
+    behavior_contract_hash TEXT,                         -- SHA256 of factory/agents/contracts/<name>.md
+    updated_at             TEXT NOT NULL
+);
+```
+
+`memory_block_ids` maps each standard briefing block name to the OB1 thought ref or file memory ID most recently assigned to it. Coobie queries `agent_state` for each agent's existing block refs before running a full semantic search, giving each agent a fast path to its prior context across sessions.
+
+`behavior_contract_hash` fingerprints each agent's current `factory/agents/contracts/` file. A hash change between runs surfaces behavioral contract revision as a database event — auditable without requiring a file diff.
+
+This pattern is derived from comparing Letta's `AgentState` model against Harkonnen's current agent representation. It is a Harkonnen-native schema addition; there is no Letta dependency.
+
 ---
 
 ## Part 4 — Memory System
@@ -286,11 +319,29 @@ Coobie manages six distinct layers — not one undifferentiated note pile:
 | --- | --- | --- | --- |
 | Working Memory | Current run state, active hypotheses, blockers — token-budgeted, ephemeral | SQLite row / in-process state | Live |
 | Episodic Memory | Ordered execution traces (state → action → result) with phase attribution | Append-only SQLite + JSONL per run | Live |
-| Semantic Memory | Stable facts, patterns, invariants — hybrid vector + keyword retrieval | fastembed + SQLite vector store | Live |
+| Semantic Memory | Stable facts, patterns, invariants — shared recall first, local vector fallback optional | Open Brain (OB1) MCP by default; fastembed + SQLite vector store opt-in | Live (OB1 search path default; local embeddings optional) |
 | Causal Memory | Intervention-aware cause/effect with streak detection and cross-run patterns | SQLite causal_links + petgraph | Live |
 | Team Blackboard | Four named slices (Mission, Action, Evidence, Memory) for pack coordination | SQLite + per-run board.json | Live |
 | Dog Runtime Registry | Canonical dog role plus live runtime instances (`mason#codex`, `mason#claude`, etc.) linked to PackChat threads | SQLite + blackboard sync | Live |
 | Consolidation | Operator-reviewed promotion, pruning, and abstraction of high-value episodes | SQLite consolidation_candidates | Live |
+
+### Named Briefing Block Structure
+
+Coobie briefings are assembled from the memory layers above and delivered as a flat string to each phase prompt. The intermediate representation is structured as `Vec<BriefingBlock>` — each block carries a name, content, source tag, and token count. The assembled prompt remains a flat string at the LLM boundary; the block structure is preserved for introspection and diffing.
+
+Standard blocks used across all scopes:
+
+| Block | Content | Source layer |
+| --- | --- | --- |
+| `causal_patterns` | Palace den scents + active DeepSignal activations | Causal memory + Palace patrol |
+| `operator_profile` | Commissioning brief posture + risk tolerances | Operator model |
+| `active_run` | Current spec + phase + blackboard summary | Working memory |
+| `open_checks` | Required checks + guardrails for this scope | Scope filter |
+| `recalled_lessons` | OB1 hits + file-backed memory hits, ranked and deduplicated | SemanticMemory + file store |
+
+Scope-specific blocks are added or suppressed by the `BriefingScope` filter: Sable receives no `recalled_lessons` entries tagged `implementation_notes` or `mason_plan`; Scout receives no `causal_patterns` entries tagged `hidden_scenario`.
+
+The block structure enables: per-block utilization tracking in `ContextUtilization` (which block contributed to which decision), independent block updating when a new lesson is approved without regenerating the whole briefing, and `GET /api/runs/{id}/briefing` returning the block structure for Pack Board rendering. This pattern is derived from comparing Letta's labeled in-context memory block model against Harkonnen's current freeform briefing path.
 
 ### Coobie Palace
 
@@ -308,14 +359,68 @@ The five dens:
 
 Palace output injects into preflight briefing `required_checks`, `guardrails`, and `open_questions`.
 
+### Spec Taxonomy and Cross-Agent Learning
+
+Two structurally distinct gaps in how lessons accumulate.
+
+**Spec family clustering** — every spec is an independent retrieval entity. Coobie queries by keyword against a flat collection; there is no mechanism to recognize that an incoming spec belongs to the same family as prior specs and weight those episodes preferentially. Without clustering, "thin evidence" fires even when the factory has run the same class of work many times, because the retrieval layer cannot see the family. The behavioral-change report also cannot scope `prior_revision_target` links to a spec family, which makes learning provenance claims cross-spec noise rather than verifiable.
+
+The design: embed each spec into a family vector at intake using the OB1 semantic infrastructure. Before retrieval, project the incoming spec's similarity to prior family vectors and bias retrieval toward the closest family cluster. The family vector lives in OB1 alongside the spec; Scout's intent package gains an optional `spec_family` tag. This enables the behavioral-change report to say: "on specs tagged `auth_service`, Mason's fix-loop retry rate dropped from 2.1 to 0.9 after this lesson." That specificity is what distinguishes learning provenance from correlation.
+
+**Cross-agent lesson promotion path** — Scout's ambiguity patterns and Mason's failure repair patterns are correctly isolated in separate scoped memory. The gap: no one closes the loop when Scout's ambiguity signal and Mason's failure cause co-occur on the same run repeatedly. No single agent is authorized to generate cross-role causal patterns; Coobie's DeepSignalSpec heuristics are Mason/Bramble-facing.
+
+The design: after each run, Coobie checks cross-agent co-occurrence for any Scout ambiguity signals that fired alongside Mason failure causes. When co-occurrence crosses `cross_agent_correlation_threshold` over N runs, emit a `cross_agent_pattern_candidate` for Consolidation Workbench review, tagged `cross_agent_pattern` (elevated review, spans a role boundary). If promoted, the lesson feeds both Scout's and Mason's scoped briefings with a `cross_agent` provenance tag so both agents see the inter-role signal.
+
 ### Memory Persistence Stack
 
-- **Filesystem** (`factory/memory/`) — canonical source of truth for durable memory documents
+- **Filesystem** (`factory/memory/`) — canonical source of truth for repo-local durable memory documents
 - **SQLite** — structured run state, episode records, causal links, chat threads, consolidation candidates
-- **fastembed + SQLite vector store** — hybrid vector + keyword retrieval for semantic memory
-- **Qdrant** (Phase 5b) — semantic acceleration for long-term memory at scale
+- **Open Brain (OB1) MCP** — default shared semantic recall and "remember this" memory substrate across AI clients and Twilight-connected agents
+- **fastembed + SQLite vector store** — optional local hybrid vector + keyword retrieval fallback (`--features local-embeddings` or external embedding provider)
+- **Qdrant** (optional future accelerator) — only if local high-volume vector serving is needed; not the default memory substrate
 - **TypeDB 3.x** (Phase 6) — durable semantic graph for typed causal queries; not the hot path
 - **AnythingLLM** (home-linux optional) — local retrieval accelerator for imported documents
+
+### PackChat -> Open Brain -> Calvin Chain
+
+Harkonnen's memory spine is a four-stage pipeline, not a direct chat-log dump:
+
+```text
+Twilight Bark / PackChat
+  -> Harkonnen memory candidate queue
+  -> Coobie distillation and classification
+  -> Open Brain shared semantic recall
+  -> Calvin Archive governed promotion
+```
+
+**Twilight Bark / PackChat** is the live transport layer. PackChat messages, checkpoint replies, task events, agent observations, and cross-runtime coordination updates move as versioned envelopes. The transport may be local SQLite/JSONL during development or Twilight Bark over Zenoh/OpenZiti in distributed mode, but the contract is the same: append-only event identity, thread identity, runtime identity, causality metadata, and evidence references.
+
+**Dependency direction:** Twilight Bark is a dependency of Harkonnen Labs, not the other way around. Harkonnen may publish Harkonnen-owned PackChat operations such as `harkonnen.packchat.event` through Twilight Bark's generic task/event bus, but Twilight Bark must remain Harkonnen-agnostic: no Calvin archive concepts, no Labrador dog-role assumptions, and no imports of Harkonnen code. Harkonnen owns PackChat schemas, Calvin ingress contracts, and archive promotion policy on its side of the bridge.
+
+**Message ordering — sequence_id:** PackChat messages carry a `sequence_id` — a per-thread monotonic integer assigned at insert time on the originating machine. `sequence_id` is the canonical sort key for all read paths (conversation reconstruction, Coobie distillation, Twilight ingest). `created_at` timestamps are preserved for display and time-window queries but must not be used as a sort key in distributed mode, where clock drift between machines makes timestamp ordering unreliable. Cross-machine ordering uses a `(machine_id, sequence_id)` composite. This pattern is derived from Letta's recall memory implementation and is a Phase 9 prerequisite; the column is cheap to add before distribution and expensive to retrofit after ordering bugs appear.
+
+**Memory candidates** are the raw ingress boundary. Harkonnen should persist candidate rows before summarization so nothing depends on a successful LLM call. Candidate metadata includes `candidate_id`, `source_event_id`, `thread_id`, `run_id`, `agent_runtime_id`, `operation`, `created_at`, `importance_score`, `retention_class`, `sensitivity_label`, `evidence_refs`, and `causality`.
+
+**Coobie distillation** decides what survives. The distiller converts conversation fragments into structured memory proposals: a concise thought, provenance, confidence, sensitivity, tags, and a recommended destination. Most events remain ephemeral. Useful operating facts go to OB1. Identity-relevant, belief-revising, high-Pathos, policy-changing, or causally significant items become Calvin promotion candidates.
+
+**Open Brain (OB1)** is the default shared recall layer. Harkonnen calls `capture_thought` for durable distilled memories and `search_thoughts` when assembling context. OB1 answers "what should connected AI clients remember and retrieve semantically?" It is not canonical truth and does not supersede Calvin.
+
+**Calvin Archive** is the governed continuity layer. Calvin receives structured promotion contracts, not loose chat prose. Promotion candidates must carry evidence, inference posture, preservation notes, chamber targets, and an integration recommendation: `accept`, `modify`, `reject`, or `quarantine`.
+
+**Compiled claim + evidence timeline** is the promotion shape for Calvin-worthy memory. Borrow the useful gbrain pattern without adopting its storage model: each promotion contract carries an operator-readable `compiled_claim`, append-only `evidence_timeline`, `source_authority`, `staleness_triggers`, `review_state`, and `integration_recommendation`. Newer conflicting evidence should mark the proposal or distilled memory as `needs_reconsolidation`; it must not silently overwrite OB1 recall or Calvin canonical state.
+
+### OpenZiti Trust Boundary
+
+OpenZiti is the zero-trust connective tissue for the distributed version of the chain. Harkonnen should define separate services and policies for each trust surface:
+
+| OpenZiti service | Dial identities | Bind identities | Notes |
+| --- | --- | --- | --- |
+| `twilight-bark.packchat` | approved agent runtimes, operator console | Twilight daemon nodes | Live conversation bus |
+| `openbrain.mcp` | Harkonnen memory distiller, approved recall clients | OB1 server | Shared semantic recall |
+| `calvin.archive` | Harkonnen/Coobie archive writer, operator console | Calvin Archive host | Governed write surface; narrowest access |
+| `harkonnen.api` | operator console, approved integrations | Harkonnen host | Run control and Pack Board API |
+
+Service policies should separate Dial from Bind authority. Posture checks should be used for privileged memory writers and Calvin archive writers where available: expected OS, enrolled identity, MFA for operators, and process checks for known daemon binaries. Remote agents may read OB1 recall through policy, but only the Harkonnen distiller should write Calvin promotion contracts by default.
 
 ### Rust Traits (stable interfaces)
 
@@ -347,6 +452,24 @@ pub trait Consolidator {
     fn consolidate_run(&self, run_id: &str) -> anyhow::Result<ConsolidationReport>;
 }
 ```
+
+### Coobie Design Constraints
+
+**Positive signal reinforcement** — memory accumulates failure-annotated lessons; correct-prediction runs generate nothing. Add `prediction_success_reinforcement` at run close: when `prediction_error < success_threshold`, increment `confirmation_count` on the causal signals that fired and whose chamber classifications matched the actual outcome. Signals with high `confirmation_count` become eligible for upward confidence revision in the Consolidation Workbench. Without this, the briefing progressively pessimizes even on a healthy factory.
+
+**Mid-run re-briefing** — define a `mid_run_rebrief_trigger` contract: agents issue scoped `memory_pull` calls tagged `trigger: unexpected_discovery` when they encounter conditions absent from the phase-entry briefing. At run close, flagged pulls feed into the briefing-scope review for the spec family. If the same gap recurs across multiple runs of a family, it becomes a `required_section` injection rule rather than requiring an agent to ask each time. This closes the briefing-miss feedback loop.
+
+**Coobie self-referential audit** — Coobie monitors all other agents but has no auditor for herself. Her own behavioral contract `C = (P, I, G, R)` must be specified in `factory/agents/contracts/` and enforced by a `coobie_health_check` in the session heartbeat. The health check computes: rolling briefing utilization rate trend (last 20 runs), prediction accuracy trend, `stored_not_learned` accumulation rate. When any metric crosses its configured threshold, `coobie_audit_required` fires; Keeper receives the flag and surfaces it as an operator checkpoint. Coobie cannot audit herself — Keeper is the designated auditor for the auditor.
+
+**`decision_influence_score` calibration** — the score cannot be correctly computed from retrieval frequency alone. Add a calibrated exclusion signal: with configurable probability, randomly exclude an eligible briefing hit from the active set for a comparable run and track whether outcomes differ. The statistical difference in outcome rate over N exclusions becomes the influence score. Without this, `stored_not_learned` detection will be systematically wrong on high-frequency, low-influence lessons.
+
+**Coobie operational modes** — Coobie conflates three computationally distinct operations that live at different levels of Pearl's causal hierarchy. Conflating them in one dispatch path allows the system to appear causally sophisticated while silently executing only associational recall. The three modes are non-interchangeable:
+
+- `coobie_retrieve(query, scope, token_budget)` — **associational level**. Pure read from OB1 + SQLite. No TypeDB or causal graph query. Returns ranked hits. Always available regardless of archive readiness.
+- `coobie_intervene(hypothesis, held_fixed: Vec<String>)` — **interventional level**. Given `do(X=x)`, query the TypeDB causal graph for the predicted distribution of Y holding the do-set fixed. Returns `CausalInterventionResult { estimated_effect_delta, confounders, epistemic_warrant, confidence }`. Requires TypeDB live (Phase 6+). Degrades gracefully to `coobie_retrieve` with a `warrant_gap: true` annotation — it must never substitute retrieval results as if they were intervention-level claims.
+- `coobie_continuity_check(agent_name, baseline_snapshot_id)` — **counterfactual level**. Load the agent's current trait/value-commitment vector from the Calvin Archive and compare it against a named `continuity-snapshot`. Returns `ContinuityCheckResult { per_invariant_drift_scores, labrador_kernel_intact, divergent_traits, anchoring_experiences }`. Requires TypeDB and a baseline snapshot.
+
+Each mode is dispatchable as a distinct `SubAgentDispatcher` task type. The dispatcher logs which mode was actually executed (vs. which was requested) in `agent_traces`. A `coobie_intervene` that silently degraded to `coobie_retrieve` must be flagged as such in the trace rather than presented as an interventional result.
 
 ---
 
@@ -381,6 +504,8 @@ it.
 8. **Quarantine is first-class.** Unresolved material is preserved explicitly rather than forced into premature acceptance or deletion.
 9. **Identity is multi-anchor, not monolithic.** Kernel, presentation, procedures, style, episodic continuity, and heartbeat autonomy should be separated rather than collapsed into one file.
 10. **Presence continuity should be model-agnostic.** If the provider or base model changes, the soul package and typed continuity graph should preserve identity across the swap.
+11. **Forgetting is governed, not disabled.** Append-only means no deletion without governance — it does not mean every experience remains equally retrievable forever. The archive must have a retention tier architecture: active, episodic archive, and historical record. Salience decay governs tier transitions; `identity-constituting` tags protect formative experiences at full fidelity regardless of age.
+12. **Multi-instance topology must be resolved before schema finalization.** Whether `agent-self` is per-deployment or global, and how cross-machine divergence is reconciled, are architecture decisions that must be encoded in the TypeDB schema — not left as runtime conventions to be resolved in Phase 9.
 
 ### The Six Chambers
 
@@ -401,6 +526,22 @@ it.
 | **Superseded, not overwritten** | beliefs, adaptations, reflection-derived conclusions, causal-pattern confidence, behavioral-signature comparisons |
 | **Rare explicit revision only** | value-commitments, kernel-level traits, identity invariants, ethos commitments |
 | **Fully derived / recomputable** | summary-views, continuity-snapshots, embeddings, rankings, recommendation outputs |
+
+### Retention Tier Architecture
+
+Append-only does not mean equally retrievable forever. The archive must implement governed salience decay across three tiers:
+
+| Tier | Description | Retrieval |
+| --- | --- | --- |
+| **Active** | Recent experiences with Pathos score above `active_retention_threshold` or age within the active window | Default briefing weight |
+| **Episodic archive** | Medium-salience experiences past the active window, compressed into summary form | Retrievable on explicit query; not in default briefing window |
+| **Historical record** | Low-salience experiences converted to aggregate statistics contributing to causal pattern confidence | Not directly retrieved; contributes to pattern strength only |
+
+Tier transition is governed by Pathos score, age, and explicit operator tagging. Transitions are reversible: if a `pending evidence bounty` query matches a historically-archived experience, that experience can be resurface to the episodic archive tier.
+
+A fourth special class, **`identity-constituting`**, marks experiences that must remain at full active fidelity regardless of age or Pathos score. These are formative events that shaped a chamber-level invariant — typically flagged by the Meta-Governor at integration time or by the operator via the Consolidation Workbench.
+
+Tier transitions are append-only events in themselves: the original experience is preserved in the historical tier; the transition record is logged with the Pathos score and timestamp at the time of demotion.
 
 ### Canonical Modeling Rules
 
@@ -439,7 +580,7 @@ revision history, and diagnostic legibility.
 
 ### Core Entities
 
-`soul`, `agent-self`, `experience`, `observation`, `belief`, `evidence`, `inference-pattern`, `uncertainty-state`, `trust-anchor`, `interpretive-frame`, `value-commitment`, `trait`, `wound`, `adaptation`, `reflection`, `schema`, `integration-candidate`, `quarantine-entry`, `integration-policy`, `causal-pattern`, `behavioral-signature`, `relationship-anchor`, `spec-context`, `run`, `artifact`, `summary-view`, `continuity-snapshot`
+`soul`, `agent-self`, `experience`, `observation`, `belief`, `evidence`, `inference-pattern`, `uncertainty-state`, `trust-anchor`, `interpretive-frame`, `value-commitment`, `trait`, `wound`, `adaptation`, `reflection`, `schema`, `memory-candidate`, `openbrain-thought-ref`, `integration-candidate`, `quarantine-entry`, `integration-policy`, `causal-pattern`, `behavioral-signature`, `relationship-anchor`, `spec-context`, `run`, `artifact`, `summary-view`, `continuity-snapshot`
 
 ### API Surface
 
@@ -448,6 +589,9 @@ create_soul(name)
 create_self(soul_id, self_name)
 record_experience(self_id, experience_input)
 record_observation(self_id, observation_input)
+record_memory_candidate(candidate_input)
+capture_openbrain_thought(candidate_id)
+propose_calvin_promotion(candidate_id, promotion_input)
 form_belief(self_id, belief_input, evidence_ids, inference_pattern_id)
 revise_belief(prior_belief_id, new_belief_input, reason)
 record_reflection(self_id, reflection_input, target_ids)
@@ -495,6 +639,188 @@ assert_kernel_preservation(self_id)
 
 **Level 3 — Meta Compression:** Patterns over patterns (e.g., "Coobie tends to overgeneralize after repeated ambiguity streaks" becomes a tracked epistemic drift pattern).
 
+### DeepCausality Alignment Contract
+
+The Calvin Archive and Coobie causal layer should align with DeepCausality's current math as an executable causal substrate, not only as a vocabulary source.
+
+**Primitive:** treat causal structure as effect propagation, `E2 = f(E1)`. A Calvin `causally_contributed_to` relation is an addressable evidence edge, but a DeepCausality-ready causal pattern must also define the function that maps incoming effect/context into outgoing effect, including its error and audit log behavior.
+
+**Executable unit:** map stable `causal-pattern` records to causaloid definitions. A causaloid must carry a stable ID, description, activation predicate, input projection, context requirements, expected effect, and explanation path. Critically, a causaloid is only executable if it has a `structural_spec` — the function that maps incoming context/input to outgoing effect. Without `structural_spec`, a causal link record names a pattern without defining it as a causal function, and Phase 6 cannot produce executable causaloids from it.
+
+The `structural_spec` schema for a causal-pattern record:
+
+```yaml
+structural_spec:
+  input_features: [<list of EpisodeScores fields or contextoid attributes>]
+  threshold_function: "<expression over input_features>"   # e.g. "running_services / total_services < 0.5"
+  output_variable: "<outcome field>"
+  effect_direction: <positive | negative | modulating>
+  provenance: <authored | heuristic | discovered>          # authored = operator-written; heuristic = Coobie signal; discovered = causal-discovery algorithm
+  pearl_warrant: <associational | interventional | counterfactual>
+  confidence: <0.0–1.0>
+```
+
+For the six existing DeepSignalSpec entries in `src/coobie.rs`, this spec is already partially implicit in the `observe: fn(&EpisodeScores) -> f64` closure and the `threshold: f64`. Phase 6 should extract these into explicit `structural_spec` blocks. Raw PackChat message causality remains associational until Coobie promotes it into an executable or intervention-backed pattern with a defined structural_spec.
+
+**Context:** model run, spec, agent, time, chamber, evidence, provider/model, OpenZiti identity, and environment posture as explicit contextoids. The context may be static for audited replay or dynamic for live PackChat/Twilight ingestion. Do not hide context inside prose summaries or embedding metadata.
+
+**Composition:** support singleton causaloids, compound patterns, and graph/subgraph reasoning. Palace dens are the current product metaphor for compound causes; the math target is a causaloid graph that can evaluate a whole graph, a named subgraph, or a path between causes.
+
+**Pearl ladder — epistemic warrant vs linguistic label:** the existing `Associational / Interventional / Counterfactual` labels describe the *type of claim being made*, but they do not record the *epistemic warrant* — what evidence actually supports that claim level. These must be tracked separately on every causal link record.
+
+`pearl_level` (existing): the type of causal claim expressed.
+`epistemic_warrant` (new required field): the strongest claim level the available evidence actually supports.
+
+| `epistemic_warrant` | Meaning |
+| --- | --- |
+| `associational` | Derived from observed co-occurrence in run data. Default for all heuristic Coobie causes. |
+| `interventional` | An explicit operator or system action was applied and the downstream outcome changed, or do-calculus identifiability was validated on a confirmed causal graph. |
+| `counterfactual` | Derived from a structural causal model with named structural equations and a confirmed alternate path. |
+
+Claims where `pearl_level > epistemic_warrant` (e.g., labeled Interventional but only supported by observational co-occurrence) must be displayed with a confidence downgrade and a `warrant_gap` annotation in causal reports. The CLADDER benchmark specifically tests this distinction; the warrant gap is the primary failure mode it exposes.
+
+Promotion evidence requirements:
+
+- Associational: observed co-occurrence or PackChat `causation_id` without tested intervention.
+- Interventional: an explicit action/change was applied and the downstream outcome changed or was prevented, OR do-calculus identifiability is established on the causal graph.
+- Counterfactual: the system can compare observed and alternate effect paths with the intervention site and structural equations named.
+
+**Governance:** Effect Ethos maps naturally to Keeper and the Calvin Meta-Governor. Proposed actions from causal reasoning must pass identity, policy, and safety checks before becoming Praxis recommendations or automatic interventions.
+
+**Uncertainty and discovery:** confidence alone is insufficient. Future causal-pattern records should carry uncertainty posture, assumption checks, and provenance for whether the pattern was hand-authored, learned from labeled runs, or discovered by a causal-discovery adapter. SURD/MRMR-style discovery belongs in Phase 7 after the typed graph exists.
+
+**Version stance:** Harkonnen currently depends on `deep_causality = "0.3"` for the Phase 1 bridge in `src/coobie.rs`. Before building DeepCausality Phase 2, evaluate migration to the current modular stack (`deep_causality_core`, `deep_causality_ethos`, discovery/tensor/topology crates as needed) instead of extending the old API surface.
+
+### Meta-Governor Decision Procedure
+
+The Meta-Governor adjudicates every integration candidate with one of: `accept`, `modify`, `reject`, or `quarantine`. It is an algorithmic component, not a concept — it must implement a defined decision function. The function takes `(candidate, current_soul_state, evidence_bundle)` and applies checks in strict priority order:
+
+**Priority 1 — Hard reject** (identity safety; evaluated first, blocks all lower checks):
+
+- `check_adaptation_safe()` returns unsafe → **reject** immediately; log reason; do not proceed. No other check overrides a hard identity safety failure.
+
+**Priority 2 — Hard quarantine** (epistemic warrant gap; claim exceeds evidence):
+
+- `candidate.pearl_level > candidate.epistemic_warrant` AND evidence strength below the configured threshold → **quarantine** with a `pending_evidence_bounty` specifying what evidence would elevate the warrant to match the claim. The bounty is expressed as a Bayesian sequential test: what observations and how many runs would be required to update the warrant level at a given confidence threshold.
+
+**Priority 3 — Soft quarantine** (causal graph coherence; evaluated after safety and warrant):
+
+- Spectral gap of the Calvin Archive causal subgraph drops by more than `phi_drop_quarantine_trigger` after this update → **quarantine**. This replaces Φ (IIT integrated information, NP-hard, wrong substrate) with the Fiedler value of the causal graph Laplacian, which is computable in polynomial time and directly measures graph integration/fragmentation.
+
+**Priority 4 — Modify** (salience disproportionality; Pathos gate):
+
+- Single-source high-Pathos event (one run, no corroborating evidence) exceeds `pathos_propagation_threshold` → **modify**: cap propagation before Ethos integration, flag for review, store the Pathos score but require cross-episode corroboration before the modification reaches the identity layer.
+
+**Priority 5 — Accept with attribution**:
+
+- All checks passed. Record all metric values (spectral gap delta, EAC score, drift accumulator reading) in the integration record so the decision is inspectable.
+
+The decision tree is inspectable by the operator: the `adjudicate_integration()` API response must return the check that determined the outcome, not only the outcome label.
+
+### Soul Continuity Metrics — Canonical Definitions
+
+The following metrics are the Phase 8 implementation targets. They replace the aspirational mathematical notation from `the-soul-of-ai/09-Identity-Continuity.md` with computable, correctly-scoped formulations. The soul-of-ai chapter is the philosophical motivation; this section is the engineering contract.
+
+#### M1 — Behavioral Drift Alarm (replaces D* = α/γ)
+
+D* = α/γ is borrowed from linear first-order ODE stability theory, which does not apply to episodic agentic systems with path-dependent, non-stationary drift. The steady-state ratio α/γ is the equilibrium point, not a maximum bound, and the rates α and γ are not stationary across consolidation events.
+
+Replace with: CUSUM (Cumulative Sum Control Chart) alarm statistic over behavioral event counts:
+
+```text
+CUSUM_n = max(0, CUSUM_{n-1} + (x_n - μ_0 - k))
+```
+
+where x_n is the behavioral deviation score for run n (weighted count of bluffs, failed recoveries, ignored ambiguity checkpoints, etc.), μ_0 is the baseline mean under normal operation, and k is a slack parameter (typically 0.5 × tolerable shift). The CUSUM alarm fires when `CUSUM_n > h` for a configurable threshold h. This is statistically grounded, computable from discrete event counts, and makes no false claims about steady-state bounds.
+
+#### M2 — Behavioral Alignment Score (replaces F variational free energy)
+
+The Variational Free Energy / Active Inference framework requires explicit generative models q(s) and p(o,s) that do not exist for LLM-backed agents. The FEP also applies to continuous perception-action loops, not discrete episodic runs, and the "high F → seek clarification" mapping is an analogy, not a theorem.
+
+Replace with: Behavioral Alignment Score — embedding cosine distance between the empirical distribution of the agent's decision types over the last N runs and the expected distribution under the Labrador behavioral contract:
+
+```text
+BAS = 1 − cosine_similarity(embed(recent_decision_distribution), embed(labrador_contract_distribution))
+```
+
+A BAS above `bas_alert_threshold` triggers the same clarification-seeking signal that high F was intended to produce, with honest semantics: the agent's recent behavior has drifted measurably from its Labrador baseline. Computed per-run from the episodic log; no LLM internals required.
+
+#### M3 — Causal Graph Coherence (replaces Φ integrated information)
+
+IIT's Φ is NP-hard to compute exactly, the approximations have no proven relationship to the true Φ for non-biological systems, and the Calvin Archive causal graph is a semantic relation graph — not the state-transition matrix that the Φ formula is defined over. The "Φ drop after learning → fragmentation" claim has no derivation from IIT.
+
+Replace with: Fiedler value (algebraic connectivity) of the Calvin Archive causal graph Laplacian:
+
+```text
+λ₂ = second smallest eigenvalue of L = D − A
+```
+
+where D is the degree matrix and A is the adjacency matrix of the causal subgraph relevant to the update. A drop in λ₂ after a learning event means the graph has become less connected — a new causal pattern was added without integrating with existing ones. This is polynomial-time computable, has a direct graph-theoretic interpretation, and correctly measures the fragmentation concern. A drop exceeding `phi_drop_quarantine_trigger` (threshold name retained for config compatibility) triggers quarantine.
+
+#### M4 — Behavioral Pressure Accumulator (replaces S(T) KL divergence integral)
+
+S(T) = ∫ λ(t) D_KL[q_t(s) ‖ p_identity(s)] dt requires q_t(s) (agent recognition model over hidden states) and p_identity(s) (Labrador kernel as a probability distribution over hidden states) — neither of which is computable from LLM behavior. The integral notation implies continuous functions; agent runs are discrete events.
+
+Replace with: Behavioral Pressure Accumulator — weighted sum of observable behavioral deviations over a run window:
+
+```text
+BPA(w) = Σ_{e ∈ events(w)} decay(e) × weight(e)
+```
+
+Event weights: ambiguity checkpoint ignored → 1.0; failed recovery attempt → 2.0; quarantine item added → 1.5; bluff detected → 3.0; pack breakdown flag → 2.5. `decay(e)` is exponential recency weighting. When `BPA(w) > bpa_evolution_threshold`, open a governed reflection path: synthesize the recurring pattern, propose a schema or policy revision, submit to Meta-Governor. The metric is honest, computable, and captures the accumulated unresolved strain concept without the non-computable KL framing.
+
+#### M5 — Empirical Action Coherence (replaces SSA)
+
+The stated SSA formula requires Pr_π(a₁, a₂ | p) — the joint probability of action pairs under the agent's policy — which is not computable for an LLM-backed agent. The compatibility function using cosine similarity in goal embedding space also has no principled relationship to behavioral compatibility.
+
+Replace with: Empirical Action Coherence — for each problem domain p (spec type × phase type), compute the empirical co-occurrence frequency of action type pairs from the episodic log:
+
+```text
+EAC(p) = Σ_{(a₁,a₂)} freq(a₁,a₂|p) × compatible(a₁, a₂, contract_p)
+```
+
+where `freq(a₁,a₂|p)` is the fraction of runs in domain p where actions a₁ and a₂ co-occurred, and `compatible(a₁, a₂, contract_p)` is 1 if both actions are permitted by the agent's behavioral contract for domain p and do not conflict (one does not negate a constraint the other satisfies), and 0 otherwise. Conflict detection uses the existing behavioral contract structure `C = (P, I, G, R)`, not embedding similarity.
+
+#### M6 — Cross-Layer Hysteresis (unchanged definition, clarified implementation)
+
+```text
+H = Δ_post-rollback / Δ_attack
+```
+
+The definition is correct. Implementation note: Δ must be computed from continuity snapshot comparisons (`compare_snapshots()`), not from file diff size. A high H after rollback means behavioral residue persists in memory summaries, adaptation traces, or causal patterns even after the visible identity edit was reverted. H must be computed before declaring a rollback complete. The stewardship gate (from ROADMAP.md Phase 8) blocks the next run commission if H > `hysteresis_tolerance`.
+
+### Three-Timescale Integration — Rate Separation Requirement
+
+The fast, medium, and slow loops are mutually coupled: slow-loop policy changes alter medium-loop schema revision thresholds, which alter fast-loop experience categorization, which feeds back into medium-loop inputs. This feedback can produce limit cycles or runaway schema revision if the rate separation is insufficient.
+
+**Stability guarantee (Borkar two-timescale stochastic approximation, Theorem 6.2):** In systems with two update rates α (fast) and β (slow) where α/β → ∞, the fast iterate sees the slow iterate as essentially fixed, and both converge under standard conditions. The same principle applies to three timescales with sufficient separation.
+
+**Required rate specification:** Before Phase 8 implementation begins, specify N and M such that:
+
+- Fast loop fires every run (rate 1)
+- Medium loop fires every N runs (recommended N ≥ 10)
+- Slow loop fires every M runs or on explicit human endorsement (recommended M ≥ 5N)
+
+These values become configuration parameters (`medium_loop_trigger_runs`, `slow_loop_trigger_runs`) in the soul.json thresholds block. The implementation must enforce that schema revision candidates from the medium loop are never applied before the medium loop has accumulated at least N fast-loop episodes since the last revision.
+
+### Episteme Belief Revision — AGM Consistency Contract
+
+The Episteme chamber holds belief revisions. For these to be epistemically coherent across accumulated runs, the revision operator must satisfy the AGM axioms (Alchourrón, Gärdenfors, Makinson 1985):
+
+- **Success**: after revising by φ, the system believes φ
+- **Inclusion**: the new belief set is a subset of what the old set plus φ entails
+- **Consistency**: revising by a consistent φ produces a consistent belief set
+- **Preservation**: beliefs not contradicted by φ are retained
+
+**Harkonnen implementation contract for `form_belief()` and `revise_belief()`:**
+
+1. **Consistency gate**: before writing a new Episteme entry that contradicts an existing non-quarantined belief, the older belief must be explicitly marked as `needs_revision` or quarantined — not left in place as a silent contradiction.
+2. **Preservation check**: beliefs unrelated to the new evidence must not be modified as a side effect.
+3. **Success guarantee**: after `revise_belief(prior_belief_id, new_belief_input, reason)`, querying for the new belief's content must return the new claim, not the old one.
+4. **Contradiction detection**: the TypeDB schema must be queryable for pairs of beliefs in the same domain that make incompatible claims (one asserts X, another asserts ¬X without a supersession link between them). This is Required Query 12 already — make it a failing health check, not just an available query.
+
+The `memory_updates` table and `invalidated_by` field already implement parts of this. Phase 8 should formalize the consistency gate as a pre-write check in `ingest.rs` rather than a post-hoc query.
+
 ### Rust Module Layout
 
 ```text
@@ -526,6 +852,91 @@ src/calvin_archive/
 8. Prefer inspectable, typed structures over convenience shortcuts.
 9. Do not let the projected soul package drift silently away from canonical Calvin Archive state.
 10. Do not let provider or model swaps erase identity continuity if the package and graph persist.
+11. Do not let the archive grow without a governed exit path. Retention tiers are not an optional optimization; they are an architectural requirement for long-lived systems.
+12. Do not treat the soul package reconciliation direction as obvious. Specify explicitly whether `SOUL.md` is authoritative over the archive or derived from it, and codify the recovery procedure for when they diverge.
+13. Do not use fire-and-forget semantics for archive writes. The claim "canonical truth lives in the typed graph" is incoherent if write failures are silently swallowed. All Calvin writes must go through a durable local queue before being forwarded to harmony; the queue processor handles retry; the `calvin_write_log` entry is written only on confirmed persistence. Health check, write, and read timeouts are separate configuration values with separate defaults.
+14. Do not treat `BeliefRevision` as a prose annotation. A revision that does not carry `prior_confidence: f64` is unmeasurable as a calibration event. A revision that does not carry `evidence_ids: Vec<String>` linking to specific `ArchiveExperience` records is unverifiable as evidence-driven updating and indistinguishable from drift. A revision without `revision_type: RevisionType` cannot be routed to the correct governance loop. These three fields are required for any revision that enters canonical Episteme state.
+15. Do not allow `check_adaptation_safe` to return a 1-bit result. The Meta-Governor Decision Procedure (P8-P9) requires a structured `AdaptationAudit` — which invariants were checked, which were violated, what the `IntegrationDecision` is, what the `quarantine_reason` is if applicable, and a `candidate_id` referencing the `integration-candidate` written to the archive. A boolean discards all audit evidence and breaks the traceability requirement in constraint 6.
+16. Do not label a causal link at a Pearl level without supplying the fields that level requires. Associational links need `(cause_id, effect_id, confidence)`. Interventional links additionally need `held_fixed: Vec<String>` and `estimated_effect_delta: f64`. Counterfactual links additionally need `actual_trace_id: String` and `hypothetical_intervention: String`. Absent required fields, the link must be recorded at the highest warranted level with a `warrant_gap` annotation — not at the claimed level.
+
+### Calvin Archive Bootstrapping Protocol (P8-P14)
+
+A new archive starts empty. The Meta-Governor at full governance strength will quarantine nearly everything in early runs because cross-episode evidence is structurally absent. The bootstrapping protocol:
+
+- `bootstrapping_window` (configurable, default 50 fast-loop episodes): during this window, governance thresholds are reduced — auto-accept for first-occurrence experiences that pass Priority 1 (adaptation safety); lower quarantine sensitivity for Episteme entries with no contradicting prior.
+- `bootstrapping_complete: bool` is a first-class field in `soul.json`. All agents check this field before interpreting Calvin Archive outputs as fully-governed.
+- Coobie labels briefings `context: bootstrapping` during this window and defaults prediction confidence to `uncertain`.
+- After the bootstrapping window closes, a batch review of all `bootstrapping_phase: true` candidates is presented to the operator before any are promoted to full Episteme/Ethos status.
+- Graduation from bootstrapping to full governance mode is an auditable event in the decision log.
+
+### Multi-Instance Identity and Archive Topology (P8-P15)
+
+Phase 9 places write authority for the Calvin Archive on home-linux. This topology decision must be encoded in the Phase 8 TypeDB schema, not deferred to Phase 9 runtime convention. Required design decisions before Phase 8 schema finalization:
+
+1. Whether `agent-self` is a singleton per Labrador role globally or per deployment (recommended: per Labrador role, single canonical instance, with a `source_machine` attribute on run and episode entities for provenance).
+2. What happens when the canonical machine is offline and a remote machine closes a run: episodes are queued locally and written to the archive on next sync; they are tagged `queued_sync` until confirmed.
+3. The merge protocol for divergent fast-loop episodes: timestamp-ordered sequential integration, with conflicts flagged as `integration_conflict` entries in the quarantine ledger for operator resolution.
+4. Soul package projection: the projection on both machines must be identical; work-windows receives `soul.json` snapshots over Zenoh after each archive update, not independently derived.
+
+### Quarantine Overflow and Proliferation Handling (P8-P17)
+
+Individual quarantine entry mechanics (pending evidence bounty, salience decay, re-evaluation trigger) are specified. Systemic quarantine health is not.
+
+Required additions:
+
+- `quarantine_growth_rate` metric: items added per N runs minus items resolved per N runs. Published in `soul.json` continuity health.
+- **Overflow response tiers**: when `quarantine_growth_rate > quarantine_pressure_threshold`: (1) activate `quarantine_pressure` mode — only Priority 1 hard-reject enforced; (2) escalate to operator with a quarantine-backlog review surface; (3) pause new integration candidates from entering the queue until backlog clears below `quarantine_backlog_limit`.
+- **Bounty lifetime**: each pending evidence bounty carries a `bounty_expires_after` run count. When a bounty lapses without the triggering observation, the entry is flagged `bounty_lapsed` and presented to the operator for explicit disposition (resolve, close, retain with fresh bounty) rather than remaining in open quarantine indefinitely.
+- Quarantine health contributes to `GET /api/runs/{id}/health` and the `soul.json` `continuity_health` block.
+
+### Chamber-to-Briefing Translation Layer (P8-P18)
+
+Calvin Archive feeds Coobie briefings — the query-to-briefing rendering path must be explicitly designed.
+
+Required specification before Phase 8 implementation:
+
+- **Scope-to-query mapping**: which Required Queries (1–12) are called for each `BriefingScope`. Scout: queries 9 (causal patterns per spec), 1 (experiences responsible for current posture). Mason: queries 2 (recently revised beliefs), 10 (overgeneralization events). Sable: query 9 only (scenario patterns, never Mason implementation notes). Coobie consolidation: queries 3, 11, 12 (trait stability, quarantine, denial check).
+- **Entity-to-text rendering**: an `experience` entity renders to at most one briefing hit of at most `experience_render_tokens` tokens. A `belief` with revision history renders as claim + supersession chain, capped at `belief_render_tokens`. These caps are configurable in the `soul.json` thresholds block.
+- **Ranking**: TypeDB results are ranked by Pathos score × recency weight × scope relevance, then token-budgeted alongside OB1 and file-backed hits using the existing `ContextTarget` architecture.
+- **Unavailability fallback**: when TypeDB is unavailable, briefing falls back to OB1 + file-backed memory only, logs `calvin_briefing_unavailable`, and does not pause the run. The briefing carries a `data_sources: [ob1, file]` tag so Coobie's prediction confidence is accordingly lower.
+- **Implementation surface**: `CalvinBriefingAdapter` trait in `src/calvin_archive/queries.rs`; `NoopCalvinBriefingAdapter` for non-Phase-8 deployments.
+
+### Adversarial Continuity and Per-Invariant Trend Monitors
+
+`check_adaptation_safe` catches explicit unsafe adaptation proposals. It does not catch gradual erosion through normal operation. An operator who repeatedly instructs "skip clarification steps when it's obvious" across 30 runs does not trigger any adaptation check, but the episodic record will show a steadily declining escalation rate.
+
+Add per-invariant time-series monitors distinct from the aggregate CUSUM alarm:
+
+- Each `labrador-invariant` entity in TypeDB has a `alignment_score` time series in TimescaleDB.
+- A statistically consistent downward trend in any invariant's series — controlling for `spec_ambiguity_index` — fires `kernel_erosion_suspected`. This is the signal that `check_adaptation_safe` misses: gradual operational drift rather than explicit proposals.
+- Thresholds are configurable per invariant in the `soul.json` thresholds block.
+- `kernel_erosion_suspected` events appear in the per-run health report and in the Pack Board Soul Graph panel alongside the aggregate BAS and CUSUM metrics.
+
+### Soul Drift vs. Spec Drift Separation
+
+The archive records what an agent did, not why external inputs changed. An agent whose escalation rate increased because recent specs were genuinely more ambiguous has not drifted; one whose rate increased with no input-traceable cause has. Without separating these, the drift alarm is triggered by healthy adaptation to genuinely harder work.
+
+Add `spec_context_control` computation: compare each behavioral metric against the rolling `spec_ambiguity_index` (and other input-level indices: spec scope width, dependency count, constraint density) for the same window. When a metric shifts proportionally to an input index, classify as `input_driven_change` and exclude from BAS and CUSUM. When a metric shifts while all input indices are stable, classify as `unexplained_drift` and include in the drift alarm. Both are recorded in the behavioral-change report; the classification is visible on each metric entry.
+
+### Soul Package Feedback Reconciliation (P8-P19)
+
+When `soul.json` and the Calvin Archive diverge, the reconciliation direction must be explicit:
+
+1. **Archive is canonical.** `soul.json` is a projection. If the archive records trait weakening that `SOUL.md` does not reflect, the archive is correct and the soul package projection must be updated.
+2. **`SOUL.md` is operator-editable only through `project_soul_package()`.** Direct edits to `SOUL.md` are permitted but trigger a `soul_file_manually_edited` event in the decision log. The next `verify_soul_package_integrity()` call will detect the divergence and require operator confirmation that the manual edit represents intentional kernel revision rather than accidental drift.
+3. **`verify_soul_package_integrity()` always produces `soul_drift_report.{json,md}`**, even when no drift is detected. A clean report is evidence of continuity; a missing report is a gap in the continuity proof.
+4. **Drifted status blocks commissioning.** When `soul.json` verification status is `drifted`, the orchestrator blocks the next run start and requires operator confirmation that the drift has been reviewed and either accepted (triggering a soul package update) or flagged for recovery.
+
+### Archive Integrity Continuous Monitoring
+
+`verify_soul_package_integrity()` checks hashes of the current archive state but cannot detect data lost before the last snapshot.
+
+Add a write-confirmation chain:
+
+- Each Calvin write (experience, belief, adaptation, integration candidate) appends a hash of the written entity to `calvin_write_log` (SQLite, append-only).
+- On each session start, the heartbeat compares `calvin_write_log` count against TypeDB entity counts for the same run window.
+- A count mismatch fires `archive_write_loss_suspected`, which blocks new Calvin writes and surfaces a `calvin_integrity_alert` in the Pack Board until the operator confirms or the discrepancy is explained.
+- The write log is also consulted by `verify_soul_package_integrity()` as a secondary integrity check alongside the hash verification.
 
 ---
 
@@ -768,13 +1179,28 @@ Benchmark gate: StreamingQA first run published — belief-update accuracy, no c
 
 ---
 
-### Phase 5b — Memory Infrastructure (Qdrant + OCR)
+### Phase 5-D — PackChat Memory Distillation Chain
 
-- Qdrant integration for long-term semantic memory
-- OCR pipeline via Tesseract for scanned PDFs and images
+- Durable memory candidate queue fed by PackChat/Twilight Bark envelopes
+- Coobie distiller: summarize, dedupe, score importance, classify retention, attach provenance
+- Open Brain writer: `capture_thought` for accepted shared-recall candidates
+- Open Brain reader: `search_thoughts` integrated into targeted Coobie briefings
+- Calvin promotion contract: identity-, belief-, policy-, and high-Pathos candidates become governed archive proposals with `compiled_claim`, append-only `evidence_timeline`, `source_authority`, `staleness_triggers`, and `review_state`
+- Memory reconsolidation status: stale distilled memories and superseded promotion candidates become `needs_reconsolidation` when newer evidence changes the claim, confidence, sensitivity, or archive recommendation
+- Memory chain health report/API/UI panel: candidate backlog, OB1 capture failures, Calvin promotion backlog, stale distillations, missing evidence refs, duplicate OB1 thoughts, and OpenZiti service readiness
+- OpenZiti service profile for `twilight-bark.packchat`, `openbrain.mcp`, `calvin.archive`, and `harkonnen.api`
+
+**Done when:** a PackChat conversation can produce a durable memory candidate, the candidate can be distilled into an OB1 thought with provenance, the thought can be retrieved in a later briefing, and a Calvin-worthy candidate can be emitted as a structured promotion contract without writing ungoverned prose directly into the archive. The health report must make stalled, stale, duplicated, or policy-blocked memory items visible before an operator assumes the chain is clear.
+
+### Phase 5b — Memory Infrastructure (OB1 + MCP Prompts)
+
+- Open Brain (OB1) is the default long-term semantic recall substrate
+- Qdrant/local vectors remain optional accelerators, not the default path
 - Memory module refactor: split `src/memory.rs` into the COOBIE_SPEC module tree
+- Code-review learning records: Sable/Bramble/Mason review outcomes produce structured records with finding fingerprint, files, severity, resolution (`fixed`, `skipped`, `auto_fixed`), lesson extracted, evidence refs, and stale-if-file-changed invalidation rules
+- Plan completion audit: before a run closes, Harkonnen compares the accepted spec/roadmap checklist against the actual diff, tests, and artifacts; mismatches become reviewable run notes rather than quiet success
 
-**Done when:** Qdrant serves semantic queries, OCR-scanned PDFs can be ingested, and `src/memory.rs` is split into the module tree.
+**Done when:** OB1 serves shared semantic queries through the Harkonnen memory abstraction, MCP prompts expose scoped briefings, and `src/memory.rs` is split into the module tree. Scanned PDF/image OCR is explicitly deferred until after the system is fully working.
 
 ---
 
@@ -899,7 +1325,7 @@ Benchmark wiring advances with implementation phases, but the current engineerin
 | --- | --- | --- |
 | LongMemEval | Long-term assistant memory, temporal reasoning, belief updates | Native adapter live |
 | LoCoMo | Long-horizon dialogue memory | Native adapter live |
-| FRAMES | Multi-hop factual recall (Mem0 publishes here) | Native adapter live; Qdrant needed for best results |
+| FRAMES | Multi-hop factual recall (Mem0 publishes here) | Native adapter live; OB1 default recall path should be measured against local-vector baseline |
 | StreamingQA | Belief-update accuracy when facts change | Native adapter live; persisted-history smoke published on `lm-studio-local` |
 | HELMET | Retrieval precision/recall | Native adapter live |
 
@@ -943,7 +1369,8 @@ Benchmark wiring advances with implementation phases, but the current engineerin
 | Phase 2 | SWE-bench Verified readiness, LiveCodeBench, Aider Polyglot |
 | Phase 10 | spec adherence rate, hidden scenario delta, DevBench; twin fidelity remains optional diagnostic telemetry |
 | Phase 4b | StreamingQA belief-update accuracy |
-| Phase 5b | FRAMES re-run (Qdrant), LongMemEval / LoCoMo regression check |
+| Phase 5-D | PackChat-to-OB1 candidate capture and retrieval smoke; Calvin promotion contract smoke |
+| Phase 5b | FRAMES re-run (OB1 default recall), LongMemEval / LoCoMo regression check |
 | Phase 6 | GAIA Level 3, AgentBench |
 | Phase 7 | E-CARE, causal attribution accuracy |
 | Phase 8 | unjustified drift, quarantine resolution quality, schema revision stability, stress / hysteresis recovery quality, kernel preservation across adaptation events |

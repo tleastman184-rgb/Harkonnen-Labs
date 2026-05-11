@@ -4,7 +4,7 @@ use std::env;
 use std::time::Duration;
 
 use crate::capacity::CapacityState;
-use crate::setup::SetupConfig;
+use crate::setup::{ProviderConfig, SetupConfig};
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
@@ -70,6 +70,63 @@ pub struct LlmResponse {
     pub usage: Option<LlmUsage>,
 }
 
+/// Typed provider backend for isolated sub-agents and provider-specific routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderBackend {
+    Anthropic {
+        model: String,
+        api_key_env: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    OpenAi {
+        model: String,
+        api_key_env: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    Gemini {
+        model: String,
+        api_key_env: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+}
+
+impl ProviderBackend {
+    pub fn from_config(config: &ProviderConfig) -> Option<Self> {
+        match config.provider_type.as_str() {
+            "anthropic" | "claude" => Some(Self::Anthropic {
+                model: config.model.clone(),
+                api_key_env: config.api_key_env.clone(),
+                base_url: config.base_url.clone(),
+            }),
+            "openai" | "codex" | "openai_compatible" | "openai-compatible" | "lmstudio"
+            | "lm_studio" | "lm-studio" => Some(Self::OpenAi {
+                model: config.model.clone(),
+                api_key_env: config.api_key_env.clone(),
+                base_url: config.base_url.clone(),
+            }),
+            "gemini" | "google" => Some(Self::Gemini {
+                model: config.model.clone(),
+                api_key_env: config.api_key_env.clone(),
+                base_url: config.base_url.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        let model = model.into();
+        match &mut self {
+            Self::Anthropic { model: current, .. }
+            | Self::OpenAi { model: current, .. }
+            | Self::Gemini { model: current, .. } => *current = model,
+        }
+        self
+    }
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -87,6 +144,84 @@ pub fn build_provider(
     setup: &SetupConfig,
 ) -> Option<Box<dyn LlmProvider>> {
     build_provider_with_capacity(agent_name, agent_provider, setup, None)
+}
+
+pub fn build_provider_backend(
+    agent_name: &str,
+    agent_provider: &str,
+    setup: &SetupConfig,
+) -> Option<ProviderBackend> {
+    let resolved_name = setup.resolve_agent_provider_name(agent_name, agent_provider);
+    let provider_cfg = setup.resolve_provider(&resolved_name)?;
+    if provider_cfg.enabled {
+        ProviderBackend::from_config(provider_cfg)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+pub async fn complete(backend: &ProviderBackend, messages: &[Message]) -> Result<String> {
+    complete_request(
+        backend,
+        LlmRequest {
+            messages: messages.to_vec(),
+            max_tokens: 4096,
+            temperature: 0.2,
+        },
+    )
+    .await
+    .map(|response| response.content)
+}
+
+pub async fn complete_request(backend: &ProviderBackend, req: LlmRequest) -> Result<LlmResponse> {
+    let provider = provider_from_backend(backend)?;
+    provider.complete(req).await
+}
+
+fn provider_from_backend(backend: &ProviderBackend) -> Result<Box<dyn LlmProvider>> {
+    match backend {
+        ProviderBackend::Anthropic {
+            model,
+            api_key_env,
+            base_url,
+        } => {
+            let api_key = env::var(api_key_env)
+                .with_context(|| format!("missing Anthropic API key env {api_key_env}"))?;
+            Ok(Box::new(AnthropicClient {
+                api_key,
+                model: model.clone(),
+                base_url: anthropic_messages_url(base_url.as_deref()),
+                http: build_http_client(),
+            }))
+        }
+        ProviderBackend::OpenAi {
+            model,
+            api_key_env,
+            base_url,
+        } => {
+            let api_key = optional_api_key(api_key_env)
+                .with_context(|| format!("missing OpenAI API key env {api_key_env}"))?;
+            Ok(Box::new(OpenAiClient {
+                api_key,
+                model: model.clone(),
+                base_url: openai_chat_completions_url(base_url.as_deref()),
+                http: build_http_client(),
+            }))
+        }
+        ProviderBackend::Gemini {
+            model,
+            api_key_env,
+            base_url,
+        } => {
+            let api_key = env::var(api_key_env)
+                .with_context(|| format!("missing Gemini API key env {api_key_env}"))?;
+            Ok(Box::new(GeminiClient {
+                base_url: gemini_generate_content_url(base_url.as_deref(), model, &api_key),
+                http: build_http_client(),
+            }))
+        }
+    }
 }
 
 /// Capacity-aware provider builder. If the resolved provider is unavailable, falls back
@@ -115,35 +250,57 @@ pub fn build_provider_with_capacity(
         if !provider_cfg.enabled {
             continue;
         }
-        let Ok(api_key) = std::env::var(&provider_cfg.api_key_env) else {
-            continue;
-        };
         let client: Box<dyn LlmProvider> = match provider_cfg.provider_type.as_str() {
-            "anthropic" | "claude" => Box::new(AnthropicClient {
-                api_key,
-                model: provider_cfg.model.clone(),
-                base_url: anthropic_messages_url(provider_cfg.base_url.as_deref()),
-                http: build_http_client(),
-            }),
-            "gemini" | "google" => Box::new(GeminiClient {
-                base_url: gemini_generate_content_url(
-                    provider_cfg.base_url.as_deref(),
-                    &provider_cfg.model,
-                    &api_key,
-                ),
-                http: build_http_client(),
-            }),
-            "openai" | "codex" => Box::new(OpenAiClient {
-                api_key,
-                model: provider_cfg.model.clone(),
-                base_url: openai_chat_completions_url(provider_cfg.base_url.as_deref()),
-                http: build_http_client(),
-            }),
+            "anthropic" | "claude" => {
+                let Ok(api_key) = std::env::var(&provider_cfg.api_key_env) else {
+                    continue;
+                };
+                Box::new(AnthropicClient {
+                    api_key,
+                    model: provider_cfg.model.clone(),
+                    base_url: anthropic_messages_url(provider_cfg.base_url.as_deref()),
+                    http: build_http_client(),
+                })
+            }
+            "gemini" | "google" => {
+                let Ok(api_key) = std::env::var(&provider_cfg.api_key_env) else {
+                    continue;
+                };
+                Box::new(GeminiClient {
+                    base_url: gemini_generate_content_url(
+                        provider_cfg.base_url.as_deref(),
+                        &provider_cfg.model,
+                        &api_key,
+                    ),
+                    http: build_http_client(),
+                })
+            }
+            "openai" | "codex" | "openai_compatible" | "openai-compatible" | "lmstudio"
+            | "lm_studio" | "lm-studio" => {
+                let Ok(api_key) = optional_api_key(&provider_cfg.api_key_env) else {
+                    continue;
+                };
+                Box::new(OpenAiClient {
+                    api_key,
+                    model: provider_cfg.model.clone(),
+                    base_url: openai_chat_completions_url(provider_cfg.base_url.as_deref()),
+                    http: build_http_client(),
+                })
+            }
             _ => continue,
         };
         return Some(client);
     }
     None
+}
+
+fn optional_api_key(api_key_env: &str) -> Result<Option<String>> {
+    if api_key_env.trim().is_empty() {
+        return Ok(None);
+    }
+    env::var(api_key_env)
+        .map(Some)
+        .with_context(|| format!("missing API key env {api_key_env}"))
 }
 
 fn build_http_client() -> reqwest::Client {
@@ -499,7 +656,7 @@ impl LlmProvider for GeminiClient {
 // ── OpenAI / Codex ────────────────────────────────────────────────────────────
 
 struct OpenAiClient {
-    api_key: String,
+    api_key: Option<String>,
     model: String,
     base_url: String,
     http: reqwest::Client,
@@ -564,15 +721,15 @@ impl LlmProvider for OpenAiClient {
         };
 
         let t0 = std::time::Instant::now();
-        let resp = self
+        let mut request = self
             .http
             .post(&self.base_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("OpenAI API request failed")?;
+            .json(&body);
+        if let Some(api_key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
+            request = request.header("Authorization", format!("Bearer {api_key}"));
+        }
+        let resp = request.send().await.context("OpenAI API request failed")?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -601,7 +758,11 @@ impl LlmProvider for OpenAiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url};
+    use super::{
+        anthropic_messages_url, gemini_generate_content_url, openai_chat_completions_url,
+        optional_api_key, ProviderBackend,
+    };
+    use crate::setup::ProviderConfig;
 
     #[test]
     fn openai_base_url_defaults_to_public_api() {
@@ -669,5 +830,76 @@ mod tests {
             ),
             "https://gateway.example.com/google/v1beta/models/gemini-2.0-flash:generateContent?key=test-key"
         );
+    }
+
+    #[test]
+    fn provider_backend_maps_openai_config() {
+        let cfg = ProviderConfig {
+            provider_type: "openai".to_string(),
+            model: "gpt-5.1".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            enabled: true,
+            credential_kind: None,
+            usage_rights: None,
+            surface: None,
+            base_url: Some("https://gateway.example.com/openai".to_string()),
+        };
+
+        assert_eq!(
+            ProviderBackend::from_config(&cfg),
+            Some(ProviderBackend::OpenAi {
+                model: "gpt-5.1".to_string(),
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                base_url: Some("https://gateway.example.com/openai".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_backend_model_override_preserves_credentials() {
+        let backend = ProviderBackend::Anthropic {
+            model: "claude-sonnet-4-6".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            base_url: None,
+        }
+        .with_model("claude-opus-4-6");
+
+        assert_eq!(
+            backend,
+            ProviderBackend::Anthropic {
+                model: "claude-opus-4-6".to_string(),
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                base_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_backend_maps_lmstudio_as_openai_compatible() {
+        let cfg = ProviderConfig {
+            provider_type: "lmstudio".to_string(),
+            model: "local/llama".to_string(),
+            api_key_env: "".to_string(),
+            enabled: true,
+            credential_kind: None,
+            usage_rights: None,
+            surface: None,
+            base_url: Some("http://localhost:1234".to_string()),
+        };
+
+        assert_eq!(
+            ProviderBackend::from_config(&cfg),
+            Some(ProviderBackend::OpenAi {
+                model: "local/llama".to_string(),
+                api_key_env: "".to_string(),
+                base_url: Some("http://localhost:1234".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn optional_api_key_allows_local_openai_compatible_without_auth() {
+        assert_eq!(optional_api_key("").expect("optional key"), None);
+        assert_eq!(optional_api_key("   ").expect("optional key"), None);
     }
 }

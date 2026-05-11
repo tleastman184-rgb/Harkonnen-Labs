@@ -229,7 +229,7 @@ async fn handle_rpc(
         "resources/list" => json!({ "resources": resource_descriptors() }),
         "prompts/list" => json!({ "prompts": prompt_descriptors() }),
         "resources/read" => read_resource(state, &envelope.params).await?,
-        "prompts/get" => get_prompt(&envelope.params)?,
+        "prompts/get" => get_prompt(state, &envelope.params).await?,
         "tools/call" => call_tool(state, &envelope.params).await?,
         _ => return Err((-32601, format!("method not found: {method}"))),
     };
@@ -657,10 +657,416 @@ async fn call_tool(state: &McpState, params: &Value) -> std::result::Result<Valu
             };
             return Ok(text_tool_result(&rendered));
         }
+        // ══════════════════════════════════════════════════════════════════════
+        // CONSOLIDATED NATIVE TOOLS — Phase 5b
+        // Replaces three npx MCP servers (filesystem, memory, sqlite) with
+        // Rust-native implementations backed by tokio::fs and sqlx.
+        // All writes are boundary-enforced to allowed directories.
+        // ══════════════════════════════════════════════════════════════════════
+
+        // ── filesystem_read alias ─────────────────────────────────────────────
+        "read_file" => {
+            let path = required_string(&arguments, "path")?;
+            let abs = resolve_allowed_read_path(&state.app.paths, &path)?;
+            let content = tokio::fs::read_to_string(&abs)
+                .await
+                .map_err(|e| (-32004, format!("read_file failed for {path}: {e}")))?;
+            return Ok(text_tool_result(&content));
+        }
+
+        "list_directory" => {
+            let path = optional_string(&arguments, "path").unwrap_or_else(|| ".".into());
+            let abs = resolve_allowed_read_path(&state.app.paths, &path)?;
+            let mut entries = tokio::fs::read_dir(&abs)
+                .await
+                .map_err(|e| (-32004, format!("list_directory failed for {path}: {e}")))?;
+            let mut names: Vec<String> = Vec::new();
+            while let Some(entry) = entries.next_entry().await.map_err(internal_error)? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                names.push(if is_dir { format!("{name}/") } else { name });
+            }
+            names.sort();
+            return Ok(text_tool_result(&names.join("\n")));
+        }
+
+        // ── workspace_write / artifact_writer aliases ─────────────────────────
+        "write_file" => {
+            let path = required_string(&arguments, "path")?;
+            let content = required_string(&arguments, "content")?;
+            let abs = resolve_allowed_write_path(&state.app.paths, &path)?;
+            if let Some(parent) = abs.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(internal_error)?;
+            }
+            tokio::fs::write(&abs, &content)
+                .await
+                .map_err(|e| (-32004, format!("write_file failed for {path}: {e}")))?;
+            return Ok(text_tool_result(&format!(
+                "wrote {} bytes to {path}",
+                content.len()
+            )));
+        }
+
+        "create_directory" => {
+            let path = required_string(&arguments, "path")?;
+            let abs = resolve_allowed_write_path(&state.app.paths, &path)?;
+            tokio::fs::create_dir_all(&abs)
+                .await
+                .map_err(|e| (-32004, format!("create_directory failed for {path}: {e}")))?;
+            return Ok(text_tool_result(&format!("created {path}")));
+        }
+
+        // ── memory_store / metadata_query aliases ─────────────────────────────
+        "memory_store" => {
+            let content = required_string(&arguments, "content")?;
+            let tags = optional_string_array(&arguments, "tags").unwrap_or_default();
+            let id = uuid::Uuid::new_v4().to_string();
+            let tag_prefix = if tags.is_empty() {
+                String::new()
+            } else {
+                format!("[{}] ", tags.join(", "))
+            };
+            let entry = format!("{tag_prefix}{content}");
+            // Write to a timestamped file in the memory store so it's indexed.
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+            let filename = format!("mcp-store-{ts}-{}.md", &id[..8]);
+            let path = state.app.paths.memory.join(&filename);
+            tokio::fs::write(
+                &path,
+                &format!("---\ntags: [mcp_store]\nsummary: {content}\n---\n{entry}"),
+            )
+            .await
+            .map_err(internal_error)?;
+            // Also capture to the default semantic memory when available.
+            let metadata = crate::memory::SemanticMemoryMetadata {
+                memory_type: Some("mcp_store".to_string()),
+                tags,
+                created_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            };
+            let _ = state.app.semantic_memory_store(&entry, metadata).await;
+            return Ok(text_tool_result(&format!("stored memory entry: {id}")));
+        }
+
+        "memory_retrieve" => {
+            let query = required_string(&arguments, "query")?;
+            let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+            let mut hits = state
+                .app
+                .memory_store
+                .retrieve_context(&query)
+                .await
+                .unwrap_or_default();
+            if let Ok(ob_hits) = state.app.semantic_memory_search(&query, limit).await {
+                for h in ob_hits {
+                    if !hits.contains(&h) {
+                        hits.push(h);
+                    }
+                }
+            }
+            hits.truncate(limit);
+            let body = hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| format!("{}. {}", i + 1, h.trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(text_tool_result(if body.is_empty() {
+                "No memory found."
+            } else {
+                &body
+            }));
+        }
+
+        "memory_list" => {
+            let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            let entries = state
+                .app
+                .memory_store
+                .list_entries()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .take(limit)
+                .collect::<Vec<_>>();
+            let body = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{}. [{}] {}", i + 1, e.id, e.summary))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(text_tool_result(if body.is_empty() {
+                "Memory is empty."
+            } else {
+                &body
+            }));
+        }
+
+        // ── db_read alias ─────────────────────────────────────────────────────
+        "db_list_tables" => {
+            let rows =
+                sqlx::query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                    .fetch_all(&state.app.pool)
+                    .await
+                    .map_err(internal_error)?;
+            let names: Vec<String> = rows
+                .iter()
+                .filter_map(|r| {
+                    use sqlx::Row as _;
+                    r.try_get("name").ok()
+                })
+                .collect();
+            return Ok(text_tool_result(&names.join("\n")));
+        }
+
+        "db_query" => {
+            let sql = required_string(&arguments, "sql")?;
+            // Enforce read-only: reject any non-SELECT statement.
+            let normalized = sql.trim().to_lowercase();
+            if !normalized.starts_with("select") && !normalized.starts_with("with") {
+                return Err((
+                    -32602,
+                    "db_query only permits SELECT / WITH queries".to_string(),
+                ));
+            }
+            let rows = sqlx::query(&sql)
+                .fetch_all(&state.app.pool)
+                .await
+                .map_err(|e| (-32004, format!("db_query failed: {e}")))?;
+            let mut lines: Vec<String> = Vec::new();
+            for row in &rows {
+                use sqlx::{Column as _, Row as _, TypeInfo as _};
+                let mut cols: Vec<String> = Vec::new();
+                for i in 0..row.len() {
+                    let col_name = row.column(i).name().to_string();
+                    let val: String = row
+                        .try_get::<String, _>(i)
+                        .or_else(|_| row.try_get::<i64, _>(i).map(|n| n.to_string()))
+                        .or_else(|_| row.try_get::<f64, _>(i).map(|n| format!("{n:.4}")))
+                        .or_else(|_| row.try_get::<bool, _>(i).map(|b| b.to_string()))
+                        .unwrap_or_else(|_| "NULL".to_string());
+                    cols.push(format!("{col_name}={val}"));
+                }
+                lines.push(cols.join(" | "));
+            }
+            let body = if lines.is_empty() {
+                "(no rows)".to_string()
+            } else {
+                format!("{} row(s):\n{}", lines.len(), lines.join("\n"))
+            };
+            return Ok(text_tool_result(&body));
+        }
+
+        // ── memory_pull: on-demand context retrieval mid-task (Phase 5b) ─────
+        "memory_pull" => {
+            let run_id = optional_string(&arguments, "run_id");
+            let query = required_string(&arguments, "query")
+                .map_err(|_| (-32602, "memory_pull requires query".to_string()))?;
+            let scope = optional_string(&arguments, "scope").unwrap_or_else(|| "general".into());
+            let trigger = optional_string(&arguments, "trigger");
+            let max_tokens = arguments
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(500) as usize;
+
+            let mut hits: Vec<String> = Vec::new();
+
+            // File-backed memory search.
+            if let Ok(h) = state.app.memory_store.retrieve_context(&query).await {
+                hits.extend(h);
+            }
+
+            // Default semantic search (OB1 when configured).
+            if let Ok(ob_hits) = state.app.semantic_memory_search(&query, 20).await {
+                for hit in ob_hits {
+                    if !hits.contains(&hit) {
+                        hits.push(hit);
+                    }
+                }
+            }
+
+            // Scope filtering: drop hits tagged with disallowed categories.
+            let disallowed = scope_disallowed_tags(&scope);
+            hits.retain(|h| {
+                let lower = h.to_lowercase();
+                !disallowed.iter().any(|tag| lower.contains(tag))
+            });
+
+            // Budget enforcement (~4 chars per token).
+            let char_budget = max_tokens * 4;
+            let mut total = 0usize;
+            let mut output_lines: Vec<String> = Vec::new();
+            for hit in &hits {
+                if total + hit.len() > char_budget {
+                    break;
+                }
+                total += hit.len();
+                output_lines.push(hit.trim().to_string());
+            }
+
+            let hits_returned = output_lines.len() as u32;
+            let tokens_approx = (total / 4) as u32;
+
+            if let Some(run_id) = run_id.as_deref() {
+                let hit_previews = output_lines
+                    .iter()
+                    .take(5)
+                    .map(|hit| hit.chars().take(220).collect::<String>())
+                    .collect::<Vec<_>>();
+                if let Err(error) = state
+                    .app
+                    .record_context_pull(
+                        run_id,
+                        &query,
+                        &scope,
+                        max_tokens as u32,
+                        tokens_approx,
+                        hits_returned,
+                        &hit_previews,
+                        trigger.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %error,
+                        "memory_pull context utilization persistence failed"
+                    );
+                }
+            }
+
+            // Log the pull call for context utilization tracking.
+            tracing::info!(
+                run_id = run_id.as_deref().unwrap_or(""),
+                query = %query,
+                scope = %scope,
+                trigger = trigger.as_deref().unwrap_or(""),
+                hits_returned = hits_returned,
+                tokens = tokens_approx,
+                "memory_pull"
+            );
+
+            let body = if output_lines.is_empty() {
+                let trigger_suffix = trigger
+                    .as_deref()
+                    .map(|value| format!(", trigger: {value}"))
+                    .unwrap_or_default();
+                format!("No memory found for query: \"{query}\" (scope: {scope}{trigger_suffix})")
+            } else {
+                format!(
+                    "# Memory pull — query: \"{query}\" | scope: {scope} | trigger: {} | {hits_returned} hit(s)\n\n{}",
+                    trigger.as_deref().unwrap_or("none"),
+                    output_lines
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| format!("{}. {h}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+
+            return Ok(text_tool_result(&body));
+        }
+
         _ => return Err((-32601, format!("unknown tool: {name}"))),
     };
 
     Ok(text_tool_result_pretty(&result))
+}
+
+/// Resolve a path for read access. Allowed roots: products, workspaces,
+/// artifacts, memory, specs, logs, the-soul-of-ai, factory/context.
+fn resolve_allowed_read_path(
+    paths: &crate::config::Paths,
+    requested: &str,
+) -> std::result::Result<std::path::PathBuf, (i64, String)> {
+    let candidate = if std::path::Path::new(requested).is_absolute() {
+        std::path::PathBuf::from(requested)
+    } else {
+        paths.root.join(requested)
+    };
+    let canonical = candidate.canonicalize().unwrap_or(candidate.clone());
+
+    let allowed: Vec<std::path::PathBuf> = vec![
+        paths.products.clone(),
+        paths.workspaces.clone(),
+        paths.artifacts.clone(),
+        paths.memory.clone(),
+        paths.specs.clone(),
+        paths.logs.clone(),
+        paths.root.join("factory/context"),
+        paths.root.join("the-soul-of-ai"),
+        paths.root.join("factory/calvin_archive"),
+        paths.root.join("ROADMAP.md"),
+        paths.root.join("MASTER_SPEC.md"),
+        paths.root.join("AGENTS.md"),
+        paths.root.join("CLAUDE.md"),
+    ];
+
+    let ok = allowed.iter().any(|root| {
+        root.canonicalize()
+            .map(|r| canonical.starts_with(&r) || canonical == r)
+            .unwrap_or_else(|_| canonical.starts_with(root))
+    });
+
+    if ok {
+        Ok(canonical)
+    } else {
+        Err((
+            -32602,
+            format!("read_file path '{requested}' is outside allowed directories"),
+        ))
+    }
+}
+
+/// Resolve a path for write access. Allowed roots: workspaces, artifacts only.
+fn resolve_allowed_write_path(
+    paths: &crate::config::Paths,
+    requested: &str,
+) -> std::result::Result<std::path::PathBuf, (i64, String)> {
+    let candidate = if std::path::Path::new(requested).is_absolute() {
+        std::path::PathBuf::from(requested)
+    } else {
+        paths.root.join(requested)
+    };
+
+    let allowed: Vec<&std::path::PathBuf> = vec![&paths.workspaces, &paths.artifacts];
+    let ok = allowed.iter().any(|root| {
+        let norm_root = root.to_string_lossy();
+        let norm_cand = candidate.to_string_lossy();
+        norm_cand.starts_with(norm_root.as_ref())
+    });
+
+    if ok {
+        Ok(candidate)
+    } else {
+        Err((
+            -32602,
+            format!(
+                "write_file path '{requested}' is outside allowed write directories \
+             (factory/workspaces, factory/artifacts)"
+            ),
+        ))
+    }
+}
+
+/// Returns tag strings that should be filtered out for a given scope name.
+/// Mirrors the BriefingScope isolation rules without requiring the full enum.
+fn scope_disallowed_tags(scope: &str) -> Vec<&'static str> {
+    match scope {
+        "sable" | "sable_preflight" | "scenario" => {
+            vec![
+                "implementation_notes",
+                "mason_plan",
+                "edit_rationale",
+                "fix_patterns",
+            ]
+        }
+        "mason" | "mason_preflight" => vec!["scenario_patterns", "hidden_scenario"],
+        _ => vec![],
+    }
 }
 
 async fn read_resource(
@@ -802,40 +1208,347 @@ async fn read_resource(
     }))
 }
 
-fn get_prompt(params: &Value) -> std::result::Result<Value, (i64, String)> {
+async fn get_prompt(state: &McpState, params: &Value) -> std::result::Result<Value, (i64, String)> {
     let name = required_string(params, "name")?;
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+
     let text = match name.as_str() {
+        // ── Static templates (kept for backwards compatibility) ───────────────
         "briefing_for_spec" => {
             let spec_id = required_string(&arguments, "spec_id")?;
             format!(
-                "Build a concise Harkonnen briefing for spec `{spec_id}`. Include likely risks, guardrails, and the next recommended operator action."
+                "Build a concise Harkonnen briefing for spec `{spec_id}`. \
+                 Include likely risks, guardrails, and the next recommended operator action."
             )
         }
         "diagnose_run" => {
             let run_id = required_string(&arguments, "run_id")?;
             format!(
-                "Diagnose Harkonnen run `{run_id}`. Summarize status, likely failure causes, operator-visible risks, and the most useful next debugging step."
+                "Diagnose Harkonnen run `{run_id}`. Summarize status, likely failure causes, \
+                 operator-visible risks, and the most useful next debugging step."
             )
         }
+
+        // ── Live-hydrated prompts (Phase 5b) ─────────────────────────────────
+
+        // coobie/briefing: pulls live memory context for given keywords and
+        // formats it as a Coobie preflight briefing the agent can act on.
+        "coobie/briefing" => {
+            let run_id = optional_string(&arguments, "run_id");
+            let phase = optional_string(&arguments, "phase").unwrap_or_else(|| "preflight".into());
+            let keywords_raw = optional_string(&arguments, "keywords").unwrap_or_default();
+            let max_tokens = arguments
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(500) as usize;
+            let query_terms: Vec<String> = keywords_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .collect();
+
+            build_coobie_briefing_prompt(state, run_id.as_deref(), &phase, &query_terms, max_tokens)
+                .await
+        }
+
+        // sable/eval-setup: run artifacts + scenario patterns, no mason content.
+        "sable/eval-setup" => {
+            let run_id = required_string(&arguments, "run_id")
+                .map_err(|_| (-32602, "sable/eval-setup requires run_id".to_string()))?;
+            build_sable_eval_prompt(state, &run_id).await
+        }
+
+        // scout/preflight: spec-scoped intent package + prior ambiguity patterns.
+        "scout/preflight" => {
+            let spec_id = optional_string(&arguments, "spec_id").unwrap_or_default();
+            let run_id = optional_string(&arguments, "run_id");
+            build_scout_preflight_prompt(state, &spec_id, run_id.as_deref()).await
+        }
+
+        // keeper/policy-check: relevant guardrails + prior decisions for an action.
+        "keeper/policy-check" => {
+            let action = required_string(&arguments, "action")
+                .map_err(|_| (-32602, "keeper/policy-check requires action".to_string()))?;
+            let context = optional_string(&arguments, "context").unwrap_or_default();
+            build_keeper_policy_prompt(state, &action, &context).await
+        }
+
         _ => return Err((-32601, format!("unknown prompt: {name}"))),
     };
 
     Ok(json!({
-        "description": format!("Prompt template `{name}`"),
+        "description": format!("Live-hydrated prompt: {name}"),
         "messages": [
             {
                 "role": "user",
-                "content": {
-                    "type": "text",
-                    "text": text
-                }
+                "content": { "type": "text", "text": text }
             }
         ]
     }))
+}
+
+// ── Live prompt builders ──────────────────────────────────────────────────────
+
+async fn build_coobie_briefing_prompt(
+    state: &McpState,
+    run_id: Option<&str>,
+    phase: &str,
+    query_terms: &[String],
+    max_tokens: usize,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    sections.push(format!(
+        "# Coobie Briefing — phase: {phase}{}\n",
+        run_id.map(|id| format!(" | run: {id}")).unwrap_or_default()
+    ));
+
+    // Pull from file-backed memory.
+    let mut hits: Vec<String> = Vec::new();
+    for term in query_terms.iter().take(8) {
+        if let Ok(h) = state.app.memory_store.retrieve_context(term).await {
+            for hit in h {
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+
+    // Pull from default semantic memory.
+    if !query_terms.is_empty() {
+        let q = query_terms.join(" ");
+        if let Ok(ob_hits) = state.app.semantic_memory_search(&q, 20).await {
+            for hit in ob_hits {
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+
+    // Budget enforcement (approximate: 1 token ≈ 4 chars).
+    let mut total_chars = 0usize;
+    let mut budgeted_hits: Vec<&str> = Vec::new();
+    for hit in &hits {
+        if !crate::memory::text_within_token_budget(
+            &format!("{}{}", "x".repeat(total_chars), hit),
+            max_tokens,
+        ) {
+            break;
+        }
+        total_chars += hit.len();
+        budgeted_hits.push(hit);
+    }
+
+    if budgeted_hits.is_empty() {
+        sections.push("**Memory:** No relevant context found for the given keywords.".into());
+    } else {
+        sections.push("## What the factory knows".into());
+        for (i, hit) in budgeted_hits.iter().enumerate() {
+            sections.push(format!("{}. {}", i + 1, hit.trim()));
+        }
+    }
+
+    // Pull top prior causes for causal guardrails.
+    let cause_rows = sqlx::query(
+        "SELECT cause_id, description, COUNT(*) as occurrences, \
+         AVG(CASE WHEN scenario_passed = 1 THEN 1.0 ELSE 0.0 END) as pass_rate \
+         FROM causal_hypotheses \
+         GROUP BY cause_id, description ORDER BY occurrences DESC LIMIT 5",
+    )
+    .fetch_all(&state.app.pool)
+    .await
+    .unwrap_or_default();
+    if !cause_rows.is_empty() {
+        sections.push("\n## Causal guardrails".into());
+        for row in &cause_rows {
+            use sqlx::Row as _;
+            let cause_id: String = row.try_get("cause_id").unwrap_or_default();
+            let desc: String = row
+                .try_get("description")
+                .unwrap_or_else(|_| cause_id.clone());
+            let occ: i64 = row.try_get("occurrences").unwrap_or(0);
+            let pct: f64 = row.try_get::<f64, _>("pass_rate").unwrap_or(1.0) * 100.0;
+            sections.push(format!(
+                "- **{desc}** ({occ} occurrences, {pct:.0}% pass rate)"
+            ));
+        }
+    }
+
+    sections.push(format!(
+        "\n*Briefing built from {} memory hits (budget: {} tokens). \
+         Apply guidance concretely — turn it into guardrails and explicit checks, not paraphrase.*",
+        budgeted_hits.len(),
+        max_tokens,
+    ));
+    sections.join("\n")
+}
+
+async fn build_sable_eval_prompt(state: &McpState, run_id: &str) -> String {
+    let mut lines = vec![
+        format!("# Sable Evaluation Setup — run: {run_id}"),
+        String::new(),
+        "## Isolation firewall".into(),
+        "You are Sable. Do NOT use content tagged: \
+         implementation_notes, mason_plan, edit_rationale, fix_patterns."
+            .into(),
+        String::new(),
+    ];
+
+    // List run artifacts.
+    let run_dir = state.app.paths.workspaces.join(run_id).join("product");
+    if let Ok(entries) = std::fs::read_dir(&run_dir) {
+        let artifacts: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        if !artifacts.is_empty() {
+            lines.push("## Available artifacts".into());
+            for a in &artifacts {
+                lines.push(format!("- {a}"));
+            }
+            lines.push(String::new());
+        }
+    }
+
+    // Pull scenario-pattern memory (no implementation content).
+    if let Ok(hits) = state
+        .app
+        .semantic_memory_search("scenario failure acceptance criteria", 4)
+        .await
+    {
+        if !hits.is_empty() {
+            lines.push("## Prior scenario patterns".into());
+            for hit in hits.iter().take(4) {
+                lines.push(format!("- {}", hit.trim()));
+            }
+            lines.push(String::new());
+        }
+    }
+
+    lines.push(
+        "Generate 2-4 hidden scenarios that verify the spec's acceptance criteria \
+         were genuinely met — not just that the pipeline ran."
+            .into(),
+    );
+    lines.join("\n")
+}
+
+async fn build_scout_preflight_prompt(
+    state: &McpState,
+    spec_id: &str,
+    run_id: Option<&str>,
+) -> String {
+    let mut lines = vec![format!(
+        "# Scout Preflight Package{}{}",
+        if spec_id.is_empty() {
+            String::new()
+        } else {
+            format!(" — spec: {spec_id}")
+        },
+        run_id.map(|id| format!(" | run: {id}")).unwrap_or_default(),
+    )];
+
+    // Query for spec-history and prior ambiguity patterns.
+    let query = if spec_id.is_empty() {
+        "spec ambiguity prior failure scout".to_string()
+    } else {
+        format!("{spec_id} spec ambiguity prior failure")
+    };
+
+    let mut hits: Vec<String> = Vec::new();
+    if let Ok(h) = state.app.memory_store.retrieve_context(&query).await {
+        hits.extend(h);
+    }
+    if let Ok(ob_hits) = state.app.semantic_memory_search(&query, 20).await {
+        for hit in ob_hits {
+            if !hits.contains(&hit) {
+                hits.push(hit);
+            }
+        }
+    }
+
+    if !hits.is_empty() {
+        lines.push(String::new());
+        lines.push("## Relevant prior context".into());
+        for hit in hits.iter().take(6) {
+            lines.push(format!("- {}", hit.trim()));
+        }
+    }
+
+    // Pull operator model commissioning brief if available.
+    let brief_path = state
+        .app
+        .paths
+        .root
+        .join(".harkonnen/operator-model/commissioning-brief.json");
+    if let Ok(raw) = std::fs::read_to_string(&brief_path) {
+        if let Ok(brief) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(patterns) = brief.get("top_patterns").and_then(|p| p.as_array()) {
+                lines.push(String::new());
+                lines.push("## Operator model patterns".into());
+                for p in patterns.iter().take(3) {
+                    if let Some(s) = p.as_str() {
+                        lines.push(format!("- {s}"));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Parse the spec, flag ambiguities, and produce a structured intent package. \
+         Do not write implementation code."
+            .into(),
+    );
+    lines.join("\n")
+}
+
+async fn build_keeper_policy_prompt(state: &McpState, action: &str, context: &str) -> String {
+    let mut lines = vec![
+        format!("# Keeper Policy Check — action: {action}"),
+        String::new(),
+        format!("**Proposed action:** {action}"),
+    ];
+    if !context.is_empty() {
+        lines.push(format!("\n**Context:** {context}"));
+    }
+
+    // Pull relevant guardrails from memory.
+    let query = format!("policy boundary guardrail {action}");
+    let mut hits: Vec<String> = Vec::new();
+    if let Ok(h) = state.app.memory_store.retrieve_context(&query).await {
+        hits.extend(h);
+    }
+    if let Ok(ob_hits) = state.app.semantic_memory_search(&query, 20).await {
+        for hit in ob_hits {
+            if !hits.contains(&hit) {
+                hits.push(hit);
+            }
+        }
+    }
+
+    if !hits.is_empty() {
+        lines.push(String::new());
+        lines.push("## Relevant policy context".into());
+        for hit in hits.iter().take(4) {
+            lines.push(format!("- {}", hit.trim()));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Issue a clear policy decision: in-bounds, out-of-bounds, or conditional with \
+         stated requirements. Update the claim record if coordination is needed."
+            .into(),
+    );
+    lines.join("\n")
 }
 
 fn required_string(params: &Value, key: &str) -> std::result::Result<String, (i64, String)> {
@@ -1172,6 +1885,116 @@ fn tool_descriptors() -> Vec<Value> {
                 }
             }
         }),
+        // ── Consolidated native tools (replaces filesystem / memory / sqlite npx servers) ──
+        json!({
+            "name": "read_file",
+            "description": "Read a file from factory workspaces, artifacts, memory, specs, or logs.",
+            "inputSchema": {
+                "type": "object", "required": ["path"],
+                "properties": { "path": { "type": "string", "description": "Relative or absolute path" } }
+            }
+        }),
+        json!({
+            "name": "list_directory",
+            "description": "List files in a factory directory (workspaces, artifacts, memory, specs, logs).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Directory path (default: .)" } }
+            }
+        }),
+        json!({
+            "name": "write_file",
+            "description": "Write content to a file inside factory/workspaces or factory/artifacts only.",
+            "inputSchema": {
+                "type": "object", "required": ["path", "content"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "create_directory",
+            "description": "Create a directory inside factory/workspaces or factory/artifacts.",
+            "inputSchema": {
+                "type": "object", "required": ["path"],
+                "properties": { "path": { "type": "string" } }
+            }
+        }),
+        json!({
+            "name": "memory_store",
+            "description": "Store a new entry in Harkonnen memory (file store + OB1 capture). Use for lessons, patterns, operator facts.",
+            "inputSchema": {
+                "type": "object", "required": ["content"],
+                "properties": {
+                    "content": { "type": "string", "description": "The memory content to store" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional classification tags" }
+                }
+            }
+        }),
+        json!({
+            "name": "memory_retrieve",
+            "description": "Retrieve memory hits from file store + OB1 for a query. Returns ranked results.",
+            "inputSchema": {
+                "type": "object", "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 8, "minimum": 1, "maximum": 20 }
+                }
+            }
+        }),
+        json!({
+            "name": "memory_list",
+            "description": "List recent memory entries in the file store.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 } }
+            }
+        }),
+        json!({
+            "name": "db_list_tables",
+            "description": "List tables in the Harkonnen SQLite state database.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "db_query",
+            "description": "Execute a read-only SELECT query against the Harkonnen SQLite state database.",
+            "inputSchema": {
+                "type": "object", "required": ["sql"],
+                "properties": { "sql": { "type": "string", "description": "A SELECT or WITH query" } }
+            }
+        }),
+        json!({
+            "name": "memory_pull",
+            "description": "On-demand context retrieval mid-task. Searches file-backed memory and OB1 for the query, applies scope isolation, and returns the top hits within the token budget.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string", "description": "The retrieval query" },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Optional run id; when supplied the pull is persisted for context utilization tracking."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Isolation scope: general | sable | mason | scout | keeper",
+                        "default": "general"
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "description": "Optional rebrief trigger such as unexpected_discovery when the phase-entry briefing is stale."
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Token budget for returned hits",
+                        "default": 500,
+                        "minimum": 50,
+                        "maximum": 4000
+                    }
+                }
+            }
+        }),
         json!({
             "name": "start_run",
             "description": "Start a new Harkonnen run from a spec path and product target.",
@@ -1477,13 +2300,48 @@ fn resource_descriptors() -> Vec<Value> {
 
 fn prompt_descriptors() -> Vec<Value> {
     vec![
+        // ── Static templates (backwards compat) ──────────────────────────────
         json!({
             "name": "briefing_for_spec",
-            "description": "Prompt template for building a Coobie-style briefing for a spec."
+            "description": "Static prompt template for a Coobie-style briefing."
         }),
         json!({
             "name": "diagnose_run",
-            "description": "Prompt template for diagnosing a completed or failed run."
+            "description": "Static prompt template for diagnosing a completed or failed run."
+        }),
+        // ── Live-hydrated prompts (Phase 5b) ─────────────────────────────────
+        json!({
+            "name": "coobie/briefing",
+            "description": "Live Coobie preflight briefing — pulls real memory hits, OB1 recall, and prior causes for the given keywords and phase.",
+            "arguments": [
+                { "name": "keywords", "description": "Comma-separated search keywords", "required": false },
+                { "name": "phase", "description": "Factory phase (preflight, scout, mason, sable, ...)", "required": false },
+                { "name": "run_id", "description": "Optional run ID for run-scoped context", "required": false },
+                { "name": "max_tokens", "description": "Token budget for memory hits (default: 500)", "required": false }
+            ]
+        }),
+        json!({
+            "name": "sable/eval-setup",
+            "description": "Live Sable evaluation context — run artifacts, scenario patterns, isolation firewall enforced.",
+            "arguments": [
+                { "name": "run_id", "description": "Run ID to evaluate", "required": true }
+            ]
+        }),
+        json!({
+            "name": "scout/preflight",
+            "description": "Live Scout preflight package — spec history, prior ambiguities, operator model posture.",
+            "arguments": [
+                { "name": "spec_id", "description": "Spec identifier", "required": false },
+                { "name": "run_id", "description": "Optional run ID for run-scoped context", "required": false }
+            ]
+        }),
+        json!({
+            "name": "keeper/policy-check",
+            "description": "Live Keeper policy context — relevant guardrails and prior decisions for a proposed action.",
+            "arguments": [
+                { "name": "action", "description": "The action under review", "required": true },
+                { "name": "context", "description": "Additional context for the policy check", "required": false }
+            ]
         }),
     ]
 }
@@ -1734,5 +2592,1253 @@ mod tests {
         assert!(!text.contains("Content-Length:"));
         assert!(text.ends_with('\n'));
         assert!(text.contains("\"ok\":true"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP SERVER END-TO-END TESTS
+// Tests exercise handle_rpc_body directly using an in-process McpState backed
+// by a temporary directory and an isolated SQLite database.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod mcp_e2e {
+    use super::*;
+    use serde_json::json;
+    use std::{sync::Arc, time::Instant};
+    use tokio::sync::RwLock;
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    /// Build a minimal McpState backed by a temp directory.
+    /// Returns `(state, _dir)` — keep `_dir` alive for the test duration.
+    async fn build_test_state() -> (McpState, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let factory = root.join("factory");
+        for sub in [
+            "specs",
+            "scenarios",
+            "artifacts",
+            "logs",
+            "workspaces",
+            "memory",
+        ] {
+            tokio::fs::create_dir_all(factory.join(sub)).await.unwrap();
+        }
+        tokio::fs::create_dir_all(root.join("products"))
+            .await
+            .unwrap();
+
+        let setup = crate::setup::SetupConfig::discover(&root).unwrap();
+        let paths = crate::config::Paths {
+            root: root.clone(),
+            factory: factory.clone(),
+            specs: factory.join("specs"),
+            scenarios: factory.join("scenarios"),
+            artifacts: factory.join("artifacts"),
+            logs: factory.join("logs"),
+            workspaces: factory.join("workspaces"),
+            memory: factory.join("memory"),
+            db_file: factory.join("state.db"),
+            products: root.join("products"),
+            setup: setup.clone(),
+        };
+
+        let pool = crate::db::init_db(&paths).await.unwrap();
+        let memory_store = crate::memory::MemoryStore::new(paths.memory.clone());
+        let coobie = crate::coobie::SqliteCoobie::new(pool.clone());
+        let (event_tx, _) = tokio::sync::broadcast::channel(512);
+        let bus = Arc::new(crate::chat::LocalJsonlPackChatBus::new(
+            paths.logs.join("packchat-bus.jsonl"),
+            "test",
+        ));
+        let chat = crate::chat::ChatStore::with_bus(pool.clone(), bus);
+        let operator_models = crate::operator_model::OperatorModelStore::new(pool.clone());
+        let dispatcher =
+            crate::subagent::SubAgentDispatcher::new(Default::default(), setup.clone());
+
+        let app = crate::orchestrator::AppContext {
+            paths,
+            pool,
+            memory_store,
+            blackboard: Arc::new(RwLock::new(crate::models::BlackboardState::default())),
+            coobie,
+            embedding_store: None,
+            event_tx,
+            chat,
+            operator_models,
+            started_at: Instant::now(),
+            calvin: None,
+            open_brain: None,
+            semantic_memory: Arc::new(crate::memory::NoopSemanticMemory),
+            dispatcher,
+        };
+
+        let state = McpState {
+            app,
+            started_at: Instant::now(),
+        };
+        (state, tmp)
+    }
+
+    /// Call `handle_rpc_body` and return the inner `result` field.
+    /// Panics if the RPC response carries an error.
+    async fn rpc(state: &McpState, body: serde_json::Value) -> serde_json::Value {
+        match handle_rpc_body(state, body)
+            .await
+            .expect("handle_rpc_body returned Err")
+        {
+            Some(resp) => {
+                assert!(
+                    resp.get("error").is_none(),
+                    "unexpected RPC error: {}",
+                    resp
+                );
+                resp["result"].clone()
+            }
+            None => serde_json::Value::Null,
+        }
+    }
+
+    /// Call `handle_rpc_body` and expect an error.  Returns `(code, message)`.
+    async fn rpc_err(state: &McpState, body: serde_json::Value) -> (i64, String) {
+        match handle_rpc_body(state, body).await {
+            Err(err) => {
+                let code = err["error"]["code"].as_i64().unwrap_or(0);
+                let message = err["error"]["message"].as_str().unwrap_or("").to_string();
+                (code, message)
+            }
+            Ok(Some(resp)) if resp.get("error").is_some() => {
+                let code = resp["error"]["code"].as_i64().unwrap_or(0);
+                let message = resp["error"]["message"].as_str().unwrap_or("").to_string();
+                (code, message)
+            }
+            Ok(other) => panic!("expected error, got: {other:?}"),
+        }
+    }
+
+    /// Build a tools/call envelope.
+    fn call(id: u64, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        })
+    }
+
+    /// Parse the text content of a tool result as JSON.
+    fn parse_tool_json(result: &serde_json::Value) -> serde_json::Value {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("expected text content");
+        serde_json::from_str(text).expect("expected JSON in tool result text")
+    }
+
+    /// Get the plain-text content of a tool result.
+    fn tool_text(result: &serde_json::Value) -> &str {
+        result["content"][0]["text"]
+            .as_str()
+            .expect("expected text content")
+    }
+
+    /// Write a minimal valid spec YAML and return the absolute path.
+    async fn write_test_spec(paths: &crate::config::Paths, name: &str) -> String {
+        let spec_path = paths.specs.join(format!("{name}.yaml"));
+        let yaml = format!(
+            "id: {name}\ntitle: {name} Test Spec\npurpose: MCP E2E test\n\
+             scope: [test]\nconstraints: []\ninputs: []\noutputs: []\n\
+             acceptance_criteria: [test passes]\nforbidden_behaviors: []\n\
+             rollback_requirements: []\ndependencies: []\n\
+             performance_expectations: []\nsecurity_expectations: []\n"
+        );
+        tokio::fs::write(&spec_path, yaml).await.unwrap();
+        spec_path.to_string_lossy().into_owned()
+    }
+
+    /// Create a product directory and return the absolute path.
+    async fn make_product_dir(paths: &crate::config::Paths, name: &str) -> String {
+        let product_dir = paths.products.join(name);
+        tokio::fs::create_dir_all(&product_dir).await.unwrap();
+        product_dir.to_string_lossy().into_owned()
+    }
+
+    // ── Protocol ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn initialize_returns_server_info() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25" }
+            }),
+        )
+        .await;
+        assert_eq!(result["serverInfo"]["name"], "harkonnen-labs");
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["protocolVersion"], "2025-11-25");
+    }
+
+    #[tokio::test]
+    async fn ping_returns_ok() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "ping", "params": {} }),
+        )
+        .await;
+        assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn notifications_initialized_returns_no_content() {
+        let (state, _dir) = build_test_state().await;
+        let result = handle_rpc_body(
+            &state,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "notifications/initialized must return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_all_expected_tools() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        let names: Vec<String> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+
+        for expected in [
+            "list_runs",
+            "get_run",
+            "get_run_report",
+            "start_run",
+            "queue_run",
+            "watch_run",
+            "list_run_decisions",
+            "get_run_reasoning_snapshot",
+            "get_run_board_snapshot",
+            "list_chat_threads",
+            "open_chat_thread",
+            "get_chat_thread",
+            "list_chat_messages",
+            "post_chat_message",
+            "list_run_checkpoints",
+            "reply_to_checkpoint",
+            "unblock_agent",
+            "read_file",
+            "write_file",
+            "list_directory",
+            "create_directory",
+            "memory_store",
+            "memory_retrieve",
+            "memory_list",
+            "memory_pull",
+            "db_list_tables",
+            "db_query",
+            "list_benchmark_suites",
+            "run_benchmarks",
+            "list_benchmark_reports",
+            "get_benchmark_report",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing tool: {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resources_list_includes_core_uris() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "resources/list", "params": {} }),
+        )
+        .await;
+        let resources = result["resources"].as_array().unwrap();
+        let uris: Vec<&str> = resources
+            .iter()
+            .filter_map(|r| r["uri"].as_str().or_else(|| r["uriTemplate"].as_str()))
+            .collect();
+        assert!(
+            uris.contains(&"harkonnen://runs"),
+            "missing harkonnen://runs"
+        );
+        assert!(
+            uris.contains(&"harkonnen://chat/threads"),
+            "missing harkonnen://chat/threads"
+        );
+        assert!(
+            uris.contains(&"harkonnen://benchmarks/suites"),
+            "missing harkonnen://benchmarks/suites"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompts_list_includes_live_hydrated_prompts() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "prompts/list", "params": {} }),
+        )
+        .await;
+        let names: Vec<&str> = result["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "coobie/briefing",
+            "sable/eval-setup",
+            "scout/preflight",
+            "keeper/policy-check",
+        ] {
+            assert!(names.contains(&expected), "missing prompt: {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_request_is_rejected() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} }]),
+        )
+        .await;
+        assert_eq!(code, -32600);
+        assert!(
+            msg.contains("batch"),
+            "expected 'batch' in error message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let (state, _dir) = build_test_state().await;
+        let (code, _msg) = rpc_err(
+            &state,
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "no_such_method", "params": {} }),
+        )
+        .await;
+        assert_eq!(code, -32601);
+    }
+
+    // ── DB tools ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_list_tables_returns_core_schema_tables() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(&state, call(10, "db_list_tables", json!({}))).await;
+        let text = tool_text(&result);
+        assert!(text.contains("runs"), "'runs' table not found: {text}");
+        assert!(
+            text.contains("run_events"),
+            "'run_events' table not found: {text}"
+        );
+        assert!(
+            text.contains("chat_threads"),
+            "'chat_threads' table not found: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_query_select_on_empty_runs_returns_no_rows() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            call(
+                11,
+                "db_query",
+                json!({ "sql": "SELECT run_id, status FROM runs LIMIT 10" }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("(no rows)"),
+            "expected '(no rows)' on empty DB, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_query_rejects_non_select_statements() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            call(
+                12,
+                "db_query",
+                json!({ "sql": "INSERT INTO runs VALUES ('x','y','z','q','n','n')" }),
+            ),
+        )
+        .await;
+        assert_eq!(code, -32602);
+        assert!(
+            msg.to_lowercase().contains("select"),
+            "expected SELECT-only message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_query_with_prefix_returns_rows() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            call(
+                13,
+                "db_query",
+                json!({ "sql": "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 5" }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("row(s)"),
+            "expected 'row(s)' in output, got: {text}"
+        );
+    }
+
+    // ── Memory tools ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_store_confirms_write() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            call(
+                20,
+                "memory_store",
+                json!({
+                    "content": "Thin evidence requires explicit preflight checks.",
+                    "tags": ["coobie", "preflight"]
+                }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("stored"),
+            "expected store confirmation, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_list_shows_entry_after_store() {
+        let (state, _dir) = build_test_state().await;
+        rpc(
+            &state,
+            call(
+                21,
+                "memory_store",
+                json!({ "content": "Mason succeeded on auth module." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(&state, call(22, "memory_list", json!({ "limit": 10 }))).await;
+        let text = tool_text(&result);
+        assert!(
+            !text.contains("Memory is empty."),
+            "memory_list should show stored entry, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_retrieve_returns_non_empty_text() {
+        let (state, _dir) = build_test_state().await;
+        rpc(
+            &state,
+            call(
+                23,
+                "memory_store",
+                json!({ "content": "Scout flagged ambiguity in the auth scope definition." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(
+            &state,
+            call(
+                24,
+                "memory_retrieve",
+                json!({ "query": "scout auth scope ambiguity", "limit": 5 }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            !text.is_empty(),
+            "memory_retrieve must return non-empty text"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_pull_returns_structured_header() {
+        let (state, _dir) = build_test_state().await;
+        rpc(
+            &state,
+            call(
+                25,
+                "memory_store",
+                json!({ "content": "Coobie preflight: check for stale runs before starting." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(
+            &state,
+            call(
+                26,
+                "memory_pull",
+                json!({ "query": "coobie preflight stale runs", "scope": "general", "max_tokens": 300 }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(!text.is_empty(), "memory_pull must return non-empty text");
+    }
+
+    #[tokio::test]
+    async fn memory_pull_with_run_id_persists_context_pull_record() {
+        let (state, _dir) = build_test_state().await;
+        let run_id = "run-context-pull";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(run_id)
+        .bind("spec-context-pull")
+        .bind("product-context-pull")
+        .bind("running")
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.app.pool)
+        .await
+        .unwrap();
+        rpc(
+            &state,
+            call(
+                27,
+                "memory_store",
+                json!({ "content": "Keeper policy check: preserve run scoped context utilization records." }),
+            ),
+        )
+        .await;
+
+        rpc(
+            &state,
+            call(
+                28,
+                "memory_pull",
+                json!({
+                    "run_id": run_id,
+                    "query": "keeper policy context utilization",
+                    "scope": "keeper",
+                    "max_tokens": 300
+                }),
+            ),
+        )
+        .await;
+
+        let records = state.app.list_context_pull_records(run_id).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].scope, "keeper");
+        assert_eq!(records[0].query, "keeper policy context utilization");
+        assert!(
+            records[0].tokens_returned <= 300,
+            "memory_pull should persist returned tokens within the requested budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_pull_unexpected_discovery_persists_rebrief_trigger() {
+        let (state, _dir) = build_test_state().await;
+        let run_id = "run-context-pull-trigger";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (run_id, spec_id, product, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(run_id)
+        .bind("spec-context-pull-trigger")
+        .bind("product-context-pull")
+        .bind("running")
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.app.pool)
+        .await
+        .unwrap();
+        rpc(
+            &state,
+            call(
+                29,
+                "memory_store",
+                json!({ "content": "Mason discovered an undocumented schema edge in the auth adapter." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(
+            &state,
+            call(
+                30,
+                "memory_pull",
+                json!({
+                    "run_id": run_id,
+                    "query": "undocumented schema edge auth adapter",
+                    "scope": "mason",
+                    "trigger": "unexpected_discovery",
+                    "max_tokens": 300
+                }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("trigger: unexpected_discovery"),
+            "memory_pull response should name the rebrief trigger; got: {text}"
+        );
+
+        let records = state.app.list_context_pull_records(run_id).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].scope, "mason");
+        assert_eq!(records[0].trigger.as_deref(), Some("unexpected_discovery"));
+        assert_eq!(records[0].query, "undocumented schema edge auth adapter");
+        assert!(
+            records[0]
+                .hit_previews
+                .iter()
+                .any(|preview| preview.contains("undocumented schema edge")),
+            "triggered pull should persist hit previews"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_pull_sable_scope_filters_implementation_notes() {
+        let (state, _dir) = build_test_state().await;
+        // Store content that contains the disallowed tag text
+        rpc(
+            &state,
+            call(
+                27,
+                "memory_store",
+                json!({ "content": "[implementation_notes] Mason used trait objects for the auth abstraction." }),
+            ),
+        )
+        .await;
+
+        let result = rpc(
+            &state,
+            call(
+                28,
+                "memory_pull",
+                json!({
+                    "query": "implementation notes auth mason",
+                    "scope": "sable",
+                    "max_tokens": 400
+                }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        // Under sable scope, hits containing "implementation_notes" are filtered out
+        assert!(
+            !text.contains("Mason used trait objects"),
+            "sable scope must suppress implementation_notes content"
+        );
+    }
+
+    // ── File tools ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_and_read_file_round_trip() {
+        let (state, _dir) = build_test_state().await;
+        let ws_run = state.app.paths.workspaces.join("rw-test");
+        tokio::fs::create_dir_all(&ws_run).await.unwrap();
+        let ws_path = "factory/workspaces/rw-test/output.txt";
+
+        let write_result = rpc(
+            &state,
+            call(
+                30,
+                "write_file",
+                json!({ "path": ws_path, "content": "Hello from write_file." }),
+            ),
+        )
+        .await;
+        assert!(
+            tool_text(&write_result).contains("wrote"),
+            "expected write confirmation"
+        );
+
+        let read_result = rpc(&state, call(31, "read_file", json!({ "path": ws_path }))).await;
+        assert_eq!(tool_text(&read_result), "Hello from write_file.");
+    }
+
+    #[tokio::test]
+    async fn read_file_outside_allowed_paths_rejected() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            call(32, "read_file", json!({ "path": "/etc/passwd" })),
+        )
+        .await;
+        assert_eq!(code, -32602);
+        assert!(
+            msg.contains("outside"),
+            "expected 'outside allowed' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_outside_workspaces_rejected() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            call(
+                33,
+                "write_file",
+                json!({ "path": "factory/memory/sneaky.md", "content": "should not write" }),
+            ),
+        )
+        .await;
+        assert_eq!(code, -32602);
+        assert!(
+            msg.contains("outside"),
+            "expected 'outside allowed write' in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_directory_shows_written_file() {
+        let (state, _dir) = build_test_state().await;
+        let ws_dir = state.app.paths.workspaces.join("dir-test");
+        tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+        tokio::fs::write(ws_dir.join("result.json"), b"{}")
+            .await
+            .unwrap();
+
+        let result = rpc(
+            &state,
+            call(
+                34,
+                "list_directory",
+                json!({ "path": "factory/workspaces/dir-test" }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("result.json"),
+            "expected result.json in listing, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_directory_in_workspace() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            call(
+                35,
+                "create_directory",
+                json!({ "path": "factory/workspaces/new-dir/sub" }),
+            ),
+        )
+        .await;
+        let text = tool_text(&result);
+        assert!(
+            text.contains("created"),
+            "expected 'created' confirmation, got: {text}"
+        );
+        assert!(
+            state.app.paths.workspaces.join("new-dir/sub").exists(),
+            "directory must exist after create_directory"
+        );
+    }
+
+    // ── Run lifecycle via MCP ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_runs_empty_on_fresh_database() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(&state, call(40, "list_runs", json!({ "limit": 20 }))).await;
+        let runs = parse_tool_json(&result);
+        assert!(
+            runs.as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "expected empty run list, got: {runs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_run_creates_queued_record() {
+        let (state, _dir) = build_test_state().await;
+        let spec = write_test_spec(&state.app.paths, "queue-run-spec").await;
+        let product = make_product_dir(&state.app.paths, "queue-run-product").await;
+
+        let result = rpc(
+            &state,
+            call(
+                41,
+                "queue_run",
+                json!({ "spec": spec, "product_path": product, "run_hidden_scenarios": false }),
+            ),
+        )
+        .await;
+        let info = parse_tool_json(&result);
+        let run_id = info["run_id"]
+            .as_str()
+            .expect("queue_run must return run_id");
+        // Status is initially "queued" but the background task may complete (and fail
+        // without a real LLM) before queue_run returns its record in test contexts.
+        let status = info["status"].as_str().unwrap_or("");
+        assert!(
+            ["queued", "running", "failed", "completed"].contains(&status),
+            "run must have a valid status, got: {status}"
+        );
+        assert!(info["spec_id"].as_str().is_some(), "run must carry spec_id");
+        assert!(!run_id.is_empty(), "run_id must not be empty");
+    }
+
+    #[tokio::test]
+    async fn get_run_returns_matching_queued_record() {
+        let (state, _dir) = build_test_state().await;
+        let spec = write_test_spec(&state.app.paths, "get-run-spec").await;
+        let product = make_product_dir(&state.app.paths, "get-run-product").await;
+
+        let queue_result = rpc(
+            &state,
+            call(
+                42,
+                "queue_run",
+                json!({ "spec": spec, "product_path": product, "run_hidden_scenarios": false }),
+            ),
+        )
+        .await;
+        let run_id = parse_tool_json(&queue_result)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let get_result = rpc(&state, call(43, "get_run", json!({ "run_id": &run_id }))).await;
+        let run = parse_tool_json(&get_result);
+        assert_eq!(run["run_id"], run_id);
+        // Status may have transitioned from "queued" to "failed" by the time we
+        // call get_run (background execution fails fast without a real LLM).
+        let status = run["status"].as_str().unwrap_or("");
+        assert!(
+            ["queued", "running", "failed", "completed"].contains(&status),
+            "run status must be a valid value, got: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_runs_shows_queued_run() {
+        let (state, _dir) = build_test_state().await;
+        let spec = write_test_spec(&state.app.paths, "list-runs-spec").await;
+        let product = make_product_dir(&state.app.paths, "list-runs-product").await;
+
+        let queue_result = rpc(
+            &state,
+            call(
+                44,
+                "queue_run",
+                json!({ "spec": spec, "product_path": product, "run_hidden_scenarios": false }),
+            ),
+        )
+        .await;
+        let run_id = parse_tool_json(&queue_result)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let list_result = rpc(&state, call(45, "list_runs", json!({ "limit": 10 }))).await;
+        let runs = parse_tool_json(&list_result);
+        let arr = runs.as_array().unwrap();
+        assert!(!arr.is_empty(), "list_runs must show the queued run");
+        assert!(
+            arr.iter().any(|r| r["run_id"] == run_id),
+            "queued run_id must appear in list"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_run_snapshot_contains_required_fields() {
+        let (state, _dir) = build_test_state().await;
+        let spec = write_test_spec(&state.app.paths, "watch-run-spec").await;
+        let product = make_product_dir(&state.app.paths, "watch-run-product").await;
+
+        let queue_result = rpc(
+            &state,
+            call(
+                46,
+                "queue_run",
+                json!({ "spec": spec, "product_path": product, "run_hidden_scenarios": false }),
+            ),
+        )
+        .await;
+        let run_id = parse_tool_json(&queue_result)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let watch_result = rpc(
+            &state,
+            call(
+                47,
+                "watch_run",
+                json!({ "run_id": &run_id, "event_limit": 5 }),
+            ),
+        )
+        .await;
+        let payload = parse_tool_json(&watch_result);
+        assert_eq!(
+            payload["run"]["run_id"], run_id,
+            "watch_run must include run record"
+        );
+        assert!(
+            payload["recent_events"].is_array(),
+            "watch_run must include recent_events"
+        );
+        assert!(
+            payload["active_checkpoints"].is_array(),
+            "watch_run must include active_checkpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_run_checkpoints_returns_current_array_for_queued_run() {
+        let (state, _dir) = build_test_state().await;
+        let spec = write_test_spec(&state.app.paths, "checkpoint-spec").await;
+        let product = make_product_dir(&state.app.paths, "checkpoint-product").await;
+
+        let queue_result = rpc(
+            &state,
+            call(
+                48,
+                "queue_run",
+                json!({ "spec": spec, "product_path": product, "run_hidden_scenarios": false }),
+            ),
+        )
+        .await;
+        let run_id = parse_tool_json(&queue_result)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let cp_result = rpc(
+            &state,
+            call(49, "list_run_checkpoints", json!({ "run_id": &run_id })),
+        )
+        .await;
+        let checkpoints = parse_tool_json(&cp_result);
+        let checkpoints = checkpoints
+            .as_array()
+            .expect("list_run_checkpoints must return an array");
+        assert!(
+            checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint["run_id"] == run_id),
+            "list_run_checkpoints must only return checkpoints for the requested run"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_not_found_returns_error() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            call(50, "get_run", json!({ "run_id": "nonexistent-xyz" })),
+        )
+        .await;
+        assert_eq!(code, -32004, "missing run must return -32004");
+        assert!(
+            msg.contains("nonexistent-xyz"),
+            "error must name the missing run_id"
+        );
+    }
+
+    // ── Chat / PackChat tools ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_and_get_chat_thread_round_trip() {
+        let (state, _dir) = build_test_state().await;
+
+        let open_result = rpc(
+            &state,
+            call(
+                60,
+                "open_chat_thread",
+                json!({ "title": "E2E Thread", "thread_kind": "general" }),
+            ),
+        )
+        .await;
+        let thread = parse_tool_json(&open_result);
+        let thread_id = thread["thread_id"]
+            .as_str()
+            .expect("open_chat_thread must return thread_id")
+            .to_string();
+
+        let get_result = rpc(
+            &state,
+            call(61, "get_chat_thread", json!({ "thread_id": &thread_id })),
+        )
+        .await;
+        let fetched = parse_tool_json(&get_result);
+        assert_eq!(
+            fetched["thread_id"], thread_id,
+            "get_chat_thread must return matching thread_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_chat_threads_shows_opened_thread() {
+        let (state, _dir) = build_test_state().await;
+
+        rpc(
+            &state,
+            call(
+                62,
+                "open_chat_thread",
+                json!({ "title": "List Test Thread", "thread_kind": "general" }),
+            ),
+        )
+        .await;
+
+        let list_result = rpc(
+            &state,
+            call(
+                63,
+                "list_chat_threads",
+                json!({ "thread_kind": "general", "limit": 10 }),
+            ),
+        )
+        .await;
+        let threads = parse_tool_json(&list_result);
+        assert!(
+            threads.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "list_chat_threads must show the opened thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_chat_messages_empty_on_new_thread() {
+        let (state, _dir) = build_test_state().await;
+
+        let open_result = rpc(
+            &state,
+            call(
+                64,
+                "open_chat_thread",
+                json!({ "title": "Empty Thread", "thread_kind": "general" }),
+            ),
+        )
+        .await;
+        let thread_id = parse_tool_json(&open_result)["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let msg_result = rpc(
+            &state,
+            call(65, "list_chat_messages", json!({ "thread_id": &thread_id })),
+        )
+        .await;
+        let messages = parse_tool_json(&msg_result);
+        assert!(
+            messages.as_array().map(|a| a.is_empty()).unwrap_or(true),
+            "new thread must have no messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_chat_thread_not_found_returns_error() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(
+            &state,
+            call(
+                66,
+                "get_chat_thread",
+                json!({ "thread_id": "nonexistent-thread-abc" }),
+            ),
+        )
+        .await;
+        assert_eq!(code, -32004);
+        assert!(
+            msg.contains("nonexistent-thread-abc"),
+            "error must name the missing thread_id"
+        );
+    }
+
+    // ── Error handling ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_required_param_returns_invalid_params() {
+        let (state, _dir) = build_test_state().await;
+        // get_run requires run_id
+        let (code, msg) = rpc_err(&state, call(70, "get_run", json!({}))).await;
+        assert_eq!(code, -32602, "missing required param must return -32602");
+        assert!(
+            msg.contains("run_id"),
+            "error must name the missing parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_name_returns_method_not_found() {
+        let (state, _dir) = build_test_state().await;
+        let (code, msg) = rpc_err(&state, call(71, "no_such_tool_ever_xyz", json!({}))).await;
+        assert_eq!(code, -32601);
+        assert!(
+            msg.contains("no_such_tool_ever_xyz"),
+            "error must name the unknown tool"
+        );
+    }
+
+    // ── Live-hydrated prompts ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn coobie_briefing_prompt_returns_messages() {
+        let (state, _dir) = build_test_state().await;
+        rpc(
+            &state,
+            call(
+                79,
+                "memory_store",
+                json!({ "content": "Coobie briefing should include the scout ambiguity guardrail for auth specs." }),
+            ),
+        )
+        .await;
+        let result = rpc(
+            &state,
+            json!({
+                "jsonrpc": "2.0", "id": 80,
+                "method": "prompts/get",
+                "params": {
+                    "name": "coobie/briefing",
+                    "arguments": {
+                        "keywords": "scout,spec,ambiguity",
+                        "phase": "preflight"
+                    }
+                }
+            }),
+        )
+        .await;
+        let messages = result["messages"]
+            .as_array()
+            .expect("must have messages array");
+        assert!(!messages.is_empty(), "coobie/briefing must return messages");
+        let text = messages[0]["content"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("Coobie"),
+            "coobie/briefing text must reference Coobie, got: {text}"
+        );
+        assert!(
+            text.contains("scout ambiguity guardrail"),
+            "coobie/briefing must include a relevant memory hit, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coobie_briefing_prompt_respects_max_tokens() {
+        let (state, _dir) = build_test_state().await;
+        rpc(
+            &state,
+            call(
+                83,
+                "memory_store",
+                json!({ "content": "Budget marker: keep the prompt compact when max_tokens is tiny." }),
+            ),
+        )
+        .await;
+        let result = rpc(
+            &state,
+            json!({
+                "jsonrpc": "2.0", "id": 84,
+                "method": "prompts/get",
+                "params": {
+                    "name": "coobie/briefing",
+                    "arguments": {
+                        "keywords": "budget,marker,compact",
+                        "phase": "preflight",
+                        "max_tokens": 5
+                    }
+                }
+            }),
+        )
+        .await;
+        let text = result["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !text.contains("Budget marker"),
+            "coobie/briefing should suppress oversized memory hits under tiny budgets, got: {text}"
+        );
+        assert!(
+            text.contains("budget: 5 tokens"),
+            "coobie/briefing should report the requested token budget, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeper_policy_check_prompt_echoes_action() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({
+                "jsonrpc": "2.0", "id": 81,
+                "method": "prompts/get",
+                "params": {
+                    "name": "keeper/policy-check",
+                    "arguments": {
+                        "action": "write to factory/scenarios",
+                        "context": "Sable wants to add a hidden scenario file"
+                    }
+                }
+            }),
+        )
+        .await;
+        let messages = result["messages"].as_array().unwrap();
+        assert!(!messages.is_empty());
+        let text = messages[0]["content"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("write to factory/scenarios"),
+            "keeper prompt must echo the action, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scout_preflight_prompt_returns_messages() {
+        let (state, _dir) = build_test_state().await;
+        let result = rpc(
+            &state,
+            json!({
+                "jsonrpc": "2.0", "id": 82,
+                "method": "prompts/get",
+                "params": {
+                    "name": "scout/preflight",
+                    "arguments": { "spec_id": "auth-spec-001" }
+                }
+            }),
+        )
+        .await;
+        let messages = result["messages"].as_array().unwrap();
+        assert!(!messages.is_empty(), "scout/preflight must return messages");
     }
 }

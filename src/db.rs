@@ -32,6 +32,158 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS calvin_write_queue (
+            queue_id TEXT PRIMARY KEY,
+            run_id TEXT,
+            operation TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            confirmed_at TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_calvin_write_queue_status_next_attempt
+        ON calvin_write_queue (status, next_attempt_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS run_predictions (
+            prediction_id      TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL UNIQUE,
+            spec_id            TEXT NOT NULL,
+            predicted_outcome  TEXT NOT NULL,
+            risk_score         REAL NOT NULL,
+            confidence         REAL NOT NULL,
+            failure_phase      TEXT,
+            failure_kind       TEXT,
+            source_cause_ids   TEXT NOT NULL DEFAULT '',
+            narrative_summary  TEXT NOT NULL,
+            created_at         TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_run_predictions_spec_created
+        ON run_predictions (spec_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS spec_family_profiles (
+            family_id        TEXT PRIMARY KEY,
+            label            TEXT NOT NULL,
+            fingerprint_json TEXT NOT NULL DEFAULT '[]',
+            spec_ids_json    TEXT NOT NULL DEFAULT '[]',
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_spec_family_profiles_updated
+        ON spec_family_profiles (updated_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS prediction_success_reinforcements (
+            reinforcement_id   TEXT PRIMARY KEY,
+            run_id             TEXT NOT NULL,
+            prediction_id      TEXT NOT NULL,
+            source_cause_id    TEXT NOT NULL,
+            prediction_error   REAL NOT NULL,
+            actual_outcome     TEXT NOT NULL,
+            confirmation_count INTEGER NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending_workbench_review',
+            created_at         TEXT NOT NULL,
+            UNIQUE(run_id, source_cause_id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_prediction_success_reinforcements_cause
+        ON prediction_success_reinforcements (source_cause_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_influence_exclusions (
+            exclusion_id          TEXT PRIMARY KEY,
+            run_id                TEXT NOT NULL,
+            phase                 TEXT NOT NULL,
+            briefing_scope        TEXT,
+            memory_key            TEXT NOT NULL,
+            memory_preview        TEXT NOT NULL,
+            spec_family           TEXT NOT NULL DEFAULT 'unknown',
+            expected_outcome      TEXT NOT NULL,
+            actual_outcome        TEXT NOT NULL,
+            exclusion_probability REAL NOT NULL,
+            selection_basis       TEXT NOT NULL,
+            created_at            TEXT NOT NULL,
+            UNIQUE(run_id, phase, memory_key)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_influence_exclusions_run
+        ON memory_influence_exclusions (run_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_influence_exclusions_key
+        ON memory_influence_exclusions (memory_key, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS run_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -168,6 +320,43 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_phase_attributions_run_id_phase
         ON phase_attributions (run_id, phase)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS context_pull_records (
+            pull_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            max_tokens INTEGER NOT NULL,
+            tokens_returned INTEGER NOT NULL,
+            hits_returned INTEGER NOT NULL,
+            hit_previews TEXT NOT NULL DEFAULT '[]',
+            trigger TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES runs(run_id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "context_pull_records",
+        "trigger",
+        "ALTER TABLE context_pull_records ADD COLUMN trigger TEXT",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_context_pull_records_run_created
+        ON context_pull_records (run_id, created_at)
         "#,
     )
     .execute(&pool)
@@ -524,6 +713,82 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_candidates (
+            candidate_id      TEXT PRIMARY KEY,
+            source_event_id   TEXT NOT NULL UNIQUE,
+            thread_id         TEXT,
+            run_id            TEXT,
+            spec_id           TEXT,
+            message_id        TEXT,
+            agent_runtime_id  TEXT,
+            agent             TEXT,
+            role              TEXT NOT NULL DEFAULT 'system',
+            operation         TEXT NOT NULL,
+            raw_payload       TEXT NOT NULL DEFAULT '{}',
+            distilled_content TEXT,
+            dedupe_key        TEXT,
+            importance_score  REAL NOT NULL DEFAULT 0.0,
+            retention_class   TEXT NOT NULL DEFAULT 'working',
+            learning_intent   TEXT NOT NULL DEFAULT 'awareness_only',
+            sensitivity_label TEXT NOT NULL DEFAULT 'normal',
+            evidence_refs     TEXT NOT NULL DEFAULT '[]',
+            causality_json    TEXT NOT NULL DEFAULT '{}',
+            status            TEXT NOT NULL DEFAULT 'pending',
+            openbrain_ref     TEXT,
+            calvin_contract_json TEXT,
+            created_at        TEXT NOT NULL,
+            processed_at      TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_candidates",
+        "dedupe_key",
+        "ALTER TABLE memory_candidates ADD COLUMN dedupe_key TEXT",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "memory_candidates",
+        "learning_intent",
+        "ALTER TABLE memory_candidates ADD COLUMN learning_intent TEXT NOT NULL DEFAULT 'awareness_only'",
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_run_status
+        ON memory_candidates (run_id, status, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_thread_status
+        ON memory_candidates (thread_id, status, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_memory_candidates_dedupe_status
+        ON memory_candidates (dedupe_key, status)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Operator Model Activation tables ──────────────────────────────────────
 
     sqlx::query(
@@ -706,6 +971,8 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
             status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'kept' | 'discarded'
             content_json    TEXT NOT NULL DEFAULT '{}',
             edited_json     TEXT,            -- operator-edited content, NULL = use content_json
+            review_class    TEXT NOT NULL DEFAULT 'standard',
+            pattern_basis_json TEXT NOT NULL DEFAULT '[]',
             confidence      REAL NOT NULL DEFAULT 0.5,
             label           TEXT NOT NULL DEFAULT '',
             created_at      TEXT NOT NULL,
@@ -714,6 +981,22 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         "#,
     )
     .execute(&pool)
+    .await?;
+
+    ensure_column(
+        &pool,
+        "consolidation_candidates",
+        "review_class",
+        "ALTER TABLE consolidation_candidates ADD COLUMN review_class TEXT NOT NULL DEFAULT 'standard'",
+    )
+    .await?;
+
+    ensure_column(
+        &pool,
+        "consolidation_candidates",
+        "pattern_basis_json",
+        "ALTER TABLE consolidation_candidates ADD COLUMN pattern_basis_json TEXT NOT NULL DEFAULT '[]'",
+    )
     .await?;
 
     sqlx::query(
@@ -959,6 +1242,75 @@ pub async fn init_db(paths: &Paths) -> Result<SqlitePool> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_memory_updates_created_at
         ON memory_updates (created_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Phase 5b: Code-review learning records ───────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS code_review_learning_records (
+            record_id                  TEXT PRIMARY KEY,
+            run_id                     TEXT NOT NULL,
+            source_agent               TEXT NOT NULL,
+            reviewer_agent             TEXT NOT NULL,
+            finding_fingerprint        TEXT NOT NULL,
+            files_json                 TEXT NOT NULL DEFAULT '[]',
+            severity                   TEXT NOT NULL,
+            resolution                 TEXT NOT NULL,
+            lesson                     TEXT NOT NULL,
+            evidence_refs_json         TEXT NOT NULL DEFAULT '[]',
+            stale_if_file_changed_json TEXT NOT NULL DEFAULT '[]',
+            status                     TEXT NOT NULL DEFAULT 'active',
+            created_at                 TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_code_review_learning_records_run
+        ON code_review_learning_records (run_id, created_at)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_code_review_learning_records_fingerprint
+        ON code_review_learning_records (run_id, finding_fingerprint)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Phase 5b: Behavioral-change reports ─────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS behavioral_change_reports (
+            report_id                       TEXT PRIMARY KEY,
+            run_id                          TEXT NOT NULL UNIQUE,
+            spec_id                         TEXT NOT NULL,
+            status                          TEXT NOT NULL,
+            summary                         TEXT NOT NULL,
+            metrics_json                    TEXT NOT NULL DEFAULT '{}',
+            prior_revision_candidates_json  TEXT NOT NULL DEFAULT '[]',
+            artifact_json                   TEXT NOT NULL DEFAULT '{}',
+            created_at                      TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_behavioral_change_reports_status
+        ON behavioral_change_reports (status, created_at)
         "#,
     )
     .execute(&pool)
