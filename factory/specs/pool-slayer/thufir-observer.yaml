@@ -1,0 +1,131 @@
+id: thufir-observer
+title: Thufir — Nightly Three-Bot Meteora Observer
+purpose: Thufir watches the three Meteora strategy bots (Spot, Bid-Ask, Curve) every night at 11:55 PM, diagnoses performance against the 1.25% daily yield target, compares strategy performance, evaluates pool selection quality, and writes a structured diagnosis that drives autonomous overnight optimization.
+scope:
+  - create new file src/thufir-observer.cjs in the bot directory
+  - read data/meteora-snapshots.json for each of the three bots
+  - read data/meteora-fees.json for each of the three bots
+  - read /tmp/meteora-pool-config.json for current pool and scout data
+  - read /tmp/pool-scout.log for pool switch history
+  - calculate daily yield per strategy and combined
+  - compare Spot vs Bid-Ask vs Curve performance
+  - evaluate pool scout effectiveness
+  - classify failure mode from six categories
+  - write diagnosis to data/thufir-notes.json
+  - install as nightly cron job at 11:55 PM
+  - log all activity with [THUFIR] prefix
+constraints:
+  - must be a standalone script not integrated into any bot loop
+  - must never modify any bot trading files or parameters
+  - must never close or open positions
+  - must run and complete within 30 seconds
+  - must fail silently and log error if any input file is missing
+  - diagnosis file must be valid JSON always
+  - reads from all three bot data directories independently
+inputs:
+  - /home/tom-eastman/Downloads/pool-slayer/bot/data/meteora-snapshots.json
+  - /home/tom-eastman/Downloads/pool-slayer/bot/data/meteora-fees.json
+  - /home/tom-eastman/Downloads/meteora-bidask/data/meteora-snapshots.json
+  - /home/tom-eastman/Downloads/meteora-bidask/data/meteora-fees.json
+  - /home/tom-eastman/Downloads/meteora-curve/data/meteora-snapshots.json
+  - /home/tom-eastman/Downloads/meteora-curve/data/meteora-fees.json
+  - /home/tom-eastman/Downloads/meteora-pool-config.json
+  - /tmp/pool-scout.log
+  - target yield of 1.25 percent per day hardcoded as TARGET_YIELD_PCT
+  - deployed capital of 133.88 USD hardcoded as DEPLOYED_USD
+  - session start of 2026-04-25T01:23:00Z hardcoded as SESSION_START
+outputs:
+  - /home/tom-eastman/Downloads/pool-slayer/bot/data/thufir-notes.json written every night
+  - cron entry installed at 55 23 * * *
+  - Telegram message sent with nightly summary
+acceptance_criteria:
+  - Thufir runs nightly without human intervention
+  - correctly identifies which strategy earned most fees that day
+  - correctly classifies LOW_VOLUME when total yield below 0.3 percent
+  - correctly classifies WRONG_POOL when scout log shows better pool available
+  - correctly classifies OUT_OF_RANGE when any layer was out more than 2 cycles
+  - correctly classifies HARVEST_GAP when unclaimed fees exceed 0.10 USD
+  - correctly classifies SOL_DRIFT when SOL price moved more than 2 percent
+  - correctly classifies TARGET_HIT when combined yield meets 1.25 percent
+  - diagnosis file always written even if target was hit
+  - previous diagnosis file overwritten each night with fresh data
+  - Telegram notification sent with one-line summary regardless of outcome
+forbidden_behaviors:
+  - do not modify any bot trading files
+  - do not make any blockchain or RPC calls
+  - do not open or close positions
+  - do not send any transactions
+  - do not crash if a data file is missing or malformed
+  - do not recommend parameter changes without data to support them
+rollback_requirements:
+  - Thufir is a standalone file and can be deleted without affecting any bot
+  - cron entry removal command must be included in code comments
+  - PAUSE_THUFIR=true in .env must disable Thufir completely
+dependencies:
+  - meteora-snapshots.json from all three bot data directories
+  - meteora-fees.json from all three bot data directories
+  - meteora-pool-config.json
+  - pool-scout.log
+  - TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from .env
+performance_expectations:
+  - completes within 30 seconds
+  - no impact on any bot performance or check cycles
+security_expectations:
+  - no private keys accessed
+  - no network calls except Telegram notification
+  - read only access to all data files
+failure_modes:
+  LOW_VOLUME:
+    trigger: combined_yield_pct below 0.30
+    meaning: market was low volume, fees too thin regardless of strategy
+    recommended_action: hold current parameters, monitor pool scout for higher volume pools
+  WRONG_POOL:
+    trigger: pool scout log shows a pool with 20 percent better fee/tvl ratio was available for more than 2 consecutive checks
+    meaning: bots were in suboptimal pool losing fee income
+    recommended_action: lower pool switch threshold or increase scout frequency
+  OUT_OF_RANGE:
+    trigger: any bot snapshot shows positionValueUsd dropped more than 15 percent from session baseline in a single cycle
+    meaning: position went out of range and capital sat idle
+    recommended_action: review range widths for the affected strategy
+  HARVEST_GAP:
+    trigger: combined unclaimed fees estimated above 0.10 USD at end of day
+    meaning: hourly harvest not firing or threshold too high
+    recommended_action: verify doHarvest cycle counter is incrementing correctly
+  SOL_DRIFT:
+    trigger: SOL price change from session open exceeds 2.0 percent in either direction
+    meaning: price movement impacted portfolio value more than fees recovered
+    recommended_action: note for Reflect — consider if rent SOL exposure should be hedged
+  TARGET_HIT:
+    trigger: combined_yield_pct meets or exceeds 1.25
+    meaning: Thufir is satisfied
+    recommended_action: no change needed
+strategy_comparison:
+  - calculate daily_yield_pct per strategy (Spot, Bid-Ask, Curve)
+  - rank strategies by yield
+  - flag if any strategy earned zero fees (possible position issue)
+  - note which strategy is consistently outperforming for Reflect to act on
+diagnosis_output_schema:
+  date: YYYY-MM-DD
+  session_start: ISO timestamp
+  combined_yield_pct: float
+  target_yield_pct: 1.25
+  missed_by_pct: float negative means target was hit
+  failure_mode: LOW_VOLUME or WRONG_POOL or OUT_OF_RANGE or HARVEST_GAP or SOL_DRIFT or TARGET_HIT
+  strategy_ranking:
+    spot_yield_pct: float
+    bidask_yield_pct: float
+    curve_yield_pct: float
+    winner: spot or bidask or curve
+  pool_address: string
+  pool_switches_today: integer
+  sol_price_open: float
+  sol_price_close: float
+  sol_change_pct: float
+  total_fees_usd: float
+  estimated_unclaimed_usd: float
+  deployed_usd: float
+  true_portfolio_usd: float
+  diagnosis: human readable explanation
+  recommended_action: human readable suggested fix
+  ready_for_reflect: true if failure mode is actionable false if LOW_VOLUME or TARGET_HIT
+  thufir_confidence: high or medium or low based on data completeness

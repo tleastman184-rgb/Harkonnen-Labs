@@ -12,7 +12,7 @@ Policy event stream: `GET /api/coordination/policy-events`.
 
 Claim work with `POST /api/coordination/claim`, heartbeat with `POST /api/coordination/heartbeat`, and release it with `POST /api/coordination/release`.
 
-Last updated: 2026-04-22T19:44:50.866401468+00:00
+Last updated: 2026-05-11T14:18:33.272297322+00:00
 
 ## Active Claims
 

@@ -1,0 +1,78 @@
+id: belt-buckle
+title: Belt Buckle Three-Layer Liquidity Bot
+purpose: >
+  Automatically manage three concentrated liquidity positions (blade, middle,
+  anchor) on the Orca SOL/USDC 0.04% Whirlpool. Monitor price every 15 minutes,
+  rebalance out-of-range positions, and maintain capital allocation across layers.
+scope:
+  - Three-layer LP strategy on Orca Whirlpools SOL/USDC pool
+  - Blade layer 20% capital plus or minus 0.75% price range
+  - Middle layer 60% capital plus or minus 1.25% price range
+  - Anchor layer 20% capital plus or minus 2.0% price range
+  - Capital rebalancing via Jupiter swap when SOL/USDC ratio drifts beyond $2
+  - Position persistence to disk via JSON file
+  - Telegram notifications on open, close, and rebalance events
+constraints:
+  - Must maintain minimum 0.60 SOL reserve for rent and gas at all times
+  - Must not open a layer if SOL balance is below 0.25 SOL
+  - Must collect fees before closing any position
+  - closePosition returns an array and must iterate and execute each transaction
+  - Capital split must target 50% SOL and 50% USDC of deployable capital
+  - Only deploy to SOL/USDC Orca Whirlpool pool Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+  - Tick spacing must be 4
+  - Slippage tolerance capped at 1%
+inputs:
+  - SOLANA_PRIVATE_KEY environment variable
+  - SOLANA_RPC_URL environment variable
+  - TELEGRAM_BOT_TOKEN environment variable
+  - TELEGRAM_CHAT_ID environment variable
+  - Live SOL price from Orca Whirlpool sqrtPrice
+  - Persisted positions from data/belt-buckle-positions.json
+outputs:
+  - Open Orca Whirlpool positions for each layer
+  - Updated data/belt-buckle-positions.json
+  - Telegram notifications for position events
+  - Console logs for all significant events
+acceptance_criteria:
+  - All 3 layers open successfully on first run with sufficient capital
+  - Out-of-range positions detected within one 15-minute check cycle
+  - Close sequence always calls collectFees before closePosition
+  - closePosition array is iterated and all returned transactions executed
+  - Missing layers redeployed after rebalance at new price center
+  - Capital swap executes via Jupiter when imbalance exceeds $2
+  - SOL reserve of 0.60 SOL never consumed for LP deployment
+  - Positions persisted atomically using write to tmp then rename
+  - Telegram notification sent on every open and close event
+forbidden_behaviors:
+  - Never close a position without first collecting fees
+  - Never use only the first transaction from closePosition
+  - Never deploy capital below the 0.25 SOL minimum threshold
+  - Never consume the 0.60 SOL reserve for liquidity positions
+  - Never reinvest all yield and always maintain reserve
+  - Never open positions on any pool other than the configured SOL/USDC pool
+  - Never skip persisting position data after a successful open
+rollback_requirements:
+  - If a layer open fails log the error and continue without aborting other layers
+  - If a swap fails log the error and proceed with available capital
+  - If position persistence fails throw PositionPersistError
+  - On fatal error exit with process.exit(1)
+  - Positions file uses atomic write using tmp and rename to prevent corruption
+dependencies:
+  - orca-so/whirlpools-sdk for Orca Whirlpool position management
+  - orca-so/common-sdk for Percentage and DecimalUtil helpers
+  - coral-xyz/anchor for AnchorWallet and Whirlpool context
+  - solana/web3.js for Solana connection and transaction handling
+  - decimal.js for high-precision decimal arithmetic
+  - bs58 for base58 keypair decoding
+  - Jupiter lite-api for SOL/USDC swap execution
+  - Helius RPC as Solana RPC provider
+performance_expectations:
+  - Price check and rebalance decision within 30 seconds per cycle
+  - Position open completes within 60 seconds including swap if needed
+  - Position close completes within 60 seconds
+  - 15-minute check interval between rebalance cycles
+security_expectations:
+  - Private key loaded from environment variable only and never hardcoded
+  - No private key written to disk or logs
+  - RPC URL loaded from environment variable only
+  - Telegram credentials loaded from environment variables only

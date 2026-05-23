@@ -1,0 +1,98 @@
+id: the-eye-observer
+title: The Eye — Nightly Performance Observer
+purpose: The Eye watches Belt Buckle performance every night at 11:55 PM, diagnoses why the 2% daily return target was missed, and writes a structured diagnosis file that drives autonomous overnight improvement.
+scope:
+  - create new file src/the-eye-observer.ts in the belt buckle bot
+  - read data/daily-snapshots.json for yield and fee data
+  - read data/narrowing-events.json for rebalance count and gas costs
+  - read /tmp/belt-buckle.log for position open and close events
+  - calculate key performance metrics for the day
+  - classify failure mode from four categories
+  - write diagnosis to data/the-eye-diagnosis.json
+  - install as nightly cron job at 11:55 PM
+  - compile to dist/the-eye-observer.js via existing typescript build
+  - log all activity with [EYE] prefix to /tmp/belt-buckle.log
+constraints:
+  - must be a standalone script not integrated into the main bot loop
+  - must never modify any bot trading files or parameters
+  - must never close or open positions
+  - must run and complete within 30 seconds
+  - must fail silently and log error if any input file is missing
+  - diagnosis file must be valid JSON always
+inputs:
+  - data/daily-snapshots.json
+  - data/narrowing-events.json
+  - /tmp/belt-buckle.log
+  - target yield of 2.0 percent per day hardcoded as TARGET_YIELD_PCT constant
+outputs:
+  - data/the-eye-diagnosis.json written every night
+  - cron entry installed at 55 23 * * *
+acceptance_criteria:
+  - the Eye runs nightly without human intervention
+  - correctly classifies CHURN when gas ratio exceeds 30 percent of gross fees
+  - correctly classifies OUT_OF_RANGE when time in range is below 60 percent
+  - correctly classifies VOLATILITY when SOL price change exceeds 3 percent
+  - correctly classifies IDLE when no clear failure mode detected
+  - diagnosis file always written even if target was hit
+  - previous diagnosis file overwritten each night with fresh data
+  - the Eye tested manually against existing daily-snapshots.json before cron install
+  - log output uses [EYE] prefix for all entries
+forbidden_behaviors:
+  - do not modify belt-buckle-v2.ts or any trading logic
+  - do not make any blockchain or RPC calls
+  - do not open or close positions
+  - do not send any transactions
+  - do not crash if a data file is missing or malformed
+rollback_requirements:
+  - the Eye is a standalone file and can be deleted without affecting the bot
+  - cron entry removal command must be included in code comments
+  - PAUSE_EYE=true in .env must disable the Eye completely
+dependencies:
+  - existing data/daily-snapshots.json
+  - existing data/narrowing-events.json
+  - existing /tmp/belt-buckle.log
+  - existing tsconfig.json and build system
+performance_expectations:
+  - completes within 30 seconds
+  - no impact on bot performance or check cycles
+security_expectations:
+  - no private keys accessed
+  - no network calls made
+  - read only access to all data files
+failure_modes:
+  CHURN:
+    trigger: gas_cost_usd divided by gross_fees_usd exceeds 0.30
+    meaning: rebalancing too frequently transaction costs eating fee income
+    recommended_action: increase cooldown timer or widen buffer zone
+  OUT_OF_RANGE:
+    trigger: time_in_range_pct below 60
+    meaning: positions spending too much time outside range earning nothing
+    recommended_action: widen range widths
+  VOLATILITY:
+    trigger: sol_change_pct absolute value exceeds 3.0
+    meaning: SOL moved too much IL canceling fee income
+    recommended_action: widen anchor or pause blade during volatile periods
+  IDLE:
+    trigger: none of the above triggered and yield below target
+    meaning: market was low volume nothing to fix
+    recommended_action: hold current parameters and monitor
+  TARGET_HIT:
+    trigger: actual_yield_pct meets or exceeds 2.0
+    meaning: the Eye is satisfied
+    recommended_action: no change needed
+diagnosis_output_schema:
+  date: YYYY-MM-DD
+  actual_yield_pct: float
+  target_yield_pct: 2.0
+  missed_by_pct: float negative means target was hit
+  failure_mode: CHURN or OUT_OF_RANGE or VOLATILITY or IDLE or TARGET_HIT
+  rebalance_count: integer
+  gas_cost_usd: float
+  gross_fees_usd: float
+  gas_ratio_pct: float
+  time_in_range_pct: float
+  sol_change_pct: float
+  portfolio_usd: float
+  diagnosis: human readable explanation
+  recommended_action: human readable suggested fix
+  ready_for_reflect: true if failure mode is actionable false if IDLE or TARGET_HIT

@@ -1,0 +1,110 @@
+id: the-eye-reflect
+title: The Eye — Reflect Agent
+purpose: The Eye brain. Reads the nightly diagnosis from the Observer queries the Eye memory for past experiment outcomes forms one precise improvement hypothesis and writes a new Harkonnen spec automatically. Reflect is the step that makes Thufir fully autonomous.
+scope:
+  - create new file src/the-eye-reflect.ts in the belt buckle bot
+  - read data/the-eye-diagnosis.json from the Observer
+  - read data/the-eye-memory.json for history of past adjustments and outcomes
+  - select one parameter to adjust based on failure mode and memory
+  - calculate the new parameter value within safe bounds
+  - write a new Harkonnen YAML spec to factory specs directory
+  - trigger Mason against the new spec automatically
+  - log all decisions with [EYE-REFLECT] prefix to /tmp/belt-buckle.log
+  - only run if ready_for_reflect is true in diagnosis file
+  - compile to dist/the-eye-reflect.js via existing typescript build
+constraints:
+  - must only change one parameter per night never multiple
+  - must never propose a change outside the safe bounds table
+  - must never change capital allocation percentages 20-60-20
+  - must never propose closing or opening positions directly
+  - must skip and log if diagnosis shows TARGET_HIT or IDLE
+  - must skip and log if PAUSE_EYE=true in .env
+  - must skip if the-eye-memory.json shows same change failed twice in a row
+  - must always write to the-eye-memory.json before triggering Mason
+inputs:
+  - data/the-eye-diagnosis.json
+  - data/the-eye-memory.json
+  - .env for PAUSE_EYE flag and ANTHROPIC_API_KEY
+outputs:
+  - new Harkonnen YAML spec written to factory specs directory
+  - data/the-eye-memory.json updated with new hypothesis entry
+  - Mason triggered automatically against the new spec
+acceptance_criteria:
+  - Reflect correctly skips when failure mode is TARGET_HIT
+  - Reflect correctly skips when failure mode is IDLE
+  - Reflect correctly skips when PAUSE_EYE=true
+  - Reflect correctly skips when same change failed twice in a row
+  - Reflect selects correct parameter for each failure mode
+  - Reflect never proposes value outside safe bounds table
+  - generated spec is valid YAML that Mason can parse
+  - Mason triggered automatically after spec is written
+  - memory file updated before Mason is triggered
+  - all decisions logged with [EYE-REFLECT] prefix
+forbidden_behaviors:
+  - do not change more than one parameter per night
+  - do not propose changes outside safe bounds
+  - do not change capital allocation
+  - do not trigger Mason if spec generation fails
+  - do not repeat an experiment that failed twice consecutively
+  - do not run if ready_for_reflect is false
+rollback_requirements:
+  - generated spec file can be deleted without affecting the bot
+  - memory file preserves full history and is never overwritten only appended
+  - if Mason fails the current bot version continues running unchanged
+dependencies:
+  - existing data/the-eye-diagnosis.json from Observer
+  - existing data/the-eye-memory.json created on first run if not present
+  - existing Harkonnen factory and cargo run command
+  - existing .env with ANTHROPIC_API_KEY
+  - existing tsconfig.json and build system
+performance_expectations:
+  - spec generation completes within 30 seconds
+  - Mason trigger is fire and forget
+security_expectations:
+  - ANTHROPIC_API_KEY read from .env never hardcoded
+  - no private keys accessed
+  - no blockchain calls made
+safe_bounds_table:
+  blade_cooldown_ms:
+    min: 900000
+    max: 7200000
+    step: 900000
+  blade_width:
+    min: 0.0060
+    max: 0.0200
+    step: 0.0010
+  middle_width:
+    min: 0.0100
+    max: 0.0300
+    step: 0.0025
+  anchor_width:
+    min: 0.0200
+    max: 0.0500
+    step: 0.0050
+  check_interval_ms:
+    min: 300000
+    max: 1800000
+    step: 300000
+  buffer_zone_pct:
+    min: 0.0005
+    max: 0.0050
+    step: 0.0005
+failure_mode_to_parameter:
+  CHURN:
+    primary: blade_cooldown_ms
+    secondary: buffer_zone_pct
+  OUT_OF_RANGE:
+    primary: blade_width
+    secondary: middle_width
+  VOLATILITY:
+    primary: anchor_width
+    secondary: check_interval_ms
+memory_schema:
+  date: YYYY-MM-DD
+  failure_mode: string
+  parameter_changed: string
+  value_before: number
+  value_after: number
+  hypothesis: string
+  next_day_yield_pct: null until filled
+  outcome: null until filled IMPROVED NEUTRAL or WORSE

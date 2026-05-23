@@ -1,0 +1,101 @@
+id: the-eye-deployment-gate
+title: The Eye — Deployment Gate
+purpose: The Eye safety layer. Validates every proposed change against a strict safety checklist before deploying. If any check fails the gate rejects the change keeps the current version running and logs the rejection. The bot never goes down and capital is never at risk from a bad deployment.
+scope:
+  - create new file src/the-eye-gate.ts in the belt buckle bot
+  - read data/the-eye-diagnosis.json to understand what change is proposed
+  - validate all proposed parameter changes against safe bounds table
+  - check bot is in stable state before deploying
+  - check PAUSE_EYE flag in .env before any action
+  - back up current belt-buckle-v2.ts before deploying
+  - deploy approved changes and restart bot
+  - write every decision to data/the-eye-change-log.json
+  - log all activity with [EYE-GATE] prefix to /tmp/belt-buckle.log
+  - compile to dist/the-eye-gate.js via existing typescript build
+constraints:
+  - must never deploy without all safety checks passing
+  - must never change capital allocation percentages 20-60-20
+  - must never deploy more than one change per 23 hour period
+  - must never deploy while bot is mid-rebalance
+  - must always create belt-buckle-v2.ts.bak before any deployment
+  - must always keep bot running even if deployment fails
+  - PAUSE_EYE=true in .env must halt all gate activity immediately
+  - proposed changes must be within safe bounds table or gate rejects
+inputs:
+  - data/the-eye-diagnosis.json
+  - data/the-eye-change-log.json for last deployment timestamp
+  - .env for PAUSE_EYE flag
+  - /tmp/belt-buckle.log for bot state detection
+outputs:
+  - deployed belt-buckle-v2.ts if all checks pass
+  - belt-buckle-v2.ts.bak backup always created before deployment
+  - data/the-eye-change-log.json updated with every decision
+  - bot restarted after successful deployment
+acceptance_criteria:
+  - gate correctly approves a valid in-bounds change
+  - gate correctly rejects an out-of-bounds change
+  - gate correctly rejects when PAUSE_EYE=true
+  - gate correctly rejects when bot is mid-rebalance
+  - gate correctly rejects when last deployment was less than 23 hours ago
+  - backup file always created before any deployment attempt
+  - change log always updated regardless of approve or reject
+  - bot always running after gate completes regardless of outcome
+  - log output uses [EYE-GATE] prefix for all entries
+forbidden_behaviors:
+  - do not deploy if any safety check fails
+  - do not change capital allocation percentages
+  - do not deploy more than once per day
+  - do not leave bot stopped if deployment fails
+  - do not delete backup files
+  - do not deploy without writing to change log
+rollback_requirements:
+  - on failed deployment restore belt-buckle-v2.ts.bak immediately
+  - restart bot from backup if new version fails to start
+  - log rollback event to change log and belt-buckle.log
+dependencies:
+  - existing belt-buckle-v2.ts
+  - existing data/the-eye-diagnosis.json
+  - existing .env
+  - existing tsconfig.json and build system
+performance_expectations:
+  - full gate check completes within 60 seconds
+  - bot downtime during deployment under 10 seconds
+security_expectations:
+  - private key never logged or transmitted
+  - backup file preserved for minimum 7 days
+safe_bounds_table:
+  blade_cooldown_ms:
+    min: 900000
+    max: 7200000
+    description: 15 minutes to 2 hours
+  blade_width:
+    min: 0.0060
+    max: 0.0200
+    description: blade range width bounds
+  middle_width:
+    min: 0.0100
+    max: 0.0300
+    description: middle range width bounds
+  anchor_width:
+    min: 0.0200
+    max: 0.0500
+    description: anchor range width bounds
+  check_interval_ms:
+    min: 300000
+    max: 1800000
+    description: 5 minutes to 30 minutes
+  buffer_zone_pct:
+    min: 0.0005
+    max: 0.0050
+    description: 0.05 percent to 0.50 percent buffer zone
+change_log_schema:
+  date: YYYY-MM-DD
+  timestamp: ISO 8601
+  failure_mode_diagnosed: string
+  change_proposed: human readable description
+  parameter_before: value before change
+  parameter_after: value after change
+  gate_decision: APPROVED or REJECTED
+  rejection_reason: string if rejected null if approved
+  deployment_success: boolean if approved
+  next_day_yield_pct: filled in by the Eye the following night

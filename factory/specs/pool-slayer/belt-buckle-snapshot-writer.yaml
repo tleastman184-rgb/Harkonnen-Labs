@@ -1,0 +1,60 @@
+id: belt-buckle-snapshot-writer
+title: Belt Buckle Automatic Daily Snapshot Writer
+purpose: Automatically write a daily performance snapshot entry to data/daily-snapshots.json once per day so the dashboard graph and Thufir Observer have accurate real data to work with.
+scope:
+  - add a daily snapshot writer function to belt-buckle-v2.ts
+  - trigger snapshot write at midnight or first check after midnight
+  - calculate all required fields from live position and wallet data
+  - append new entry to data/daily-snapshots.json without overwriting history
+  - never write duplicate entries for the same date
+constraints:
+  - must not break existing three-layer blade/middle/anchor logic
+  - must not interrupt active rebalance cycles
+  - must not change capital allocation or range widths
+  - snapshot write must be non-blocking and fail silently if data unavailable
+  - always append to existing file never overwrite
+inputs:
+  - Solana wallet private key
+  - Solana RPC URL
+  - existing belt-buckle-v2.ts source code
+  - existing data/daily-snapshots.json
+outputs:
+  - modified belt-buckle-v2.ts with snapshot writer function
+  - daily-snapshots.json updated automatically each night
+acceptance_criteria:
+  - snapshot entry written within first check cycle after midnight
+  - no duplicate entries for the same date
+  - all required fields populated with real data
+  - existing snapshot history preserved on every write
+  - bot continues normal operation after snapshot write
+forbidden_behaviors:
+  - do not overwrite existing snapshot entries
+  - do not block the main bot loop while writing snapshot
+  - do not crash the bot if snapshot write fails
+  - do not change any trading logic or parameters
+rollback_requirements:
+  - keep original belt-buckle-v2.ts as belt-buckle-v2.ts.bak before changes
+  - snapshot writer can be disabled by removing the function call without affecting bot
+dependencies:
+  - existing belt-buckle-v2.ts
+  - existing data/daily-snapshots.json
+  - existing node_modules
+performance_expectations:
+  - snapshot write completes within 5 seconds
+  - no impact on check cycle timing
+security_expectations:
+  - private key never logged or transmitted
+  - all transactions signed locally
+snapshot_schema:
+  date: YYYY-MM-DD string of the day being recorded
+  portfolioUsd: total USD value of all open positions at time of snapshot
+  feesStartUsd: always 0 for now until fee tracking is implemented
+  feesEndUsd: fees collected during the day from belt-buckle-harvests.json
+  yieldPct: feesEndUsd divided by portfolioUsd multiplied by 100
+  solPrice: current SOL price in USD at time of snapshot
+  solChangePct: SOL price change percentage vs previous day snapshot
+  solPnlUsd: unrealized gain or loss from SOL price movement on deployed capital
+  ilUsd: impermanent loss estimate based on SOL price change
+  gasCostUsd: total transaction costs for the day from narrowing-events.json
+  netChangeUsd: portfolioUsd minus previous day portfolioUsd
+  fullyAccounted: true

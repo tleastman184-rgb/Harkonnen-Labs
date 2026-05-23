@@ -1,0 +1,52 @@
+id: belt-buckle-antichurn
+title: Belt Buckle Anti-Churn Optimization
+purpose: Reduce churn and maximize fee income on the Belt Buckle three-layer SOL/USDC bot targeting 2% net daily return.
+scope:
+  - increase check interval from 5 minutes to 10 minutes
+  - add 30 minute cooldown timer per layer after each rebalance
+  - add buffer zone requiring price 0.1 percent outside range before rebalancing
+  - add minimum fee threshold of 0.25 USD before rebalancing
+  - only rebalance the layer that is out of range
+  - write automatic daily snapshot to data/daily-snapshots.json once per day
+constraints:
+  - single pool only Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+  - minimum 30 minute cooldown between rebalances of the same layer
+  - never change capital allocation percentages 20-60-20
+  - never change range widths 0.0090 0.0125 0.0250
+  - always maintain 1.5 SOL liquid for gas fees
+  - preserve existing close sequence collectFees then closePosition
+inputs:
+  - Solana wallet private key
+  - Solana RPC URL
+  - existing belt-buckle-v2.ts source code
+outputs:
+  - modified belt-buckle-v2.ts with anti-churn logic
+  - updated check interval to 10 minutes
+  - cooldown and buffer zone logic added
+  - automatic daily snapshot writer added
+acceptance_criteria:
+  - rebalance frequency drops by at least 50 percent
+  - net daily return reaches 2 percent or above on deployed capital
+  - no position sits idle out of range for more than 2 hours
+  - bot runs stable overnight without capital erosion
+  - daily-snapshots.json updates automatically every 24 hours
+forbidden_behaviors:
+  - do not close positions unnecessarily
+  - do not change capital allocation percentages
+  - do not change range widths
+  - do not add new external dependencies
+  - do not rebalance during cooldown period
+rollback_requirements:
+  - keep original belt-buckle-v2.ts as belt-buckle-v2.ts.bak before making changes
+  - all changes must be reversible by restoring the backup file
+dependencies:
+  - existing belt-buckle-v2.ts
+  - existing data/daily-snapshots.json
+  - existing node_modules
+performance_expectations:
+  - check cycle completes within 10 seconds
+  - rebalance completes within 30 seconds of trigger
+  - daily snapshot writes within 60 seconds of midnight
+security_expectations:
+  - private key never logged or transmitted
+  - all transactions signed locally
